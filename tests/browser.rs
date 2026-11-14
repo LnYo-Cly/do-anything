@@ -1333,6 +1333,7 @@ fn a_second_open_with_a_different_connect_is_a_step_error() {
     let browser = UserBrowser::start();
     let dir = TempDir::new("browser-connect-change");
     let url = server.url("/browser/form?case=connect-change");
+    let other_port = closed_port();
     let case = dir.write(
         "connect-change.yaml",
         &format!(
@@ -1342,11 +1343,10 @@ steps:
       connect: "{}"
       url: "{url}"
   - browser.open:
-      connect: "http://localhost:{}"
+      connect: "http://127.0.0.1:{other_port}"
       url: "{url}"
 "##,
-            browser.connect_url(),
-            browser.port
+            browser.connect_url()
         ),
     );
 
