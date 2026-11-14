@@ -10,7 +10,7 @@ name = "da"
 path = "src/main.rs"
 
 [features]
-default = ["http", "cli", "log", "db"]
+default = ["http", "cli", "log", "db", "browser"]
 # The `http.request` step and the HTTP client it needs.
 http = ["dep:schemars", "dep:ureq"]
 # The `cli.run` step and the child-process timeout it needs.

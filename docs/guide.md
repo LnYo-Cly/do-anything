@@ -77,11 +77,11 @@ cargo build
 
 The binary is written to `target/debug/da` (`target\debug\da.exe` on Windows).
 The `http` feature provides the `http.request` step, `cli` provides `cli.run`,
-`log` provides the `log.file` observer and `db` provides `db.query`; these four
-are enabled by default. The `browser` feature provides the `browser.*` steps and
-is opt-in: it adds about 12 MiB to the release binary and needs a Chrome or
-Chromium installed on the machine. Build it with
-`--no-default-features --features http,cli,log,db,browser`, build a subset with
+`log` provides the `log.file` observer, `db` provides `db.query` and `browser`
+provides the `browser.*` steps; these five are enabled by default. The `browser`
+feature adds about 0.5 MiB to the release binary and needs a Chrome or Chromium
+installed on the machine; it never downloads a browser. Build a subset with
+`--no-default-features --features http,cli,log,db`, build only one driver with
 `--no-default-features --features cli`, or build nothing extra with
 `--no-default-features`.
 
@@ -1042,7 +1042,7 @@ page instead of opening another one.
 
 | Step | Arguments | Result |
 | --- | --- | --- |
-| `browser.open` | `url` required; `headless` defaults to `true`; `width` and `height` default to 1280×800 | `url`, `title` |
+| `browser.open` | `url` required; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title` |
 | `browser.click` | locator | `{}`, or the clicked element's `text` when it has one |
 | `browser.type` | locator; `text` required | `{}` |
 | `browser.press` | `key` required, for example `Enter` or `Tab` | `{}` |
@@ -1051,16 +1051,22 @@ page instead of opening another one.
 
 A **locator** is exactly one of `css` (a CSS selector) and `xpath` (an XPath
 expression), plus an optional `timeout_ms` (default 5000) that says how long to
-wait for the element to appear. Giving both, or neither, is a case error that
-`da lint` reports before anything runs. `browser.wait` accepts the same locator
-or `url_contains`, which waits until the current URL contains that text.
+wait for the element to appear and be visible. Giving both, or neither, is a case
+error that `da lint` reports before anything runs. `browser.wait` accepts the same
+locator or `url_contains`, which waits until the current URL contains that text.
 `browser.open` returns the URL the page actually reached, after redirects, and
-its title.
+its title. Its own `timeout_ms` bounds how long the page may take to finish
+loading; exceeding it is a timeout (exit 5).
+
+`browser.press` accepts `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, the four
+arrow keys, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one printable
+character. Any other key name is an argument error that `da lint` reports.
 
 `headless`, `width` and `height` only apply when the first `browser.open` creates
 the page. A later `browser.open` that gives a different effective value is a step
 error instead of being silently ignored, so one case cannot change the browser it
-is driving halfway through.
+is driving halfway through. `timeout_ms` applies to each navigation, so a later
+`browser.open` may choose a different value.
 
 The browser is closed when the case ends, whether it passed, failed an
 assertion, errored or timed out. A session belongs to one case, so `--jobs 4`
@@ -1071,8 +1077,16 @@ Chrome is found in this order:
 
 1. `DA_CHROME`, an absolute path to the `chrome`, `chromium` or `msedge`
    executable.
-2. The library's own lookup: `CHROME`, the usual program names on `PATH`, the
-   registry on Windows and the application folders on macOS.
+2. The usual install locations: on Windows Chrome, Chromium and Edge under
+   `ProgramFiles`, `ProgramFiles(x86)` and `LocalAppData`; on macOS
+   `/Applications/Google Chrome.app` and `/Applications/Chromium.app`; on Linux
+   `/usr/bin/google-chrome`, `/usr/bin/chromium` and `/snap/bin/chromium`.
+3. These program names on `PATH`: `google-chrome`, `google-chrome-stable`,
+   `chromium`, `chromium-browser` and `chrome`.
+
+Each case starts its own browser process with a fresh temporary profile and a
+debugger that listens on a loopback port the operating system chooses, so two
+cases at the same time cannot share a profile or a port.
 
 When no browser is found, or it cannot start, the step is an environment error
 (exit 4) whose message names `DA_CHROME`. An element that does not appear within
