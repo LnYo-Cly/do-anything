@@ -1063,9 +1063,10 @@ the user's browser keeps running and the user's other tabs are untouched.
 | `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000 | `url` |
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
 
-A **locator** is exactly one of these four forms, plus an optional `timeout_ms`
-(default 5000) that says how long to wait for the element to appear and be
-visible:
+A **locator** is exactly one of `css`, `xpath`, `text` and `role`; `name` is an
+optional modifier for `role`. Every locator also accepts an optional
+`timeout_ms` (default 5000) that says how long to wait for the element to appear
+and be visible.
 
 | Locator | Meaning |
 | --- | --- |
