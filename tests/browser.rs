@@ -609,16 +609,30 @@ fn a_missing_element_fails_with_its_locator_and_timeout() {
     let dir = TempDir::new("browser-missing");
     let url = server.url("/browser/form?case=missing");
 
-    for (name, step, timeout) in [
+    for (name, step, timeout, locator) in [
         (
             "click.yaml",
             "  - browser.click:\n      css: \"#never\"\n      timeout_ms: 300\n",
             "300",
+            "#never",
         ),
         (
             "wait.yaml",
             "  - browser.wait:\n      css: \"#never\"\n      timeout_ms: 200\n",
             "200",
+            "#never",
+        ),
+        (
+            "click-text.yaml",
+            "  - browser.click:\n      text: \"No such text\"\n      timeout_ms: 300\n",
+            "300",
+            "No such text",
+        ),
+        (
+            "wait-role.yaml",
+            "  - browser.wait:\n      role: button\n      name: \"No such button\"\n      timeout_ms: 200\n",
+            "200",
+            "No such button",
         ),
     ] {
         let case = dir.write(
@@ -642,7 +656,7 @@ fn a_missing_element_fails_with_its_locator_and_timeout() {
         let value = json_stdout(&output);
         let message = case_error(&value);
         assert!(
-            message.contains("#never"),
+            message.contains(locator),
             "{name}: the message must name the locator, got: {message}"
         );
         assert!(
