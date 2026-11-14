@@ -5,6 +5,8 @@
 
 use crate::core::registry::Registry;
 
+#[cfg(feature = "browser")]
+pub mod browser;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "db")]
@@ -16,6 +18,10 @@ pub mod log;
 
 /// Registers every driver enabled at build time.
 pub fn register(registry: &mut Registry) -> Result<(), String> {
+    #[cfg(feature = "browser")]
+    {
+        browser::register(registry)?;
+    }
     #[cfg(feature = "cli")]
     {
         cli::register(registry)?;
@@ -28,7 +34,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     {
         http::register(registry)?;
     }
-    #[cfg(not(any(feature = "cli", feature = "db", feature = "http")))]
+    #[cfg(not(any(feature = "browser", feature = "cli", feature = "db", feature = "http")))]
     {
         let _ = registry;
     }

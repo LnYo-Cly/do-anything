@@ -25,6 +25,8 @@ db = [
     "dep:tokio-postgres-rustls",
     "dep:rustls",
 ]
+# The `browser.*` steps and the Chrome DevTools Protocol client they need.
+browser = ["dep:schemars", "dep:headless_chrome"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -43,6 +45,9 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring", "webpki-roots"],
 # Only to install the crypto provider `tokio-postgres-rustls` asks for; this is
 # the same crate and version `ureq` already builds with.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# The default `offline` feature is the one used: it ships pre-generated CDP
+# types. `fetch` would download a browser at run time and stays off.
+headless_chrome = { version = "1.0.22", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
