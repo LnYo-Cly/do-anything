@@ -990,6 +990,16 @@ unchanged by that wrapper.
 - SQLite opens the file read-only, so the connection has no write permission,
   and it also sets `PRAGMA query_only`. A database file that does not exist is
   an environment error (exit 4) — the step never creates one.
+- SQLite also registers an authorizer that allows only the actions a read
+  takes: `SELECT`, reading a column, calling a function, a recursive common
+  table expression, and a fixed list of read-only `PRAGMA` names such as
+  `table_info`, `index_list` and `integrity_check`. Every other action — a
+  write, a schema change, `ATTACH`, `DETACH`, a transaction — is denied while
+  the statement is prepared, so nothing in the statement runs.
+- A statement that SQLite itself reports as one that would write is refused
+  right after it is prepared, before its first step. `VACUUM` is refused there:
+  SQLite asks the authorizer nothing about it, and `VACUUM INTO 'copy.db'`
+  creates the target file when it runs.
 - PostgreSQL sets `SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` and runs
   the statement in an explicit `READ ONLY` transaction that is always rolled
   back. A statement that tries to write is refused by the server.
@@ -1003,13 +1013,12 @@ gone`, and a statement list such as `SELECT 1; DELETE FROM orders` all fail the
 step with an environment error (exit 4) whose message says the step is read-only.
 The database is left exactly as it was. SQLite does not accept a data-modifying
 common table expression at all, so there the statement is a syntax error before
-either read-only layer sees it; PostgreSQL accepts the syntax, and the read-only
+any read-only layer sees it; PostgreSQL accepts the syntax, and the read-only
 transaction is what refuses it.
 
-One side effect is outside the database file itself: SQLite refuses
-`VACUUM INTO 'copy.db'` because the connection is read-only, but it opens the
-target file before it stops, so an empty `copy.db` can be left behind. No data
-is copied. The step's "never created" promise is about the database it opens.
+The refusal is also a promise about the file system: a refused `VACUUM INTO
+'copy.db'` or `ATTACH DATABASE 'other.db' AS other` leaves no file at that path.
+No data is copied, and the target is never opened.
 
 #### Connection strings and secrets
 
