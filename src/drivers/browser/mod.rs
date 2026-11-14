@@ -681,7 +681,11 @@ impl BrowserSession {
                 "could not open `{url}`: {error_text}"
             )));
         }
-        wait_for_load(connection, &page, url, deadline)?;
+        // Chrome omits `loaderId` for a same-document navigation (a fragment
+        // or history change): no new document loads, so no load event fires.
+        if reply.get("loaderId").is_some() {
+            wait_for_load(connection, &page, url, deadline)?;
+        }
 
         let current = connection
             .evaluate(&page, "location.href", deadline)

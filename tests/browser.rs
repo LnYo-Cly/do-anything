@@ -843,3 +843,47 @@ fn a_missing_da_chrome_is_an_environment_error() {
         "the environment error must say how to set the path, got: {message}"
     );
 }
+
+#[test]
+fn a_fragment_open_navigates_within_the_page_without_waiting_for_a_load() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-fragment-open");
+    let page = server.url("/browser/form?case=fragment");
+    let case = dir.write(
+        "fragment.yaml",
+        &format!(
+            r##"name: open a fragment of the same page
+steps:
+  - browser.open:
+      url: "{page}"
+  - browser.open:
+      url: "{page}#greeting"
+      timeout_ms: 3000
+    expect:
+      - path: $.url
+        contains: "#greeting"
+  - browser.read:
+      css: "#visits"
+    expect:
+      - path: $.text
+        equals: "visits: 1"
+"##
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "a same-document open must not wait for a load event: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
