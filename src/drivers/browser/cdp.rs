@@ -197,13 +197,40 @@ impl Connection {
             deadline,
         )?;
         if let Some(details) = reply.get("exceptionDetails") {
-            let message = details
-                .get("exception")
-                .and_then(|exception| exception.get("description"))
-                .and_then(Value::as_str)
-                .or_else(|| details.get("text").and_then(Value::as_str))
-                .unwrap_or("the page script raised an exception");
-            return Err(CdpError::Script(message.to_string()));
+            return Err(CdpError::Script(exception_message(details)));
+        }
+        Ok(reply
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    /// Calls a JavaScript function with a DOM node as `this`.
+    ///
+    /// The accessibility tree names a node by its backend id; after
+    /// `DOM.resolveNode` this form runs the action on that exact element rather
+    /// than searching for it again by a selector.
+    pub fn call_function(
+        &mut self,
+        session_id: &str,
+        object_id: &str,
+        function: &str,
+        deadline: Deadline,
+    ) -> Result<Value, CdpError> {
+        let reply = self.call(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": function,
+                "returnByValue": true,
+                "awaitPromise": false,
+            }),
+            Some(session_id),
+            deadline,
+        )?;
+        if let Some(details) = reply.get("exceptionDetails") {
+            return Err(CdpError::Script(exception_message(details)));
         }
         Ok(reply
             .get("result")
@@ -331,6 +358,17 @@ fn split_ws_url(url: &str) -> Result<(&str, u16), CdpError> {
         .parse::<u16>()
         .map_err(|error| CdpError::Transport(format!("`{url}` has no usable port: {error}")))?;
     Ok((host, port))
+}
+
+/// Flattens a CDP `exceptionDetails` member into one message.
+fn exception_message(details: &Value) -> String {
+    details
+        .get("exception")
+        .and_then(|exception| exception.get("description"))
+        .and_then(Value::as_str)
+        .or_else(|| details.get("text").and_then(Value::as_str))
+        .unwrap_or("the page script raised an exception")
+        .to_string()
 }
 
 /// Flattens a CDP `error` member into one message.

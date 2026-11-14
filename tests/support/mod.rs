@@ -346,6 +346,7 @@ fn browser_form(query: &str) -> String {
   onclick="document.getElementById('trusted-result').textContent =
     (window.event &amp;&amp; window.event.isTrusted) ? 'trusted click' : 'untrusted click';">Click me</button>
 <p id="trusted-result"></p>
+<div id="editor" contenteditable="true">Editor</div>
 <a id="next" href="/browser/second?case={label}&amp;token=ok">Next</a>
 <script>
 var visits = Number(localStorage.getItem('browser-visits') || '0') + 1;

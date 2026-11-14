@@ -12,15 +12,17 @@
 mod support;
 
 use std::fs;
-use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use support::{TempDir, TestServer};
+use support::{TempDir, TestServer, closed_port};
 
 /// The binary under test, as an absolute path.
 fn da() -> &'static str {
@@ -160,6 +162,303 @@ steps:
         equals: "not set yet"
 "##
     )
+}
+
+/// The Chrome the connect test drives, as the user's own browser.
+///
+/// The test starts it, opens the tab the user is supposedly looking at, runs a
+/// case against it and then checks that the case neither closed the process nor
+/// touched that tab. `Drop` ends the browser the test owns; the case must not.
+struct UserBrowser {
+    child: Child,
+    profile: PathBuf,
+    port: u16,
+}
+
+impl UserBrowser {
+    /// Starts a browser with a debug port the test can name to `connect`.
+    fn start() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let profile = std::env::temp_dir().join(format!(
+            "da-test-user-browser-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&profile).expect("the test browser profile must be created");
+        let port = free_port();
+        let mut command = Command::new(chrome_executable());
+        command
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .arg(format!("--remote-debugging-port={port}"))
+            .arg("--headless=new")
+            .arg("--disable-extensions")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("about:blank")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("the test browser must start");
+        let browser = Self {
+            child,
+            profile,
+            port,
+        };
+        browser.wait_until_ready();
+        browser
+    }
+
+    /// Waits until the DevTools endpoint answers, so a case can connect.
+    fn wait_until_ready(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok((200, _)) = http_request(self.port, "GET", "/json/version") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the test browser did not open its debug port {port}",
+                port = self.port
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The loopback URL a case passes as `connect`.
+    fn connect_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Opens one more tab, as the user's own tab, and returns its target id.
+    fn open_tab(&self, url: &str) -> String {
+        let (status, body) = http_request(self.port, "PUT", &format!("/json/new?{url}"))
+            .expect("the test browser must accept a new tab");
+        assert_eq!(status, 200, "the test browser refused a new tab: {body}");
+        let value: Value = serde_json::from_str(&body).expect("the new tab must be a JSON object");
+        value["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the new tab must have an id: {value}"))
+            .to_string()
+    }
+
+    /// Every page target the browser currently has, in the order Chrome lists
+    /// them.
+    fn page_tabs(&self) -> Vec<Value> {
+        let (status, body) = http_request(self.port, "GET", "/json/list")
+            .expect("the test browser must list its tabs");
+        assert_eq!(status, 200, "the test browser refused to list tabs: {body}");
+        let tabs: Vec<Value> =
+            serde_json::from_str(&body).expect("the tab list must be a JSON array");
+        tabs.into_iter()
+            .filter(|tab| tab["type"].as_str() == Some("page"))
+            .collect()
+    }
+}
+
+impl Drop for UserBrowser {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.profile);
+    }
+}
+
+/// A loopback port nothing is listening on.
+fn free_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a free port must be available");
+    let port = listener
+        .local_addr()
+        .expect("the free port must have an address")
+        .port();
+    drop(listener);
+    port
+}
+
+/// The Chrome executable, found the same way the driver finds it.
+fn chrome_executable() -> PathBuf {
+    if let Some(value) = std::env::var_os("DA_CHROME") {
+        let path = PathBuf::from(value);
+        assert!(
+            path.is_file(),
+            "DA_CHROME points to a missing file: {}",
+            path.display()
+        );
+        return path;
+    }
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
+            let Some(root) = std::env::var_os(variable) else {
+                continue;
+            };
+            let root = PathBuf::from(root);
+            candidates.push(root.join("Google/Chrome/Application/chrome.exe"));
+            candidates.push(root.join("Chromium/Application/chrome.exe"));
+            candidates.push(root.join("Microsoft/Edge/Application/msedge.exe"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ));
+        candidates.push(PathBuf::from(
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for path in [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+        ] {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return path;
+    }
+    for name in [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "chrome",
+    ] {
+        if let Some(path) = find_program_on_path(name) {
+            return path;
+        }
+    }
+    panic!("the connect test needs Chrome or Chromium; set DA_CHROME to its executable");
+}
+
+/// Finds `name`, or `name.exe` on Windows, in one of the `PATH` directories.
+fn find_program_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|directory| {
+        [directory.join(name), directory.join(format!("{name}.exe"))]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// One HTTP/1.1 request to the test browser's DevTools endpoint.
+///
+/// The answer is read by `content-length`; a DevTools endpoint keeps the
+/// connection open, so reading to end-of-file would wait for the timeout.
+fn http_request(port: u16, method: &str, path: &str) -> Result<(u16, String), String> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        .map_err(|error| format!("could not connect to {address}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("could not configure the connection: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("could not configure the connection: {error}"))?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("could not send the request: {error}"))?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut header_end = None;
+    loop {
+        if header_end.is_none()
+            && let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            header_end = Some(index + 4);
+        }
+        if let Some(body_start) = header_end {
+            let header = String::from_utf8_lossy(&response[..body_start]);
+            if let Some(length) = header.lines().skip(1).find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            }) && response.len() >= body_start + length
+            {
+                break;
+            }
+        }
+        assert!(
+            response.len() < 1 << 20,
+            "the DevTools endpoint answered more than 1 MiB"
+        );
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error) => return Err(format!("could not read the answer: {error}")),
+        }
+    }
+
+    let body_start = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .ok_or_else(|| "the answer has no header block".to_string())?;
+    let header = String::from_utf8_lossy(&response[..body_start]);
+    let status = header
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("the answer has no status line: {header}"))?;
+    let body = String::from_utf8_lossy(&response[body_start..]).into_owned();
+    Ok((status, body))
+}
+
+/// Waits until the browser lists at least `wanted` pages.
+fn wait_for_pages(browser: &UserBrowser, wanted: usize) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pages = browser.page_tabs();
+        if pages.len() >= wanted {
+            return pages;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the test browser listed {} pages, expected at least {wanted}: {pages:?}",
+            pages.len()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits until no page URL contains `fragment`.
+fn wait_for_page_to_close(browser: &UserBrowser, fragment: &str) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pages = browser.page_tabs();
+        if !pages.iter().any(|page| {
+            page["url"]
+                .as_str()
+                .is_some_and(|url| url.contains(fragment))
+        }) {
+            return pages;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the page `{fragment}` was still open after the case: {pages:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The target id of one listed page.
+fn page_id(page: &Value) -> &str {
+    page["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a listed page must have an id: {page}"))
 }
 
 #[test]
@@ -745,6 +1044,36 @@ fn every_step_reports_its_argument_errors_in_lint() {
             "  - browser.open:\n      url: \"http://127.0.0.1:1/\"\n      bogus: true\n",
             "bogus",
         ),
+        (
+            "connect-remote.yaml",
+            "  - browser.open:\n      connect: \"http://192.168.1.10:9222\"\n      url: \"http://127.0.0.1:1/\"\n",
+            "loopback",
+        ),
+        (
+            "connect-headless.yaml",
+            "  - browser.open:\n      connect: \"http://127.0.0.1:9222\"\n      url: \"http://127.0.0.1:1/\"\n      headless: true\n",
+            "headless",
+        ),
+        (
+            "click-two-locators.yaml",
+            "  - browser.click:\n      css: \"#a\"\n      text: Later\n",
+            "cannot both be set",
+        ),
+        (
+            "read-name-alone.yaml",
+            "  - browser.read:\n      name: Submit\n",
+            "role",
+        ),
+        (
+            "type-name-alone.yaml",
+            "  - browser.type:\n      name: Submit\n      text: hello\n",
+            "role",
+        ),
+        (
+            "wait-role-and-url.yaml",
+            "  - browser.wait:\n      role: button\n      url_contains: next\n",
+            "cannot be combined",
+        ),
     ];
     for (name, step, _) in cases {
         dir.write(name, &format!("name: invalid browser step\nsteps:\n{step}"));
@@ -886,4 +1215,299 @@ steps:
         stdout(&output),
         stderr(&output)
     );
+}
+
+#[test]
+fn connect_drives_a_page_in_a_browser_it_does_not_close() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let mut browser = UserBrowser::start();
+    let user_tab = browser.open_tab(&server.url("/browser/form?case=user-tab"));
+    let before = wait_for_pages(&browser, 2);
+    assert_eq!(
+        before.len(),
+        2,
+        "the user's browser must start with its own page and the user tab: {before:?}"
+    );
+    assert!(
+        before.iter().any(|page| page_id(page) == user_tab),
+        "the user tab must be listed before the case: {before:?}"
+    );
+    let initial_ids: Vec<String> = before
+        .iter()
+        .map(|page| page_id(page).to_string())
+        .collect();
+
+    let dir = TempDir::new("browser-connect");
+    let case_url = server.url("/browser/form?case=connect");
+    let case = dir.write(
+        "connect.yaml",
+        &format!(
+            r##"name: connect to the user's browser
+steps:
+  - browser.open:
+      connect: "{}"
+      url: "{case_url}"
+    expect:
+      - path: $.title
+        equals: Browser form
+  - browser.read:
+      css: "#case"
+    expect:
+      - path: $.text
+        equals: connect
+  - browser.read:
+      text: "no greeting yet"
+    expect:
+      - path: $.text
+        equals: "no greeting yet"
+"##,
+            browser.connect_url()
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    assert_eq!(value["cases"][0]["status"], "passed", "{value}");
+
+    assert!(
+        browser
+            .child
+            .try_wait()
+            .expect("the test must watch the browser process")
+            .is_none(),
+        "connect mode must not end the user's browser"
+    );
+    let after = wait_for_page_to_close(&browser, "case=connect");
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the case must close only the tab it opened: {after:?}"
+    );
+    let after_ids: Vec<&str> = after.iter().map(page_id).collect();
+    for id in &initial_ids {
+        assert!(
+            after_ids.contains(&id.as_str()),
+            "the case must leave the user's tab {id} open: {after:?}"
+        );
+    }
+    assert!(
+        after_ids.contains(&user_tab.as_str()),
+        "the case must leave the user tab open: {after:?}"
+    );
+}
+
+#[test]
+fn a_second_open_with_a_different_connect_is_a_step_error() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let browser = UserBrowser::start();
+    let dir = TempDir::new("browser-connect-change");
+    let url = server.url("/browser/form?case=connect-change");
+    let case = dir.write(
+        "connect-change.yaml",
+        &format!(
+            r##"name: change the connected browser
+steps:
+  - browser.open:
+      connect: "{}"
+      url: "{url}"
+  - browser.open:
+      connect: "http://localhost:{}"
+      url: "{url}"
+"##,
+            browser.connect_url(),
+            browser.port
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("connect"),
+        "the message must name the changed option, got: {message}"
+    );
+}
+
+#[test]
+fn connect_to_a_closed_port_is_an_environment_error() {
+    let dir = TempDir::new("browser-connect-closed");
+    let port = closed_port();
+    let case = dir.write(
+        "connect-closed.yaml",
+        &format!(
+            r##"name: connect to nothing
+steps:
+  - browser.open:
+      connect: "http://127.0.0.1:{port}"
+      url: "http://127.0.0.1:9/"
+"##
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("--remote-debugging-port"),
+        "the message must say how to start Chrome, got: {message}"
+    );
+}
+
+#[test]
+fn connect_to_a_non_devtools_server_is_an_environment_error() {
+    let server = TestServer::start();
+    let dir = TempDir::new("browser-connect-not-devtools");
+    let case = dir.write(
+        "connect-not-devtools.yaml",
+        &format!(
+            r##"name: connect to another server
+steps:
+  - browser.open:
+      connect: "http://127.0.0.1:{}"
+      url: "http://127.0.0.1:9/"
+"##,
+            server.port()
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("--remote-debugging-port"),
+        "the message must say how to start Chrome, got: {message}"
+    );
+}
+
+#[test]
+fn text_and_role_locators_drive_a_page() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-locators");
+    let case = dir.write(
+        "locators.yaml",
+        &format!(
+            r##"name: text and role locators
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.type:
+      role: textbox
+      name: Name
+      text: Ada
+  - browser.click:
+      role: button
+      name: Greet
+  - browser.wait:
+      text: "Hello, Ada!"
+  - browser.read:
+      text: "Hello, Ada!"
+    expect:
+      - path: $.text
+        equals: "Hello, Ada!"
+  - browser.click:
+      text: Later
+  - browser.wait:
+      text: "late result"
+      timeout_ms: 2000
+  - browser.read:
+      role: button
+      name: Later
+    expect:
+      - path: $.text
+        equals: Later
+  - browser.read:
+      text: "late result"
+    expect:
+      - path: $.text
+        equals: "late result"
+  - browser.type:
+      text: Editor
+      value: " typed"
+  - browser.read:
+      css: "#editor"
+    expect:
+      - path: $.text
+        contains: typed
+  - browser.click:
+      role: link
+      name: Next
+  - browser.wait:
+      url_contains: /browser/second
+  - browser.read:
+      text: "second page"
+    expect:
+      - path: $.text
+        equals: "second page"
+"##,
+            server.url("/browser/form?case=locators")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    assert_eq!(value["cases"][0]["status"], "passed", "{value}");
 }
