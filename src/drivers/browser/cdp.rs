@@ -331,7 +331,7 @@ impl Connection {
     }
 }
 
-/// The loopback address a `ws://` URL names.
+/// The loopback address a `ws://` URL names; any other host is refused.
 ///
 /// Chrome always prints `ws://127.0.0.1:<port>/...` in `DevToolsActivePort`;
 /// parsing it here keeps the connection independent of a URL helper crate.
@@ -341,8 +341,14 @@ fn socket_address(url: &str) -> Result<SocketAddr, CdpError> {
     address
         .to_socket_addrs()
         .map_err(|error| CdpError::Transport(format!("`{url}` is not a usable address: {error}")))?
-        .next()
-        .ok_or_else(|| CdpError::Transport(format!("`{url}` did not resolve to an address")))
+        // A debug port is full control of a browser: whatever a DevTools
+        // endpoint answers, the connection stays on this machine.
+        .find(|address| address.ip().is_loopback())
+        .ok_or_else(|| {
+            CdpError::Transport(format!(
+                "`{url}` is not a loopback address; only a browser on this machine is used"
+            ))
+        })
 }
 
 /// Splits a `ws://host:port/path` URL into its host and port.
@@ -397,6 +403,15 @@ mod tests {
             split_ws_url("ws://localhost:1/devtools/page/1").ok(),
             Some(("localhost", 1))
         );
+    }
+
+    #[test]
+    fn only_a_loopback_websocket_address_is_used() {
+        assert!(socket_address("ws://127.0.0.1:9222/devtools/browser/a").is_ok());
+        assert!(socket_address("ws://[::1]:9222/devtools/browser/a").is_ok());
+        // A DevTools endpoint could name another host; a debug port is full
+        // control of a browser, so the connection must stay on this machine.
+        assert!(socket_address("ws://192.0.2.1:9222/devtools/browser/a").is_err());
     }
 
     #[test]
