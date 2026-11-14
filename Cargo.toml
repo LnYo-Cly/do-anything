@@ -10,7 +10,7 @@ name = "da"
 path = "src/main.rs"
 
 [features]
-default = ["http", "cli", "log", "db"]
+default = ["http", "cli", "log", "db", "browser"]
 # The `http.request` step and the HTTP client it needs.
 http = ["dep:schemars", "dep:ureq"]
 # The `cli.run` step and the child-process timeout it needs.
@@ -25,6 +25,8 @@ db = [
     "dep:tokio-postgres-rustls",
     "dep:rustls",
 ]
+# The `browser.*` steps and the Chrome DevTools Protocol client they need.
+browser = ["dep:schemars", "dep:tungstenite"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -43,6 +45,9 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring", "webpki-roots"],
 # Only to install the crypto provider `tokio-postgres-rustls` asks for; this is
 # the same crate and version `ureq` already builds with.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# The synchronous WebSocket client the DevTools Protocol connection speaks.
+# Only the plain `ws://` handshake is used, so no TLS feature is enabled.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

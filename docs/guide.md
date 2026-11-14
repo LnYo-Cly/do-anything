@@ -24,6 +24,7 @@ The complete reference for `da`: installation options, building from source, the
   - [`http.request`](#httprequest)
   - [`cli.run`](#clirun)
   - [`db.query`](#dbquery)
+  - [Browser steps](#browser-steps)
   - [`log.file`](#logfile)
 - [Failure bundles](#failure-bundles)
 - [Output](#output)
@@ -75,10 +76,13 @@ cargo build
 ```
 
 The binary is written to `target/debug/da` (`target\debug\da.exe` on Windows).
-The `http` feature provides the `http.request` step, the `cli` feature provides
-the `cli.run` step and the `log` feature provides the `log.file` observer; all
-three are enabled by default. Build a subset with
-`--no-default-features --features cli`, or nothing at all with
+The `http` feature provides the `http.request` step, `cli` provides `cli.run`,
+`log` provides the `log.file` observer, `db` provides `db.query` and `browser`
+provides the `browser.*` steps; these five are enabled by default. The `browser`
+feature adds about 0.5 MiB to the release binary and needs a Chrome or Chromium
+installed on the machine; it never downloads a browser. Build a subset with
+`--no-default-features --features http,cli,log,db`, build only one driver with
+`--no-default-features --features cli`, or build nothing extra with
 `--no-default-features`.
 
 ## Test
@@ -92,6 +96,11 @@ cargo test
 
 The integration tests in `tests/cli.rs` run the compiled binary against a local
 HTTP server that each test starts itself. They never reach the network.
+
+The browser tests in `tests/browser.rs` launch the Chrome or Chromium already
+installed on the machine and drive pages served by the same local test server.
+When no browser can be started they print why and skip; set
+`DA_TEST_BROWSER=1` to make that a failure instead, which is what CI does.
 
 ### Self-test suite
 
@@ -455,8 +464,9 @@ error for a kind held by another type.
 
 The built-in `http.request`, `cli.run`, `db.query` and `log.file` use no
 session, so their behavior is unchanged: each step still opens and closes what
-it needs within the step. The contract exists for the drivers and observers
-that need a resource across steps.
+it needs within the step. The `browser.*` steps use one browser session per
+case (see [Browser steps](#browser-steps)); the contract exists for the drivers
+and observers that need a resource across steps.
 
 ### Classification and filtering
 
@@ -1021,6 +1031,100 @@ A refused connection and a statement the server rejects are both environment
 errors (exit 4); exceeding `timeout_ms` is a timeout (exit 5). The message names
 the SQLite file it could not open, but never repeats a PostgreSQL URL, which
 usually carries a password.
+
+### Browser steps
+
+The `browser.*` steps drive one page in a Chrome or Chromium that is already
+installed. They are provided by the `browser` feature and never download a
+browser. A case has one page: the first `browser.open` creates it, every later
+step of the same case uses it, and a second `browser.open` navigates that same
+page instead of opening another one.
+
+| Step | Arguments | Result |
+| --- | --- | --- |
+| `browser.open` | `url` required; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title` |
+| `browser.click` | locator | `{}`, or the clicked element's `text` when it has one |
+| `browser.type` | locator; `text` required | `{}` |
+| `browser.press` | `key` required, for example `Enter` or `Tab` | `{}` |
+| `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000 | `url` |
+| `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
+
+A **locator** is exactly one of `css` (a CSS selector) and `xpath` (an XPath
+expression), plus an optional `timeout_ms` (default 5000) that says how long to
+wait for the element to appear and be visible. Giving both, or neither, is a case
+error that `da lint` reports before anything runs. `browser.wait` accepts the same
+locator or `url_contains`, which waits until the current URL contains that text.
+`browser.open` returns the URL the page actually reached, after redirects, and
+its title. Its own `timeout_ms` bounds how long the page may take to finish
+loading; exceeding it is a timeout (exit 5).
+
+`browser.press` accepts `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, the four
+arrow keys, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one printable
+character. Any other key name is an argument error that `da lint` reports.
+
+`headless`, `width` and `height` only apply when the first `browser.open` creates
+the page. A later `browser.open` that gives a different effective value is a step
+error instead of being silently ignored, so one case cannot change the browser it
+is driving halfway through. `timeout_ms` applies to each navigation, so a later
+`browser.open` may choose a different value.
+
+The browser is closed when the case ends, whether it passed, failed an
+assertion, errored or timed out. A session belongs to one case, so `--jobs 4`
+gives four running cases four browsers. A case that never calls `browser.open`
+never starts one.
+
+Chrome is found in this order:
+
+1. `DA_CHROME`, an absolute path to the `chrome`, `chromium` or `msedge`
+   executable.
+2. The usual install locations: on Windows Chrome, Chromium and Edge under
+   `ProgramFiles`, `ProgramFiles(x86)` and `LocalAppData`; on macOS
+   `/Applications/Google Chrome.app` and `/Applications/Chromium.app`; on Linux
+   `/usr/bin/google-chrome`, `/usr/bin/chromium` and `/snap/bin/chromium`.
+3. These program names on `PATH`: `google-chrome`, `google-chrome-stable`,
+   `chromium`, `chromium-browser` and `chrome`.
+
+Each case starts its own browser process with a fresh temporary profile and a
+debugger that listens on a loopback port the operating system chooses, so two
+cases at the same time cannot share a profile or a port.
+
+When no browser is found, or it cannot start, the step is an environment error
+(exit 4) whose message names `DA_CHROME`. An element that does not appear within
+`timeout_ms` fails the step like a failed assertion (exit 1) and the message
+contains the locator and the timeout. The text `browser.type` sends and
+`browser.read` returns is redacted like every other value in output and failure
+bundles. See [Secrets](#secrets).
+
+```yaml
+name: Greeting is shown
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/login
+    expect:
+      - path: $.title
+        equals: Sign in
+  - browser.type:
+      css: "#user"
+      text: alice
+  - browser.type:
+      xpath: "//*[@id='password']"
+      text: "${env:DA_PASSWORD}"
+  - browser.press:
+      key: Enter
+  - browser.wait:
+      css: "#welcome"
+  - browser.read:
+      css: "#welcome"
+    expect:
+      - path: $.text
+        equals: "Welcome, alice"
+  - browser.read:
+      css: "#welcome"
+      attribute: data-state
+    expect:
+      - path: $.value
+        equals: ready
+```
 
 ### `log.file`
 

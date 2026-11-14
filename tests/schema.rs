@@ -5,10 +5,12 @@
 
 mod support;
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "browser", feature = "cli"))]
 use std::fs;
+#[cfg(any(feature = "browser", feature = "cli"))]
+use std::path::Path;
 #[cfg(feature = "cli")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::LazyLock;
 
@@ -57,7 +59,7 @@ fn schema() -> &'static Value {
     &SCHEMA
 }
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "browser", feature = "cli"))]
 fn validator(schema: &'static Value) -> jsonschema::Validator {
     jsonschema::validator_for(schema).expect("the emitted schema must compile")
 }
@@ -304,7 +306,7 @@ fn step_definition(name: &str) -> do_anything::core::registry::StepDefinition {
 }
 
 /// Every registered step definition, keyed by name.
-#[cfg(any(feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
 fn built_in_registry() -> do_anything::core::registry::Registry {
     let mut registry = do_anything::core::registry::Registry::new();
     do_anything::drivers::register(&mut registry).expect("the built-in drivers must register");
@@ -317,9 +319,15 @@ fn built_in_registry() -> do_anything::core::registry::Registry {
 ///
 /// The values only have to pass `validate`; it checks arguments without
 /// starting the program or opening a connection.
-#[cfg(any(feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
 fn valid_arguments(step: &str) -> Value {
     match step {
+        "browser.open" => json!({"url": "http://127.0.0.1:1/"}),
+        "browser.click" => json!({"css": "#name"}),
+        "browser.type" => json!({"css": "#name", "text": "hello"}),
+        "browser.press" => json!({"key": "Enter"}),
+        "browser.wait" => json!({"css": "#name"}),
+        "browser.read" => json!({"css": "#name"}),
         "cli.run" => json!({"command": "da"}),
         "http.request" => json!({"url": "http://127.0.0.1:1/health"}),
         "db.query" => json!({"url": "sqlite:app.db", "sql": "SELECT 1"}),
@@ -331,7 +339,7 @@ fn valid_arguments(step: &str) -> Value {
 ///
 /// A bound that the schema can express but this list cannot construct is
 /// caught by the assertion on the constructed value, which fails loudly.
-#[cfg(any(feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
 fn declared_bounds(schema: &Value) -> Vec<(&'static str, Value)> {
     ["minimum", "minLength", "pattern"]
         .into_iter()
@@ -341,7 +349,7 @@ fn declared_bounds(schema: &Value) -> Vec<(&'static str, Value)> {
 
 /// A value that violates one bound, and a value on the bound when one can be
 /// constructed generically.
-#[cfg(any(feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
 fn bound_values(keyword: &str, bound: &Value) -> (Value, Option<Value>) {
     match keyword {
         "minimum" => {
@@ -377,7 +385,7 @@ fn bound_values(keyword: &str, bound: &Value) -> (Value, Option<Value>) {
 /// neither may be looser than the other. The reverse direction, a value that
 /// `validate` refuses while the schema accepts it, is covered by the two
 /// `*_timeout_of_zero_*` tests above.
-#[cfg(any(feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
 #[test]
 fn every_declared_argument_bound_is_enforced_by_validate() {
     let registry = built_in_registry();
@@ -435,7 +443,9 @@ fn every_declared_argument_bound_is_enforced_by_validate() {
         }
     }
 
-    let drivers = usize::from(cfg!(feature = "cli")) + usize::from(cfg!(feature = "http"));
+    let drivers = usize::from(cfg!(feature = "browser"))
+        + usize::from(cfg!(feature = "cli"))
+        + usize::from(cfg!(feature = "http"));
     assert!(
         checked >= drivers,
         "expected at least one bounded argument per built-in driver, checked {checked}"
@@ -670,12 +680,30 @@ fn the_schema_accepts_every_valid_repository_case() {
 }
 
 /// Whether this build can describe an observation at all.
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "browser", feature = "cli"))]
 fn describes_observations(schema: &Value) -> bool {
     schema["properties"]["observe"]["additionalProperties"] != Value::Bool(false)
 }
 
-#[cfg(all(feature = "http", feature = "cli"))]
+/// Whether this build registers every step a documented case uses.
+///
+/// A build with `http` and `cli` but no `browser` cannot describe the browser
+/// example, and that is not a schema defect: the same rule already applies to
+/// an example that declares an observer.
+#[cfg(any(feature = "browser", all(feature = "http", feature = "cli")))]
+fn describes_steps(schema: &Value, instance: &Value) -> bool {
+    instance["steps"].as_array().is_none_or(|steps| {
+        steps.iter().all(|step| {
+            step.as_object().is_none_or(|fields| {
+                fields
+                    .keys()
+                    .all(|name| schema["$defs"].get(name).is_some())
+            })
+        })
+    })
+}
+
+#[cfg(any(feature = "browser", all(feature = "http", feature = "cli")))]
 #[test]
 fn the_schema_accepts_every_case_example_in_the_docs() {
     let validator = validator(schema());
@@ -691,6 +719,11 @@ fn the_schema_accepts_every_case_example_in_the_docs() {
             );
             let instance: Value =
                 serde_saphyr::from_str(example).expect("the example must be valid YAML");
+            // A build without a driver cannot describe an example that uses
+            // its steps; every build that has the driver checks it.
+            if !describes_steps(schema(), &instance) {
+                continue;
+            }
             // A build without the observer cannot describe an example that
             // declares one; every build that has the observer checks it.
             if instance.get("observe").is_some() && !describes_observations(schema()) {
@@ -704,9 +737,16 @@ fn the_schema_accepts_every_case_example_in_the_docs() {
             checked += 1;
         }
     }
+    // The http and cli build checks every example that has those drivers; the
+    // browser-only build checks the browser example and skips the rest.
+    let minimum = if cfg!(all(feature = "http", feature = "cli")) {
+        5
+    } else {
+        1
+    };
     assert!(
-        checked >= 5,
-        "expected the docs to hold case examples, found {checked}"
+        checked >= minimum,
+        "expected the docs to hold at least {minimum} example(s), found {checked}"
     );
 }
 
@@ -736,7 +776,7 @@ fn the_schema_embeds_each_registered_step_with_its_description() {
     );
 }
 
-#[cfg(not(any(feature = "cli", feature = "db", feature = "http")))]
+#[cfg(not(any(feature = "browser", feature = "cli", feature = "db", feature = "http")))]
 #[test]
 fn the_schema_is_valid_when_no_step_is_registered() {
     let schema = schema();
@@ -781,7 +821,7 @@ fn files_with_extension(dir: PathBuf, extension: &str) -> Vec<PathBuf> {
 /// Complete case files in a document: `yaml` blocks with a top-level `name:`.
 ///
 /// Fragments that show only part of a case have no `name:` line and are skipped.
-#[cfg(all(feature = "http", feature = "cli"))]
+#[cfg(any(feature = "browser", all(feature = "http", feature = "cli")))]
 fn case_examples(text: &str) -> Vec<&str> {
     text.split(
         "```yaml

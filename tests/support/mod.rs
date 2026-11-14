@@ -228,6 +228,17 @@ fn route(
         }
         (_, "/status/500") => json_response("500 Internal Server Error", r#"{"error":"boom"}"#),
         (_, "/text") => text_response("200 OK", "hello world"),
+        // The browser tests drive real pages. The label in `?case=` lets four
+        // cases prove that each one sees its own page and its own browser.
+        (_, "/browser/form") => html_response("200 OK", &browser_form(query)),
+        (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
+        // Headers and the start of the page arrive, but the document never
+        // finishes loading before a short navigation timeout, which is what
+        // `browser.open`'s own `timeout_ms` has to report.
+        (_, "/browser/stall") => {
+            thread::sleep(Duration::from_secs(5));
+            html_response("200 OK", &browser_second(query))
+        }
         // A fixed body with one number, one boolean and one null, so a test can
         // assert on how each JSON scalar is redacted without depending on a
         // duration or a timestamp.
@@ -299,6 +310,101 @@ fn text_response(status: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+fn html_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The page the browser tests open: a form, a delayed element and a link.
+///
+/// The script counts visits in `localStorage`, which survives a navigation but
+/// not a new browser profile. A case that opens the page twice therefore proves
+/// both that the second `browser.open` navigates and that the browser session was
+/// reused.
+fn browser_form(query: &str) -> String {
+    let label = escape_html(&query_value(query, "case"));
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Browser form</title></head>
+<body>
+<h1>Browser form</h1>
+<p id="case">{label}</p>
+<p id="visits"></p>
+<form id="form">
+<label for="name">Name</label>
+<input id="name" name="name" autocomplete="off">
+<button id="submit" type="submit">Greet</button>
+</form>
+<p id="greeting" data-state="ready">no greeting yet</p>
+<div id="late-target"></div>
+<button id="later" type="button">Later</button>
+<button id="trusted" type="button"
+  onclick="document.getElementById('trusted-result').textContent =
+    (window.event &amp;&amp; window.event.isTrusted) ? 'trusted click' : 'untrusted click';">Click me</button>
+<p id="trusted-result"></p>
+<a id="next" href="/browser/second?case={label}&amp;token=ok">Next</a>
+<script>
+var visits = Number(localStorage.getItem('browser-visits') || '0') + 1;
+localStorage.setItem('browser-visits', String(visits));
+document.getElementById('visits').textContent = 'visits: ' + visits;
+document.getElementById('form').addEventListener('submit', function (event) {{
+  event.preventDefault();
+  document.getElementById('greeting').textContent =
+    'Hello, ' + document.getElementById('name').value + '!';
+}});
+document.getElementById('later').addEventListener('click', function () {{
+  setTimeout(function () {{
+    var p = document.createElement('p');
+    p.id = 'late';
+    p.textContent = 'late result';
+    document.getElementById('late-target').appendChild(p);
+  }}, 300);
+}});
+</script>
+</body></html>"#
+    )
+}
+
+fn browser_second(query: &str) -> String {
+    let label = escape_html(&query_value(query, "case"));
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Second page</title></head>
+<body>
+<p id="case">{label}</p>
+<p id="second">second page</p>
+</body></html>"#
+    )
+}
+
+/// The value of one `name=value` pair of a query string.
+fn query_value(query: &str, name: &str) -> String {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_default()
+}
+
+/// Escapes text for HTML text and double-quoted attribute values.
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// A temporary directory removed when the value is dropped.
