@@ -57,6 +57,12 @@ jobs:
         run: cargo test --no-default-features --features log
       - name: Test (browser only)
         run: cargo test --no-default-features --features browser
+      # Verify the exact package that would be uploaded, including a build from
+      # the packaged sources. One Linux runner is enough: the package contents
+      # and the verification build do not depend on the operating system.
+      - name: Package (crates.io dry run)
+        if: runner.os == 'Linux'
+        run: cargo publish --dry-run --locked
 
   # The PostgreSQL half of `db.query` needs a server, which the check job does
   # not have: there the tests skip and print why. This job runs them for real
