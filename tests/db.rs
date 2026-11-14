@@ -311,6 +311,92 @@ fn every_write_statement_is_refused_and_the_data_is_unchanged() {
     }
 }
 
+/// Runs one statement that would create a file, and proves it created none.
+///
+/// `VACUUM INTO` and `ATTACH` are the two statements that reach the file system
+/// outside the database file itself. A write refused after it starts can leave a
+/// zero-byte target behind, so the step must refuse both before the statement
+/// runs, and the database must be left alone as well.
+fn assert_file_writing_statement_leaves_nothing(
+    dir: &TempDir,
+    database: &Path,
+    sql: &str,
+    target: &Path,
+) {
+    let before = sqlite_rows(database);
+    let case = format!(
+        "name: Writes a file\nsteps:\n  - db.query:\n      url: sqlite:app.db\n      sql: {sql:?}\n"
+    );
+    let output = run_case(dir, &case);
+
+    assert_eq!(
+        exit_code(&output),
+        Some(4),
+        "`{sql}` must be refused, stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        messages(&output).contains("read-only"),
+        "the message must say the step is read-only for `{sql}`: {}",
+        messages(&output)
+    );
+    assert!(
+        !target.exists(),
+        "`{sql}` left a file at {}",
+        target.display()
+    );
+    assert_eq!(
+        sqlite_rows(database),
+        before,
+        "`{sql}` changed the database"
+    );
+}
+
+#[test]
+fn a_vacuum_into_is_refused_and_leaves_no_file() {
+    let dir = TempDir::new("db-vacuum-into");
+    let database = fixture(&dir);
+    let target = dir.path().join("copy.db");
+    let sql = format!("VACUUM INTO '{}'", target.display());
+
+    assert_file_writing_statement_leaves_nothing(&dir, &database, &sql, &target);
+}
+
+#[test]
+fn an_attach_is_refused_and_leaves_no_file() {
+    let dir = TempDir::new("db-attach");
+    let database = fixture(&dir);
+    let target = dir.path().join("attached.db");
+    let sql = format!("ATTACH DATABASE '{}' AS x", target.display());
+
+    assert_file_writing_statement_leaves_nothing(&dir, &database, &sql, &target);
+}
+
+#[test]
+fn a_read_only_pragma_still_runs() {
+    let dir = TempDir::new("db-pragma");
+    fixture(&dir);
+    let case = r#"
+name: Reads the table schema
+steps:
+  - db.query:
+      url: sqlite:app.db
+      sql: PRAGMA table_info(items)
+    expect:
+      - path: $.row_count
+        equals: 6
+      - path: $.rows[0].name
+        equals: id
+      - path: $.rows[0].type
+        equals: INTEGER
+"#;
+
+    let output = run_case(&dir, case);
+
+    assert_eq!(exit_code(&output), Some(0), "stderr: {}", stderr(&output));
+}
+
 #[test]
 fn a_statement_list_is_refused_before_anything_runs() {
     let dir = TempDir::new("db-multi");
