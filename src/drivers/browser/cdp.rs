@@ -197,13 +197,40 @@ impl Connection {
             deadline,
         )?;
         if let Some(details) = reply.get("exceptionDetails") {
-            let message = details
-                .get("exception")
-                .and_then(|exception| exception.get("description"))
-                .and_then(Value::as_str)
-                .or_else(|| details.get("text").and_then(Value::as_str))
-                .unwrap_or("the page script raised an exception");
-            return Err(CdpError::Script(message.to_string()));
+            return Err(CdpError::Script(exception_message(details)));
+        }
+        Ok(reply
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    /// Calls a JavaScript function with a DOM node as `this`.
+    ///
+    /// The accessibility tree names a node by its backend id; after
+    /// `DOM.resolveNode` this form runs the action on that exact element rather
+    /// than searching for it again by a selector.
+    pub fn call_function(
+        &mut self,
+        session_id: &str,
+        object_id: &str,
+        function: &str,
+        deadline: Deadline,
+    ) -> Result<Value, CdpError> {
+        let reply = self.call(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": function,
+                "returnByValue": true,
+                "awaitPromise": false,
+            }),
+            Some(session_id),
+            deadline,
+        )?;
+        if let Some(details) = reply.get("exceptionDetails") {
+            return Err(CdpError::Script(exception_message(details)));
         }
         Ok(reply
             .get("result")
@@ -304,7 +331,7 @@ impl Connection {
     }
 }
 
-/// The loopback address a `ws://` URL names.
+/// The loopback address a `ws://` URL names; any other host is refused.
 ///
 /// Chrome always prints `ws://127.0.0.1:<port>/...` in `DevToolsActivePort`;
 /// parsing it here keeps the connection independent of a URL helper crate.
@@ -314,8 +341,14 @@ fn socket_address(url: &str) -> Result<SocketAddr, CdpError> {
     address
         .to_socket_addrs()
         .map_err(|error| CdpError::Transport(format!("`{url}` is not a usable address: {error}")))?
-        .next()
-        .ok_or_else(|| CdpError::Transport(format!("`{url}` did not resolve to an address")))
+        // A debug port is full control of a browser: whatever a DevTools
+        // endpoint answers, the connection stays on this machine.
+        .find(|address| address.ip().is_loopback())
+        .ok_or_else(|| {
+            CdpError::Transport(format!(
+                "`{url}` is not a loopback address; only a browser on this machine is used"
+            ))
+        })
 }
 
 /// Splits a `ws://host:port/path` URL into its host and port.
@@ -331,6 +364,17 @@ fn split_ws_url(url: &str) -> Result<(&str, u16), CdpError> {
         .parse::<u16>()
         .map_err(|error| CdpError::Transport(format!("`{url}` has no usable port: {error}")))?;
     Ok((host, port))
+}
+
+/// Flattens a CDP `exceptionDetails` member into one message.
+fn exception_message(details: &Value) -> String {
+    details
+        .get("exception")
+        .and_then(|exception| exception.get("description"))
+        .and_then(Value::as_str)
+        .or_else(|| details.get("text").and_then(Value::as_str))
+        .unwrap_or("the page script raised an exception")
+        .to_string()
 }
 
 /// Flattens a CDP `error` member into one message.
@@ -359,6 +403,15 @@ mod tests {
             split_ws_url("ws://localhost:1/devtools/page/1").ok(),
             Some(("localhost", 1))
         );
+    }
+
+    #[test]
+    fn only_a_loopback_websocket_address_is_used() {
+        assert!(socket_address("ws://127.0.0.1:9222/devtools/browser/a").is_ok());
+        assert!(socket_address("ws://[::1]:9222/devtools/browser/a").is_ok());
+        // A DevTools endpoint could name another host; a debug port is full
+        // control of a browser, so the connection must stay on this machine.
+        assert!(socket_address("ws://192.0.2.1:9222/devtools/browser/a").is_err());
     }
 
     #[test]

@@ -1049,20 +1049,58 @@ browser. A case has one page: the first `browser.open` creates it, every later
 step of the same case uses it, and a second `browser.open` navigates that same
 page instead of opening another one.
 
+By default the case starts its own browser. With `connect`, it instead drives a
+browser the user already runs with a debug port, so the user's logged-in state is
+available. The case opens a new tab there and closes only that tab when it ends;
+the user's browser keeps running and the user's other tabs are untouched.
+
 | Step | Arguments | Result |
 | --- | --- | --- |
-| `browser.open` | `url` required; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title` |
+| `browser.open` | `url` required; optional `connect`; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title` |
 | `browser.click` | locator | `{}`, or the clicked element's `text` when it has one |
-| `browser.type` | locator; `text` required | `{}` |
+| `browser.type` | locator; `text` required unless `value` is given | `{}` |
 | `browser.press` | `key` required, for example `Enter` or `Tab` | `{}` |
 | `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000 | `url` |
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
 
-A **locator** is exactly one of `css` (a CSS selector) and `xpath` (an XPath
-expression), plus an optional `timeout_ms` (default 5000) that says how long to
-wait for the element to appear and be visible. Giving both, or neither, is a case
-error that `da lint` reports before anything runs. `browser.wait` accepts the same
-locator or `url_contains`, which waits until the current URL contains that text.
+A **locator** is exactly one of `css`, `xpath`, `text` and `role`; `name` is an
+optional modifier for `role`. Every locator also accepts an optional
+`timeout_ms` (default 5000) that says how long to wait for the element to appear
+and be visible.
+
+| Locator | Meaning |
+| --- | --- |
+| `css` | A CSS selector. |
+| `xpath` | An XPath expression. |
+| `text` | Visible text. Whitespace is normalized by collapsing every run of whitespace to one space and trimming the ends; the result must equal the given value exactly. The innermost matching element wins, so a paragraph that matches is chosen over its parent that contains the same text. |
+| `role` | An accessibility role, for example `button`, `link` or `textbox`. |
+| `name` | With `role` only: the accessibility name must equal this value exactly. For a native `<button>Greet</button>` the role is `button` and the name is `Greet`; for `<input id="user">` with `<label for="user">User</label>` the role is `textbox` and the name is `User`. |
+
+`role` and `name` come from Chrome's accessibility tree, so implicit roles work:
+a native `<button>` or `<a href>` does not need a `role` attribute. The element
+must be visible. When more than one element matches, the first in document order
+is used, like `querySelector`.
+
+Giving two locator forms, or none, is a case error that `da lint` reports before
+anything runs; `name` without `role` is refused the same way. `browser.wait`
+accepts the same locator or `url_contains`, which waits until the current URL
+contains that text.
+
+`browser.type` keeps its original `text` argument as the text to type. Because
+`text` is also a locator, the two meanings are separated by `value`: when `value`
+is given, `text` names the element and `value` is typed. These two steps are
+equivalent except for how the element is found:
+
+```yaml
+- browser.type:
+    css: "#name"
+    text: Ada
+
+- browser.type:
+    text: Editor
+    value: Ada
+```
+
 `browser.open` returns the URL the page actually reached, after redirects, and
 its title. Its own `timeout_ms` bounds how long the page may take to finish
 loading; exceeding it is a timeout (exit 5).
@@ -1077,10 +1115,53 @@ error instead of being silently ignored, so one case cannot change the browser i
 is driving halfway through. `timeout_ms` applies to each navigation, so a later
 `browser.open` may choose a different value.
 
+#### Connecting to a browser that is already open
+
+Start Chrome with a debug port, then name that endpoint in `browser.open`:
+
+| System | Command |
+| --- | --- |
+| Windows | `"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222` |
+| macOS | `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222` |
+| Linux | `google-chrome --remote-debugging-port=9222` |
+
+```yaml
+name: Use the browser I am already signed in to
+steps:
+  - browser.open:
+      connect: "http://127.0.0.1:9222"
+      url: http://127.0.0.1:8080/orders
+  - browser.click:
+      role: button
+      name: New order
+  - browser.read:
+      text: "Order created"
+```
+
+`connect` must be `http://<host>:<port>` and the host must be `127.0.0.1`,
+`localhost` or `[::1]`; any other host is an argument error, because a remote
+debug port would hand the browser to another machine. The step reads
+`GET /json/version` at that address to find the browser's DevTools WebSocket,
+opens a new tab and drives it like a browser the case started itself. Only the
+tab this case opened is closed when the case ends; the user's browser and its
+other tabs keep running. `connect` cannot be combined with `headless`, `width`
+or `height`, and a second `browser.open` in the same case must give the same
+`connect` value.
+
+A debug port is full control of the browser: every cookie, every signed-in
+session and every page it can reach. Keep it on loopback, do not expose it on a
+network interface, and close Chrome when you no longer need it. Newer Chrome
+versions refuse a debug port on the default profile; if yours does, start Chrome
+with a dedicated `--user-data-dir` that you have signed in to, and treat that as
+a separate profile from your everyday one. If the port is closed or the address
+is not a DevTools endpoint, `browser.open` is an environment error (exit 4) whose
+message names `--remote-debugging-port`.
+
 The browser is closed when the case ends, whether it passed, failed an
 assertion, errored or timed out. A session belongs to one case, so `--jobs 4`
 gives four running cases four browsers. A case that never calls `browser.open`
-never starts one.
+never starts one. A connected browser is the exception: the case closes only its
+own tab and never sends `Browser.close`.
 
 Chrome is found in this order:
 
@@ -1093,9 +1174,10 @@ Chrome is found in this order:
 3. These program names on `PATH`: `google-chrome`, `google-chrome-stable`,
    `chromium`, `chromium-browser` and `chrome`.
 
-Each case starts its own browser process with a fresh temporary profile and a
+Each case that starts its own browser gets a fresh temporary profile and a
 debugger that listens on a loopback port the operating system chooses, so two
-cases at the same time cannot share a profile or a port.
+cases at the same time cannot share a profile or a port. Connected cases share
+the user's browser but each one opens and closes its own tab.
 
 When no browser is found, or it cannot start, the step is an environment error
 (exit 4) whose message names `DA_CHROME`. An element that does not appear within

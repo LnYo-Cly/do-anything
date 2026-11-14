@@ -5,15 +5,21 @@
 //! same session, so it sees the page the first step opened; the runner closes
 //! the browser when the case ends, whatever the case's result was.
 //!
-//! Locators are deterministic on purpose: a CSS selector or an XPath
-//! expression, never a coordinate or a screenshot. Element lookup waits for the
-//! element to appear and to be visible, so a step does not race the page's own
-//! scripts.
+//! A case either starts its own browser or, with `connect`, drives a browser the
+//! user already runs with a debug port. The connected browser is never closed:
+//! only the tab this case opened is.
 //!
-//! The protocol lives in [`cdp`] and the process in [`launch`]; this module turns
-//! their messages into step results and step errors.
+//! Locators are deterministic on purpose: a CSS selector, an XPath expression,
+//! visible text or an accessibility role and name, never a coordinate or a
+//! screenshot. Element lookup waits for the element to appear and to be visible,
+//! so a step does not race the page's own scripts.
+//!
+//! The protocol lives in [`cdp`], the process in [`launch`], and the loopback
+//! DevTools lookup in [`connect`]; this module turns their messages into step
+//! results and step errors.
 
 mod cdp;
+mod connect;
 mod launch;
 
 use std::io::Write;
@@ -25,6 +31,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use self::cdp::{CdpError, Connection, Deadline};
+use self::connect::Endpoint;
 use self::launch::Launched;
 use crate::core::registry::{Registry, StepDefinition, StepError};
 use crate::core::session::{Session, Sessions};
@@ -54,24 +61,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Registers every browser step.
 pub fn register(registry: &mut Registry) -> Result<(), String> {
     for definition in [
-        step::<OpenArgs>(
-            STEP_NAMES[0],
-            "Opens `url` in the case's browser and returns the page's `url` and `title`.",
-            validate_open,
-            run_open,
-        )?,
+        open_step()?,
         locator_step::<ClickArgs>(
             STEP_NAMES[1],
             "Clicks the element the locator names and returns its `text` when it has one.",
             validate_click,
             run_click,
         )?,
-        locator_step::<TypeArgs>(
-            STEP_NAMES[2],
-            "Types `text` into the element the locator names.",
-            validate_type,
-            run_type,
-        )?,
+        type_step()?,
         step::<PressArgs>(
             STEP_NAMES[3],
             "Presses `key`, such as `Enter` or `Tab`, on the focused element.",
@@ -96,6 +93,40 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     Ok(())
 }
 
+/// Builds `browser.open`, whose `connect` is a plain string in the schema.
+fn open_step() -> Result<StepDefinition, String> {
+    let mut definition = step::<OpenArgs>(
+        STEP_NAMES[0],
+        "Opens `url` in the case's browser, or in a browser the user already runs when `connect` is given, and returns the page's `url` and `title`.",
+        validate_open,
+        run_open,
+    )?;
+    string_property(&mut definition.args_schema, "connect");
+    Ok(definition)
+}
+
+/// Builds `browser.type`, whose `value` is a plain string in the schema.
+///
+/// `text` has two meanings here: it is the typing text unless `value` is also
+/// given, and only then does it name the element. The schema must accept the
+/// common `css` + `text` form, so its `text` branch also requires `value`.
+fn type_step() -> Result<StepDefinition, String> {
+    let mut definition = locator_step::<TypeArgs>(
+        STEP_NAMES[2],
+        "Types `text`, or `value` when `text` names the element, into the element the locator names.",
+        validate_type,
+        run_type,
+    )?;
+    string_property(&mut definition.args_schema, "value");
+    definition.args_schema["oneOf"] = json!([
+        { "required": ["css"] },
+        { "required": ["xpath"] },
+        { "required": ["text", "value"] },
+        { "required": ["role"] }
+    ]);
+    Ok(definition)
+}
+
 /// Builds one step from its argument type.
 fn step<T: JsonSchema>(
     name: &'static str,
@@ -114,7 +145,7 @@ fn step<T: JsonSchema>(
     })
 }
 
-/// Builds a step whose locator arguments are exactly one of `css` and `xpath`.
+/// Builds a step whose locator arguments are exactly one of the four forms.
 fn locator_step<T: JsonSchema>(
     name: &'static str,
     description: &'static str,
@@ -122,9 +153,13 @@ fn locator_step<T: JsonSchema>(
     run: fn(&Value, &mut Sessions) -> Result<Value, StepError>,
 ) -> Result<StepDefinition, String> {
     let mut definition = step::<T>(name, description, validate, run)?;
-    string_property(&mut definition.args_schema, "css");
-    string_property(&mut definition.args_schema, "xpath");
-    exactly_one_of(&mut definition.args_schema, &["css", "xpath"]);
+    for property in ["css", "xpath", "text", "role", "name"] {
+        string_property(&mut definition.args_schema, property);
+    }
+    exactly_one_of(
+        &mut definition.args_schema,
+        &["css", "xpath", "text", "role"],
+    );
     Ok(definition)
 }
 
@@ -136,12 +171,12 @@ fn wait_step(
     run: fn(&Value, &mut Sessions) -> Result<Value, StepError>,
 ) -> Result<StepDefinition, String> {
     let mut definition = step::<WaitArgs>(name, description, validate, run)?;
-    for property in ["css", "xpath", "url_contains"] {
+    for property in ["css", "xpath", "text", "role", "name", "url_contains"] {
         string_property(&mut definition.args_schema, property);
     }
     exactly_one_of(
         &mut definition.args_schema,
-        &["css", "xpath", "url_contains"],
+        &["css", "xpath", "text", "role", "url_contains"],
     );
     Ok(definition)
 }
@@ -184,6 +219,12 @@ struct OpenArgs {
     /// Absolute URL of the page to open, including the scheme.
     #[schemars(extend("minLength" = 1))]
     url: String,
+    /// Loopback DevTools endpoint of a browser the user already runs, for
+    /// example `http://127.0.0.1:9222`. The case opens a new tab there and
+    /// closes only that tab. Cannot be combined with `headless`, `width` or
+    /// `height`.
+    #[serde(default)]
+    connect: Option<String>,
     /// Run Chrome without a visible window. Defaults to `true`.
     #[serde(default = "default_headless")]
     headless: bool,
@@ -212,6 +253,15 @@ struct ClickArgs {
     /// XPath expression of the element.
     #[serde(default)]
     xpath: Option<String>,
+    /// Visible text of the element, with whitespace normalized.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the element, for example `button`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -228,12 +278,23 @@ struct TypeArgs {
     /// XPath expression of the element.
     #[serde(default)]
     xpath: Option<String>,
+    /// Text to type into the element, or the visible text of the element when
+    /// `value` gives the text to type.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the element, for example `textbox`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
+    /// Text to type when `text` names the element instead.
+    #[serde(default)]
+    value: Option<String>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
-    /// Text to type into the element.
-    text: String,
 }
 
 /// Arguments of `browser.press`.
@@ -255,6 +316,15 @@ struct WaitArgs {
     /// XPath expression of the element.
     #[serde(default)]
     xpath: Option<String>,
+    /// Visible text of the element, with whitespace normalized.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the element, for example `button`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
     /// Text the current URL must contain.
     #[serde(default)]
     url_contains: Option<String>,
@@ -274,6 +344,15 @@ struct ReadArgs {
     /// XPath expression of the element.
     #[serde(default)]
     xpath: Option<String>,
+    /// Visible text of the element, with whitespace normalized.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the element, for example `button`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -311,28 +390,85 @@ enum Locator {
     Css(String),
     /// An XPath expression.
     Xpath(String),
+    /// The visible text of an element, with whitespace normalized.
+    Text(String),
+    /// One accessibility role, optionally narrowed by an exact name.
+    Role { role: String, name: Option<String> },
 }
 
 impl Locator {
-    /// Reads exactly one locator from two optional arguments.
-    fn from_args(css: &Option<String>, xpath: &Option<String>) -> Result<Self, String> {
-        match (css.as_deref(), xpath.as_deref()) {
-            (Some(_), Some(_)) => Err(
-                "invalid arguments: `css` and `xpath` cannot both be set; give exactly one locator"
+    /// Reads exactly one locator from the optional arguments.
+    ///
+    /// `name` is not a locator of its own: it narrows `role`, so a case that
+    /// gives only `name` is refused instead of being read as a broad match.
+    fn from_args(
+        css: &Option<String>,
+        xpath: &Option<String>,
+        text: &Option<String>,
+        role: &Option<String>,
+        name: &Option<String>,
+    ) -> Result<Self, String> {
+        if name.is_some() && role.is_none() {
+            return Err(
+                "invalid arguments: `name` can only be used with `role`; give `role` and `name` together"
                     .to_string(),
-            ),
-            (Some(selector), None) if selector.trim().is_empty() => {
-                Err("invalid arguments: `css` must not be empty".to_string())
-            }
-            (None, Some(expression)) if expression.trim().is_empty() => {
-                Err("invalid arguments: `xpath` must not be empty".to_string())
-            }
-            (Some(selector), None) => Ok(Self::Css(selector.to_string())),
-            (None, Some(expression)) => Ok(Self::Xpath(expression.to_string())),
-            (None, None) => {
-                Err("invalid arguments: give one locator: `css` or `xpath`".to_string())
-            }
+            );
         }
+        let given = [
+            css.is_some(),
+            xpath.is_some(),
+            text.is_some(),
+            role.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if given == 0 {
+            return Err(
+                "invalid arguments: give one locator: `css`, `xpath`, `text` or `role`".to_string(),
+            );
+        }
+        if given > 1 {
+            return Err(
+                "invalid arguments: locator fields cannot both be set; give exactly one of `css`, `xpath`, `text` and `role`"
+                    .to_string(),
+            );
+        }
+        if let Some(value) = css {
+            if value.trim().is_empty() {
+                return Err("invalid arguments: `css` must not be empty".to_string());
+            }
+            return Ok(Self::Css(value.to_string()));
+        }
+        if let Some(value) = xpath {
+            if value.trim().is_empty() {
+                return Err("invalid arguments: `xpath` must not be empty".to_string());
+            }
+            return Ok(Self::Xpath(value.to_string()));
+        }
+        if let Some(value) = text {
+            if value.trim().is_empty() {
+                return Err("invalid arguments: `text` must not be empty".to_string());
+            }
+            return Ok(Self::Text(value.to_string()));
+        }
+        let Some(role) = role else {
+            return Err(
+                "invalid arguments: give one locator: `css`, `xpath`, `text` or `role`".to_string(),
+            );
+        };
+        if role.trim().is_empty() {
+            return Err("invalid arguments: `role` must not be empty".to_string());
+        }
+        if let Some(name) = name
+            && name.trim().is_empty()
+        {
+            return Err("invalid arguments: `name` must not be empty".to_string());
+        }
+        Ok(Self::Role {
+            role: role.clone(),
+            name: name.clone(),
+        })
     }
 
     /// The locator as an error message names it.
@@ -340,70 +476,139 @@ impl Locator {
         match self {
             Self::Css(selector) => format!("CSS selector `{selector}`"),
             Self::Xpath(expression) => format!("XPath `{expression}`"),
+            Self::Text(text) => format!("visible text `{text}`"),
+            Self::Role {
+                role,
+                name: Some(name),
+            } => format!("role `{role}` named `{name}`"),
+            Self::Role { role, name: None } => format!("role `{role}`"),
         }
     }
 
     /// A JavaScript expression that evaluates to the element or to `null`.
     ///
-    /// The selector is passed through `serde_json` so a quote or a backslash in
-    /// it can never end the string literal or add code.
-    fn element_expression(&self) -> String {
+    /// Every user string is passed through `serde_json` so a quote or a
+    /// backslash in it can never end the string literal or add code.
+    fn element_expression(&self) -> Option<String> {
         match self {
             Self::Css(selector) => {
-                format!("document.querySelector({})", json_string(selector))
+                Some(format!("document.querySelector({})", json_string(selector)))
             }
-            Self::Xpath(expression) => format!(
+            Self::Xpath(expression) => Some(format!(
                 "document.evaluate({}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue",
                 json_string(expression)
-            ),
+            )),
+            Self::Text(text) => Some(text_search_expression(text)),
+            // The accessibility tree names this element; there is no selector
+            // to evaluate in the page.
+            Self::Role { .. } => None,
         }
     }
 
     /// An expression that reports whether the element exists and is visible.
-    fn locate_expression(&self) -> String {
-        format!(
-            "(function () {{ var el = {}; if (!el || el.nodeType !== 1) return {{ found: false }}; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return {{ found: true, visible: style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0 }}; }})()",
-            self.element_expression()
-        )
-    }
-
-    /// An expression that scrolls the element into view and returns its centre.
-    fn center_expression(&self) -> String {
-        format!(
-            "(function () {{ var el = {}; if (!el) return null; el.scrollIntoView({{ block: 'center', inline: 'center' }}); var rect = el.getBoundingClientRect(); return {{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }}; }})()",
-            self.element_expression()
-        )
-    }
-
-    /// An expression that focuses the element and reports whether it took.
-    fn focus_expression(&self) -> String {
-        format!(
-            "(function () {{ var el = {}; if (!el) return false; el.focus(); return document.activeElement === el; }})()",
-            self.element_expression()
-        )
-    }
-
-    /// An expression for the element's text content, trimmed.
-    fn text_expression(&self) -> String {
-        format!(
-            "(function () {{ var el = {}; if (!el) return ''; return String(el.textContent === null ? '' : el.textContent).trim(); }})()",
-            self.element_expression()
-        )
-    }
-
-    /// An expression for one attribute, or `null` when it is absent.
-    fn attribute_expression(&self, attribute: &str) -> String {
-        format!(
-            "(function () {{ var el = {}; if (!el) return null; return el.getAttribute({}); }})()",
-            self.element_expression(),
-            json_string(attribute)
-        )
+    ///
+    /// Text reports a hidden match as found-but-not-visible so its failure says
+    /// the element exists instead of claiming the page has no such text.
+    fn locate_expression(&self) -> Option<String> {
+        if let Self::Text(text) = self {
+            return Some(text_locate_expression(text));
+        }
+        let element = self.element_expression()?;
+        Some(format!(
+            "(function () {{ var el = {element}; if (!el || el.nodeType !== 1) return {{ found: false }}; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return {{ found: true, visible: style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0 }}; }})()"
+        ))
     }
 
     /// A step failure that names the locator and what was attempted.
     fn action_error(&self, action: &str, error: impl std::fmt::Display) -> StepError {
         StepError::Execution(format!("could not {action} {}: {error}", self.describe()))
     }
+}
+
+/// The body of a center lookup, run with the located element as `el`.
+const CENTER_BODY: &str = "if (!el) return null; el.scrollIntoView({ block: 'center', inline: 'center' }); var rect = el.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };";
+
+/// The body of a focus lookup, run with the located element as `el`.
+const FOCUS_BODY: &str = "if (!el) return false; el.focus(); return document.activeElement === el;";
+
+/// The body of a text read, run with the located element as `el`.
+const TEXT_BODY: &str =
+    "if (!el) return ''; return String(el.textContent === null ? '' : el.textContent).trim();";
+
+/// The body of a visibility read, run with the located element as `el`.
+const VISIBLE_BODY: &str = "if (!el || el.nodeType !== 1) return false; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;";
+
+/// JavaScript that returns the innermost visible element whose normalized text
+/// equals `__DA_WANTED__`.
+const TEXT_SEARCH_TEMPLATE: &str = r#"(function () {
+  var wanted = __DA_WANTED__;
+  var normalize = function (value) {
+    return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
+  };
+  var visible = function (el) {
+    var style = window.getComputedStyle(el);
+    var rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
+  };
+  var all = document.querySelectorAll('*');
+  var matches = [];
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (visible(el) && normalize(el.innerText) === wanted) matches.push(el);
+  }
+  for (var j = 0; j < matches.length; j++) {
+    var candidate = matches[j];
+    var innermost = true;
+    for (var k = 0; k < matches.length; k++) {
+      if (k !== j && candidate.contains(matches[k])) { innermost = false; break; }
+    }
+    if (innermost) return candidate;
+  }
+  return null;
+})()"#;
+
+/// JavaScript that reports whether any element's normalized text matches and
+/// whether an innermost visible one exists.
+const TEXT_LOCATE_TEMPLATE: &str = r#"(function () {
+  var wanted = __DA_WANTED__;
+  var normalize = function (value) {
+    return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
+  };
+  var visible = function (el) {
+    var style = window.getComputedStyle(el);
+    var rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
+  };
+  var all = document.querySelectorAll('*');
+  var matched = false;
+  var matches = [];
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (normalize(el.innerText) === wanted) {
+      matched = true;
+      if (visible(el)) matches.push(el);
+    }
+  }
+  if (!matches.length) return { found: matched };
+  for (var j = 0; j < matches.length; j++) {
+    var candidate = matches[j];
+    var innermost = true;
+    for (var k = 0; k < matches.length; k++) {
+      if (k !== j && candidate.contains(matches[k])) { innermost = false; break; }
+    }
+    if (innermost) return { found: true, visible: true };
+  }
+  return { found: false };
+})()"#;
+
+/// Builds the text search script for one value.
+fn text_search_expression(text: &str) -> String {
+    TEXT_SEARCH_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
+}
+
+/// Builds the text locate script for one value.
+fn text_locate_expression(text: &str) -> String {
+    TEXT_LOCATE_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
 }
 
 /// Encodes text as a JavaScript string literal.
@@ -421,26 +626,32 @@ enum WaitTarget {
 }
 
 impl WaitTarget {
-    /// Reads exactly one of the three accepted forms.
+    /// Reads exactly one of the accepted forms.
     fn from_args(args: &WaitArgs) -> Result<Self, String> {
-        if args.css.is_some() && args.xpath.is_some() {
-            return Err("invalid arguments: `css` and `xpath` cannot both be set; give exactly one of `css`, `xpath` and `url_contains`".to_string());
-        }
-        let locator = Locator::from_args(&args.css, &args.xpath);
-        match (&locator, args.url_contains.as_deref()) {
-            (Ok(_), Some(_)) => Err(
-                "invalid arguments: `url_contains` cannot be combined with a locator; give exactly one of `css`, `xpath` and `url_contains`"
-                    .to_string(),
-            ),
-            (Ok(locator), None) => Ok(Self::Element(locator.clone())),
-            (Err(_), Some(text)) if text.trim().is_empty() => {
-                Err("invalid arguments: `url_contains` must not be empty".to_string())
+        let has_locator = args.css.is_some()
+            || args.xpath.is_some()
+            || args.text.is_some()
+            || args.role.is_some();
+        if let Some(text) = args.url_contains.as_deref() {
+            if has_locator || args.name.is_some() {
+                return Err(
+                    "invalid arguments: `url_contains` cannot be combined with a locator; give exactly one of `css`, `xpath`, `text`, `role` and `url_contains`"
+                        .to_string(),
+                );
             }
-            (Err(_), Some(text)) => Ok(Self::Url(text.to_string())),
-            (Err(message), None) => Err(format!(
-                "invalid arguments: give exactly one of `css`, `xpath` and `url_contains`; {message}"
-            )),
+            if text.trim().is_empty() {
+                return Err("invalid arguments: `url_contains` must not be empty".to_string());
+            }
+            return Ok(Self::Url(text.to_string()));
         }
+        if !has_locator && args.name.is_none() {
+            return Err(
+                "invalid arguments: give exactly one of `css`, `xpath`, `text`, `role` and `url_contains`"
+                    .to_string(),
+            );
+        }
+        Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
+            .map(Self::Element)
     }
 }
 
@@ -554,21 +765,48 @@ fn code_for_char(character: char) -> String {
     }
 }
 
+/// How the case's browser was obtained.
+enum Origin {
+    /// The case started this browser process and ends it when the case ends.
+    Launched(Launched),
+    /// The case connected to the user's browser and closes only its own tab.
+    Connected { target_id: String },
+}
+
 /// One case's browser, its page, and the options that created it.
 struct BrowserSession {
     /// Taken by [`Session::close`], which releases it before the case report is
     /// written. `Drop` only matters on the fallback path.
     connection: Option<Connection>,
-    browser: Option<Launched>,
+    origin: Option<Origin>,
     /// The target session every page command is sent with.
     page: String,
     port: u16,
     headless: bool,
     width: u32,
     height: u32,
+    /// The connected endpoint, as `connect` named it; `None` when the case
+    /// started its own browser.
+    connect: Option<String>,
+}
+
+/// One element resolved from a locator.
+enum Located {
+    /// An expression that evaluates to the element again.
+    Expression(String),
+    /// A DOM node handle produced from the accessibility tree.
+    Object(String),
 }
 
 impl BrowserSession {
+    /// Creates the session described by `browser.open`.
+    fn open(args: &OpenArgs, connect: Option<&Endpoint>) -> Result<Self, String> {
+        match connect {
+            Some(endpoint) => Self::connect_to(endpoint),
+            None => Self::launch(args),
+        }
+    }
+
     /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs) -> Result<Self, String> {
         let browser = Launched::launch(
@@ -585,54 +823,56 @@ impl BrowserSession {
         .map_err(|error| {
             format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
         })?;
-
-        let setup = Deadline::after(LAUNCH_TIMEOUT);
-        let target = connection
-            .call(
-                "Target.createTarget",
-                json!({ "url": "about:blank" }),
-                None,
-                setup,
-            )
-            .map_err(|error| format!("could not open a page in the browser: {error}"))?;
-        let target_id = target
-            .get("targetId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "the browser did not return a target id".to_string())?;
-        let attached = connection
-            .call(
-                "Target.attachToTarget",
-                json!({ "targetId": target_id, "flatten": true }),
-                None,
-                setup,
-            )
-            .map_err(|error| format!("could not attach to the page the browser opened: {error}"))?;
-        let page = attached
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "the browser did not return a page session id".to_string())?
-            .to_string();
-        connection
-            .call("Page.enable", json!({}), Some(&page), setup)
-            .map_err(|error| format!("could not enable page events: {error}"))?;
-        connection
-            .call("Runtime.enable", json!({}), Some(&page), setup)
-            .map_err(|error| format!("could not enable page scripts: {error}"))?;
+        let (page, _) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
 
         Ok(Self {
             connection: Some(connection),
-            browser: Some(browser),
+            origin: Some(Origin::Launched(browser)),
             page,
             port,
             headless: args.headless,
             width: args.width,
             height: args.height,
+            connect: None,
+        })
+    }
+
+    /// Attaches a page in a browser the user already runs.
+    fn connect_to(endpoint: &Endpoint) -> Result<Self, String> {
+        let websocket_url = endpoint.websocket_url(connect::CONNECT_TIMEOUT)?;
+        let mut connection = Connection::connect(&websocket_url, Deadline::after(LAUNCH_TIMEOUT))
+            .map_err(|error| {
+            endpoint.explain(format!("could not open the DevTools connection: {error}"))
+        })?;
+        let (page, target_id) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
+
+        Ok(Self {
+            connection: Some(connection),
+            origin: Some(Origin::Connected { target_id }),
+            page,
+            port: endpoint.port(),
+            headless: true,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            connect: Some(endpoint.name()),
         })
     }
 
     /// Refuses an option that only applies when the session is created.
-    fn ensure_same_options(&self, args: &OpenArgs) -> Result<(), StepError> {
+    fn ensure_same_options(
+        &self,
+        args: &OpenArgs,
+        connect: Option<&Endpoint>,
+    ) -> Result<(), StepError> {
         let mut changes = Vec::new();
+        let wanted_connect = connect.map(Endpoint::name);
+        if wanted_connect.as_deref() != self.connect.as_deref() {
+            changes.push(format!(
+                "`connect` from `{}` to `{}`",
+                self.connect.as_deref().unwrap_or("none"),
+                wanted_connect.as_deref().unwrap_or("none")
+            ));
+        }
         if args.headless != self.headless {
             changes.push(format!(
                 "`headless` from `{}` to `{}`",
@@ -649,7 +889,7 @@ impl BrowserSession {
             return Ok(());
         }
         Err(StepError::Execution(format!(
-            "`browser.open` changed {} after the browser session was created; the first `browser.open` of a case sets `headless`, `width` and `height`, so repeat those values or open the page in a new case",
+            "`browser.open` changed {} after the browser session was created; the first `browser.open` of a case sets `connect`, `headless`, `width` and `height`, so repeat those values or open the page in a new case",
             changes.join(", ")
         )))
     }
@@ -699,9 +939,23 @@ impl BrowserSession {
     }
 
     /// Waits for the element the locator names to exist and be visible.
-    fn locate(&mut self, locator: &Locator, deadline: Deadline) -> Result<(), StepError> {
+    fn locate(&mut self, locator: &Locator, deadline: Deadline) -> Result<Located, StepError> {
+        if let Locator::Role { role, name } = locator {
+            return self.locate_role(locator, role, name.as_deref(), deadline);
+        }
+        let expression = locator.locate_expression().ok_or_else(|| {
+            StepError::Execution(format!(
+                "could not use {}: the locator has no page expression",
+                locator.describe()
+            ))
+        })?;
+        let element = locator.element_expression().ok_or_else(|| {
+            StepError::Execution(format!(
+                "could not use {}: the locator has no page expression",
+                locator.describe()
+            ))
+        })?;
         let page = self.page.clone();
-        let expression = locator.locate_expression();
         loop {
             let outcome = self
                 .connection_mut()?
@@ -710,7 +964,7 @@ impl BrowserSession {
                 Ok(value) => {
                     if value.get("found").and_then(Value::as_bool) == Some(true) {
                         if value.get("visible").and_then(Value::as_bool) == Some(true) {
-                            return Ok(());
+                            return Ok(Located::Expression(element));
                         }
                         if deadline.passed() {
                             return Err(StepError::Execution(format!(
@@ -727,49 +981,167 @@ impl BrowserSession {
                         )));
                     }
                 }
-                Err(CdpError::Script(message)) => {
-                    return Err(StepError::Execution(format!(
-                        "could not use {}: {message}",
-                        locator.describe()
-                    )));
-                }
-                Err(CdpError::Timeout { .. }) => {
-                    return Err(StepError::Execution(format!(
-                        "could not find {} within {} ms; check the page and the locator",
-                        locator.describe(),
-                        deadline.timeout_ms()
-                    )));
-                }
-                Err(error) => {
-                    return Err(StepError::Environment(format!(
-                        "the browser failed while waiting for {}: {error}",
-                        locator.describe()
-                    )));
-                }
+                Err(error) => return Err(locate_error(locator, error, deadline)),
             }
             std::thread::sleep(POLL_INTERVAL);
         }
     }
 
-    /// Evaluates one expression for a step and maps its errors.
-    fn evaluate(
+    /// Waits for an accessibility node with `role` and `name` to be visible.
+    fn locate_role(
         &mut self,
         locator: &Locator,
-        expression: &str,
+        role: &str,
+        name: Option<&str>,
+        deadline: Deadline,
+    ) -> Result<Located, StepError> {
+        loop {
+            let (matched, objects) = self.role_objects(locator, role, name, deadline)?;
+            for object_id in objects {
+                let visible = self.call_function_on(
+                    locator,
+                    &object_id,
+                    VISIBLE_BODY,
+                    "check the visibility of",
+                    deadline,
+                )?;
+                if visible == Value::Bool(true) {
+                    return Ok(Located::Object(object_id));
+                }
+            }
+            if deadline.passed() {
+                return Err(if matched {
+                    StepError::Execution(format!(
+                        "{} was found but not visible within {} ms; check the page and the locator",
+                        locator.describe(),
+                        deadline.timeout_ms()
+                    ))
+                } else {
+                    StepError::Execution(format!(
+                        "could not find {} within {} ms; check the page and the locator",
+                        locator.describe(),
+                        deadline.timeout_ms()
+                    ))
+                });
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Queries the accessibility tree and resolves its matching DOM nodes.
+    ///
+    /// `queryAXTree` already filters by role and accessible name; the checks
+    /// repeat both so a browser that filters loosely cannot match the wrong
+    /// name. Only non-ignored nodes count.
+    fn role_objects(
+        &mut self,
+        locator: &Locator,
+        role: &str,
+        name: Option<&str>,
+        deadline: Deadline,
+    ) -> Result<(bool, Vec<String>), StepError> {
+        let page = self.page.clone();
+        let connection = self.connection_mut()?;
+        let document = connection
+            .call(
+                "DOM.getDocument",
+                json!({ "depth": 0 }),
+                Some(&page),
+                deadline,
+            )
+            .map_err(|error| locate_error(locator, error, deadline))?;
+        let node_id = document
+            .pointer("/root/nodeId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                StepError::Environment(
+                    "the browser did not return the document root while looking up a role"
+                        .to_string(),
+                )
+            })?;
+        let mut params = json!({ "nodeId": node_id, "role": role });
+        if let Some(name) = name {
+            params["accessibleName"] = json!(name);
+        }
+        let reply = connection
+            .call("Accessibility.queryAXTree", params, Some(&page), deadline)
+            .map_err(|error| locate_error(locator, error, deadline))?;
+        let nodes = reply
+            .get("nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut matched = false;
+        let mut objects = Vec::new();
+        for node in nodes {
+            if node.get("ignored").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if node.pointer("/role/value").and_then(Value::as_str) != Some(role) {
+                continue;
+            }
+            if let Some(name) = name
+                && node.pointer("/name/value").and_then(Value::as_str) != Some(name)
+            {
+                continue;
+            }
+            matched = true;
+            let Some(backend_node_id) = node.get("backendDOMNodeId").and_then(Value::as_i64) else {
+                continue;
+            };
+            let resolved = connection
+                .call(
+                    "DOM.resolveNode",
+                    json!({ "backendNodeId": backend_node_id }),
+                    Some(&page),
+                    deadline,
+                )
+                .map_err(|error| locate_error(locator, error, deadline))?;
+            if let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str) {
+                objects.push(object_id.to_string());
+            }
+        }
+        Ok((matched, objects))
+    }
+
+    /// Runs one action body on a located element and maps its errors.
+    fn run_on(
+        &mut self,
+        locator: &Locator,
+        located: &Located,
+        body: &str,
+        action: &str,
+        deadline: Deadline,
+    ) -> Result<Value, StepError> {
+        match located {
+            Located::Expression(expression) => {
+                let page = self.page.clone();
+                let script = format!("(function () {{ var el = {expression}; {body} }})()");
+                self.connection_mut()?
+                    .evaluate(&page, &script, deadline)
+                    .map_err(|error| evaluate_error(locator, error, action, deadline))
+            }
+            Located::Object(object_id) => {
+                self.call_function_on(locator, object_id, body, action, deadline)
+            }
+        }
+    }
+
+    /// Runs one action body with a resolved DOM node as `this`.
+    fn call_function_on(
+        &mut self,
+        locator: &Locator,
+        object_id: &str,
+        body: &str,
         action: &str,
         deadline: Deadline,
     ) -> Result<Value, StepError> {
         let page = self.page.clone();
+        let function = format!("function () {{ var el = this; {body} }}");
         self.connection_mut()?
-            .evaluate(&page, expression, deadline)
-            .map_err(|error| match error {
-                CdpError::Timeout { .. } => StepError::Timeout(format!(
-                    "could not {action} {} within {} ms",
-                    locator.describe(),
-                    deadline.timeout_ms()
-                )),
-                error => locator.action_error(action, error),
-            })
+            .call_function(&page, object_id, &function, deadline)
+            .map_err(|error| evaluate_error(locator, error, action, deadline))
     }
 
     /// Sends one page command for a step and maps its errors.
@@ -795,6 +1167,78 @@ impl BrowserSession {
                 "the browser session is already closed; run `browser.open` again".to_string(),
             )
         })
+    }
+}
+
+/// Opens one new tab and attaches it as the session's page.
+fn attach(connection: &mut Connection, deadline: Deadline) -> Result<(String, String), String> {
+    let target = connection
+        .call(
+            "Target.createTarget",
+            json!({ "url": "about:blank" }),
+            None,
+            deadline,
+        )
+        .map_err(|error| format!("could not open a page in the browser: {error}"))?;
+    let target_id = target
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "the browser did not return a target id".to_string())?
+        .to_string();
+    let attached = connection
+        .call(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+            None,
+            deadline,
+        )
+        .map_err(|error| format!("could not attach to the page the browser opened: {error}"))?;
+    let page = attached
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "the browser did not return a page session id".to_string())?
+        .to_string();
+    connection
+        .call("Page.enable", json!({}), Some(&page), deadline)
+        .map_err(|error| format!("could not enable page events: {error}"))?;
+    connection
+        .call("Runtime.enable", json!({}), Some(&page), deadline)
+        .map_err(|error| format!("could not enable page scripts: {error}"))?;
+    Ok((page, target_id))
+}
+
+/// Maps a failure while looking for an element to the error class a step uses.
+fn locate_error(locator: &Locator, error: CdpError, deadline: Deadline) -> StepError {
+    match error {
+        CdpError::Script(message) => {
+            StepError::Execution(format!("could not use {}: {message}", locator.describe()))
+        }
+        CdpError::Timeout { .. } => StepError::Execution(format!(
+            "could not find {} within {} ms; check the page and the locator",
+            locator.describe(),
+            deadline.timeout_ms()
+        )),
+        error => StepError::Environment(format!(
+            "the browser failed while waiting for {}: {error}",
+            locator.describe()
+        )),
+    }
+}
+
+/// Maps a failure of one element action to the error class a step uses.
+fn evaluate_error(
+    locator: &Locator,
+    error: CdpError,
+    action: &str,
+    deadline: Deadline,
+) -> StepError {
+    match error {
+        CdpError::Timeout { .. } => StepError::Timeout(format!(
+            "could not {action} {} within {} ms",
+            locator.describe(),
+            deadline.timeout_ms()
+        )),
+        error => locator.action_error(action, error),
     }
 }
 
@@ -851,24 +1295,49 @@ impl Session for BrowserSession {
         };
         record_close(self.port);
         let mut errors = Vec::new();
-        if let Err(error) = connection.call(
-            "Browser.close",
-            json!({}),
-            None,
-            Deadline::after(Duration::from_secs(2)),
-        ) {
-            match error {
-                // Chrome may close the socket as it answers, or never answer.
-                // The process check below decides whether the close worked.
-                CdpError::Transport(_) | CdpError::Timeout { .. } => {}
-                error => errors.push(format!("could not ask the browser to close: {error}")),
+        match self.origin.take() {
+            Some(Origin::Launched(browser)) => {
+                if let Err(error) = connection.call(
+                    "Browser.close",
+                    json!({}),
+                    None,
+                    Deadline::after(Duration::from_secs(2)),
+                ) {
+                    match error {
+                        // Chrome may close the socket as it answers, or never
+                        // answer. The process check in `shutdown` decides
+                        // whether the close worked.
+                        CdpError::Transport(_) | CdpError::Timeout { .. } => {}
+                        error => {
+                            errors.push(format!("could not ask the browser to close: {error}"));
+                        }
+                    }
+                }
+                drop(connection);
+                if let Err(error) = browser.shutdown() {
+                    errors.push(error);
+                }
             }
-        }
-        drop(connection);
-        if let Some(browser) = self.browser.take()
-            && let Err(error) = browser.shutdown()
-        {
-            errors.push(error);
+            Some(Origin::Connected { target_id }) => {
+                // Only this case's tab is ours. `Browser.close` is never sent:
+                // the browser belongs to the user and must keep running.
+                if let Err(error) = connection.call(
+                    "Target.closeTarget",
+                    json!({ "targetId": target_id }),
+                    None,
+                    Deadline::after(Duration::from_secs(2)),
+                ) {
+                    match error {
+                        // The tab may have closed itself; disconnecting is
+                        // enough in that case.
+                        CdpError::Transport(_) | CdpError::Timeout { .. } => {}
+                        CdpError::Method { message, .. } if message.contains("No target") => {}
+                        error => errors.push(format!("could not close the page: {error}")),
+                    }
+                }
+                drop(connection);
+            }
+            None => drop(connection),
         }
         if errors.is_empty() {
             Ok(())
@@ -918,11 +1387,27 @@ fn check_timeout(timeout_ms: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn check_open(args: &OpenArgs) -> Result<(), String> {
+fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
     if args.url.trim().is_empty() {
         return Err(
             "invalid arguments: `url` must not be empty; give the page to open".to_string(),
         );
+    }
+    if raw.get("connect").is_some_and(Value::is_null) {
+        return Err(
+            "invalid arguments: `connect` must be a string like `http://127.0.0.1:9222`"
+                .to_string(),
+        );
+    }
+    if let Some(connect) = &args.connect {
+        for field in ["headless", "width", "height"] {
+            if raw.get(field).is_some() {
+                return Err(format!(
+                    "invalid arguments: `connect` cannot be combined with `{field}`; the connected browser keeps its own window"
+                ));
+            }
+        }
+        Endpoint::parse(connect)?;
     }
     if args.width == 0 {
         return Err("invalid arguments: `width` must be at least 1".to_string());
@@ -933,20 +1418,42 @@ fn check_open(args: &OpenArgs) -> Result<(), String> {
     check_timeout(args.timeout_ms)
 }
 
-fn validate_open(args: &Value) -> Result<(), String> {
-    check_open(&parse_for_validate(args)?)
+fn validate_open(raw: &Value) -> Result<(), String> {
+    let args: OpenArgs = parse_for_validate(raw)?;
+    check_open(raw, &args)
 }
 
 fn validate_click(args: &Value) -> Result<(), String> {
     let args: ClickArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
-    Locator::from_args(&args.css, &args.xpath).map(|_| ())
+    Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name).map(|_| ())
+}
+
+/// The text `browser.type` sends.
+///
+/// `text` is the typing text unless `value` is also given; then `text` names
+/// the element and `value` is what is typed.
+fn type_text(args: &TypeArgs) -> Result<&str, String> {
+    args.value.as_deref().or(args.text.as_deref()).ok_or_else(|| {
+        "invalid arguments: `text` is required; give the text to type, or `value` when `text` names the element"
+            .to_string()
+    })
+}
+
+/// The locator `browser.type` uses.
+fn type_locator(args: &TypeArgs) -> Result<Locator, String> {
+    if args.value.is_some() {
+        Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
+    } else {
+        Locator::from_args(&args.css, &args.xpath, &None, &args.role, &args.name)
+    }
 }
 
 fn validate_type(args: &Value) -> Result<(), String> {
     let args: TypeArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
-    Locator::from_args(&args.css, &args.xpath).map(|_| ())
+    type_text(&args)?;
+    type_locator(&args).map(|_| ())
 }
 
 fn validate_press(args: &Value) -> Result<(), String> {
@@ -963,7 +1470,7 @@ fn validate_wait(args: &Value) -> Result<(), String> {
 fn validate_read(args: &Value) -> Result<(), String> {
     let args: ReadArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
-    Locator::from_args(&args.css, &args.xpath)?;
+    Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)?;
     if let Some(attribute) = &args.attribute
         && attribute.trim().is_empty()
     {
@@ -985,17 +1492,26 @@ fn session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
 }
 
 fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
-    let args: OpenArgs = parse(args)?;
-    check_open(&args).map_err(StepError::InvalidArguments)?;
+    let raw = args;
+    let args: OpenArgs = parse(raw)?;
+    check_open(raw, &args).map_err(StepError::InvalidArguments)?;
+    let connect = args
+        .connect
+        .as_deref()
+        .map(Endpoint::parse)
+        .transpose()
+        .map_err(StepError::InvalidArguments)?;
     let existing = sessions
         .get::<BrowserSession>(SESSION_KIND)
         .map_err(StepError::Execution)?
         .is_some();
     let session = sessions
-        .get_or_create(SESSION_KIND, || BrowserSession::launch(&args))
+        .get_or_create(SESSION_KIND, || {
+            BrowserSession::open(&args, connect.as_ref())
+        })
         .map_err(StepError::Environment)?;
     if existing {
-        session.ensure_same_options(&args)?;
+        session.ensure_same_options(&args, connect.as_ref())?;
     }
     let (url, title) = session.navigate(&args.url, Duration::from_millis(args.timeout_ms))?;
     Ok(json!({ "url": url, "title": title }))
@@ -1004,12 +1520,12 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
 fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: ClickArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
-    let locator =
-        Locator::from_args(&args.css, &args.xpath).map_err(StepError::InvalidArguments)?;
+    let locator = Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
+        .map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    session.locate(&locator, deadline)?;
-    let center = session.evaluate(&locator, &locator.center_expression(), "click", deadline)?;
+    let located = session.locate(&locator, deadline)?;
+    let center = session.run_on(&locator, &located, CENTER_BODY, "click", deadline)?;
     let x = center
         .get("x")
         .and_then(Value::as_f64)
@@ -1036,15 +1552,9 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     }
     // A click may navigate, which detaches the element. The click itself
     // succeeded, so a text that can no longer be read is not a failure.
-    let page = session.page.clone();
     let text = session
-        .connection
-        .as_mut()
-        .and_then(|connection| {
-            connection
-                .evaluate(&page, &locator.text_expression(), deadline)
-                .ok()
-        })
+        .run_on(&locator, &located, TEXT_BODY, "read the text of", deadline)
+        .ok()
         .and_then(|value| value.as_str().map(str::to_string));
     match text {
         Some(text) if !text.trim().is_empty() => Ok(json!({ "text": text.trim() })),
@@ -1055,19 +1565,21 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
 fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: TypeArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
-    let locator =
-        Locator::from_args(&args.css, &args.xpath).map_err(StepError::InvalidArguments)?;
+    let text = type_text(&args)
+        .map_err(StepError::InvalidArguments)?
+        .to_string();
+    let locator = type_locator(&args).map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    session.locate(&locator, deadline)?;
-    let focused = session.evaluate(&locator, &locator.focus_expression(), "focus", deadline)?;
+    let located = session.locate(&locator, deadline)?;
+    let focused = session.run_on(&locator, &located, FOCUS_BODY, "focus", deadline)?;
     if focused != Value::Bool(true) {
         return Err(locator.action_error("focus", "the element did not take focus"));
     }
     session.dispatch(
         &locator,
         "Input.insertText",
-        json!({ "text": args.text }),
+        json!({ "text": text }),
         "type into",
         deadline,
     )?;
@@ -1160,25 +1672,19 @@ fn wait_for_url(
 fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: ReadArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
-    let locator =
-        Locator::from_args(&args.css, &args.xpath).map_err(StepError::InvalidArguments)?;
+    let locator = Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
+        .map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    session.locate(&locator, deadline)?;
-    let text = session.evaluate(
-        &locator,
-        &locator.text_expression(),
-        "read the text of",
-        deadline,
-    )?;
+    let located = session.locate(&locator, deadline)?;
+    let text = session.run_on(&locator, &located, TEXT_BODY, "read the text of", deadline)?;
     let mut result = json!({ "text": text.as_str().unwrap_or_default() });
     if let Some(attribute) = &args.attribute {
-        let value = session.evaluate(
-            &locator,
-            &locator.attribute_expression(attribute),
-            "read the attribute of",
-            deadline,
-        )?;
+        let body = format!(
+            "if (!el) return null; return el.getAttribute({});",
+            json_string(attribute)
+        );
+        let value = session.run_on(&locator, &located, &body, "read the attribute of", deadline)?;
         result["value"] = value;
     }
     Ok(result)
@@ -1248,12 +1754,24 @@ mod tests {
             definition.args_schema["properties"]["timeout_ms"]["minimum"],
             1
         );
+        assert_eq!(
+            definition.args_schema["properties"]["connect"]["type"],
+            "string"
+        );
 
         assert!((definition.validate)(&json!({"url": "http://127.0.0.1:1/"})).is_ok());
         assert!(
             (definition.validate)(&json!({"url": "http://127.0.0.1:1/", "timeout_ms": 30000}))
                 .is_ok(),
             "a navigation timeout is a valid argument"
+        );
+        assert!(
+            (definition.validate)(&json!({
+                "url": "http://127.0.0.1:1/",
+                "connect": "http://127.0.0.1:9222"
+            }))
+            .is_ok(),
+            "a loopback connect endpoint is a valid argument"
         );
         for (label, args) in [
             ("missing url", json!({})),
@@ -1262,6 +1780,22 @@ mod tests {
             ("zero height", json!({"url": "http://x/", "height": 0})),
             ("zero timeout", json!({"url": "http://x/", "timeout_ms": 0})),
             ("unknown", json!({"url": "http://x/", "bogus": true})),
+            (
+                "remote connect",
+                json!({"url": "http://x/", "connect": "http://192.168.1.1:9222"}),
+            ),
+            (
+                "connect with headless",
+                json!({"url": "http://x/", "connect": "http://127.0.0.1:9222", "headless": true}),
+            ),
+            (
+                "connect with width",
+                json!({"url": "http://x/", "connect": "http://127.0.0.1:9222", "width": 800}),
+            ),
+            (
+                "connect with height",
+                json!({"url": "http://x/", "connect": "http://127.0.0.1:9222", "height": 600}),
+            ),
         ] {
             assert!(
                 (definition.validate)(&args).is_err(),
@@ -1271,21 +1805,19 @@ mod tests {
     }
 
     #[test]
-    fn a_locator_is_exactly_one_of_css_and_xpath() {
+    fn a_locator_is_exactly_one_of_four_forms() {
         for step in ["browser.click", "browser.type", "browser.read"] {
             let definition = definition(step);
             let branches = definition.args_schema["oneOf"]
                 .as_array()
                 .unwrap_or_else(|| panic!("`{step}` must declare oneOf"));
-            assert_eq!(branches.len(), 2, "`{step}`: {branches:?}");
-            assert_eq!(
-                definition.args_schema["properties"]["css"]["type"],
-                "string"
-            );
-            assert_eq!(
-                definition.args_schema["properties"]["xpath"]["type"],
-                "string"
-            );
+            assert_eq!(branches.len(), 4, "`{step}`: {branches:?}");
+            for property in ["css", "xpath", "text", "role", "name"] {
+                assert_eq!(
+                    definition.args_schema["properties"][property]["type"], "string",
+                    "`{step}`: `{property}` must be a string"
+                );
+            }
 
             let base = if step == "browser.type" {
                 json!({"css": "#name", "text": "hello"})
@@ -1295,6 +1827,24 @@ mod tests {
             assert!(
                 (definition.validate)(&base).is_ok(),
                 "`{step}` must accept one locator: {base}"
+            );
+            let text = if step == "browser.type" {
+                json!({"text": "Later", "value": "hello"})
+            } else {
+                json!({"text": "Later"})
+            };
+            assert!(
+                (definition.validate)(&text).is_ok(),
+                "`{step}` must accept a text locator: {text}"
+            );
+            let role = if step == "browser.type" {
+                json!({"role": "textbox", "name": "Name", "text": "hello"})
+            } else {
+                json!({"role": "textbox", "name": "Name"})
+            };
+            assert!(
+                (definition.validate)(&role).is_ok(),
+                "`{step}` must accept a role locator: {role}"
             );
             let both = if step == "browser.type" {
                 json!({"css": "#a", "xpath": "//*[@id='a']", "text": "hello"})
@@ -1311,6 +1861,14 @@ mod tests {
             let error =
                 (definition.validate)(&none).expect_err("a missing locator must be refused");
             assert!(error.contains("one locator"), "{step}: {error}");
+            let name = if step == "browser.type" {
+                json!({"name": "Submit", "text": "hello"})
+            } else {
+                json!({"name": "Submit"})
+            };
+            let error =
+                (definition.validate)(&name).expect_err("a name without a role must be refused");
+            assert!(error.contains("role"), "{step}: {error}");
         }
     }
 
@@ -1320,11 +1878,13 @@ mod tests {
         let branches = definition.args_schema["oneOf"]
             .as_array()
             .expect("`browser.wait` must declare oneOf");
-        assert_eq!(branches.len(), 3, "{branches:?}");
+        assert_eq!(branches.len(), 5, "{branches:?}");
 
         for args in [
             json!({"css": "#late"}),
             json!({"xpath": "//*[@id='late']"}),
+            json!({"text": "late result"}),
+            json!({"role": "button", "name": "Later"}),
             json!({"url_contains": "/done"}),
         ] {
             assert!(
@@ -1349,6 +1909,7 @@ mod tests {
                 json!({"url_contains": ""}),
                 "must not be empty",
             ),
+            ("name without role", json!({"name": "Later"}), "role"),
         ] {
             let error = (definition.validate)(&args).expect_err("the target must be refused");
             assert!(error.contains(fragment), "{label}: {error}");
@@ -1413,12 +1974,87 @@ mod tests {
             Locator::Xpath("//*[@id='name']".to_string()).describe(),
             "XPath `//*[@id='name']`"
         );
+        assert_eq!(
+            Locator::Text("Later".to_string()).describe(),
+            "visible text `Later`"
+        );
+        assert_eq!(
+            Locator::Role {
+                role: "button".to_string(),
+                name: Some("Later".to_string()),
+            }
+            .describe(),
+            "role `button` named `Later`"
+        );
 
-        let quoted = Locator::Css("a\"b\\c".to_string()).locate_expression();
+        let quoted = Locator::Css("a\"b\\c".to_string())
+            .element_expression()
+            .expect("a CSS locator has a page expression");
         assert!(
             quoted.contains(r#"document.querySelector("a\"b\\c")"#),
             "a selector must be passed as a JSON string literal: {quoted}"
         );
+
+        let text = Locator::Text("a\"b\\c".to_string())
+            .element_expression()
+            .expect("a text locator has a page expression");
+        assert!(
+            text.contains(r#""a\"b\\c""#),
+            "the wanted text must be passed as a JSON string literal: {text}"
+        );
+        assert!(
+            Locator::Role {
+                role: "button".to_string(),
+                name: None,
+            }
+            .element_expression()
+            .is_none(),
+            "a role locator has no page expression"
+        );
+    }
+
+    #[test]
+    fn type_reads_the_value_only_when_text_names_the_element() {
+        let typed = TypeArgs {
+            css: Some("#name".to_string()),
+            xpath: None,
+            text: Some("Ada".to_string()),
+            role: None,
+            name: None,
+            value: None,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        };
+        assert_eq!(type_text(&typed).ok(), Some("Ada"));
+        assert_eq!(
+            type_locator(&typed).ok(),
+            Some(Locator::Css("#name".to_string()))
+        );
+
+        let located = TypeArgs {
+            css: None,
+            xpath: None,
+            text: Some("Editor".to_string()),
+            role: None,
+            name: None,
+            value: Some(" typed".to_string()),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        };
+        assert_eq!(type_text(&located).ok(), Some(" typed"));
+        assert_eq!(
+            type_locator(&located).ok(),
+            Some(Locator::Text("Editor".to_string()))
+        );
+
+        let missing = TypeArgs {
+            css: Some("#name".to_string()),
+            xpath: None,
+            text: None,
+            role: None,
+            name: None,
+            value: None,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        };
+        assert!(type_text(&missing).is_err());
     }
 
     #[test]
