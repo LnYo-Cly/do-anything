@@ -273,11 +273,15 @@ fn base64_spans(text: &str, secret: &[u8]) -> Vec<Span> {
         }
         let include_before = !(offset * 8).is_multiple_of(6);
         let include_after = !(offset * 8 + secret.len() * 8).is_multiple_of(6);
-        for alphabet in [BASE64_STANDARD, BASE64_URL_SAFE] {
-            let needle: String = values
-                .iter()
-                .map(|value| alphabet[*value as usize] as char)
-                .collect();
+        let standard = base64_needle(&values, BASE64_STANDARD);
+        let url_safe = base64_needle(&values, BASE64_URL_SAFE);
+        // The alphabets differ only at values 62 and 63. Most secrets never
+        // reach them, and searching the same text twice would only cost time.
+        let mut needles = vec![standard];
+        if url_safe != needles[0] {
+            needles.push(url_safe);
+        }
+        for needle in needles {
             let mut from = 0;
             while from < text.len() {
                 let Some(relative) = text[from..].find(&needle) else {
@@ -302,6 +306,14 @@ fn base64_spans(text: &str, secret: &[u8]) -> Vec<Span> {
         }
     }
     merge_spans(spans)
+}
+
+/// Writes fixed six-bit values with one base64 alphabet.
+fn base64_needle(values: &[u8], alphabet: &[u8; 64]) -> String {
+    values
+        .iter()
+        .map(|value| alphabet[*value as usize] as char)
+        .collect()
 }
 
 /// The six-bit values of the characters fully determined by `secret`.
