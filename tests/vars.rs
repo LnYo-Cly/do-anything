@@ -1002,3 +1002,332 @@ fn a_secret_never_appears_in_an_error_message() {
         stdout(&json)
     );
 }
+
+/// The `report.json` files written under `dir`.
+fn report_json_files(dir: &Path) -> Vec<(PathBuf, Value)> {
+    files_under(dir)
+        .into_iter()
+        .filter_map(|(path, bytes)| {
+            if path.file_name().and_then(|name| name.to_str()) != Some("report.json") {
+                return None;
+            }
+            let value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|error| panic!("{} must be JSON: {error}", path.display()));
+            Some((path, value))
+        })
+        .collect()
+}
+
+/// Checks one run of an encoded form: no channel, bundle file or report scalar
+/// may contain the raw or encoded secret, and the marker must be present.
+fn assert_encoded_secret_redacted(
+    output: &Output,
+    bundle_dir: &Path,
+    forbidden: &[&str],
+    context: &str,
+) {
+    let text_stdout = stdout(output);
+    let text_stderr = stderr(output);
+    for (channel, content) in [("stdout", &text_stdout), ("stderr", &text_stderr)] {
+        for value in forbidden {
+            assert!(
+                !content.contains(value),
+                "{context} {channel} leaked {value:?}: {content}"
+            );
+        }
+        assert!(
+            content.contains("***") || channel == "stderr",
+            "{context} {channel} must show the redaction marker: {content}"
+        );
+    }
+
+    let bundle = searchable_bytes(&[bundle_dir]);
+    let bundle = String::from_utf8_lossy(&bundle);
+    for value in forbidden {
+        assert!(
+            !bundle.contains(value),
+            "{context} bundle leaked {value:?}: {bundle}"
+        );
+    }
+    assert!(
+        bundle.contains("***"),
+        "{context} bundle must show the redaction marker"
+    );
+
+    let reports = report_json_files(bundle_dir);
+    assert!(!reports.is_empty(), "{context} must write report.json");
+    for (path, value) in reports {
+        for secret in forbidden {
+            assert_no_scalar_contains(&value, secret, &path.display().to_string());
+        }
+        assert!(
+            serde_json::to_string(&value)
+                .expect("a report must serialize")
+                .contains("***"),
+            "{} must show the redaction marker",
+            path.display()
+        );
+    }
+}
+
+/// A program that prints the base64 form of a JSON object holding its argument.
+#[cfg(feature = "cli")]
+fn base64_json_command(dir: &TempDir) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let script = dir.write(
+            "emit-base64.ps1",
+            "param([string]$Secret)\n$json = '{\"token\":\"' + $Secret + '\"}'\n[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))\n",
+        );
+        (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                path_str(&script).to_string(),
+            ],
+        )
+    } else {
+        let script = dir.write(
+            "emit-base64.sh",
+            "#!/bin/sh\nprintf '{\"token\":\"%s\"}' \"$1\" | base64\n",
+        );
+        ("/bin/sh".to_string(), vec![path_str(&script).to_string()])
+    }
+}
+
+/// The gate for a percent-encoded value in a URL inside a response body.
+#[test]
+#[cfg(feature = "http")]
+fn a_percent_encoded_secret_in_a_response_url_is_redacted_everywhere() {
+    const SECRET: &str = "s3cr3t-DA-PERCENT-8842";
+    const NAME: &str = "DA_TEST_PERCENT_SECRET";
+
+    let server = support::TestServer::start();
+    let dir = TempDir::new("encoded-percent");
+    let encoded = support::percent_encode(SECRET.as_bytes());
+    let case = dir.write(
+        "percent.yaml",
+        &format!(
+            r#"
+name: Percent encoded URL
+steps:
+  - http.request:
+      method: POST
+      url: {base}/encoded-secret
+      json:
+        secret: "${{env:{name}}}"
+    expect:
+      - path: $.body.url
+        contains: "not-the-encoded-secret"
+"#,
+            base = server.url(""),
+            name = NAME
+        ),
+    );
+
+    let text_bundles = dir.path().join("bundles-text");
+    let text = run_da_with_env(
+        dir.path(),
+        &[
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&text_bundles),
+        ],
+        &[(NAME, SECRET)],
+    );
+    assert_eq!(exit_code(&text), Some(1), "stderr: {:?}", stderr(&text));
+    assert!(
+        stdout(&text).contains("token=***"),
+        "the URL must show one marker: {:?}",
+        stdout(&text)
+    );
+
+    let json_bundles = dir.path().join("bundles-json");
+    let json = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&json_bundles),
+        ],
+        &[(NAME, SECRET)],
+    );
+    assert_eq!(exit_code(&json), Some(1), "stderr: {:?}", stderr(&json));
+    let parsed: Value =
+        serde_json::from_str(&stdout(&json)).expect("stdout must be one JSON object");
+    assert!(
+        serde_json::to_string(&parsed)
+            .expect("the report must serialize")
+            .contains("token=***"),
+        "the JSON report must show the URL marker: {parsed}"
+    );
+
+    for (label, output, bundles) in [
+        ("text", &text, &text_bundles),
+        ("json", &json, &json_bundles),
+    ] {
+        assert_encoded_secret_redacted(
+            output,
+            bundles,
+            &[SECRET, encoded.as_str()],
+            &format!("{label} percent URL"),
+        );
+    }
+}
+
+/// The gate for `Basic <base64(user:secret)>` in a response body.
+#[test]
+#[cfg(feature = "http")]
+fn a_basic_authorization_secret_in_a_response_body_is_redacted_everywhere() {
+    const SECRET: &str = "s3cr3t-DA-BASIC-7519";
+    const NAME: &str = "DA_TEST_BASIC_SECRET";
+
+    let server = support::TestServer::start();
+    let dir = TempDir::new("encoded-basic");
+    let encoded = support::base64_encode(format!("alice:{SECRET}").as_bytes());
+    let case = dir.write(
+        "basic.yaml",
+        &format!(
+            r#"
+name: Basic authorization body
+steps:
+  - http.request:
+      method: POST
+      url: {base}/encoded-secret
+      json:
+        user: alice
+        secret: "${{env:{name}}}"
+    expect:
+      - path: $.body.authorization
+        contains: "not-the-encoded-authorization"
+"#,
+            base = server.url(""),
+            name = NAME
+        ),
+    );
+
+    let text_bundles = dir.path().join("bundles-text");
+    let text = run_da_with_env(
+        dir.path(),
+        &[
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&text_bundles),
+        ],
+        &[(NAME, SECRET)],
+    );
+    assert_eq!(exit_code(&text), Some(1), "stderr: {:?}", stderr(&text));
+    assert!(
+        stdout(&text).contains("Basic YWxpY2U6***"),
+        "the authorization header must keep only the user prefix: {:?}",
+        stdout(&text)
+    );
+
+    let json_bundles = dir.path().join("bundles-json");
+    let json = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&json_bundles),
+        ],
+        &[(NAME, SECRET)],
+    );
+    assert_eq!(exit_code(&json), Some(1), "stderr: {:?}", stderr(&json));
+    assert!(
+        stdout(&json).contains("Basic YWxpY2U6***"),
+        "the JSON report must keep only the user prefix: {:?}",
+        stdout(&json)
+    );
+
+    for (label, output, bundles) in [
+        ("text", &text, &text_bundles),
+        ("json", &json, &json_bundles),
+    ] {
+        assert_encoded_secret_redacted(
+            output,
+            bundles,
+            &[SECRET, encoded.as_str()],
+            &format!("{label} basic authorization"),
+        );
+    }
+}
+
+/// The gate for a `cli.run` result that is base64 JSON containing the secret.
+#[test]
+#[cfg(feature = "cli")]
+fn a_base64_json_secret_in_command_output_is_redacted_everywhere() {
+    const SECRET: &str = "s3cr3t-DA-CLI-9191";
+    const NAME: &str = "DA_TEST_CLI_BASE64_SECRET";
+
+    let dir = TempDir::new("encoded-cli");
+    let (command, mut args) = base64_json_command(&dir);
+    args.push(format!("${{env:{NAME}}}"));
+    let encoded = support::base64_encode(format!(r#"{{"token":"{SECRET}"}}"#).as_bytes());
+    let args = serde_json::to_string(&args).expect("the command arguments must serialize");
+    let case = dir.write(
+        "cli.yaml",
+        &format!(
+            r#"
+name: Base64 JSON command output
+steps:
+  - cli.run:
+      command: '{command}'
+      args: {args}
+    expect:
+      - path: $.stdout
+        contains: "not-the-encoded-json"
+"#
+        ),
+    );
+
+    let text_bundles = dir.path().join("bundles-text");
+    let text = run_da_with_env(
+        dir.path(),
+        &[
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&text_bundles),
+        ],
+        &[(NAME, SECRET)],
+    );
+    assert_eq!(exit_code(&text), Some(1), "stderr: {:?}", stderr(&text));
+
+    let json_bundles = dir.path().join("bundles-json");
+    let json = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&json_bundles),
+        ],
+        &[(NAME, SECRET)],
+    );
+    assert_eq!(exit_code(&json), Some(1), "stderr: {:?}", stderr(&json));
+
+    for (label, output, bundles) in [
+        ("text", &text, &text_bundles),
+        ("json", &json, &json_bundles),
+    ] {
+        assert_encoded_secret_redacted(
+            output,
+            bundles,
+            &[SECRET, encoded.as_str()],
+            &format!("{label} base64 command output"),
+        );
+    }
+}
