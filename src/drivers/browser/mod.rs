@@ -1330,9 +1330,8 @@ impl Session for BrowserSession {
                     match error {
                         // The tab may have closed itself; disconnecting is
                         // enough in that case.
-                        CdpError::Transport(_)
-                        | CdpError::Timeout { .. }
-                        | CdpError::Method { .. } => {}
+                        CdpError::Transport(_) | CdpError::Timeout { .. } => {}
+                        CdpError::Method { message, .. } if message.contains("No target") => {}
                         error => errors.push(format!("could not close the page: {error}")),
                     }
                 }

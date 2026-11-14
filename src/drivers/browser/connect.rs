@@ -114,18 +114,12 @@ impl Endpoint {
     fn get_json_version(&self, timeout: Duration) -> Result<(u16, String), String> {
         let deadline = Instant::now() + timeout;
         let address = format!("{}:{}", self.host, self.port);
-        let mut addresses = address
+        let addresses = address
             .to_socket_addrs()
             .map_err(|error| format!("`{address}` is not a usable address: {error}"))?;
-        let socket = addresses
-            .next()
-            .ok_or_else(|| format!("`{address}` did not resolve to an address"))?;
+        let mut stream = connect_any(addresses, deadline)
+            .map_err(|error| format!("could not connect to `{address}`: {error}"))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err("the connection timed out".to_string());
-        }
-        let mut stream = TcpStream::connect_timeout(&socket, remaining)
-            .map_err(|error| format!("could not connect to {socket}: {error}"))?;
         stream
             .set_write_timeout(Some(remaining))
             .map_err(|error| format!("could not configure the connection: {error}"))?;
@@ -138,6 +132,26 @@ impl Endpoint {
             .map_err(|error| format!("could not send the request: {error}"))?;
         read_response(&mut stream, deadline)
     }
+}
+
+/// Connects to the first address that accepts, so `localhost` can try both
+/// `127.0.0.1` and `::1`.
+fn connect_any(
+    addresses: impl Iterator<Item = std::net::SocketAddr>,
+    deadline: Instant,
+) -> Result<TcpStream, String> {
+    let mut last = None;
+    for socket in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("the connection timed out".to_string());
+        }
+        match TcpStream::connect_timeout(&socket, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = Some(format!("{socket}: {error}")),
+        }
+    }
+    Err(last.unwrap_or_else(|| "the host did not resolve to an address".to_string()))
 }
 
 /// Splits `host:port` and `[::1]:port`.
