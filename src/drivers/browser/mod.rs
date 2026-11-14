@@ -7,21 +7,25 @@
 //!
 //! Locators are deterministic on purpose: a CSS selector or an XPath
 //! expression, never a coordinate or a screenshot. Element lookup waits for the
-//! element to appear, so a step does not race the page's own scripts.
+//! element to appear and to be visible, so a step does not race the page's own
+//! scripts.
+//!
+//! The protocol lives in [`cdp`] and the process in [`launch`]; this module turns
+//! their messages into step results and step errors.
+
+mod cdp;
+mod launch;
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use headless_chrome::browser::tab::NoElementFound;
-use headless_chrome::util::Timeout;
-use headless_chrome::{Browser, Element, LaunchOptions, Tab};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use self::cdp::{CdpError, Connection, Deadline};
+use self::launch::Launched;
 use crate::core::registry::{Registry, StepDefinition, StepError};
 use crate::core::session::{Session, Sessions};
 
@@ -39,8 +43,13 @@ pub const STEP_NAMES: [&str; 6] = [
 ];
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 800;
+/// How long starting the browser and opening its page may take.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often an element or URL is looked at again.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Registers every browser step.
 pub fn register(registry: &mut Registry) -> Result<(), String> {
@@ -186,6 +195,11 @@ struct OpenArgs {
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_height")]
     height: u32,
+    /// How long the page may take to finish loading, in milliseconds. Defaults
+    /// to 30000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_navigation_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Arguments of `browser.click`.
@@ -286,6 +300,10 @@ fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
 
+fn default_navigation_timeout_ms() -> u64 {
+    DEFAULT_NAVIGATION_TIMEOUT_MS
+}
+
 /// A deterministic way to name one element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Locator {
@@ -325,36 +343,73 @@ impl Locator {
         }
     }
 
-    /// Waits for the element and returns it.
-    fn find<'a>(&self, tab: &'a Tab, timeout: Duration) -> Result<Element<'a>, StepError> {
-        let result = match self {
-            Self::Css(selector) => tab.wait_for_element_with_custom_timeout(selector, timeout),
-            Self::Xpath(expression) => tab.wait_for_xpath_with_custom_timeout(expression, timeout),
-        };
-        result.map_err(|error| {
-            // Running out of the wait is the case the step exists to report;
-            // any other error means the browser itself is in trouble.
-            if error.downcast_ref::<NoElementFound>().is_some()
-                || error.downcast_ref::<Timeout>().is_some()
-            {
-                StepError::Execution(format!(
-                    "could not find {} within {} ms; check the page and the locator",
-                    self.describe(),
-                    timeout.as_millis()
-                ))
-            } else {
-                StepError::Environment(format!(
-                    "the browser failed while waiting for {}: {error}",
-                    self.describe()
-                ))
+    /// A JavaScript expression that evaluates to the element or to `null`.
+    ///
+    /// The selector is passed through `serde_json` so a quote or a backslash in
+    /// it can never end the string literal or add code.
+    fn element_expression(&self) -> String {
+        match self {
+            Self::Css(selector) => {
+                format!("document.querySelector({})", json_string(selector))
             }
-        })
+            Self::Xpath(expression) => format!(
+                "document.evaluate({}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue",
+                json_string(expression)
+            ),
+        }
+    }
+
+    /// An expression that reports whether the element exists and is visible.
+    fn locate_expression(&self) -> String {
+        format!(
+            "(function () {{ var el = {}; if (!el || el.nodeType !== 1) return {{ found: false }}; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return {{ found: true, visible: style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0 }}; }})()",
+            self.element_expression()
+        )
+    }
+
+    /// An expression that scrolls the element into view and returns its centre.
+    fn center_expression(&self) -> String {
+        format!(
+            "(function () {{ var el = {}; if (!el) return null; el.scrollIntoView({{ block: 'center', inline: 'center' }}); var rect = el.getBoundingClientRect(); return {{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }}; }})()",
+            self.element_expression()
+        )
+    }
+
+    /// An expression that focuses the element and reports whether it took.
+    fn focus_expression(&self) -> String {
+        format!(
+            "(function () {{ var el = {}; if (!el) return false; el.focus(); return document.activeElement === el; }})()",
+            self.element_expression()
+        )
+    }
+
+    /// An expression for the element's text content, trimmed.
+    fn text_expression(&self) -> String {
+        format!(
+            "(function () {{ var el = {}; if (!el) return ''; return String(el.textContent === null ? '' : el.textContent).trim(); }})()",
+            self.element_expression()
+        )
+    }
+
+    /// An expression for one attribute, or `null` when it is absent.
+    fn attribute_expression(&self, attribute: &str) -> String {
+        format!(
+            "(function () {{ var el = {}; if (!el) return null; return el.getAttribute({}); }})()",
+            self.element_expression(),
+            json_string(attribute)
+        )
     }
 
     /// A step failure that names the locator and what was attempted.
     fn action_error(&self, action: &str, error: impl std::fmt::Display) -> StepError {
         StepError::Execution(format!("could not {action} {}: {error}", self.describe()))
     }
+}
+
+/// Encodes text as a JavaScript string literal.
+fn json_string(value: &str) -> String {
+    // `to_string` of a JSON string cannot fail: the value is already UTF-8.
+    Value::String(value.to_string()).to_string()
 }
 
 /// What `browser.wait` waits for.
@@ -389,40 +444,186 @@ impl WaitTarget {
     }
 }
 
-/// One case's browser and the page every browser step of that case uses.
+/// One key `browser.press` can send.
+struct Key {
+    key: String,
+    code: String,
+    virtual_key_code: i64,
+    text: Option<String>,
+}
+
+impl Key {
+    /// Reads a named key or one printable character.
+    fn parse(value: &str) -> Result<Self, String> {
+        if let Some((key, code, virtual_key_code, text)) = named_key(value) {
+            return Ok(Self {
+                key: key.to_string(),
+                code: code.to_string(),
+                virtual_key_code,
+                text: text.map(str::to_string),
+            });
+        }
+        let mut characters = value.chars();
+        if let (Some(character), None) = (characters.next(), characters.next())
+            && !character.is_control()
+        {
+            return Ok(Self {
+                key: character.to_string(),
+                code: code_for_char(character),
+                virtual_key_code: if character.is_ascii() {
+                    i64::from(character.to_ascii_uppercase() as u8)
+                } else {
+                    0
+                },
+                text: Some(character.to_string()),
+            });
+        }
+        Err(format!(
+            "invalid arguments: `{value}` is not a key name; use `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, an arrow key, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or a single printable character"
+        ))
+    }
+
+    /// The parameters of the key-down event this key sends.
+    fn down_params(&self) -> Value {
+        self.event_params(
+            if self.text.is_some() {
+                "keyDown"
+            } else {
+                "rawKeyDown"
+            },
+            true,
+        )
+    }
+
+    /// The parameters of the key-up event this key sends.
+    fn up_params(&self) -> Value {
+        self.event_params("keyUp", false)
+    }
+
+    /// One `Input.dispatchKeyEvent` parameter object.
+    fn event_params(&self, event_type: &str, with_text: bool) -> Value {
+        let mut params = json!({
+            "type": event_type,
+            "key": self.key,
+            "windowsVirtualKeyCode": self.virtual_key_code,
+            "nativeVirtualKeyCode": self.virtual_key_code,
+        });
+        if !self.code.is_empty() {
+            params["code"] = json!(self.code);
+        }
+        if with_text && let Some(text) = &self.text {
+            params["text"] = json!(text);
+            params["unmodifiedText"] = json!(text);
+        }
+        params
+    }
+}
+
+/// The named keys `browser.press` accepts, with their DOM key, code, virtual
+/// key code and the text a key-down event carries.
+fn named_key(name: &str) -> Option<(&'static str, &'static str, i64, Option<&'static str>)> {
+    Some(match name {
+        "Enter" => ("Enter", "Enter", 13, Some("\r")),
+        "Tab" => ("Tab", "Tab", 9, None),
+        "Escape" => ("Escape", "Escape", 27, None),
+        "Backspace" => ("Backspace", "Backspace", 8, None),
+        "Delete" => ("Delete", "Delete", 46, None),
+        "ArrowUp" => ("ArrowUp", "ArrowUp", 38, None),
+        "ArrowDown" => ("ArrowDown", "ArrowDown", 40, None),
+        "ArrowLeft" => ("ArrowLeft", "ArrowLeft", 37, None),
+        "ArrowRight" => ("ArrowRight", "ArrowRight", 39, None),
+        "Home" => ("Home", "Home", 36, None),
+        "End" => ("End", "End", 35, None),
+        "PageUp" => ("PageUp", "PageUp", 33, None),
+        "PageDown" => ("PageDown", "PageDown", 34, None),
+        "Space" => (" ", "Space", 32, Some(" ")),
+        _ => return None,
+    })
+}
+
+/// The DOM `code` of a printable character, when it has a conventional one.
+fn code_for_char(character: char) -> String {
+    if character.is_ascii_alphabetic() {
+        format!("Key{}", character.to_ascii_uppercase())
+    } else if character.is_ascii_digit() {
+        format!("Digit{character}")
+    } else if character == ' ' {
+        "Space".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// One case's browser, its page, and the options that created it.
 struct BrowserSession {
     /// Taken by [`Session::close`], which releases it before the case report is
     /// written. `Drop` only matters on the fallback path.
-    browser: Option<Browser>,
-    tab: std::sync::Arc<Tab>,
+    connection: Option<Connection>,
+    browser: Option<Launched>,
+    /// The target session every page command is sent with.
+    page: String,
+    port: u16,
     headless: bool,
     width: u32,
     height: u32,
 }
 
 impl BrowserSession {
-    /// Launches the browser described by `browser.open`.
+    /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs) -> Result<Self, String> {
-        let path = chrome_path()?;
-        let options = LaunchOptions::default_builder()
-            .headless(args.headless)
-            .window_size(Some((args.width, args.height)))
-            .path(Some(path))
-            .build()
-            .map_err(|error| format!("could not build the Chrome launch options: {error}"))?;
-        let browser = Browser::new(options).map_err(|error| {
-            format!(
-                "could not start Chrome: {error}; set `DA_CHROME` to the Chrome or Chromium executable if it is installed elsewhere"
-            )
+        let browser = Launched::launch(
+            args.headless,
+            args.width,
+            args.height,
+            Deadline::after(LAUNCH_TIMEOUT),
+        )?;
+        let port = browser.port();
+        let mut connection = Connection::connect(
+            browser.websocket_url(),
+            Deadline::after(LAUNCH_TIMEOUT),
+        )
+        .map_err(|error| {
+            format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
         })?;
-        let tab = browser.new_tab().map_err(|error| {
-            format!(
-                "could not open a page in Chrome: {error}; set `DA_CHROME` to the Chrome or Chromium executable if it is installed elsewhere"
+
+        let setup = Deadline::after(LAUNCH_TIMEOUT);
+        let target = connection
+            .call(
+                "Target.createTarget",
+                json!({ "url": "about:blank" }),
+                None,
+                setup,
             )
-        })?;
+            .map_err(|error| format!("could not open a page in the browser: {error}"))?;
+        let target_id = target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the browser did not return a target id".to_string())?;
+        let attached = connection
+            .call(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+                None,
+                setup,
+            )
+            .map_err(|error| format!("could not attach to the page the browser opened: {error}"))?;
+        let page = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the browser did not return a page session id".to_string())?
+            .to_string();
+        connection
+            .call("Page.enable", json!({}), Some(&page), setup)
+            .map_err(|error| format!("could not enable page events: {error}"))?;
+        connection
+            .call("Runtime.enable", json!({}), Some(&page), setup)
+            .map_err(|error| format!("could not enable page scripts: {error}"))?;
+
         Ok(Self {
+            connection: Some(connection),
             browser: Some(browser),
-            tab,
+            page,
+            port,
             headless: args.headless,
             width: args.width,
             height: args.height,
@@ -454,87 +655,231 @@ impl BrowserSession {
     }
 
     /// Navigates the session's page and returns its current URL and title.
-    fn navigate(&self, url: &str) -> Result<(String, String), StepError> {
-        self.tab
-            .navigate_to(url)
-            .map_err(|error| StepError::Environment(format!("could not open `{url}`: {error}")))?;
-        self.tab.wait_until_navigated().map_err(|error| {
-            StepError::Timeout(format!("the page `{url}` did not finish loading: {error}"))
-        })?;
-        let current = self.tab.get_url();
-        let title = self.tab.get_title().map_err(|error| {
-            StepError::Environment(format!("could not read the title of `{url}`: {error}"))
-        })?;
+    fn navigate(&mut self, url: &str, timeout: Duration) -> Result<(String, String), StepError> {
+        let page = self.page.clone();
+        let deadline = Deadline::after(timeout);
+        let connection = self.connection_mut()?;
+        // Events from the about:blank page must not be mistaken for this
+        // navigation's load event.
+        connection.take_messages();
+        let reply = connection
+            .call(
+                "Page.navigate",
+                json!({ "url": url }),
+                Some(&page),
+                deadline,
+            )
+            .map_err(|error| match error {
+                CdpError::Timeout { .. } => StepError::Timeout(format!(
+                    "could not open `{url}` within {} ms: {error}",
+                    timeout.as_millis()
+                )),
+                error => StepError::Environment(format!("could not open `{url}`: {error}")),
+            })?;
+        if let Some(error_text) = reply.get("errorText").and_then(Value::as_str) {
+            return Err(StepError::Environment(format!(
+                "could not open `{url}`: {error_text}"
+            )));
+        }
+        wait_for_load(connection, &page, url, deadline)?;
+
+        let current = connection
+            .evaluate(&page, "location.href", deadline)
+            .map(|value| value.as_str().unwrap_or(url).to_string())
+            .map_err(|error| load_error(error, url, deadline, "read the URL of"))?;
+        let title = connection
+            .evaluate(&page, "document.title", deadline)
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .map_err(|error| load_error(error, url, deadline, "read the title of"))?;
         Ok((current, title))
+    }
+
+    /// Waits for the element the locator names to exist and be visible.
+    fn locate(&mut self, locator: &Locator, deadline: Deadline) -> Result<(), StepError> {
+        let page = self.page.clone();
+        let expression = locator.locate_expression();
+        loop {
+            let outcome = self
+                .connection_mut()?
+                .evaluate(&page, &expression, deadline);
+            match outcome {
+                Ok(value) => {
+                    if value.get("found").and_then(Value::as_bool) == Some(true) {
+                        if value.get("visible").and_then(Value::as_bool) == Some(true) {
+                            return Ok(());
+                        }
+                        if deadline.passed() {
+                            return Err(StepError::Execution(format!(
+                                "{} was found but not visible within {} ms; check the page and the locator",
+                                locator.describe(),
+                                deadline.timeout_ms()
+                            )));
+                        }
+                    } else if deadline.passed() {
+                        return Err(StepError::Execution(format!(
+                            "could not find {} within {} ms; check the page and the locator",
+                            locator.describe(),
+                            deadline.timeout_ms()
+                        )));
+                    }
+                }
+                Err(CdpError::Script(message)) => {
+                    return Err(StepError::Execution(format!(
+                        "could not use {}: {message}",
+                        locator.describe()
+                    )));
+                }
+                Err(CdpError::Timeout { .. }) => {
+                    return Err(StepError::Execution(format!(
+                        "could not find {} within {} ms; check the page and the locator",
+                        locator.describe(),
+                        deadline.timeout_ms()
+                    )));
+                }
+                Err(error) => {
+                    return Err(StepError::Environment(format!(
+                        "the browser failed while waiting for {}: {error}",
+                        locator.describe()
+                    )));
+                }
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Evaluates one expression for a step and maps its errors.
+    fn evaluate(
+        &mut self,
+        locator: &Locator,
+        expression: &str,
+        action: &str,
+        deadline: Deadline,
+    ) -> Result<Value, StepError> {
+        let page = self.page.clone();
+        self.connection_mut()?
+            .evaluate(&page, expression, deadline)
+            .map_err(|error| match error {
+                CdpError::Timeout { .. } => StepError::Timeout(format!(
+                    "could not {action} {} within {} ms",
+                    locator.describe(),
+                    deadline.timeout_ms()
+                )),
+                error => locator.action_error(action, error),
+            })
+    }
+
+    /// Sends one page command for a step and maps its errors.
+    fn dispatch(
+        &mut self,
+        locator: &Locator,
+        method: &str,
+        params: Value,
+        action: &str,
+        deadline: Deadline,
+    ) -> Result<(), StepError> {
+        let page = self.page.clone();
+        self.connection_mut()?
+            .call(method, params, Some(&page), deadline)
+            .map(|_| ())
+            .map_err(|error| locator.action_error(action, error))
+    }
+
+    /// The open connection, or the error a step reports after a close.
+    fn connection_mut(&mut self) -> Result<&mut Connection, StepError> {
+        self.connection.as_mut().ok_or_else(|| {
+            StepError::Execution(
+                "the browser session is already closed; run `browser.open` again".to_string(),
+            )
+        })
+    }
+}
+
+/// Waits for the loaded document, skipping an event that belongs to the page
+/// the session started on.
+fn wait_for_load(
+    connection: &mut Connection,
+    page: &str,
+    url: &str,
+    deadline: Deadline,
+) -> Result<(), StepError> {
+    loop {
+        match connection.wait_for_event("Page.loadEventFired", deadline) {
+            Ok(_) => {}
+            Err(CdpError::Timeout { .. }) => {
+                return Err(StepError::Timeout(format!(
+                    "the page `{url}` did not finish loading within {} ms",
+                    deadline.timeout_ms()
+                )));
+            }
+            Err(error) => {
+                return Err(StepError::Environment(format!(
+                    "the browser failed while loading `{url}`: {error}"
+                )));
+            }
+        }
+        let current = connection
+            .evaluate(page, "location.href", deadline)
+            .map_err(|error| load_error(error, url, deadline, "read the URL of"))?;
+        let ready = connection
+            .evaluate(page, "document.readyState", deadline)
+            .map_err(|error| load_error(error, url, deadline, "read the state of"))?;
+        if current.as_str() != Some("about:blank") && ready.as_str() == Some("complete") {
+            return Ok(());
+        }
+    }
+}
+
+/// Maps a failed read after navigation to the error class the step reports.
+fn load_error(error: CdpError, url: &str, deadline: Deadline, action: &str) -> StepError {
+    match error {
+        CdpError::Timeout { .. } => StepError::Timeout(format!(
+            "the page `{url}` did not finish loading within {} ms",
+            deadline.timeout_ms()
+        )),
+        error => StepError::Environment(format!("could not {action} `{url}`: {error}")),
     }
 }
 
 impl Session for BrowserSession {
     fn close(&mut self) -> Result<(), String> {
-        let Some(browser) = self.browser.take() else {
+        let Some(mut connection) = self.connection.take() else {
             return Ok(());
         };
-        record_close();
-        let debug_url = browser.get_ws_url();
-        drop(browser);
-        if let Some(port) = debug_port(&debug_url) {
-            let address = SocketAddr::from(([127, 0, 0, 1], port));
-            let started = Instant::now();
-            while started.elapsed() < Duration::from_secs(2) {
-                if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err() {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(50));
+        record_close(self.port);
+        let mut errors = Vec::new();
+        if let Err(error) = connection.call(
+            "Browser.close",
+            json!({}),
+            None,
+            Deadline::after(Duration::from_secs(2)),
+        ) {
+            match error {
+                // Chrome may close the socket as it answers, or never answer.
+                // The process check below decides whether the close worked.
+                CdpError::Transport(_) | CdpError::Timeout { .. } => {}
+                error => errors.push(format!("could not ask the browser to close: {error}")),
             }
-            return Err(format!(
-                "the browser process is still listening on its debug port {port} after close"
-            ));
         }
-        Ok(())
+        drop(connection);
+        if let Some(browser) = self.browser.take()
+            && let Err(error) = browser.shutdown()
+        {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 
-/// The Chrome executable to launch.
-///
-/// `DA_CHROME` wins; otherwise the library's own lookup is used. Both failure
-/// messages name `DA_CHROME`, because that is the one thing the user can set.
-fn chrome_path() -> Result<PathBuf, String> {
-    match std::env::var_os("DA_CHROME") {
-        Some(value) if !value.is_empty() => {
-            let path = PathBuf::from(value);
-            if path.is_file() {
-                Ok(path)
-            } else {
-                Err(format!(
-                    "`DA_CHROME` points to `{}`, which is not a file; set `DA_CHROME` to the Chrome or Chromium executable",
-                    path.display()
-                ))
-            }
-        }
-        _ => headless_chrome::browser::default_executable().map_err(|error| {
-            format!(
-                "could not find Chrome or Chromium: {error}; set `DA_CHROME` to the Chrome or Chromium executable"
-            )
-        }),
-    }
-}
-
-/// The port headless_chrome's debug WebSocket listens on.
-fn debug_port(url: &str) -> Option<u16> {
-    let rest = url
-        .strip_prefix("ws://")
-        .or_else(|| url.strip_prefix("wss://"))?;
-    let authority = rest.split('/').next()?;
-    let (_, port) = authority.rsplit_once(':')?;
-    port.parse().ok()
-}
-
-/// Records that [`Session::close`] ran.
+/// Records that [`Session::close`] ran, with the debug port it closed.
 ///
 /// This is a test hook for the case-end test: the process also ends when the
 /// fallback `Drop` runs, so the record is what tells an explicit close from the
 /// fallback. It writes nothing unless `DA_TEST_BROWSER_CLOSE_LOG` names a file.
-fn record_close() {
+fn record_close(port: u16) {
     let Some(path) = std::env::var_os("DA_TEST_BROWSER_CLOSE_LOG") else {
         return;
     };
@@ -546,7 +891,7 @@ fn record_close() {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "browser session closed");
+        let _ = writeln!(file, "browser session closed port={port}");
     }
 }
 
@@ -561,7 +906,7 @@ fn parse_for_validate<T: DeserializeOwned>(args: &Value) -> Result<T, String> {
     serde_json::from_value(args.clone()).map_err(|error| format!("invalid arguments: {error}"))
 }
 
-/// Checks a timeout argument.
+/// Checks a `timeout_ms` argument.
 fn check_timeout(timeout_ms: u64) -> Result<(), String> {
     if timeout_ms == 0 {
         return Err("invalid arguments: `timeout_ms` must be at least 1".to_string());
@@ -581,7 +926,7 @@ fn check_open(args: &OpenArgs) -> Result<(), String> {
     if args.height == 0 {
         return Err("invalid arguments: `height` must be at least 1".to_string());
     }
-    Ok(())
+    check_timeout(args.timeout_ms)
 }
 
 fn validate_open(args: &Value) -> Result<(), String> {
@@ -602,13 +947,7 @@ fn validate_type(args: &Value) -> Result<(), String> {
 
 fn validate_press(args: &Value) -> Result<(), String> {
     let args: PressArgs = parse_for_validate(args)?;
-    if args.key.trim().is_empty() {
-        return Err(
-            "invalid arguments: `key` must not be empty; use a key such as `Enter` or `Tab`"
-                .to_string(),
-        );
-    }
-    Ok(())
+    Key::parse(&args.key).map(|_| ())
 }
 
 fn validate_wait(args: &Value) -> Result<(), String> {
@@ -654,7 +993,7 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     if existing {
         session.ensure_same_options(&args)?;
     }
-    let (url, title) = session.navigate(&args.url)?;
+    let (url, title) = session.navigate(&args.url, Duration::from_millis(args.timeout_ms))?;
     Ok(json!({ "url": url, "title": title }))
 }
 
@@ -663,15 +1002,48 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let locator =
         Locator::from_args(&args.css, &args.xpath).map_err(StepError::InvalidArguments)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    let element = locator.find(&session.tab, Duration::from_millis(args.timeout_ms))?;
-    element
-        .click()
-        .map_err(|error| locator.action_error("click", error))?;
+    session.locate(&locator, deadline)?;
+    let center = session.evaluate(&locator, &locator.center_expression(), "click", deadline)?;
+    let x = center
+        .get("x")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| locator.action_error("click", "the element has no position"))?;
+    let y = center
+        .get("y")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| locator.action_error("click", "the element has no position"))?;
+    for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        session.dispatch(
+            &locator,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": event_type,
+                "x": x,
+                "y": y,
+                "button": "left",
+                "buttons": buttons,
+                "clickCount": 1,
+            }),
+            "click",
+            deadline,
+        )?;
+    }
     // A click may navigate, which detaches the element. The click itself
     // succeeded, so a text that can no longer be read is not a failure.
-    match element.get_inner_text() {
-        Ok(text) if !text.trim().is_empty() => Ok(json!({ "text": text.trim() })),
+    let page = session.page.clone();
+    let text = session
+        .connection
+        .as_mut()
+        .and_then(|connection| {
+            connection
+                .evaluate(&page, &locator.text_expression(), deadline)
+                .ok()
+        })
+        .and_then(|value| value.as_str().map(str::to_string));
+    match text {
+        Some(text) if !text.trim().is_empty() => Ok(json!({ "text": text.trim() })),
         _ => Ok(json!({})),
     }
 }
@@ -681,33 +1053,42 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let locator =
         Locator::from_args(&args.css, &args.xpath).map_err(StepError::InvalidArguments)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    let element = locator.find(&session.tab, Duration::from_millis(args.timeout_ms))?;
-    element
-        .type_into(&args.text)
-        .map_err(|error| locator.action_error("type into", error))?;
+    session.locate(&locator, deadline)?;
+    let focused = session.evaluate(&locator, &locator.focus_expression(), "focus", deadline)?;
+    if focused != Value::Bool(true) {
+        return Err(locator.action_error("focus", "the element did not take focus"));
+    }
+    session.dispatch(
+        &locator,
+        "Input.insertText",
+        json!({ "text": args.text }),
+        "type into",
+        deadline,
+    )?;
     Ok(json!({}))
 }
 
 fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: PressArgs = parse(args)?;
-    if args.key.trim().is_empty() {
-        return Err(StepError::InvalidArguments(
-            "invalid arguments: `key` must not be empty; use a key such as `Enter` or `Tab`"
-                .to_string(),
-        ));
-    }
+    let key = Key::parse(&args.key).map_err(StepError::InvalidArguments)?;
+    let deadline = Deadline::after(Duration::from_secs(5));
     let session = session(sessions)?;
-    session.tab.press_key(&args.key).map_err(|error| {
-        if error.to_string().starts_with("Key not found") {
-            StepError::InvalidArguments(format!(
-                "invalid arguments: `{}` is not a key name; use a key such as `Enter` or `Tab`",
-                args.key
-            ))
-        } else {
-            StepError::Execution(format!("could not press `{}`: {error}", args.key))
-        }
-    })?;
+    let page = session.page.clone();
+    for params in [key.down_params(), key.up_params()] {
+        session
+            .connection_mut()?
+            .call("Input.dispatchKeyEvent", params, Some(&page), deadline)
+            .map_err(|error| match error {
+                CdpError::Timeout { .. } => StepError::Timeout(format!(
+                    "could not press `{}` within {} ms",
+                    args.key,
+                    deadline.timeout_ms()
+                )),
+                error => StepError::Execution(format!("could not press `{}`: {error}", args.key)),
+            })?;
+    }
     Ok(json!({}))
 }
 
@@ -715,35 +1096,60 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: WaitArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let target = WaitTarget::from_args(&args).map_err(StepError::InvalidArguments)?;
-    let timeout = Duration::from_millis(args.timeout_ms);
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
     let url = match target {
         WaitTarget::Element(locator) => {
-            locator.find(&session.tab, timeout)?;
-            session.tab.get_url()
+            session.locate(&locator, deadline)?;
+            let page = session.page.clone();
+            session
+                .connection_mut()?
+                .evaluate(&page, "location.href", deadline)
+                .map_err(|error| {
+                    StepError::Environment(format!("could not read the current URL: {error}"))
+                })?
         }
-        WaitTarget::Url(text) => wait_for_url(&session.tab, &text, timeout)?,
+        WaitTarget::Url(wanted) => wait_for_url(session, &wanted, deadline)?,
     };
-    Ok(json!({ "url": url }))
+    Ok(json!({ "url": url.as_str().unwrap_or_default() }))
 }
 
 /// Waits until the page's URL contains `wanted`.
-fn wait_for_url(tab: &Tab, wanted: &str, timeout: Duration) -> Result<String, StepError> {
-    let started = Instant::now();
+fn wait_for_url(
+    session: &mut BrowserSession,
+    wanted: &str,
+    deadline: Deadline,
+) -> Result<Value, StepError> {
+    let page = session.page.clone();
     loop {
-        if let Ok(value) = tab.evaluate("location.href", false)
-            && let Some(Value::String(url)) = value.value
-            && url.contains(wanted)
+        match session
+            .connection_mut()?
+            .evaluate(&page, "location.href", deadline)
         {
-            return Ok(url);
+            Ok(value) => {
+                if value.as_str().is_some_and(|url| url.contains(wanted)) {
+                    return Ok(value);
+                }
+                if deadline.passed() {
+                    return Err(StepError::Execution(format!(
+                        "the URL did not contain `{wanted}` within {} ms",
+                        deadline.timeout_ms()
+                    )));
+                }
+            }
+            Err(CdpError::Timeout { .. }) => {
+                return Err(StepError::Execution(format!(
+                    "the URL did not contain `{wanted}` within {} ms",
+                    deadline.timeout_ms()
+                )));
+            }
+            Err(error) => {
+                return Err(StepError::Environment(format!(
+                    "the browser failed while waiting for the URL: {error}"
+                )));
+            }
         }
-        if started.elapsed() >= timeout {
-            return Err(StepError::Execution(format!(
-                "the URL did not contain `{wanted}` within {} ms",
-                timeout.as_millis()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -752,17 +1158,24 @@ fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let locator =
         Locator::from_args(&args.css, &args.xpath).map_err(StepError::InvalidArguments)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    let element = locator.find(&session.tab, Duration::from_millis(args.timeout_ms))?;
-    let text = element
-        .get_inner_text()
-        .map_err(|error| locator.action_error("read the text of", error))?;
-    let mut result = json!({ "text": text });
+    session.locate(&locator, deadline)?;
+    let text = session.evaluate(
+        &locator,
+        &locator.text_expression(),
+        "read the text of",
+        deadline,
+    )?;
+    let mut result = json!({ "text": text.as_str().unwrap_or_default() });
     if let Some(attribute) = &args.attribute {
-        let value = element
-            .get_attribute_value(attribute)
-            .map_err(|error| locator.action_error("read the attribute of", error))?;
-        result["value"] = value.map_or(Value::Null, Value::String);
+        let value = session.evaluate(
+            &locator,
+            &locator.attribute_expression(attribute),
+            "read the attribute of",
+            deadline,
+        )?;
+        result["value"] = value;
     }
     Ok(result)
 }
@@ -827,13 +1240,23 @@ mod tests {
         assert_eq!(definition.args_schema["properties"]["width"]["minimum"], 1);
         assert_eq!(definition.args_schema["properties"]["height"]["minimum"], 1);
         assert_eq!(definition.args_schema["properties"]["url"]["minLength"], 1);
+        assert_eq!(
+            definition.args_schema["properties"]["timeout_ms"]["minimum"],
+            1
+        );
 
         assert!((definition.validate)(&json!({"url": "http://127.0.0.1:1/"})).is_ok());
+        assert!(
+            (definition.validate)(&json!({"url": "http://127.0.0.1:1/", "timeout_ms": 30000}))
+                .is_ok(),
+            "a navigation timeout is a valid argument"
+        );
         for (label, args) in [
             ("missing url", json!({})),
             ("empty url", json!({"url": ""})),
             ("zero width", json!({"url": "http://x/", "width": 0})),
             ("zero height", json!({"url": "http://x/", "height": 0})),
+            ("zero timeout", json!({"url": "http://x/", "timeout_ms": 0})),
             ("unknown", json!({"url": "http://x/", "bogus": true})),
         ] {
             assert!(
@@ -949,9 +1372,13 @@ mod tests {
 
         let press = definition("browser.press");
         assert!((press.validate)(&json!({"key": "Enter"})).is_ok());
+        assert!((press.validate)(&json!({"key": "x"})).is_ok());
         let error =
             (press.validate)(&json!({"key": ""})).expect_err("an empty key must be refused");
         assert!(error.contains("key"), "{error}");
+        let error = (press.validate)(&json!({"key": "NotAKey"}))
+            .expect_err("an unknown key name must be refused");
+        assert!(error.contains("not a key"), "{error}");
         assert_eq!(press.args_schema["properties"]["key"]["minLength"], 1);
     }
 
@@ -973,18 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_ports_are_read_from_the_websocket_url() {
-        assert_eq!(
-            debug_port("ws://127.0.0.1:41234/devtools/browser/abc"),
-            Some(41234)
-        );
-        assert_eq!(debug_port("wss://127.0.0.1:9/devtools/browser"), Some(9));
-        assert_eq!(debug_port("browser is not running"), None);
-        assert_eq!(debug_port("ws://127.0.0.1/devtools/browser"), None);
-    }
-
-    #[test]
-    fn a_locator_names_itself_in_an_error() {
+    fn a_locator_names_itself_in_an_error_and_in_its_script() {
         assert_eq!(
             Locator::Css("#name".to_string()).describe(),
             "CSS selector `#name`"
@@ -993,5 +1409,41 @@ mod tests {
             Locator::Xpath("//*[@id='name']".to_string()).describe(),
             "XPath `//*[@id='name']`"
         );
+
+        let quoted = Locator::Css("a\"b\\c".to_string()).locate_expression();
+        assert!(
+            quoted.contains(r#"document.querySelector("a\"b\\c")"#),
+            "a selector must be passed as a JSON string literal: {quoted}"
+        );
+    }
+
+    #[test]
+    fn named_and_printable_keys_produce_their_events() {
+        let enter = Key::parse("Enter").expect("Enter is a key name");
+        let down = enter.down_params();
+        assert_eq!(down["type"], "keyDown");
+        assert_eq!(down["key"], "Enter");
+        assert_eq!(down["code"], "Enter");
+        assert_eq!(down["windowsVirtualKeyCode"], 13);
+        assert_eq!(down["text"], "\r");
+        assert_eq!(enter.up_params()["type"], "keyUp");
+        assert!(enter.up_params().get("text").is_none());
+
+        let tab = Key::parse("Tab").expect("Tab is a key name");
+        assert_eq!(tab.down_params()["type"], "rawKeyDown");
+        assert_eq!(tab.down_params()["windowsVirtualKeyCode"], 9);
+        assert!(tab.down_params().get("text").is_none());
+
+        let letter = Key::parse("a").expect("one printable character is a key");
+        assert_eq!(letter.down_params()["text"], "a");
+        assert_eq!(letter.down_params()["code"], "KeyA");
+        assert_eq!(letter.down_params()["type"], "keyDown");
+
+        for value in ["", "NotAKey", "ab", "\u{1}"] {
+            assert!(
+                Key::parse(value).is_err(),
+                "`{value}` must not be accepted as a key"
+            );
+        }
     }
 }

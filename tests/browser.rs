@@ -13,9 +13,11 @@ mod support;
 
 use std::fs;
 use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use serde_json::Value;
 use support::{TempDir, TestServer};
@@ -471,16 +473,96 @@ steps:
 }
 
 #[test]
+fn a_click_changes_the_page_through_a_real_mouse_event() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-mouse");
+    let case = dir.write(
+        "mouse.yaml",
+        &format!(
+            r##"name: real mouse click
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#trusted"
+  - browser.read:
+      css: "#trusted-result"
+    expect:
+      - path: $.text
+        equals: "trusted click"
+"##,
+            server.url("/browser/form?case=mouse")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    assert_eq!(
+        value["cases"][0]["status"], "passed",
+        "the click must be a trusted browser mouse event, not a script call: {value}"
+    );
+}
+
+#[test]
+fn browser_open_honours_its_navigation_timeout() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-open-timeout");
+    let url = server.url("/browser/stall?case=timeout");
+    let case = dir.write(
+        "timeout.yaml",
+        &format!(
+            "name: slow page\nsteps:\n  - browser.open:\n      url: \"{url}\"\n      timeout_ms: 300\n"
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(5),
+        "a navigation that exceeds `timeout_ms` is a timeout: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("/browser/stall") && message.contains("300"),
+        "the timeout must name the URL and the wait, got: {message}"
+    );
+}
+
+#[test]
 fn an_assertion_failure_closes_the_browser() {
     let server = TestServer::start();
     let Some(_guard) = chrome_test(&server) else {
         return;
     };
     let dir = TempDir::new("browser-close");
-    // `tempfile`, which headless_chrome uses for the profile, reads TEMP/TMP on
-    // Windows and TMPDIR elsewhere. Putting them under the test's own directory
-    // makes the profile it creates observable and keeps the check independent of
-    // any other browser on the machine.
+    // `std::env::temp_dir` reads TEMP/TMP on Windows and TMPDIR elsewhere.
+    // Putting them under the test's own directory makes the browser profile
+    // observable and keeps the check independent of any other browser on the
+    // machine.
     let profile_home = dir.path().join("tmp");
     fs::create_dir_all(&profile_home).expect("the profile directory must be created");
     let close_log = dir.path().join("close.log");
@@ -518,10 +600,20 @@ fn an_assertion_failure_closes_the_browser() {
         record.contains("browser"),
         "the close record must name the browser session, got: {record:?}"
     );
+    let port: u16 = record
+        .split("port=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("the close record must name the debug port, got: {record:?}"));
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err(),
+        "the browser debug port {port} still accepts connections after the case"
+    );
 
-    // headless_chrome kills the child and waits for it before it removes the
-    // profile directory, so a leftover directory means the process outlived the
-    // case.
+    // A leftover profile directory means the process outlived the case or the
+    // cleanup failed.
     let leftovers: Vec<PathBuf> = fs::read_dir(&profile_home)
         .expect("the profile directory must be readable")
         .filter_map(Result::ok)
@@ -529,7 +621,7 @@ fn an_assertion_failure_closes_the_browser() {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rust-headless-chrome-profile"))
+                .is_some_and(|name| name.starts_with("da-chrome-profile"))
         })
         .collect();
     assert!(
@@ -623,6 +715,11 @@ fn every_step_reports_its_argument_errors_in_lint() {
             "text",
         ),
         ("press-no-key.yaml", "  - browser.press:\n      {}\n", "key"),
+        (
+            "press-unknown-key.yaml",
+            "  - browser.press:\n      key: NotAKey\n",
+            "not a key",
+        ),
         (
             "wait-both.yaml",
             "  - browser.wait:\n      css: \"#a\"\n      url_contains: next\n",

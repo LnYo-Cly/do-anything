@@ -232,6 +232,13 @@ fn route(
         // cases prove that each one sees its own page and its own browser.
         (_, "/browser/form") => html_response("200 OK", &browser_form(query)),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
+        // Headers and the start of the page arrive, but the document never
+        // finishes loading before a short navigation timeout, which is what
+        // `browser.open`'s own `timeout_ms` has to report.
+        (_, "/browser/stall") => {
+            thread::sleep(Duration::from_secs(5));
+            html_response("200 OK", &browser_second(query))
+        }
         // A fixed body with one number, one boolean and one null, so a test can
         // assert on how each JSON scalar is redacted without depending on a
         // duration or a timestamp.
@@ -332,9 +339,13 @@ fn browser_form(query: &str) -> String {
 <input id="name" name="name" autocomplete="off">
 <button id="submit" type="submit">Greet</button>
 </form>
-<p id="greeting" data-state="ready"></p>
+<p id="greeting" data-state="ready">no greeting yet</p>
 <div id="late-target"></div>
 <button id="later" type="button">Later</button>
+<button id="trusted" type="button"
+  onclick="document.getElementById('trusted-result').textContent =
+    (window.event &amp;&amp; window.event.isTrusted) ? 'trusted click' : 'untrusted click';">Click me</button>
+<p id="trusted-result"></p>
 <a id="next" href="/browser/second?case={label}&amp;token=ok">Next</a>
 <script>
 var visits = Number(localStorage.getItem('browser-visits') || '0') + 1;
