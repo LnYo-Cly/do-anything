@@ -510,8 +510,8 @@ fn a_connection_string_from_the_environment_is_redacted_everywhere() {
     std::fs::create_dir_all(&secret_dir).expect("the secret directory must be created");
     sqlite_fixture(&secret_dir.join("app.db"));
 
-    // The second step fails on purpose 鈥?it names a database file that is not
-    // there 鈥?so the path reaches a message, a failure bundle is written and
+    // The second step fails on purpose —it names a database file that is not
+    // there —so the path reaches a message, a failure bundle is written and
     // every channel can be searched. The URL is single-quoted: a Windows path
     // holds backslashes, which YAML would read as escapes inside double quotes.
     let case = r#"

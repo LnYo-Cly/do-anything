@@ -221,7 +221,7 @@ fn is_read_only(action: &AuthAction<'_>) -> bool {
 
 fn open_error(path: &Path, error: &rusqlite::Error) -> StepError {
     StepError::Environment(format!(
-        "could not open the SQLite database `{}`: {error}; check that the file exists and is readable 鈥?`db.query` never creates one",
+        "could not open the SQLite database `{}`: {error}; check that the file exists and is readable —`db.query` never creates one",
         display(path)
     ))
 }
