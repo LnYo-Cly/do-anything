@@ -132,16 +132,16 @@ impl Launched {
     fn release(&mut self) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Some(mut child) = self.child.take() {
-            match wait_for_exit(&mut child, EXIT_TIMEOUT) {
-                Ok(()) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    errors.push(format!(
-                        "the browser did not exit within {} ms after `Browser.close`, so it was killed: {error}",
-                        EXIT_TIMEOUT.as_millis()
-                    ));
-                }
+            // A browser that is slow to exit (seen on loaded CI runners) is
+            // still released once killing it succeeds; only a browser that
+            // cannot be stopped is a close error.
+            if let Err(error) = wait_for_exit(&mut child, EXIT_TIMEOUT)
+                && let Err(kill_error) = child.kill().and_then(|()| child.wait().map(drop))
+            {
+                errors.push(format!(
+                    "the browser did not exit within {} ms after `Browser.close` ({error}) and could not be killed: {kill_error}",
+                    EXIT_TIMEOUT.as_millis()
+                ));
             }
         }
         if let Some(profile) = self.profile.take()
