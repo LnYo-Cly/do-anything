@@ -15,6 +15,7 @@ use crate::core::output;
 use crate::core::paths;
 use crate::core::report::CaseReport;
 use crate::core::secrets::Secrets;
+use crate::core::session::{EvidenceContent, SessionEvidence, check_kind};
 
 /// Version of the bundle layout this build writes.
 pub const SCHEMA_VERSION: u64 = 1;
@@ -56,6 +57,23 @@ impl FailureBundles {
         case: &CaseReport,
         secrets: &Secrets,
     ) -> Result<PathBuf, String> {
+        self.write_with_evidence(position, case, secrets, &[])
+    }
+
+    /// Writes the bundle of one failed case with the evidence its sessions
+    /// returned.
+    ///
+    /// Each session kind becomes a directory under the bundle. Text evidence is
+    /// redacted with `secrets`; bytes are written unchanged. A session that
+    /// could not return its evidence leaves a text file naming the reason, so
+    /// the bundle still explains the gap.
+    pub fn write_with_evidence(
+        &mut self,
+        position: usize,
+        case: &CaseReport,
+        secrets: &Secrets,
+        evidence: &[SessionEvidence],
+    ) -> Result<PathBuf, String> {
         // Checked before anything is created, so a case file that vanished
         // leaves no empty directory behind.
         std::fs::metadata(&case.file).map_err(|error| {
@@ -81,7 +99,7 @@ impl FailureBundles {
             ));
         }
 
-        if let Err(detail) = stage(&staging, case, &final_dir, secrets) {
+        if let Err(detail) = stage(&staging, case, &final_dir, secrets, evidence) {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(failure(case, detail));
         }
@@ -120,6 +138,7 @@ fn stage(
     case: &CaseReport,
     final_dir: &Path,
     secrets: &Secrets,
+    evidence: &[SessionEvidence],
 ) -> Result<(), String> {
     let case_copy = staging.join("case.yaml");
     std::fs::copy(&case.file, &case_copy).map_err(|error| {
@@ -139,7 +158,57 @@ fn stage(
     write_json(
         &staging.join("report.json"),
         &secrets.redact_json(&output::case_json(&reported)),
-    )
+    )?;
+    stage_evidence(staging, evidence, secrets)
+}
+
+/// Writes each session's evidence under a directory named after its kind.
+fn stage_evidence(
+    staging: &Path,
+    evidence: &[SessionEvidence],
+    secrets: &Secrets,
+) -> Result<(), String> {
+    for group in evidence {
+        check_kind(&group.kind).map_err(|error| {
+            format!(
+                "could not write the evidence of session `{}`: {error}",
+                group.kind
+            )
+        })?;
+        if group.files.is_empty() && group.error.is_none() {
+            continue;
+        }
+        let directory = staging.join(&group.kind);
+        std::fs::create_dir_all(&directory).map_err(|error| {
+            format!(
+                "could not create the evidence directory `{}`: {error}",
+                paths::display(&directory)
+            )
+        })?;
+        for file in &group.files {
+            let path = directory.join(file.name());
+            let bytes = match file.content() {
+                EvidenceContent::Text(text) => secrets.redact(text).into_bytes(),
+                EvidenceContent::Bytes(bytes) => bytes.clone(),
+            };
+            std::fs::write(&path, bytes).map_err(|error| {
+                format!(
+                    "could not write the evidence file `{}`: {error}",
+                    paths::display(&path)
+                )
+            })?;
+        }
+        if let Some(error) = &group.error {
+            let path = directory.join("evidence-error.txt");
+            std::fs::write(&path, secrets.redact(error).into_bytes()).map_err(|write_error| {
+                format!(
+                    "could not write the evidence error file `{}`: {write_error}",
+                    paths::display(&path)
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn write_meta(dir: &Path, case: &CaseReport, secrets: &Secrets) -> Result<(), String> {
@@ -350,6 +419,63 @@ mod tests {
             report["bundle"],
             json!(paths::display(&bundle)),
             "the bundled report must point at its own directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_evidence_is_written_by_kind_and_text_is_redacted() {
+        use crate::core::session::Evidence;
+
+        let dir = fixture("evidence");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: Evidence\nsteps: []\n")
+            .expect("the case file must be written");
+        let mut bundles = FailureBundles::new(dir.join("failures"));
+        let mut secrets = Secrets::new();
+        secrets.record("s3cr3t-value");
+        let evidence = vec![
+            SessionEvidence {
+                kind: "test.evidence".to_string(),
+                files: vec![
+                    Evidence::text("dom.html", "<p>s3cr3t-value</p>")
+                        .expect("the text evidence name is valid"),
+                    Evidence::bytes("screen.bin", vec![0x89, b'P', b'N', b'G'])
+                        .expect("the binary evidence name is valid"),
+                ],
+                error: None,
+            },
+            SessionEvidence {
+                kind: "test.broken".to_string(),
+                files: Vec::new(),
+                error: Some("could not read s3cr3t-value".to_string()),
+            },
+        ];
+
+        let bundle = bundles
+            .write_with_evidence(0, &failing_case(source), &secrets, &evidence)
+            .expect("the bundle must be written");
+
+        assert_eq!(
+            names(&bundle.join("test.evidence")),
+            vec!["dom.html", "screen.bin"]
+        );
+        let text = std::fs::read_to_string(bundle.join("test.evidence/dom.html"))
+            .expect("the text evidence must be readable");
+        assert_eq!(text, "<p>***</p>");
+        assert_eq!(
+            std::fs::read(bundle.join("test.evidence/screen.bin"))
+                .expect("the binary evidence must be readable"),
+            vec![0x89, b'P', b'N', b'G']
+        );
+        let error = std::fs::read_to_string(bundle.join("test.broken/evidence-error.txt"))
+            .expect("the evidence error must be readable");
+        assert!(!error.contains("s3cr3t-value"), "the error leaked: {error}");
+        assert!(error.contains("***"), "got: {error}");
+        assert!(
+            bundle.join("meta.json").is_file(),
+            "meta.json must be written after the evidence"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

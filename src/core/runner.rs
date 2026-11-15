@@ -20,7 +20,7 @@ use crate::core::report::{
     CaseReport, CaseStatus, Problem, ProblemKind, RunOutcome, RunReport, StepReport, StepStatus,
 };
 use crate::core::secrets::Secrets;
-use crate::core::session::Sessions;
+use crate::core::session::{SessionEvidence, Sessions};
 
 /// Validates every case, then runs the ones the filters select.
 ///
@@ -176,7 +176,10 @@ fn run_one(
         case: index,
         name: loaded.case.name.clone(),
     });
-    let mut report = run_case(index, loaded, registry, bus, secrets);
+    let CaseRun {
+        mut report,
+        evidence,
+    } = run_case(index, loaded, registry, bus, secrets, bundles.is_some());
     if report.status != CaseStatus::Passed
         && let Some(writer) = bundles
     {
@@ -185,7 +188,7 @@ fn run_one(
         // differ by position, so nothing else is shared.
         let mut writer = lock(writer);
         let secrets = lock(secrets);
-        match writer.write(index, &report, &secrets) {
+        match writer.write_with_evidence(index, &report, &secrets, &evidence) {
             Ok(directory) => report.bundle = Some(directory),
             Err(message) => lock(collected).bundle_errors.push((index, message)),
         }
@@ -349,18 +352,28 @@ fn positioned(loaded: &LoadedCase, location: Location, message: String) -> CaseE
     }
 }
 
+/// One case's report and the evidence its sessions returned.
+struct CaseRun {
+    report: CaseReport,
+    evidence: Vec<SessionEvidence>,
+}
+
 fn run_case(
     index: usize,
     loaded: &LoadedCase,
     registry: &Registry,
     bus: &EventBus,
     secrets: &Mutex<&mut Secrets>,
-) -> CaseReport {
+    bundles_enabled: bool,
+) -> CaseRun {
     let started = Instant::now();
     let mut vars = loaded.case.vars.clone();
     // One set of resources belongs to this case and to no other. It is created
     // here, on the worker that runs the case, so `--jobs` cannot share it.
     let mut sessions = Sessions::new();
+    if let Some(directory) = loaded.path.parent() {
+        sessions.set_base_directory(directory);
+    }
     let mut steps = Vec::with_capacity(loaded.case.steps.len());
     // One observation per declared name belongs to this case and to no other,
     // so two cases that run at the same time never share what they collect.
@@ -440,16 +453,27 @@ fn run_case(
         steps.push(report);
     }
 
+    // Evidence is collected before the sessions release their resources, and
+    // only when the case already did not pass and a bundle will be written.
+    // A passing case never takes a screenshot, even though its sessions are
+    // still open here.
+    let status_before_close = match stopped.as_ref().map(|problem| problem.kind) {
+        None => CaseStatus::Passed,
+        Some(ProblemKind::Assertion) => CaseStatus::Failed,
+        Some(_) => CaseStatus::Error,
+    };
+    let evidence = if bundles_enabled && status_before_close != CaseStatus::Passed {
+        sessions.collect_evidence()
+    } else {
+        Vec::new()
+    };
+
     // Every session belongs to this case and is closed here, whatever path the
     // case took. `close_all` removes a session before closing it, so a failing
     // close cannot be attempted twice.
     let close_errors = sessions.close_all();
 
-    let mut status = match stopped.as_ref().map(|problem| problem.kind) {
-        None => CaseStatus::Passed,
-        Some(ProblemKind::Assertion) => CaseStatus::Failed,
-        Some(_) => CaseStatus::Error,
-    };
+    let mut status = status_before_close;
     let mut error = stopped;
     // A case that already failed or errored keeps its own verdict; the close
     // errors are attached to the report without replacing the problem. A case
@@ -464,19 +488,22 @@ fn run_case(
         });
     }
 
-    CaseReport {
-        file: loaded.path.clone(),
-        name: loaded.case.name.clone(),
-        project: loaded.case.project.clone(),
-        suite: loaded.case.suite.clone(),
-        layer: loaded.case.layer.clone(),
-        tags: loaded.case.tags.clone(),
-        status,
-        duration: started.elapsed(),
-        steps,
-        error,
-        close_errors,
-        bundle: None,
+    CaseRun {
+        report: CaseReport {
+            file: loaded.path.clone(),
+            name: loaded.case.name.clone(),
+            project: loaded.case.project.clone(),
+            suite: loaded.case.suite.clone(),
+            layer: loaded.case.layer.clone(),
+            tags: loaded.case.tags.clone(),
+            status,
+            duration: started.elapsed(),
+            steps,
+            error,
+            close_errors,
+            bundle: None,
+        },
+        evidence,
     }
 }
 
