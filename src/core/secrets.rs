@@ -185,32 +185,130 @@ fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
 /// bytes a particular encoder escapes.
 fn percent_spans(text: &str, secret: &[u8]) -> Vec<Span> {
     let bytes = text.as_bytes();
-    if !bytes.iter().any(|byte| *byte == b'%' || *byte == b'+') {
+    // A span that is worth replacing contains at least one escape. Only `%` can
+    // escape an arbitrary byte, and `+` escapes a space, so text without either
+    // one has nothing to find; an all-literal span is left to the exact match.
+    let has_percent = bytes.contains(&b'%');
+    let has_plus_escape = secret.contains(&b' ') && bytes.contains(&b'+');
+    if !has_percent && !has_plus_escape {
         return Vec::new();
     }
 
+    // A match can only start on the first byte written as itself, on `%` for an
+    // escaped first byte, or on `+` for a space. The position scan keeps this
+    // linear in the text instead of allocating a candidate list at every byte.
+    let first = secret[0];
+    let is_space = first == b' ';
+    let mut positions = Vec::new();
+    let mut next = Vec::new();
     let mut spans = Vec::new();
     let mut start = 0;
-    while start < bytes.len() {
-        if let Some(end) = percent_end(bytes, secret, start)
-            && has_encoded_token(&bytes[start..end])
-        {
-            spans.push((start, end));
-            start = end;
+    while let Some(candidate) = next_candidate(bytes, start, first, is_space) {
+        if pure_literal_mismatch(bytes, secret, candidate) {
+            start = next_boundary(text, candidate);
             continue;
         }
-        start += 1;
+        let end = percent_end(bytes, secret, candidate, &mut positions, &mut next).filter(|end| {
+            text.is_char_boundary(*end) && has_encoded_token(&bytes[candidate..*end])
+        });
+        if let Some(end) = end {
+            spans.push((candidate, end));
+            start = end;
+        } else {
+            start = next_boundary(text, candidate);
+        }
     }
     spans
 }
 
+const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
+const BYTE_HIGHS: u64 = 0x8080_8080_8080_8080;
+
+/// Sets the high bit of every byte of `word` that equals `target`.
+fn bytes_equal(word: u64, target: u8) -> u64 {
+    let difference = word ^ (u64::from(target) * BYTE_ONES);
+    difference.wrapping_sub(BYTE_ONES) & !difference & BYTE_HIGHS
+}
+
+/// The next byte that can start a percent-encoded match.
+///
+/// The eight-byte steps matter: a scan that visits every byte of a one-mebibyte
+/// log line costs more than the rest of redaction together.
+fn next_candidate(bytes: &[u8], from: usize, first: u8, is_space: bool) -> Option<usize> {
+    let mut index = from;
+    while index + 8 <= bytes.len() {
+        let Ok(chunk) = bytes[index..index + 8].try_into() else {
+            break;
+        };
+        let word = u64::from_le_bytes(chunk);
+        let mut matches = bytes_equal(word, first) | bytes_equal(word, b'%');
+        if is_space {
+            matches |= bytes_equal(word, b'+');
+        }
+        if matches != 0 {
+            return Some(index + matches.trailing_zeros() as usize / 8);
+        }
+        index += 8;
+    }
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == first || byte == b'%' || (is_space && byte == b'+') {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether a start cannot produce a span with an escape.
+///
+/// While the text and the secret agree and no escape character appears, the
+/// only interpretation is the literal one. A mismatch then rules every
+/// interpretation out, and a complete literal run contains no escape, so the
+/// span would be left to the exact match anyway. The function stops at the
+/// first escape character and leaves that start to the full matcher.
+fn pure_literal_mismatch(text: &[u8], secret: &[u8], start: usize) -> bool {
+    for (index, &byte) in secret.iter().enumerate() {
+        let Some(&text_byte) = text.get(start + index) else {
+            return true;
+        };
+        if text_byte == b'%' || (byte == b' ' && text_byte == b'+') {
+            return false;
+        }
+        if text_byte != byte {
+            return true;
+        }
+    }
+    true
+}
+
+/// The first character boundary after `position`.
+fn next_boundary(text: &str, position: usize) -> usize {
+    let mut next = position + 1;
+    while next < text.len() && !text.is_char_boundary(next) {
+        next += 1;
+    }
+    next
+}
+
 /// The furthest end reachable from `start`, or `None`.
-fn percent_end(text: &[u8], secret: &[u8], start: usize) -> Option<usize> {
-    let mut positions = vec![start];
-    let mut next = Vec::new();
+///
+/// An ambiguous byte can double the positions that still match, so the set has
+/// no fixed size. The two vectors belong to the caller and are reused for every
+/// candidate of one secret, which keeps the common single-position case free of
+/// allocation after the first call.
+fn percent_end(
+    text: &[u8],
+    secret: &[u8],
+    start: usize,
+    positions: &mut Vec<usize>,
+    next: &mut Vec<usize>,
+) -> Option<usize> {
+    positions.clear();
+    positions.push(start);
     for &byte in secret {
         next.clear();
-        for &position in &positions {
+        for &position in positions.iter() {
             if position >= text.len() {
                 continue;
             }
@@ -235,9 +333,9 @@ fn percent_end(text: &[u8], secret: &[u8], start: usize) -> Option<usize> {
         }
         next.sort_unstable();
         next.dedup();
-        std::mem::swap(&mut positions, &mut next);
+        std::mem::swap(positions, next);
     }
-    positions.into_iter().max()
+    positions.iter().copied().max()
 }
 
 /// Whether a span contains at least one byte written as an escape.
@@ -545,6 +643,59 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_that_starts_with_a_non_ascii_character_is_matched_at_boundaries() {
+        let mut secrets = Secrets::new();
+        secrets.record("密钥-token-42");
+        let encoded: String = "密钥-token-42"
+            .bytes()
+            .map(|byte| format!("%{byte:02x}"))
+            .collect();
+
+        assert_eq!(secrets.redact(&format!("x{encoded}y")), "x***y");
+
+        // A leading byte of another character equals the first byte of the
+        // secret; the failed attempt must not split that character.
+        assert_eq!(secrets.redact("密X密钥-token-42"), "密X***");
+        assert_eq!(secrets.redact("密X密钥-token-42!"), "密X***!");
+    }
+
+    #[test]
+    fn a_percent_encoded_match_crosses_an_eight_byte_boundary() {
+        let mut secrets = Secrets::new();
+        secrets.record("abcdefgh");
+
+        assert_eq!(secrets.redact("xxxxxxx%61bcdefgh"), "xxxxxxx***");
+        assert_eq!(
+            secrets.redact("xxxxxxx%61%62%63%64%65%66%67%68"),
+            "xxxxxxx***"
+        );
+    }
+
+    /// Every ambiguous step doubles the positions that may still complete. The
+    /// only branch that finishes this text is the fourth one, at offset 15;
+    /// a matcher that keeps a fixed number of positions loses it.
+    #[test]
+    fn four_ambiguous_positions_still_complete_the_match() {
+        let mut secrets = Secrets::new();
+        let secret = "%2%252%352%253";
+        secrets.record(secret);
+        let text = "%25%32%252%352%25%335%32%25%25%25%2525%252%25%3253";
+
+        let spans = percent_spans(text, secret.as_bytes());
+        assert!(
+            spans.iter().any(|&(start, end)| start == 0 && end == 20),
+            "the branch that completes ends at 20; spans: {spans:?}"
+        );
+
+        let redacted = secrets.redact(text);
+        assert_eq!(redacted, format!("***{}", &text[20..]));
+        assert!(
+            !redacted.contains(&text[..20]),
+            "the complete encoding of the secret must not survive: {redacted}"
+        );
+    }
+
+    #[test]
     fn a_secret_is_redacted_in_all_three_base64_offsets() {
         let mut secrets = Secrets::new();
         secrets.record("abcdefgh");
@@ -609,5 +760,72 @@ mod tests {
             "***",
             "the literal form also satisfies the zero-encoded-byte form and must not be replaced twice"
         );
+    }
+
+    fn base64(data: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let bytes = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let bits =
+                (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+            let characters = chunk.len() + 1;
+            for index in 0..4 {
+                if index < characters {
+                    out.push(alphabet[((bits >> (18 - 6 * index)) & 63) as usize] as char);
+                } else if pad {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// The strongest regression guard for the bit arithmetic: for every shift
+    /// of the secret inside a larger base64 document, every character that
+    /// carries secret bits is replaced and every character that does not is
+    /// left alone.
+    #[test]
+    fn no_base64_character_with_secret_bits_survives_at_any_offset() {
+        let secret = "s3cr3t-中~/+";
+        let mut secrets = Secrets::new();
+        secrets.record(secret);
+        let filler = b"Zq7!x.\x01\xffAB";
+        let mut checked = 0;
+        for prefix_len in 0..7 {
+            for suffix_len in 0..7 {
+                for (alphabet, pad) in [
+                    (BASE64_STANDARD, true),
+                    (BASE64_STANDARD, false),
+                    (BASE64_URL_SAFE, true),
+                    (BASE64_URL_SAFE, false),
+                ] {
+                    let mut data = filler[..prefix_len].to_vec();
+                    data.extend_from_slice(secret.as_bytes());
+                    data.extend_from_slice(&filler[..suffix_len]);
+                    let encoded = base64(&data, alphabet, pad);
+                    let first = prefix_len * 8 / 6;
+                    let last = ((prefix_len + secret.len()) * 8 - 1) / 6;
+                    let characters: Vec<char> = encoded.chars().collect();
+                    let lead: String = characters[..first].iter().collect();
+                    let mut tail: String = characters[last + 1..].iter().collect();
+                    if tail.chars().all(|character| character == '=') {
+                        tail.clear();
+                    }
+                    let text = format!("before {encoded} after");
+                    let expected = format!("before {lead}***{tail} after");
+                    assert_eq!(
+                        secrets.redact(&text),
+                        expected,
+                        "prefix {prefix_len}, suffix {suffix_len}, pad {pad}, input {text}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 7 * 7 * 4);
     }
 }
