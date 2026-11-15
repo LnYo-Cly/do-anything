@@ -263,19 +263,16 @@ fn percent_spans(text: &str, secret: &[u8]) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut start = 0;
     while let Some(candidate) = next_candidate(bytes, start, first, is_space) {
-        if pure_literal_mismatch(bytes, secret, candidate) {
-            start = next_boundary(text, candidate);
-            continue;
-        }
-        let end = percent_end(bytes, secret, candidate, &mut positions, &mut next).filter(|end| {
-            text.is_char_boundary(*end) && has_encoded_token(&bytes[candidate..*end])
-        });
-        if let Some(end) = end {
+        if !pure_literal_mismatch(bytes, secret, candidate)
+            && let Some((end, true)) =
+                percent_end(bytes, secret, candidate, &mut positions, &mut next)
+            && text.is_char_boundary(end)
+        {
             spans.push((candidate, end));
-            start = end;
-        } else {
-            start = next_boundary(text, candidate);
         }
+        // Another occurrence may start inside this one, so advance by one
+        // character instead of jumping past the span.
+        start = next_boundary(text, candidate);
     }
     spans
 }
@@ -350,24 +347,26 @@ fn next_boundary(text: &str, position: usize) -> usize {
     next
 }
 
-/// The furthest end reachable from `start`, or `None`.
+/// The furthest end reachable from `start`, and whether the branch that
+/// reaches it consumed an escape.
 ///
 /// An ambiguous byte can double the positions that still match, so the set has
-/// no fixed size. The two vectors belong to the caller and are reused for every
-/// candidate of one secret, which keeps the common single-position case free of
-/// allocation after the first call.
+/// no fixed size. A position is paired with the flag so an all-literal branch
+/// is never mistaken for an encoded one. The two vectors belong to the caller
+/// and are reused for every candidate of one secret, which keeps the common
+/// single-position case free of allocation after the first call.
 fn percent_end(
     text: &[u8],
     secret: &[u8],
     start: usize,
-    positions: &mut Vec<usize>,
-    next: &mut Vec<usize>,
-) -> Option<usize> {
+    positions: &mut Vec<(usize, bool)>,
+    next: &mut Vec<(usize, bool)>,
+) -> Option<(usize, bool)> {
     positions.clear();
-    positions.push(start);
+    positions.push((start, false));
     for &byte in secret {
         next.clear();
-        for &position in positions.iter() {
+        for &(position, escaped) in positions.iter() {
             if position >= text.len() {
                 continue;
             }
@@ -377,14 +376,14 @@ fn percent_end(
                 if let (Some(high), Some(low)) = (high, low)
                     && (high << 4 | low) == byte
                 {
-                    next.push(position + 3);
+                    next.push((position + 3, true));
                 }
             }
             if byte == b' ' && text[position] == b'+' {
-                next.push(position + 1);
+                next.push((position + 1, true));
             }
             if text[position] == byte {
-                next.push(position + 1);
+                next.push((position + 1, escaped));
             }
         }
         if next.is_empty() {
@@ -394,15 +393,11 @@ fn percent_end(
         next.dedup();
         std::mem::swap(positions, next);
     }
-    positions.iter().copied().max()
-}
-
-/// Whether a span contains at least one byte written as an escape.
-fn has_encoded_token(bytes: &[u8]) -> bool {
-    bytes.contains(&b'+')
-        || bytes.windows(3).any(|window| {
-            window[0] == b'%' && hex_value(window[1]).is_some() && hex_value(window[2]).is_some()
-        })
+    let end = positions.iter().map(|(position, _)| *position).max()?;
+    let escaped = positions
+        .iter()
+        .any(|(position, escaped)| *position == end && *escaped);
+    Some((end, escaped))
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -906,6 +901,45 @@ mod tests {
         secrets.record("1234");
 
         assert_eq!(secrets.redact_json(&json!(12345678)), json!("***5678"));
+    }
+
+    #[test]
+    fn overlapping_percent_encoded_occurrences_of_one_value_leave_no_tail() {
+        let mut upper = Secrets::new();
+        upper.record("AAAAAAAA");
+        assert_eq!(upper.redact(&"%41".repeat(9)), "***");
+
+        let mut lower = Secrets::new();
+        lower.record("aaaaaaaa");
+        assert_eq!(lower.redact(&format!("a{}", "%61".repeat(8))), "***");
+        assert_eq!(lower.redact(&format!("{}a", "%61".repeat(8))), "***");
+
+        let mut periodic = Secrets::new();
+        periodic.record("abcdabcd");
+        assert_eq!(periodic.redact("abcd%61bcd%61bcd"), "***");
+    }
+
+    #[test]
+    fn a_literal_percent_hex_value_keeps_the_exact_result() {
+        let mut secrets = Secrets::new();
+        secrets.record("abcdef%41");
+        secrets.record("cdef%41xy");
+
+        // `%41` is literal text inside both values; nothing here is encoded, so
+        // the old longest-first exact pass must decide the result.
+        assert_eq!(secrets.redact("abcdef%41xyz"), "***xyz");
+
+        let mut second_longer = Secrets::new();
+        second_longer.record("abcdef%41");
+        second_longer.record("def%41xyz0");
+        assert_eq!(second_longer.redact("abcdef%41xyz0"), "abc***");
+
+        let mut literal_and_encoded = Secrets::new();
+        literal_and_encoded.record("abcdef%41");
+        assert_eq!(
+            literal_and_encoded.redact("abcdef%41 | abcdef%2541"),
+            "*** | ***"
+        );
     }
 
     fn base64(data: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
