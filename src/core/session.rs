@@ -11,6 +11,7 @@
 //! `--jobs` cannot share one.
 
 use std::any::Any;
+use std::path::{Path, PathBuf};
 
 use crate::core::registry::is_allowed_name_character;
 
@@ -30,6 +31,73 @@ impl<T: Any> AsAny for T {
     }
 }
 
+/// One file a session offers as evidence for a failed case.
+///
+/// The engine does not interpret the file: a text file is redacted with the
+/// run's secrets when it is written, and bytes are written unchanged. The name
+/// is one safe path segment; the writer puts it under a directory named after
+/// the session kind, so two sessions cannot collide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    name: String,
+    content: EvidenceContent,
+}
+
+/// The payload of one [`Evidence`] file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvidenceContent {
+    /// UTF-8 text, redacted before it is written.
+    Text(String),
+    /// Bytes written unchanged, for example an image.
+    Bytes(Vec<u8>),
+}
+
+impl Evidence {
+    /// Creates a text evidence file.
+    ///
+    /// The name must be one safe path segment and must not shadow a file the
+    /// bundle layout already uses.
+    pub fn text(name: impl Into<String>, text: impl Into<String>) -> Result<Self, String> {
+        let name = name.into();
+        check_evidence_name(&name)?;
+        Ok(Self {
+            name,
+            content: EvidenceContent::Text(text.into()),
+        })
+    }
+
+    /// Creates a binary evidence file.
+    pub fn bytes(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Result<Self, String> {
+        let name = name.into();
+        check_evidence_name(&name)?;
+        Ok(Self {
+            name,
+            content: EvidenceContent::Bytes(bytes.into()),
+        })
+    }
+
+    /// The file name, as one path segment.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The file content.
+    pub fn content(&self) -> &EvidenceContent {
+        &self.content
+    }
+}
+
+/// The evidence one session returned, or why it could not return any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEvidence {
+    /// Session kind, used as the directory that holds the files.
+    pub kind: String,
+    /// Files the session returned.
+    pub files: Vec<Evidence>,
+    /// Why the session could not return its evidence, if it failed.
+    pub error: Option<String>,
+}
+
 /// A resource a case keeps alive across its steps.
 ///
 /// The runner calls [`Self::close`] exactly once when the case ends. An
@@ -45,6 +113,16 @@ pub trait Session: Send + AsAny {
     /// The message is reported as a close error. The runner has already decided
     /// the case's own result, so a close failure never hides it.
     fn close(&mut self) -> Result<(), String>;
+
+    /// Returns files that help diagnose a case that did not pass.
+    ///
+    /// The runner asks only after a case did not pass and only when failure
+    /// bundles are enabled, before [`Self::close`] releases the resource. The
+    /// default is no evidence, which is what a session with nothing to add
+    /// returns.
+    fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// The sessions of one case, keyed by the kind the plugin chose.
@@ -56,6 +134,8 @@ pub trait Session: Send + AsAny {
 pub struct Sessions {
     /// In creation order; [`Self::close_all`] pops from the end.
     entries: Vec<SessionEntry>,
+    /// Directory a session resolves a relative path against when it writes one.
+    base_directory: Option<PathBuf>,
 }
 
 /// One open session and the kind it is stored under.
@@ -68,6 +148,19 @@ impl Sessions {
     /// Creates an empty set.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the directory a session resolves a relative output path against.
+    ///
+    /// The runner sets this to the directory that holds the case file before
+    /// the first step runs. A session that does not write a path ignores it.
+    pub fn set_base_directory(&mut self, directory: impl Into<PathBuf>) {
+        self.base_directory = Some(directory.into());
+    }
+
+    /// The directory a session resolves a relative output path against.
+    pub fn base_directory(&self) -> Option<&Path> {
+        self.base_directory.as_deref()
     }
 
     /// Returns the session of `kind`, creating it with `create` on first use.
@@ -118,6 +211,31 @@ impl Sessions {
         }
     }
 
+    /// Asks every open session for its failure evidence.
+    ///
+    /// A session that fails is reported in its group's `error` instead of
+    /// stopping the others. A session that returns no files and no error is
+    /// left out, so a case with no evidence adds no directory to its bundle.
+    pub fn collect_evidence(&mut self) -> Vec<SessionEvidence> {
+        let mut groups = Vec::new();
+        for entry in &mut self.entries {
+            match entry.session.evidence() {
+                Ok(files) if files.is_empty() => {}
+                Ok(files) => groups.push(SessionEvidence {
+                    kind: entry.kind.to_string(),
+                    files,
+                    error: None,
+                }),
+                Err(message) => groups.push(SessionEvidence {
+                    kind: entry.kind.to_string(),
+                    files: Vec::new(),
+                    error: Some(format!("session `{}`: {message}", entry.kind)),
+                }),
+            }
+        }
+        groups
+    }
+
     /// Closes every open session in reverse creation order.
     ///
     /// Every session is attempted, even when an earlier close fails, and each
@@ -163,12 +281,45 @@ where
     })
 }
 
-/// Checks a session kind against the step name rule.
-fn check_kind(kind: &str) -> Result<(), String> {
+/// Checks an evidence file name: one safe segment that cannot shadow the
+/// bundle's own files.
+fn check_evidence_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(
+            "evidence file name is empty; use letters, digits, `.`, `_` and `-`".to_string(),
+        );
+    }
+    if matches!(name, "." | "..") {
+        return Err(format!(
+            "evidence file name `{name}` is a path segment, not a file name"
+        ));
+    }
+    if let Some(character) = name.chars().find(|character| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '-')
+    }) {
+        return Err(format!(
+            "evidence file name `{name}` contains `{character}`; use only letters, digits, `.`, `_` and `-`"
+        ));
+    }
+    if matches!(name, "case.yaml" | "report.json" | "meta.json") {
+        return Err(format!(
+            "evidence file name `{name}` is reserved by the failure bundle; choose another name"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a session kind against the step name rule and as a path segment.
+pub(crate) fn check_kind(kind: &str) -> Result<(), String> {
     if kind.is_empty() {
         return Err(
             "session kind is empty; use lowercase letters, digits, `.`, `_` and `-`".to_string(),
         );
+    }
+    if matches!(kind, "." | "..") {
+        return Err(format!(
+            "session kind `{kind}` is a path segment, not a name; use lowercase letters, digits, `.`, `_` and `-`"
+        ));
     }
     if let Some(character) = kind
         .chars()
@@ -301,11 +452,11 @@ mod tests {
         let mut sessions = Sessions::new();
 
         let error = sessions
-            .get_or_create::<Tracked>("test.session", || Err("no browser".to_string()))
+            .get_or_create::<Tracked>("test.session", || Err("no resource".to_string()))
             .expect_err("the factory failure must be reported");
 
         assert!(error.contains("test.session"), "got: {error}");
-        assert!(error.contains("no browser"), "got: {error}");
+        assert!(error.contains("no resource"), "got: {error}");
         assert!(
             sessions
                 .get::<Tracked>("test.session")
@@ -333,6 +484,133 @@ mod tests {
                 error.contains("lowercase letters"),
                 "the message must state the rule for `{kind}`, got: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn evidence_names_are_one_safe_segment_and_cannot_shadow_the_bundle() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "../meta.json",
+            "space name",
+            "café",
+        ] {
+            assert!(
+                Evidence::text(name, "text").is_err(),
+                "`{name}` must be refused as an evidence name"
+            );
+            assert!(
+                Evidence::bytes(name, vec![0]).is_err(),
+                "`{name}` must be refused as an evidence name"
+            );
+        }
+        for name in ["case.yaml", "report.json", "meta.json"] {
+            let error = Evidence::text(name, "text").expect_err("a reserved name must be refused");
+            assert!(error.contains("reserved"), "got: {error}");
+        }
+        assert!(Evidence::text("page.txt", "text").is_ok());
+        assert!(Evidence::bytes("PAGE.TXT", vec![0]).is_ok());
+    }
+
+    #[test]
+    fn a_session_that_refuses_or_returns_nothing_is_handled() {
+        struct Nothing;
+        impl Session for Nothing {
+            fn close(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        struct Refusing;
+        impl Session for Refusing {
+            fn close(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+                Err("the page is gone".to_string())
+            }
+        }
+
+        let mut sessions = Sessions::new();
+        sessions
+            .get_or_create("test.nothing", || Ok(Nothing))
+            .expect("the empty session must be created");
+        assert!(
+            sessions.collect_evidence().is_empty(),
+            "a session with no evidence must not add a group"
+        );
+
+        sessions
+            .get_or_create("test.refusing", || Ok(Refusing))
+            .expect("the refusing session must be created");
+        let groups = sessions.collect_evidence();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, "test.refusing");
+        assert!(groups[0].files.is_empty());
+        assert!(
+            groups[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("page is gone")),
+            "got: {groups:?}"
+        );
+    }
+
+    #[test]
+    fn collecting_evidence_groups_text_and_binary_files_by_session_kind() {
+        struct EvidenceSession;
+        impl Session for EvidenceSession {
+            fn close(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+                Ok(vec![
+                    Evidence::text("notes.txt", "the page said no")
+                        .expect("the text name is valid"),
+                    Evidence::bytes("screen.bin", vec![0x89, b'P', b'N', b'G'])
+                        .expect("the binary name is valid"),
+                ])
+            }
+        }
+
+        let mut sessions = Sessions::new();
+        sessions.set_base_directory("cases/shop");
+        assert_eq!(
+            sessions.base_directory().map(Path::to_path_buf),
+            Some(PathBuf::from("cases/shop"))
+        );
+        sessions
+            .get_or_create("test.evidence", || Ok(EvidenceSession))
+            .expect("the evidence session must be created");
+
+        let groups = sessions.collect_evidence();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, "test.evidence");
+        assert!(groups[0].error.is_none());
+        assert_eq!(groups[0].files[0].name(), "notes.txt");
+        assert_eq!(
+            groups[0].files[0].content(),
+            &EvidenceContent::Text("the page said no".to_string())
+        );
+        assert_eq!(groups[0].files[1].name(), "screen.bin");
+        assert_eq!(
+            groups[0].files[1].content(),
+            &EvidenceContent::Bytes(vec![0x89, b'P', b'N', b'G'])
+        );
+    }
+
+    #[test]
+    fn a_session_kind_cannot_be_a_path_segment() {
+        let mut sessions = Sessions::new();
+        for kind in [".", ".."] {
+            let error = sessions
+                .get_or_create::<Other>(kind, || Ok(Other))
+                .expect_err("a path segment must not be a session kind");
+            assert!(error.contains("path segment"), "got: {error}");
         }
     }
 

@@ -1084,6 +1084,7 @@ the user's browser keeps running and the user's other tabs are untouched.
 | `browser.press` | `key` required, for example `Enter` or `Tab` | `{}` |
 | `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000 | `url` |
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
+| `browser.screenshot` | `path` required | `path`, `bytes` |
 
 A **locator** is exactly one of `css`, `xpath`, `text` and `role`; `name` is an
 optional modifier for `role`. Every locator also accepts an optional
@@ -1130,6 +1131,27 @@ loading; exceeding it is a timeout (exit 5).
 `browser.press` accepts `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, the four
 arrow keys, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one printable
 character. Any other key name is an argument error that `da lint` reports.
+
+`browser.screenshot` writes a PNG to `path` and returns the path and the number
+of bytes written. A relative path is resolved against the directory that holds
+the case file, so a case can keep its output beside itself. The step covers every
+visible editable field before capturing: `textarea`, `select`, elements whose
+`contenteditable` is on, and every `input` whose type is not `button`, `submit`,
+`reset`, `checkbox`, `radio`, `image`, `hidden`, `range` or `color`. Each field
+gets an opaque black box at its viewport position with the highest `z-index`;
+the boxes are removed immediately after the capture, and also when the capture
+fails. There is no option to turn the cover off. Use `browser.read` when the value
+of a field is what the case needs to assert.
+
+Screenshots stay local. `browser.screenshot` writes only the path the case gives,
+and a failure bundle writes its copy under the bundle directory. Neither copy
+enters text output, `--output json` or a future shareable report.
+
+The cover hides editable fields, not ordinary text. A page that writes a secret
+into a heading, a paragraph or an attribute still shows it in the screenshot
+pixels; `dom.html` is redacted, but the PNG is not. The cover applies to the
+page's main document, so an editable field inside an iframe is not reached. Treat
+both kinds of page as unsuitable for screenshots that leave the machine.
 
 `headless`, `width` and `height` only apply when the first `browser.open` creates
 the page. A later `browser.open` that gives a different effective value is a step
@@ -1299,10 +1321,22 @@ pass also leaves a directory that an agent can read afterwards:
     ├── 0-wrong-exit-code/
     │   ├── case.yaml                  copy of the case file
     │   ├── report.json                the case as `--output json` shows it
+    │   ├── browser/                   present only when a session had evidence
+    │   │   ├── screenshot.png         the page, with editable fields covered
+    │   │   └── dom.html               serialized page HTML, text-redacted
     │   └── meta.json                  written last
     └── 1-login-returns-a-token/
-        └── (the same three files)
+        └── (the same files; a case without a browser session has no browser/)
 ```
+
+A session supplies failure evidence only after the case did not pass and only when
+failure bundles are enabled. The runner asks before it closes the session, so the
+page still exists; `--no-bundle` and a passing case never take a screenshot. The
+evidence directory is named after the session kind, which keeps two sessions in
+one case from colliding. Text files are redacted with `${env:NAME}` values; byte
+files such as the PNG are written unchanged. A session that cannot collect its
+evidence leaves `evidence-error.txt` in its directory with the reason, and the
+case result and the rest of the bundle are unaffected.
 
 `meta.json` holds at least these fields:
 

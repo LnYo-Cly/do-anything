@@ -328,6 +328,7 @@ fn valid_arguments(step: &str) -> Value {
         "browser.press" => json!({"key": "Enter"}),
         "browser.wait" => json!({"css": "#name"}),
         "browser.read" => json!({"css": "#name"}),
+        "browser.screenshot" => json!({"path": "screen.png"}),
         "cli.run" => json!({"command": "da"}),
         "http.request" => json!({"url": "http://127.0.0.1:1/health"}),
         "db.query" => json!({"url": "sqlite:app.db", "sql": "SELECT 1"}),
