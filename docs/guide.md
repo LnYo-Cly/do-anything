@@ -707,6 +707,10 @@ Redaction has limits that matter when you choose a value:
 - **Other transformations are not recognized.** Encodings other than percent
   encoding and base64, a second round of either encoding, compression, hashes,
   and values a program splits, reorders or reassembles still appear as they are.
+- **base64 wrapped at a fixed width is not recognized.** A value that was
+  encoded and then broken across lines at a fixed width, the way MIME and PEM
+  wrap, no longer matches after the first line break, because the newline
+  splits the encoded characters.
 - **A JSON scalar changes type when it contains a secret.** A number, a boolean
   or `null` that is redacted becomes a string, so the type of that one value
   changes in the report.
