@@ -419,7 +419,8 @@ const MASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// `position: fixed` uses the viewport rectangle `getBoundingClientRect`
 /// returns, and `z-index` is the largest value a browser accepts. The element
 /// stays in the page only until the screenshot is captured; cleanup is a
-/// separate call so it can run after a failed capture too.
+/// separate call so it can run after a failed capture too. The page is not
+/// notified when the masks appear or disappear.
 const MASK_INPUTS_SCRIPT: &str = r#"(function () {
   var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
   var fields = document.querySelectorAll('input, textarea, select, [contenteditable]');
@@ -440,7 +441,6 @@ const MASK_INPUTS_SCRIPT: &str = r#"(function () {
     document.documentElement.appendChild(mask);
     masks.push(mask);
   }
-  document.dispatchEvent(new Event('da:screenshot-mask'));
   return masks.length;
 })()"#;
 
@@ -1250,7 +1250,6 @@ impl BrowserSession {
                     "could not cover the editable fields before the screenshot: {error}"
                 ))
             })?;
-        record_screenshot(self.port);
 
         let captured = self.connection_mut()?.call(
             "Page.captureScreenshot",
@@ -1562,27 +1561,6 @@ fn step_error_text(error: StepError) -> String {
         | StepError::Environment(message)
         | StepError::Timeout(message)
         | StepError::Execution(message) => message,
-    }
-}
-
-/// Records that a screenshot was attempted, with the debug port it used.
-///
-/// This is a test hook for the no-bundle and passing-case checks: the page is
-/// gone after a passing run, so a record is what makes "no screenshot" visible.
-/// It writes nothing unless `DA_TEST_BROWSER_SCREENSHOT_LOG` names a file.
-fn record_screenshot(port: u16) {
-    let Some(path) = std::env::var_os("DA_TEST_BROWSER_SCREENSHOT_LOG") else {
-        return;
-    };
-    if path.is_empty() {
-        return;
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "screenshot port={port}");
     }
 }
 

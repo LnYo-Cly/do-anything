@@ -374,11 +374,11 @@ document.getElementById('later').addEventListener('click', function () {{
 /// A page whose script records whether every visible editable field was
 /// covered while a screenshot mask existed.
 ///
-/// The record is written when the browser driver dispatches the
-/// `da:screenshot-mask` event, which happens after the masks are inserted and
-/// before the screenshot is captured. It is deliberately latched: the cleanup
-/// removes the masks afterwards, but the report keeps what was true during the
-/// screenshot so a later `browser.read` can assert on it.
+/// A `MutationObserver` on `document.documentElement` watches for the masks the
+/// driver appends; the page is not told about them by any custom event. The
+/// record is deliberately latched: the cleanup removes the masks afterwards,
+/// but the report keeps what was true during the screenshot so a later
+/// `browser.read` can assert on it.
 fn browser_mask() -> &'static str {
     r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>Mask probe</title>
@@ -439,7 +439,19 @@ function recordMasks() {
   }
   document.getElementById('mask-report').textContent = parts.join(',');
 }
-document.addEventListener('da:screenshot-mask', recordMasks);
+var observer = new MutationObserver(function (records) {
+  for (var i = 0; i < records.length; i++) {
+    var added = records[i].addedNodes;
+    for (var j = 0; j < added.length; j++) {
+      var node = added[j];
+      if (node.nodeType === 1 && node.hasAttribute('data-da-screenshot-mask')) {
+        recordMasks();
+        return;
+      }
+    }
+  }
+});
+observer.observe(document.documentElement, { childList: true, subtree: true });
 </script>
 </body></html>"##
 }
