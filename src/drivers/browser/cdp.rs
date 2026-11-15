@@ -174,6 +174,14 @@ pub struct Connection {
     queued: MessageQueue,
 }
 
+/// Result of evaluating a script that returns either a DOM node handle or a JSON value.
+pub enum RemoteResult {
+    /// A remote object handle (`objectId`).
+    Object(String),
+    /// A primitive JSON value returned directly.
+    Value(Value),
+}
+
 impl Connection {
     /// Connects to `url`, a `ws://` URL that the browser printed.
     pub fn connect(url: &str, deadline: Deadline) -> Result<Self, CdpError> {
@@ -290,6 +298,81 @@ impl Connection {
             "Runtime.callFunctionOn",
             json!({
                 "objectId": object_id,
+                "functionDeclaration": function,
+                "returnByValue": true,
+                "awaitPromise": false,
+            }),
+            Some(session_id),
+            deadline,
+        )?;
+        if let Some(details) = reply.get("exceptionDetails") {
+            return Err(CdpError::Script(exception_message(details)));
+        }
+        Ok(reply
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    /// Evaluates a JavaScript expression and returns either a remote `objectId`
+    /// (for a DOM node or object) or a primitive JSON value.
+    pub fn evaluate_remote(
+        &mut self,
+        session_id: &str,
+        expression: &str,
+        deadline: Deadline,
+    ) -> Result<RemoteResult, CdpError> {
+        let reply = self.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": false,
+                "awaitPromise": false,
+            }),
+            Some(session_id),
+            deadline,
+        )?;
+        parse_remote_result(&reply)
+    }
+
+    /// Calls a JavaScript function with a DOM node as `this` and returns either
+    /// a remote `objectId` or a primitive JSON value.
+    pub fn call_function_remote(
+        &mut self,
+        session_id: &str,
+        object_id: &str,
+        function: &str,
+        deadline: Deadline,
+    ) -> Result<RemoteResult, CdpError> {
+        let reply = self.call(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": function,
+                "returnByValue": false,
+                "awaitPromise": false,
+            }),
+            Some(session_id),
+            deadline,
+        )?;
+        parse_remote_result(&reply)
+    }
+
+    /// Calls a JavaScript function with `this` and one `objectId` argument, returning a value.
+    pub fn call_function_with_object(
+        &mut self,
+        session_id: &str,
+        object_id: &str,
+        arg_object_id: &str,
+        function: &str,
+        deadline: Deadline,
+    ) -> Result<Value, CdpError> {
+        let reply = self.call(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "arguments": [{ "objectId": arg_object_id }],
                 "functionDeclaration": function,
                 "returnByValue": true,
                 "awaitPromise": false,
@@ -495,6 +578,26 @@ fn split_ws_url(url: &str) -> Result<(&str, u16), CdpError> {
         .parse::<u16>()
         .map_err(|error| CdpError::Transport(format!("`{url}` has no usable port: {error}")))?;
     Ok((host, port))
+}
+
+/// Extracts either a remote `objectId` or a primitive value from a Runtime reply.
+fn parse_remote_result(reply: &Value) -> Result<RemoteResult, CdpError> {
+    if let Some(details) = reply.get("exceptionDetails") {
+        return Err(CdpError::Script(exception_message(details)));
+    }
+    let result = reply.get("result");
+    if let Some(object_id) = result
+        .and_then(|value| value.get("objectId"))
+        .and_then(Value::as_str)
+    {
+        return Ok(RemoteResult::Object(object_id.to_string()));
+    }
+    Ok(RemoteResult::Value(
+        result
+            .and_then(|value| value.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    ))
 }
 
 /// Parses one text frame as a CDP message.

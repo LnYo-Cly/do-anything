@@ -2150,3 +2150,480 @@ fn schema_and_lint_validate_testid_within_nth_and_testid_attribute() {
         );
     }
 }
+
+#[test]
+fn testid_and_custom_testid_attribute_locate_and_act() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-testid");
+    let url = server.url("/browser/locators");
+
+    let default_case = dir.write(
+        "default-testid.yaml",
+        &format!(
+            r##"name: default data-testid
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: solo-btn
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: solo
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&default_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let custom_case = dir.write(
+        "custom-testid.yaml",
+        &format!(
+            r##"name: custom testid_attribute
+steps:
+  - browser.open:
+      url: "{url}"
+      testid_attribute: data-qa
+  - browser.wait:
+      testid: custom-btn
+  - browser.click:
+      testid: custom-btn
+  - browser.type:
+      testid: custom-input
+      text: hello qa
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: qa
+  - browser.read:
+      testid: custom-btn
+      attribute: data-qa
+    expect:
+      - path: $.value
+        equals: custom-btn
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&custom_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let hidden_case = dir.write(
+        "hidden-testid.yaml",
+        &format!(
+            r##"name: hidden testid waits for visibility
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.read:
+      testid: hidden-note
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&hidden_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("not visible"),
+        "expected visibility error, got: {message}"
+    );
+}
+
+#[test]
+fn within_scopes_locators_and_supports_nesting_and_nth() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-within");
+    let url = server.url("/browser/locators");
+
+    let valid_case = dir.write(
+        "within.yaml",
+        &format!(
+            r##"name: within scopes every locator kind
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: save-btn
+      within:
+        css: ".group"
+        within:
+          role: region
+          name: Beta Panel
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: beta
+  - browser.click:
+      xpath: "//button[@data-testid='save-btn']"
+      within:
+        css: "#panel-a"
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: alpha
+  - browser.click:
+      role: button
+      name: Save
+      within:
+        css: "#panel-b"
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: beta
+  - browser.click:
+      text: Save
+      within:
+        css: "#panel-a"
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: alpha
+  - browser.click:
+      testid: save-btn
+      within:
+        css: ".panel"
+        nth: 1
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: beta
+  - browser.type:
+      testid: note-input
+      text: scoped text
+      within:
+        role: region
+        name: Alpha Panel
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&valid_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let ambiguous_within = dir.write(
+        "ambiguous-within.yaml",
+        &format!(
+            r##"name: ambiguous within fails immediately
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: save-btn
+      timeout_ms: 10000
+      within:
+        css: ".panel"
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&ambiguous_within),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("2") && message.contains(".panel"),
+        "ambiguous `within` must report count 2 and container locator, got: {message}"
+    );
+}
+
+#[test]
+fn nth_selects_zero_based_match_waits_for_async_match_and_fails_when_out_of_range() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-nth");
+    let url = server.url("/browser/locators");
+
+    let case = dir.write(
+        "nth.yaml",
+        &format!(
+            r##"name: nth indexing
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: nth-item
+      nth: 1
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: nth-1
+  - browser.click:
+      css: ".nth-btn"
+      nth: 2
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: nth-2
+  - browser.click:
+      css: ".hidden-plus-visible"
+      nth: 1
+  - browser.click:
+      css: "#spawn-second"
+  - browser.click:
+      css: ".async-nth"
+      nth: 1
+      timeout_ms: 2000
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: async-1
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let oob_case = dir.write(
+        "nth-oob.yaml",
+        &format!(
+            r##"name: nth out of range fails
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: ".nth-btn"
+      nth: 5
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&oob_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("5") && message.contains("3") && message.contains("300"),
+        "out-of-range nth must name index 5, count 3, and timeout 300, got: {message}"
+    );
+}
+
+#[test]
+fn multiple_matches_fail_immediately_for_all_five_locators_and_redact_secrets() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-strict-unique");
+    let url = server.url("/browser/locators");
+
+    for (name, locator_yaml, fragment) in [
+        (
+            "dup-css.yaml",
+            "      css: \".dup-gate-btn\"\n",
+            ".dup-gate-btn",
+        ),
+        (
+            "dup-xpath.yaml",
+            "      xpath: \"//button[@class='dup-gate-btn']\"\n",
+            "dup-gate-btn",
+        ),
+        (
+            "dup-text.yaml",
+            "      text: \"Gate Duplicate\"\n",
+            "Gate Duplicate",
+        ),
+        (
+            "dup-role.yaml",
+            "      role: button\n      name: \"Gate Duplicate\"\n",
+            "Gate Duplicate",
+        ),
+        (
+            "dup-testid.yaml",
+            "      testid: \"dup-gate-testid\"\n",
+            "dup-gate-testid",
+        ),
+        (
+            "dup-hidden-css.yaml",
+            "      css: \".hidden-plus-visible\"\n",
+            ".hidden-plus-visible",
+        ),
+        (
+            "dup-hidden-testid.yaml",
+            "      testid: \"hv-btn\"\n",
+            "hv-btn",
+        ),
+    ] {
+        let case = dir.write(
+            name,
+            &format!(
+                "name: strict match {name}\nsteps:\n  - browser.open:\n      url: \"{url}\"\n  - browser.click:\n{locator_yaml}      timeout_ms: 10000\n"
+            ),
+        );
+        let output = run_da_in(
+            dir.path(),
+            &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        );
+        assert_eq!(
+            exit_code(&output),
+            Some(1),
+            "{name} must fail: stdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let value = json_stdout(&output);
+        let message = case_error(&value);
+        assert!(
+            message.contains('2') && message.contains(fragment),
+            "{name}: error must mention count 2 and locator `{fragment}`, got: {message}"
+        );
+        let duration_ms = value["cases"][0]["steps"][1]["duration_ms"]
+            .as_u64()
+            .unwrap_or(u64::MAX);
+        assert!(
+            duration_ms < 5000,
+            "{name}: multi-match must fail immediately instead of waiting for timeout_ms (took {duration_ms} ms)"
+        );
+    }
+
+    let secret = "locator-secret-xyz-987";
+    let many_case = dir.write(
+        "many-redacted.yaml",
+        &format!(
+            r##"name: many candidates truncated and redacted
+steps:
+  - browser.open:
+      url: "{url}?secret=${{env:DA_LOCATOR_SECRET}}"
+  - browser.read:
+      css: ".many-item"
+      timeout_ms: 10000
+"##
+        ),
+    );
+    let output = run_da_with_env(
+        dir.path(),
+        &["--output", "json", "run", path_str(&many_case)],
+        &[("DA_LOCATOR_SECRET", secret.to_string())],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let raw_stdout = stdout(&output);
+    assert!(
+        !raw_stdout.contains(secret),
+        "secret leaked in JSON stdout: {raw_stdout}"
+    );
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains('7')
+            && message.contains("li")
+            && message.contains("many-1")
+            && message.contains("many-2")
+            && message.contains("***"),
+        "expected count 7, tag, ids, and redacted secret in error, got: {message}"
+    );
+    assert!(
+        !message.contains("definitely exceeds sixty characters in length"),
+        "candidate text longer than 60 chars must be truncated, got: {message}"
+    );
+    assert!(
+        !message.contains("Item 6") && !message.contains("Item 7"),
+        "at most 5 candidates may appear in error, got: {message}"
+    );
+
+    let bundle_rel = value["cases"][0]["bundle"]
+        .as_str()
+        .expect("failed case must write a failure bundle");
+    let report_path = dir.path().join(bundle_rel).join("report.json");
+    let report_text = fs::read_to_string(&report_path).expect("report.json must exist");
+    assert!(
+        !report_text.contains(secret),
+        "secret leaked in bundle report.json: {report_text}"
+    );
+}

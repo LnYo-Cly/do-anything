@@ -54,9 +54,9 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// Starts a server on a random loopback port.
+    /// Starts a server on a random loopback port that Chrome does not block.
     pub fn start() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind the test server");
+        let listener = bind_browser_safe_listener();
         let port = listener
             .local_addr()
             .expect("failed to read the test server address")
@@ -237,6 +237,7 @@ fn route(
         // created only after all three settled, so a `browser.wait` step sees
         // requests that completed during that step.
         (_, "/browser/network") => html_response("200 OK", &browser_network(query)),
+        (_, "/browser/locators") => html_response("200 OK", &browser_locators(query)),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
         // finishes loading before a short navigation timeout, which is what
@@ -571,6 +572,87 @@ fn browser_second(query: &str) -> String {
     )
 }
 
+/// A page for testing `testid`, `within`, `nth`, and strict unique matching.
+fn browser_locators(query: &str) -> String {
+    let secret = escape_html(&query_value(query, "secret"));
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Locator probe</title></head>
+<body>
+<h1>Locator probe</h1>
+<p id="locator-result">none</p>
+
+<button id="solo-btn" data-testid="solo-btn" type="button"
+  onclick="document.getElementById('locator-result').textContent = 'solo';">Solo</button>
+<button id="qa-btn" data-qa="custom-btn" type="button"
+  onclick="document.getElementById('locator-result').textContent = 'qa';">QA Button</button>
+<input id="qa-input" data-qa="custom-input" autocomplete="off">
+
+<section id="panel-a" class="panel" data-testid="panel" role="region" aria-label="Alpha Panel">
+  <div class="group">
+    <button id="save-a" class="scoped-btn" data-testid="save-btn" type="button"
+      onclick="document.getElementById('locator-result').textContent = 'alpha';">Save</button>
+    <input class="scoped-input" data-testid="note-input" autocomplete="off">
+  </div>
+</section>
+<section id="panel-b" class="panel" data-testid="panel" role="region" aria-label="Beta Panel">
+  <div class="group">
+    <button id="save-b" class="scoped-btn" data-testid="save-btn" type="button"
+      onclick="document.getElementById('locator-result').textContent = 'beta';">Save</button>
+    <input class="scoped-input" data-testid="note-input" autocomplete="off">
+  </div>
+</section>
+
+<div id="nth-list">
+  <button class="nth-btn" data-testid="nth-item" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'nth-0';">Item 0</button>
+  <button class="nth-btn" data-testid="nth-item" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'nth-1';">Item 1</button>
+  <button class="nth-btn" data-testid="nth-item" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'nth-2';">Item 2</button>
+</div>
+
+<div id="delayed-nth">
+  <button class="async-nth" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'async-0';">First</button>
+</div>
+<button id="spawn-second" type="button"
+  onclick="setTimeout(function () {{
+    var b = document.createElement('button');
+    b.className = 'async-nth';
+    b.type = 'button';
+    b.textContent = 'Second';
+    b.onclick = function () {{ document.getElementById('locator-result').textContent = 'async-1'; }};
+    document.getElementById('delayed-nth').appendChild(b);
+  }}, 250);">Spawn second</button>
+
+<div id="hidden-dup-wrap">
+  <button class="hidden-plus-visible" data-testid="hv-btn" type="button" style="display:none">Hidden</button>
+  <button class="hidden-plus-visible" data-testid="hv-btn" type="button">Visible</button>
+</div>
+
+<div id="dup-gate">
+  <button id="dup-one" class="dup-gate-btn" data-testid="dup-gate-testid" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'dup-1';">Gate Duplicate</button>
+  <button id="dup-two" class="dup-gate-btn" data-testid="dup-gate-testid" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'dup-2';">Gate Duplicate</button>
+</div>
+
+<ul id="many-items">
+  <li id="many-1" class="many-item">First candidate</li>
+  <li id="many-2" class="many-item">Second candidate with a very long text payload that definitely exceeds sixty characters in length</li>
+  <li id="many-3" class="many-item">Secret token {secret}</li>
+  <li id="many-4" class="many-item">Item 4</li>
+  <li id="many-5" class="many-item">Item 5</li>
+  <li id="many-6" class="many-item">Item 6</li>
+  <li id="many-7" class="many-item">Item 7</li>
+</ul>
+
+<p id="hidden-note" data-testid="hidden-note" style="display:none">Hidden note</p>
+</body></html>"#
+    )
+}
+
 /// The value of one `name=value` pair of a query string.
 fn query_value(query: &str, name: &str) -> String {
     query
@@ -646,4 +728,104 @@ pub fn closed_port() -> u16 {
         .port();
     drop(listener);
     port
+}
+
+/// Binds a loopback listener whose port is not on Chrome's restricted-port list
+/// (`ERR_UNSAFE_PORT`). Holds any rejected listener open until a safe port is
+/// acquired so the OS does not hand back the same restricted port.
+fn bind_browser_safe_listener() -> TcpListener {
+    let mut rejected = Vec::new();
+    for _ in 0..32 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind the test server");
+        let port = listener
+            .local_addr()
+            .expect("failed to read the test server address")
+            .port();
+        if !is_chrome_restricted_port(port) {
+            return listener;
+        }
+        rejected.push(listener);
+    }
+    TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind the test server")
+}
+
+/// Ports Chrome refuses with `net::ERR_UNSAFE_PORT` (from Chromium `port_util.cc`).
+fn is_chrome_restricted_port(port: u16) -> bool {
+    matches!(
+        port,
+        1 | 7
+            | 9
+            | 11
+            | 13
+            | 15
+            | 17
+            | 19
+            | 20
+            | 21
+            | 22
+            | 23
+            | 25
+            | 37
+            | 42
+            | 43
+            | 53
+            | 69
+            | 77
+            | 79
+            | 87
+            | 95
+            | 101
+            | 102
+            | 103
+            | 104
+            | 109
+            | 110
+            | 111
+            | 113
+            | 115
+            | 117
+            | 119
+            | 123
+            | 135
+            | 137
+            | 139
+            | 143
+            | 161
+            | 179
+            | 389
+            | 427
+            | 465
+            | 512
+            | 513
+            | 514
+            | 515
+            | 526
+            | 530
+            | 531
+            | 532
+            | 540
+            | 548
+            | 554
+            | 556
+            | 563
+            | 587
+            | 601
+            | 636
+            | 989
+            | 990
+            | 993
+            | 995
+            | 1719
+            | 1720
+            | 1723
+            | 2049
+            | 3659
+            | 4045
+            | 4190
+            | 5060
+            | 5061
+            | 6000
+            | 6566
+            | 6665..=6669 | 6697 | 10080
+    )
 }
