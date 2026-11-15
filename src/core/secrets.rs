@@ -50,19 +50,37 @@ impl Secrets {
     }
 
     /// Replaces every occurrence of every secret with [`MARKER`].
+    ///
+    /// Encoded matches are discovered against the original text for every
+    /// secret before anything is replaced: one marker must never destroy
+    /// another secret's needle. A literal match that shares bytes with an
+    /// encoded one is replaced together with it, while literal matches that
+    /// touch no encoded match still resolve longest-first as they always did.
     pub fn redact(&self, text: &str) -> String {
         if self.values.is_empty() {
             return text.to_string();
         }
-        // Longest first, so a secret that contains another one is replaced as a
-        // whole instead of leaving a fragment behind.
+        let ordered = self.ordered_values();
+        let mut encoded = Vec::new();
+        for value in &ordered {
+            if value.len() >= ENCODED_MIN_BYTES {
+                encoded.extend(percent_spans(text, value.as_bytes()));
+                encoded.extend(base64_spans(text, value.as_bytes()));
+            }
+        }
+        if encoded.is_empty() {
+            return redact_exact(text, &ordered);
+        }
+        let covered = cover_encoded_matches(text, &ordered, encoded);
+        redact_around(text, &ordered, &covered)
+    }
+
+    /// The recorded values, longest first, so a value that contains another
+    /// one is replaced as a whole instead of leaving a fragment behind.
+    fn ordered_values(&self) -> Vec<&str> {
         let mut ordered: Vec<&str> = self.values.iter().map(String::as_str).collect();
         ordered.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        let mut redacted = text.to_string();
-        for value in ordered {
-            redacted = redact_value(&redacted, value);
-        }
-        redacted
+        ordered
     }
 
     /// Replaces every secret inside a JSON value.
@@ -73,8 +91,10 @@ impl Secrets {
     ///
     /// A string keeps its own text and is redacted in place. A number, a
     /// boolean or null has no inner text to replace, so its JSON text is
-    /// redacted and the result becomes a string: `10` with the secret `1`
-    /// becomes `"***0"`, and `true` with the secret `true` becomes `"***"`.
+    /// redacted with the exact form only and the result becomes a string: `10`
+    /// with the secret `1` becomes `"***0"`, and `true` with the secret `true`
+    /// becomes `"***"`. Encoded forms apply to strings and keys, not to these
+    /// scalars.
     pub fn redact_json(&self, value: &Value) -> Value {
         if self.values.is_empty() {
             return value.clone();
@@ -101,9 +121,11 @@ impl Secrets {
     ///
     /// A token that contains no secret keeps its type; one that does becomes a
     /// string, because a partly replaced number or boolean is not a valid token
-    /// of its original type.
+    /// of its original type. Only exact occurrences count here: the encoded
+    /// forms are a string-and-key behavior, and a number that happens to spell
+    /// a base64 form must keep its value and type.
     fn redact_scalar(&self, text: &str, original: &Value) -> Value {
-        let redacted = self.redact(text);
+        let redacted = redact_exact(text, &self.ordered_values());
         if redacted == text {
             original.clone()
         } else {
@@ -124,37 +146,74 @@ const BASE64_STANDARD: &[u8; 64] =
 const BASE64_URL_SAFE: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-/// Redacts one secret, including its percent-encoded and base64 forms.
-fn redact_value(text: &str, value: &str) -> String {
-    if value.len() < ENCODED_MIN_BYTES {
-        return text.replace(value, MARKER);
+/// Replaces the literal occurrences only, longest first.
+///
+/// This is the whole behavior before encoded forms existed, including how it
+/// resolves two literal matches that overlap only partly: the longer value is
+/// replaced and the other one is left where the marker did not reach.
+fn redact_exact(text: &str, ordered: &[&str]) -> String {
+    let mut redacted = text.to_string();
+    for value in ordered {
+        redacted = redacted.replace(value, MARKER);
     }
-
-    let mut encoded = percent_spans(text, value.as_bytes());
-    encoded.extend(base64_spans(text, value.as_bytes()));
-    if encoded.is_empty() {
-        // The encoded forms must not change the behavior of the exact match.
-        return text.replace(value, MARKER);
-    }
-
-    let mut spans: Vec<Span> = text
-        .match_indices(value)
-        .map(|(start, matched)| (start, start + matched.len()))
-        .collect();
-    spans.extend(encoded);
-    replace_spans(text, &merge_spans(spans))
+    redacted
 }
 
-/// Replaces every span with one marker.
-fn replace_spans(text: &str, spans: &[Span]) -> String {
-    let mut redacted = String::with_capacity(text.len() + spans.len() * MARKER.len());
+/// Extends the encoded spans over every literal match they touch.
+///
+/// Literal matches that overlap an encoded match have to become one marker:
+/// replacing either one first would leave the other's bytes split around the
+/// marker. Components made only of literal matches are left out, so their
+/// longest-first overlap behavior is untouched and the exact pass keeps it.
+fn cover_encoded_matches(text: &str, ordered: &[&str], encoded: Vec<Span>) -> Vec<Span> {
+    let mut spans: Vec<(usize, usize, bool)> = encoded
+        .into_iter()
+        .map(|(start, end)| (start, end, true))
+        .collect();
+    for value in ordered {
+        spans.extend(
+            text.match_indices(value)
+                .map(|(start, matched)| (start, start + matched.len(), false)),
+        );
+    }
+    spans.sort_unstable();
+
+    let mut covered = Vec::new();
+    let mut component: Option<(usize, usize, bool)> = None;
+    for (start, end, is_encoded) in spans {
+        match component {
+            Some((component_start, component_end, has_encoded)) if start < component_end => {
+                component = Some((
+                    component_start.min(start),
+                    component_end.max(end),
+                    has_encoded || is_encoded,
+                ));
+            }
+            Some((component_start, component_end, true)) => {
+                covered.push((component_start, component_end));
+                component = Some((start, end, is_encoded));
+            }
+            Some(_) => component = Some((start, end, is_encoded)),
+            None => component = Some((start, end, is_encoded)),
+        }
+    }
+    if let Some((start, end, true)) = component {
+        covered.push((start, end));
+    }
+    covered
+}
+
+/// Replaces the covered intervals with one marker each and redacts the gaps
+/// with exact matching only.
+fn redact_around(text: &str, ordered: &[&str], covered: &[Span]) -> String {
+    let mut redacted = String::with_capacity(text.len() + covered.len() * MARKER.len());
     let mut cursor = 0;
-    for &(start, end) in spans {
-        redacted.push_str(&text[cursor..start]);
+    for &(start, end) in covered {
+        redacted.push_str(&redact_exact(&text[cursor..start], ordered));
         redacted.push_str(MARKER);
         cursor = end;
     }
-    redacted.push_str(&text[cursor..]);
+    redacted.push_str(&redact_exact(&text[cursor..], ordered));
     redacted
 }
 
@@ -760,6 +819,93 @@ mod tests {
             "***",
             "the literal form also satisfies the zero-encoded-byte form and must not be replaced twice"
         );
+    }
+
+    #[test]
+    fn a_literal_match_does_not_hide_another_secret_base64_form() {
+        let mut secrets = Secrets::new();
+        secrets.record("YWJjZGVmZ2");
+        secrets.record("abcdefgh");
+
+        assert_eq!(secrets.redact("YWJjZGVmZ2g="), "***");
+    }
+
+    #[test]
+    fn a_literal_match_does_not_hide_another_secret_percent_form() {
+        let mut secrets = Secrets::new();
+        secrets.record("prefix%61bc");
+        secrets.record("abcdefgh");
+
+        assert_eq!(secrets.redact("prefix%61bcdefgh"), "***");
+    }
+
+    #[test]
+    fn overlapping_base64_matches_leave_no_encoded_tail() {
+        let mut secrets = Secrets::new();
+        secrets.record("abcdefghij");
+        secrets.record("fghijklm");
+
+        // Base64 of `abcdefghijklm`; both values occur inside the same encoding.
+        assert_eq!(secrets.redact("YWJjZGVmZ2hpamtsbQ=="), "***");
+    }
+
+    #[test]
+    fn overlapping_percent_matches_leave_no_encoded_tail() {
+        let mut secrets = Secrets::new();
+        secrets.record("abcdefghij");
+        secrets.record("fghijklm");
+        let encoded: String = "abcdefghijklm"
+            .bytes()
+            .map(|byte| format!("%{byte:02x}"))
+            .collect();
+
+        assert_eq!(secrets.redact(&encoded), "***");
+    }
+
+    #[test]
+    fn partly_overlapping_literal_values_keep_their_longest_first_result() {
+        let mut six = Secrets::new();
+        six.record("abcdef");
+        six.record("cdefgh");
+        assert_eq!(six.redact("abcdefgh"), "***gh");
+
+        let mut ten = Secrets::new();
+        ten.record("abcdefghij");
+        ten.record("efghijklmn");
+        assert_eq!(ten.redact("abcdefghijklmn"), "***klmn");
+    }
+
+    #[test]
+    fn a_separate_encoded_match_does_not_change_literal_resolution() {
+        let mut secrets = Secrets::new();
+        secrets.record("abcdefghij");
+        secrets.record("efghijklmn");
+        secrets.record("01234567");
+
+        assert_eq!(
+            secrets.redact("abcdefghijklmn | MDEyMzQ1Njc="),
+            "***klmn | ***"
+        );
+    }
+
+    #[test]
+    fn an_encoded_only_match_does_not_change_a_json_number() {
+        let mut secrets = Secrets::new();
+        // U+3F7D three times is nine bytes; its base64 is 472947294729.
+        secrets.record("\u{3f7d}\u{3f7d}\u{3f7d}");
+
+        assert_eq!(
+            secrets.redact_json(&json!({"amount": 472947294729_u64, "text": "472947294729"})),
+            json!({"amount": 472947294729_u64, "text": "***"})
+        );
+    }
+
+    #[test]
+    fn exact_scalar_redaction_still_converts_the_number() {
+        let mut secrets = Secrets::new();
+        secrets.record("1234");
+
+        assert_eq!(secrets.redact_json(&json!(12345678)), json!("***5678"));
     }
 
     fn base64(data: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
