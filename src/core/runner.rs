@@ -20,7 +20,7 @@ use crate::core::report::{
     CaseReport, CaseStatus, Problem, ProblemKind, RunOutcome, RunReport, StepReport, StepStatus,
 };
 use crate::core::secrets::Secrets;
-use crate::core::session::Sessions;
+use crate::core::session::{SessionEvidence, Sessions};
 
 /// Validates every case, then runs the ones the filters select.
 ///
@@ -176,7 +176,10 @@ fn run_one(
         case: index,
         name: loaded.case.name.clone(),
     });
-    let mut report = run_case(index, loaded, registry, bus, secrets);
+    let CaseRun {
+        mut report,
+        evidence,
+    } = run_case(index, loaded, registry, bus, secrets, bundles.is_some());
     if report.status != CaseStatus::Passed
         && let Some(writer) = bundles
     {
@@ -185,7 +188,7 @@ fn run_one(
         // differ by position, so nothing else is shared.
         let mut writer = lock(writer);
         let secrets = lock(secrets);
-        match writer.write(index, &report, &secrets) {
+        match writer.write_with_evidence(index, &report, &secrets, &evidence) {
             Ok(directory) => report.bundle = Some(directory),
             Err(message) => lock(collected).bundle_errors.push((index, message)),
         }
@@ -349,18 +352,28 @@ fn positioned(loaded: &LoadedCase, location: Location, message: String) -> CaseE
     }
 }
 
+/// One case's report and the evidence its sessions returned.
+struct CaseRun {
+    report: CaseReport,
+    evidence: Vec<SessionEvidence>,
+}
+
 fn run_case(
     index: usize,
     loaded: &LoadedCase,
     registry: &Registry,
     bus: &EventBus,
     secrets: &Mutex<&mut Secrets>,
-) -> CaseReport {
+    bundles_enabled: bool,
+) -> CaseRun {
     let started = Instant::now();
     let mut vars = loaded.case.vars.clone();
     // One set of resources belongs to this case and to no other. It is created
     // here, on the worker that runs the case, so `--jobs` cannot share it.
     let mut sessions = Sessions::new();
+    if let Some(directory) = loaded.path.parent() {
+        sessions.set_base_directory(directory);
+    }
     let mut steps = Vec::with_capacity(loaded.case.steps.len());
     // One observation per declared name belongs to this case and to no other,
     // so two cases that run at the same time never share what they collect.
@@ -440,16 +453,27 @@ fn run_case(
         steps.push(report);
     }
 
+    // Evidence is collected before the sessions release their resources, and
+    // only when the case already did not pass and a bundle will be written.
+    // A passing case never asks for evidence, even though its sessions are
+    // still open here.
+    let status_before_close = match stopped.as_ref().map(|problem| problem.kind) {
+        None => CaseStatus::Passed,
+        Some(ProblemKind::Assertion) => CaseStatus::Failed,
+        Some(_) => CaseStatus::Error,
+    };
+    let evidence = if bundles_enabled && status_before_close != CaseStatus::Passed {
+        sessions.collect_evidence()
+    } else {
+        Vec::new()
+    };
+
     // Every session belongs to this case and is closed here, whatever path the
     // case took. `close_all` removes a session before closing it, so a failing
     // close cannot be attempted twice.
     let close_errors = sessions.close_all();
 
-    let mut status = match stopped.as_ref().map(|problem| problem.kind) {
-        None => CaseStatus::Passed,
-        Some(ProblemKind::Assertion) => CaseStatus::Failed,
-        Some(_) => CaseStatus::Error,
-    };
+    let mut status = status_before_close;
     let mut error = stopped;
     // A case that already failed or errored keeps its own verdict; the close
     // errors are attached to the report without replacing the problem. A case
@@ -464,19 +488,22 @@ fn run_case(
         });
     }
 
-    CaseReport {
-        file: loaded.path.clone(),
-        name: loaded.case.name.clone(),
-        project: loaded.case.project.clone(),
-        suite: loaded.case.suite.clone(),
-        layer: loaded.case.layer.clone(),
-        tags: loaded.case.tags.clone(),
-        status,
-        duration: started.elapsed(),
-        steps,
-        error,
-        close_errors,
-        bundle: None,
+    CaseRun {
+        report: CaseReport {
+            file: loaded.path.clone(),
+            name: loaded.case.name.clone(),
+            project: loaded.case.project.clone(),
+            suite: loaded.case.suite.clone(),
+            layer: loaded.case.layer.clone(),
+            tags: loaded.case.tags.clone(),
+            status,
+            duration: started.elapsed(),
+            steps,
+            error,
+            close_errors,
+            bundle: None,
+        },
+        evidence,
     }
 }
 
@@ -738,6 +765,7 @@ mod tests {
     use crate::core::case::Case;
     use crate::core::observer::Observer;
     use crate::core::registry::StepDefinition;
+    use crate::core::session::{Evidence, Session};
     use serde_json::json;
 
     /// An observer that reports the arguments it was created with.
@@ -1109,6 +1137,140 @@ mod tests {
         );
 
         assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// Counts how often the runner asks one kind of session for evidence.
+    static EVIDENCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingSession;
+
+    impl Session for CountingSession {
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+            EVIDENCE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![
+                Evidence::text("notes.txt", "the session was asked").expect("the name is valid"),
+            ])
+        }
+    }
+
+    #[test]
+    fn session_evidence_is_collected_only_for_a_failed_case_with_bundles() {
+        let dir = std::env::temp_dir().join(format!("da-runner-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the fixture directory must be created");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: case\nsteps: []\n").expect("the case file must be written");
+
+        let mut registry = registry();
+        registry
+            .register(StepDefinition {
+                name: "test.session",
+                description: "Opens a session that counts its evidence requests.",
+                args_schema: json!({"type": "object"}),
+                validate: |_| Ok(()),
+                run: |_, sessions| {
+                    sessions
+                        .get_or_create("test.session", || Ok(CountingSession))
+                        .map_err(StepError::Environment)?;
+                    Ok(json!({"opened": true}))
+                },
+            })
+            .expect("the session step must register");
+
+        let session_step = |expect| Step {
+            action: "test.session".to_string(),
+            args: json!({}),
+            expect,
+            save: Vec::new(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        };
+        let failing_expectation = || {
+            vec![crate::core::case::Expectation {
+                path: "$.opened".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!(false)),
+            }]
+        };
+
+        let mut cases = loaded(vec![session_step(Vec::new())]);
+        cases[0].path = source.clone();
+        EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let mut bundles = FailureBundles::new(dir.join("passing-failures"));
+        let outcome = run(
+            &cases,
+            &registry,
+            &EventBus::new(),
+            Some(&mut bundles),
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            EVIDENCE_CALLS.load(Ordering::SeqCst),
+            0,
+            "a passing case must not ask for evidence, even when bundles are enabled"
+        );
+
+        let mut failing = loaded(vec![session_step(failing_expectation())]);
+        failing[0].path = source.clone();
+        EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let outcome = run(
+            &failing,
+            &registry,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert_eq!(
+            outcome.exit_code(),
+            crate::exit::ExitCode::TestFailure,
+            "{outcome:?}"
+        );
+        assert_eq!(
+            EVIDENCE_CALLS.load(Ordering::SeqCst),
+            0,
+            "`--no-bundle` must not ask for evidence"
+        );
+
+        EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let mut bundles = FailureBundles::new(dir.join("failures"));
+        let outcome = run(
+            &failing,
+            &registry,
+            &EventBus::new(),
+            Some(&mut bundles),
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        let RunOutcome::Completed(report) = outcome else {
+            panic!("the run must complete");
+        };
+        assert_eq!(
+            EVIDENCE_CALLS.load(Ordering::SeqCst),
+            1,
+            "a failing case with bundles must ask once"
+        );
+        let bundle = report.cases[0]
+            .bundle
+            .as_ref()
+            .expect("the failed case must get a bundle");
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("test.session/notes.txt"))
+                .expect("the evidence must be written"),
+            "the session was asked"
+        );
+        assert!(report.bundle_errors.is_empty(), "{report:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
