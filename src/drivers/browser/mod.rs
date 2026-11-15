@@ -820,9 +820,6 @@ impl Locator {
     }
 }
 
-/// The body of a center lookup, run with the located element as `el`.
-const CENTER_BODY: &str = "if (!el) return null; el.scrollIntoView({ block: 'center', inline: 'center' }); var rect = el.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };";
-
 /// The body of a focus lookup, run with the located element as `el`.
 const FOCUS_BODY: &str = "if (!el) return false; el.focus(); return document.activeElement === el;";
 
@@ -911,12 +908,118 @@ fn text_collect_script(text: &str) -> String {
     TEXT_COLLECT_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
 }
 
-/// One matched element summary returned for ambiguous-locator errors.
-#[derive(Debug, Deserialize)]
+/// One matched element summary returned for ambiguous-locator and occlusion errors.
+#[derive(Clone, Debug, Deserialize)]
 struct CandidateInfo {
     tag: String,
     id: String,
     text: String,
+}
+
+impl CandidateInfo {
+    /// Formats `<tag#id> "text"` with text truncated to at most 60 characters.
+    fn format_label(&self) -> String {
+        let mut label = format!("<{}", self.tag);
+        if !self.id.is_empty() {
+            label.push('#');
+            label.push_str(&self.id);
+        }
+        label.push('>');
+        let text = truncate_chars(self.text.trim(), 60);
+        if !text.is_empty() {
+            label.push_str(&format!(" \"{text}\""));
+        }
+        label
+    }
+}
+
+/// Inspects an element (`el`) for visibility, disabled state, geometry, and hit-test.
+const ACTIONABLE_INSPECT_BODY: &str = r#"
+var summarizeNode = function (node) {
+  var tag = node.tagName ? node.tagName.toLowerCase() : 'element';
+  var id = node.id ? String(node.id) : '';
+  var raw = (node.innerText && node.innerText.trim()) ? node.innerText : node.textContent;
+  var text = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ').trim();
+  if (text.length > 240) text = text.slice(0, 240);
+  return { tag: tag, id: id, text: text };
+};
+if (!el || el.nodeType !== 1) return { status: 'not_visible' };
+var style = window.getComputedStyle(el);
+var rect = el.getBoundingClientRect();
+if (
+  style.display === 'none' ||
+  style.visibility === 'hidden' ||
+  style.visibility === 'collapse' ||
+  rect.width <= 0 ||
+  rect.height <= 0
+) {
+  return { status: 'not_visible' };
+}
+var fs = typeof el.closest === 'function' ? el.closest('fieldset[disabled]') : null;
+var inDisabledFieldset = false;
+if (fs) {
+  var legend = fs.querySelector('legend');
+  if (!legend || !legend.contains(el)) inDisabledFieldset = true;
+}
+var ariaNode = typeof el.closest === 'function' ? el.closest('[aria-disabled]') : null;
+var ariaDisabled = ariaNode !== null && String(ariaNode.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+if (el.disabled === true || el.hasAttribute('disabled') || inDisabledFieldset || ariaDisabled) {
+  return { status: 'disabled' };
+}
+var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+var cx0 = rect.left + rect.width / 2;
+var cy0 = rect.top + rect.height / 2;
+if (cx0 < 0 || cx0 >= vw || cy0 < 0 || cy0 >= vh) {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  rect = el.getBoundingClientRect();
+}
+var cx = rect.left + rect.width / 2;
+var cy = rect.top + rect.height / 2;
+var hit = document.elementFromPoint(cx, cy);
+var hitOk = hit !== null && (hit === el || el.contains(hit));
+var blocker = !hitOk && hit ? summarizeNode(hit) : null;
+return {
+  status: 'ready_candidate',
+  rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+  x: cx,
+  y: cy,
+  hit_ok: hitOk,
+  blocker: blocker
+};
+"#;
+
+/// Viewport rectangle used to check stability across consecutive polls.
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ElementRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl ElementRect {
+    fn same_geometry(self, other: Self) -> bool {
+        (self.x - other.x).abs() <= 0.5
+            && (self.y - other.y).abs() <= 0.5
+            && (self.width - other.width).abs() <= 0.5
+            && (self.height - other.height).abs() <= 0.5
+    }
+}
+
+/// JSON result returned by `ACTIONABLE_INSPECT_BODY`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ActionableInspect {
+    NotVisible,
+    Disabled,
+    ReadyCandidate {
+        rect: ElementRect,
+        x: f64,
+        y: f64,
+        hit_ok: bool,
+        blocker: Option<CandidateInfo>,
+    },
 }
 
 /// Status returned by the page candidate-resolution script when no single element was picked.
@@ -940,17 +1043,7 @@ enum PageResolveStatus {
 fn format_candidates(candidates: &[CandidateInfo], total: usize) -> String {
     let mut parts = Vec::with_capacity(candidates.len().min(5));
     for (index, candidate) in candidates.iter().take(5).enumerate() {
-        let mut label = format!("{}: <{}", index + 1, candidate.tag);
-        if !candidate.id.is_empty() {
-            label.push('#');
-            label.push_str(&candidate.id);
-        }
-        label.push('>');
-        let text = truncate_chars(candidate.text.trim(), 60);
-        if !text.is_empty() {
-            label.push_str(&format!(" \"{text}\""));
-        }
-        parts.push(label);
+        parts.push(format!("{}: {}", index + 1, candidate.format_label()));
     }
     if total > 5 {
         format!("{} (showing 5 of {total})", parts.join(", "))
@@ -1361,67 +1454,155 @@ impl BrowserSession {
         target: &ElementTarget,
         deadline: Deadline,
     ) -> Result<Located, StepError> {
+        let is_locator_visible_only =
+            matches!(target.locator, Locator::Text(_) | Locator::Role { .. });
+        self.poll_target(target, deadline, |session, target_desc, object_id| {
+            let visible = if is_locator_visible_only {
+                true
+            } else {
+                session.call_function_poll(
+                    target_desc,
+                    &object_id,
+                    VISIBLE_BODY,
+                    "check the visibility of",
+                    deadline,
+                )? == Value::Bool(true)
+            };
+            if visible {
+                Ok(Ok(Located(object_id)))
+            } else {
+                Ok(Err(PendingReason::Hidden))
+            }
+        })
+    }
+
+    /// Waits for the target element to exist, be visible, enabled, stable across
+    /// two consecutive polls, and unoccluded at its click point.
+    fn locate_actionable_target(
+        &mut self,
+        target: &ElementTarget,
+        deadline: Deadline,
+    ) -> Result<ActionableTarget, StepError> {
+        let mut previous_rect: Option<ElementRect> = None;
+        self.poll_target(target, deadline, |session, target_desc, object_id| {
+            let raw = session.call_function_poll(
+                target_desc,
+                &object_id,
+                ACTIONABLE_INSPECT_BODY,
+                "inspect the actionability of",
+                deadline,
+            )?;
+            let inspect: ActionableInspect = serde_json::from_value(raw).map_err(|error| {
+                LocateError::Step(StepError::Environment(format!(
+                    "the browser returned an invalid actionability state for {target_desc}: {error}"
+                )))
+            })?;
+            match inspect {
+                ActionableInspect::NotVisible => {
+                    previous_rect = None;
+                    Ok(Err(PendingReason::Hidden))
+                }
+                ActionableInspect::Disabled => {
+                    previous_rect = None;
+                    Ok(Err(PendingReason::Disabled))
+                }
+                ActionableInspect::ReadyCandidate {
+                    rect,
+                    x,
+                    y,
+                    hit_ok,
+                    blocker,
+                } => {
+                    let stable = previous_rect.is_some_and(|prev| prev.same_geometry(rect));
+                    previous_rect = Some(rect);
+                    if !stable {
+                        return Ok(Err(PendingReason::Unstable));
+                    }
+                    if !hit_ok {
+                        return Ok(Err(PendingReason::Occluded(blocker)));
+                    }
+                    Ok(Ok(ActionableTarget {
+                        located: Located(object_id),
+                        x,
+                        y,
+                    }))
+                }
+            }
+        })
+    }
+
+    /// Shared polling loop for `locate_target` and `locate_actionable_target`.
+    fn poll_target<T>(
+        &mut self,
+        target: &ElementTarget,
+        deadline: Deadline,
+        mut check: impl FnMut(&mut Self, &str, String) -> Result<Result<T, PendingReason>, LocateError>,
+    ) -> Result<T, StepError> {
         let target_desc = target.describe_with(&self.testid_attribute);
-        let mut last_pending: Option<(String, PendingReason)> = None;
+        let mut last_pending = (target_desc.clone(), PendingReason::Missing);
         loop {
             let poll = match self.resolve_target_once(target, deadline) {
                 Ok(poll) => poll,
                 Err(LocateError::Timeout) => {
-                    let (desc, reason) =
-                        last_pending.unwrap_or((target_desc, PendingReason::Missing));
-                    return Err(pending_timeout_error(&desc, reason, deadline));
+                    return Err(pending_timeout_error(
+                        &last_pending.0,
+                        last_pending.1,
+                        deadline,
+                    ));
                 }
                 Err(LocateError::Step(error)) => return Err(error),
             };
             match poll {
-                ResolvePoll::Found(object_id) => {
-                    let visible =
-                        if matches!(target.locator, Locator::Text(_) | Locator::Role { .. }) {
-                            true
-                        } else {
-                            let page = self.page.clone();
-                            let function =
-                                format!("function () {{ var el = this; {VISIBLE_BODY} }}");
-                            match self
-                                .connection_mut()?
-                                .call_function(&page, &object_id, &function, deadline)
-                            {
-                                Ok(value) => value == Value::Bool(true),
-                                Err(CdpError::Timeout { .. }) => {
-                                    return Err(pending_timeout_error(
-                                        &target_desc,
-                                        PendingReason::Hidden,
-                                        deadline,
-                                    ));
-                                }
-                                Err(error) => {
-                                    return Err(evaluate_error(
-                                        &target_desc,
-                                        error,
-                                        "check the visibility of",
-                                        deadline,
-                                    ));
-                                }
-                            }
-                        };
-                    if visible {
-                        return Ok(Located(object_id));
+                ResolvePoll::Found(object_id) => match check(self, &target_desc, object_id) {
+                    Ok(Ok(ready)) => return Ok(ready),
+                    Ok(Err(reason)) => {
+                        last_pending = (target_desc.clone(), reason);
                     }
-                    last_pending = Some((target_desc.clone(), PendingReason::Hidden));
-                }
+                    Err(LocateError::Timeout) => {
+                        return Err(pending_timeout_error(
+                            &last_pending.0,
+                            last_pending.1,
+                            deadline,
+                        ));
+                    }
+                    Err(LocateError::Step(error)) => return Err(error),
+                },
                 ResolvePoll::Pending {
                     target_desc: desc,
                     reason,
                 } => {
-                    last_pending = Some((desc, reason));
+                    last_pending = (desc, reason);
                 }
             }
             if deadline.passed() {
-                let (desc, reason) = last_pending.unwrap_or((target_desc, PendingReason::Missing));
-                return Err(pending_timeout_error(&desc, reason, deadline));
+                return Err(pending_timeout_error(
+                    &last_pending.0,
+                    last_pending.1,
+                    deadline,
+                ));
             }
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    /// Runs one action body inside a poll loop, preserving `LocateError::Timeout`.
+    fn call_function_poll(
+        &mut self,
+        target_desc: &str,
+        object_id: &str,
+        body: &str,
+        action: &str,
+        deadline: Deadline,
+    ) -> Result<Value, LocateError> {
+        let page = self.page.clone();
+        let function = format!("function () {{ var el = this; {body} }}");
+        self.connection_mut()
+            .map_err(LocateError::Step)?
+            .call_function(&page, object_id, &function, deadline)
+            .map_err(|error| match error {
+                CdpError::Timeout { .. } => LocateError::Timeout,
+                other => LocateError::Step(action_error(target_desc, action, other)),
+            })
     }
 
     /// Runs one non-blocking resolution pass over `target` and its `within` chain.
@@ -1854,6 +2035,13 @@ fn attach(connection: &mut Connection, deadline: Deadline) -> Result<(String, St
     Ok((page, target_id))
 }
 
+/// An actionable target with its verified viewport click coordinates.
+struct ActionableTarget {
+    located: Located,
+    x: f64,
+    y: f64,
+}
+
 /// Outcome of one resolution poll for an [`ElementTarget`].
 enum ResolvePoll {
     /// A single element (or the `nth`-indexed element) resolved to a DOM `objectId`.
@@ -1865,11 +2053,14 @@ enum ResolvePoll {
     },
 }
 
-/// Why one poll did not yield an element yet.
+/// Why one poll did not yield an actionable element yet.
 enum PendingReason {
     Missing,
     Hidden,
     OutOfRange { index: usize, count: usize },
+    Disabled,
+    Unstable,
+    Occluded(Option<CandidateInfo>),
 }
 
 /// Failure during one non-blocking resolution pass.
@@ -1884,22 +2075,33 @@ fn pending_timeout_error(
     reason: PendingReason,
     deadline: Deadline,
 ) -> StepError {
+    let ms = deadline.timeout_ms();
     match reason {
         PendingReason::Missing => StepError::Execution(format!(
-            "could not find {target_desc} within {} ms; check the page and the locator",
-            deadline.timeout_ms()
+            "could not find {target_desc} within {ms} ms; check the page and the locator"
         )),
         PendingReason::Hidden => StepError::Execution(format!(
-            "{target_desc} was found but not visible within {} ms; check the page and the locator",
-            deadline.timeout_ms()
+            "{target_desc} was found but not visible within {ms} ms; check the page and the locator"
         )),
         PendingReason::OutOfRange { index, count } => {
             let noun = if count == 1 { "element" } else { "elements" };
             StepError::Execution(format!(
-                "could not find {target_desc} within {} ms: `nth` index {index} is out of range for {count} matched {noun}",
-                deadline.timeout_ms()
+                "could not find {target_desc} within {ms} ms: `nth` index {index} is out of range for {count} matched {noun}"
             ))
         }
+        PendingReason::Disabled => StepError::Execution(format!(
+            "{target_desc} remained disabled (`disabled` or `aria-disabled=\"true\"`) within {ms} ms"
+        )),
+        PendingReason::Unstable => StepError::Execution(format!(
+            "{target_desc} position or size was not stable across consecutive polls within {ms} ms"
+        )),
+        PendingReason::Occluded(Some(blocker)) => StepError::Execution(format!(
+            "{target_desc} was occluded by {} at its click point within {ms} ms",
+            blocker.format_label()
+        )),
+        PendingReason::Occluded(None) => StepError::Execution(format!(
+            "{target_desc} was not hit-testable (`elementFromPoint` returned nothing) within {ms} ms"
+        )),
     }
 }
 
@@ -2447,16 +2649,9 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
-    let located = session.locate_target(&target, deadline)?;
-    let center = session.run_on(&target_desc, &located, CENTER_BODY, "click", deadline)?;
-    let x = center
-        .get("x")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| action_error(&target_desc, "click", "the element has no position"))?;
-    let y = center
-        .get("y")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| action_error(&target_desc, "click", "the element has no position"))?;
+    let actionable = session.locate_actionable_target(&target, deadline)?;
+    let located = actionable.located;
+    let (x, y) = (actionable.x, actionable.y);
     for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
         session.dispatch(
             &target_desc,
@@ -2501,8 +2696,14 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
-    let located = session.locate_target(&target, deadline)?;
-    let focused = session.run_on(&target_desc, &located, FOCUS_BODY, "focus", deadline)?;
+    let actionable = session.locate_actionable_target(&target, deadline)?;
+    let focused = session.run_on(
+        &target_desc,
+        &actionable.located,
+        FOCUS_BODY,
+        "focus",
+        deadline,
+    )?;
     if focused != Value::Bool(true) {
         return Err(action_error(
             &target_desc,

@@ -238,6 +238,7 @@ fn route(
         // requests that completed during that step.
         (_, "/browser/network") => html_response("200 OK", &browser_network(query)),
         (_, "/browser/locators") => html_response("200 OK", &browser_locators(query)),
+        (_, "/browser/actionability") => html_response("200 OK", browser_actionability()),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
         // finishes loading before a short navigation timeout, which is what
@@ -651,6 +652,97 @@ fn browser_locators(query: &str) -> String {
 <p id="hidden-note" data-testid="hidden-note" style="display:none">Hidden note</p>
 </body></html>"#
     )
+}
+
+/// A page for testing actionability checks on `browser.click` and `browser.type`.
+fn browser_actionability() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Actionability probe</title></head>
+<body>
+<h1>Actionability probe</h1>
+<p id="action-result">none</p>
+
+<button id="always-disabled" disabled type="button"
+  onclick="document.getElementById('action-result').textContent = 'always-disabled';">Always Disabled</button>
+<button id="always-aria-disabled" aria-disabled="true" type="button"
+  onclick="document.getElementById('action-result').textContent = 'always-aria-disabled';">Aria Disabled</button>
+<input id="disabled-input" disabled autocomplete="off"
+  oninput="document.getElementById('action-result').textContent = 'typed:' + this.value;">
+
+<button id="start-enable" type="button"
+  onclick="setTimeout(function () {
+    document.getElementById('enable-later').disabled = false;
+  }, 250);">Start Enable</button>
+<button id="enable-later" disabled type="button"
+  onclick="document.getElementById('action-result').textContent = 'enabled-clicked';">Enable Later</button>
+
+<button id="start-enable-input" type="button"
+  onclick="setTimeout(function () {
+    document.getElementById('enable-input-later').removeAttribute('aria-disabled');
+  }, 250);">Start Enable Input</button>
+<input id="enable-input-later" aria-disabled="true" autocomplete="off"
+  oninput="document.getElementById('action-result').textContent = 'aria-typed:' + this.value;">
+
+<div style="height:44px;">
+  <button id="always-moving" type="button" style="position:relative;left:0px;"
+    onclick="document.getElementById('action-result').textContent = 'moving-clicked';">Always Moving</button>
+</div>
+<script>
+(function () {
+  var offset = 0;
+  setInterval(function () {
+    offset = (offset + 7) % 1000;
+    var el = document.getElementById('always-moving');
+    if (el) el.style.left = offset + 'px';
+  }, 15);
+})();
+</script>
+
+<div style="height:44px;">
+  <button id="start-move" type="button"
+    onclick="
+      var step = 0;
+      var btn = document.getElementById('settle-later');
+      var timer = setInterval(function () {
+        step += 1;
+        btn.style.left = (step * 30) + 'px';
+        if (step >= 6) {
+          clearInterval(timer);
+          btn.style.left = '200px';
+          btn.dataset.settled = 'yes';
+        }
+      }, 30);
+    ">Start Move</button>
+  <button id="settle-later" type="button" style="position:relative;left:0px;"
+    onclick="document.getElementById('action-result').textContent = 'settle:' + (this.dataset.settled || 'no');">Settle Later</button>
+</div>
+
+<div style="position:relative;width:220px;height:40px;">
+  <button id="occluded-btn" type="button" style="width:220px;height:40px;"
+    onclick="document.getElementById('action-result').textContent = 'occluded-clicked';">Occluded Target</button>
+  <div id="blocker-overlay" style="position:absolute;inset:0;background:rgba(0,0,0,0.2);"
+    onclick="document.getElementById('action-result').textContent = 'blocker-clicked';">Blocking Overlay</div>
+</div>
+
+<div style="position:relative;width:220px;height:32px;">
+  <input id="occluded-input" style="width:220px;height:30px;" autocomplete="off"
+    oninput="document.getElementById('action-result').textContent = 'occluded-typed:' + this.value;">
+  <div id="input-blocker" style="position:absolute;inset:0;background:rgba(0,0,0,0.2);">Input Blocker</div>
+</div>
+
+<button id="start-uncover" type="button"
+  onclick="setTimeout(function () {
+    document.getElementById('temp-blocker').style.display = 'none';
+  }, 250);">Start Uncover</button>
+<div style="position:relative;width:220px;height:40px;">
+  <button id="uncover-later" type="button" style="width:220px;height:40px;"
+    onclick="document.getElementById('action-result').textContent = 'uncovered-clicked';">Uncover Later</button>
+  <div id="temp-blocker" style="position:absolute;inset:0;background:rgba(0,0,0,0.2);">Temp Blocker</div>
+</div>
+
+<button id="child-btn" type="button"
+  onclick="document.getElementById('action-result').textContent = 'child-clicked';"><span id="inner-label">Nested Child</span></button>
+</body></html>"#
 }
 
 /// The value of one `name=value` pair of a query string.

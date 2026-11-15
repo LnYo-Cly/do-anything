@@ -2627,3 +2627,332 @@ steps:
         "secret leaked in bundle report.json: {report_text}"
     );
 }
+
+#[test]
+fn click_and_type_wait_for_enabled_stable_and_unoccluded_elements() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-actionability-wait");
+    let url = server.url("/browser/actionability");
+
+    let case = dir.write(
+        "actionability-wait.yaml",
+        &format!(
+            r##"name: click and type wait for actionability checks to pass
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#start-enable"
+  - browser.click:
+      css: "#enable-later"
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: enabled-clicked
+  - browser.click:
+      css: "#start-enable-input"
+  - browser.type:
+      css: "#enable-input-later"
+      text: now ready
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: aria-typed:now ready
+  - browser.click:
+      css: "#start-move"
+  - browser.click:
+      css: "#settle-later"
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: settle:yes
+  - browser.click:
+      css: "#start-uncover"
+  - browser.click:
+      css: "#uncover-later"
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: uncovered-clicked
+  - browser.click:
+      css: "#child-btn"
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: child-clicked
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn actionability_timeouts_name_failed_check_and_blocker_while_read_and_wait_stay_unchanged() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-actionability-fail");
+    let url = server.url("/browser/actionability");
+
+    // 1. disabled attribute on click -> fails with disabled check name
+    let disabled_click = dir.write(
+        "disabled-click.yaml",
+        &format!(
+            r##"name: disabled click times out naming disabled check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#always-disabled"
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&disabled_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("disabled"),
+        "expected disabled actionability timeout, got: {message}"
+    );
+
+    // 2. aria-disabled="true" on click -> fails with disabled check name
+    let aria_disabled_click = dir.write(
+        "aria-disabled-click.yaml",
+        &format!(
+            r##"name: aria-disabled click times out naming disabled check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#always-aria-disabled"
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&aria_disabled_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("disabled"),
+        "expected aria-disabled actionability timeout, got: {message}"
+    );
+
+    // 3. disabled attribute on type -> fails with disabled check name
+    let disabled_type = dir.write(
+        "disabled-type.yaml",
+        &format!(
+            r##"name: disabled type times out naming disabled check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      css: "#disabled-input"
+      text: ignored
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&disabled_type),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("disabled"),
+        "expected disabled type timeout, got: {message}"
+    );
+
+    // 4. moving element on click -> fails naming unstable / moving position
+    let moving_click = dir.write(
+        "moving-click.yaml",
+        &format!(
+            r##"name: moving element click times out naming stability check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#always-moving"
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&moving_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("stable") || message.contains("moving"),
+        "expected stability actionability timeout, got: {message}"
+    );
+
+    // 5. occluded click -> fails naming occluding #blocker-overlay element
+    let occluded_click = dir.write(
+        "occluded-click.yaml",
+        &format!(
+            r##"name: occluded click times out naming blocking element
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#occluded-btn"
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&occluded_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("blocker-overlay"),
+        "expected occluding element `blocker-overlay` in error, got: {message}"
+    );
+
+    // 6. occluded type -> fails naming occluding #input-blocker element
+    let occluded_type = dir.write(
+        "occluded-type.yaml",
+        &format!(
+            r##"name: occluded type times out naming blocking element
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      css: "#occluded-input"
+      text: blocked
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&occluded_type),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("input-blocker"),
+        "expected occluding element `input-blocker` in error, got: {message}"
+    );
+
+    // 7. read and wait only check existence + visibility, so disabled/moving/occluded still succeed
+    let read_wait_case = dir.write(
+        "read-and-wait-unchanged.yaml",
+        &format!(
+            r##"name: read and wait ignore disabled moving and occluded checks
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.wait:
+      css: "#always-disabled"
+  - browser.read:
+      css: "#always-disabled"
+    expect:
+      - path: $.text
+        equals: Always Disabled
+  - browser.wait:
+      css: "#always-moving"
+  - browser.wait:
+      css: "#occluded-btn"
+  - browser.read:
+      css: "#occluded-btn"
+    expect:
+      - path: $.text
+        equals: Occluded Target
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&read_wait_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
