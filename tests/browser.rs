@@ -2020,3 +2020,133 @@ fn browser_screenshot_resolves_a_relative_path_against_the_case_file() {
         "the screenshot must be a PNG"
     );
 }
+
+#[test]
+fn schema_and_lint_validate_testid_within_nth_and_testid_attribute() {
+    let dir = TempDir::new("browser-locator-modifiers");
+    let schema_output = run_da_in(dir.path(), &["schema"]);
+    assert_eq!(
+        exit_code(&schema_output),
+        Some(0),
+        "da schema failed: {}",
+        stderr(&schema_output)
+    );
+    let schema_value: Value =
+        serde_json::from_str(&stdout(&schema_output)).expect("da schema must emit valid JSON");
+    let validator =
+        jsonschema::validator_for(&schema_value).expect("da schema must compile as Draft 2020-12");
+
+    let valid_yaml = concat!(
+        "name: Valid new locator modifiers\n",
+        "steps:\n",
+        "  - browser.open:\n",
+        "      url: http://127.0.0.1:8080/\n",
+        "      testid_attribute: data-qa\n",
+        "  - browser.click:\n",
+        "      testid: submit-btn\n",
+        "      nth: 0\n",
+        "      within:\n",
+        "        css: form.checkout\n",
+        "        within:\n",
+        "          role: region\n",
+        "          name: Payment\n",
+        "          nth: 1\n",
+        "  - browser.type:\n",
+        "      testid: card-input\n",
+        "      text: \"4242\"\n",
+        "  - browser.wait:\n",
+        "      testid: confirmation\n",
+        "      within:\n",
+        "        css: main\n",
+        "  - browser.read:\n",
+        "      testid: receipt\n",
+        "      nth: 0\n",
+    );
+    let valid_path = dir.write("valid.yaml", valid_yaml);
+    let valid_instance: Value = serde_saphyr::from_str(valid_yaml).expect("valid YAML must parse");
+    assert!(
+        validator.is_valid(&valid_instance),
+        "schema must accept valid testid/within/nth/testid_attribute: {:?}",
+        validator
+            .iter_errors(&valid_instance)
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+    let valid_lint = run_da_in(
+        dir.path(),
+        &["--output", "json", "lint", path_str(&valid_path)],
+    );
+    assert_eq!(
+        exit_code(&valid_lint),
+        Some(0),
+        "lint must accept valid case: {}",
+        stdout(&valid_lint)
+    );
+
+    let invalid_cases = [
+        (
+            "empty_testid_attribute",
+            "name: Bad\nsteps:\n  - browser.open:\n      url: http://127.0.0.1/\n      testid_attribute: \"\"\n",
+        ),
+        (
+            "space_in_testid_attribute",
+            "name: Bad\nsteps:\n  - browser.open:\n      url: http://127.0.0.1/\n      testid_attribute: \"data qa\"\n",
+        ),
+        (
+            "multiple_locators_with_testid",
+            "name: Bad\nsteps:\n  - browser.click:\n      css: \"#a\"\n      testid: btn\n",
+        ),
+        (
+            "name_without_role_and_testid",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      name: Submit\n",
+        ),
+        (
+            "negative_nth",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      nth: -1\n",
+        ),
+        (
+            "float_nth",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      nth: 1.5\n",
+        ),
+        (
+            "null_nth",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      nth: null\n",
+        ),
+        (
+            "invalid_empty_within",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      within: {}\n",
+        ),
+        (
+            "invalid_within_name_without_role",
+            "name: Bad\nsteps:\n  - browser.read:\n      testid: label\n      within:\n        testid: panel\n        name: Panel\n",
+        ),
+        (
+            "url_contains_with_within",
+            "name: Bad\nsteps:\n  - browser.wait:\n      url_contains: /done\n      within:\n        css: main\n",
+        ),
+        (
+            "url_contains_with_nth",
+            "name: Bad\nsteps:\n  - browser.wait:\n      url_contains: /done\n      nth: 0\n",
+        ),
+        (
+            "url_contains_with_testid",
+            "name: Bad\nsteps:\n  - browser.wait:\n      url_contains: /done\n      testid: done\n",
+        ),
+    ];
+
+    for (label, yaml) in invalid_cases {
+        let instance: Value = serde_saphyr::from_str(yaml).expect("case YAML must parse");
+        assert!(
+            !validator.is_valid(&instance),
+            "da schema must reject `{label}`"
+        );
+        let file = dir.write(&format!("{label}.yaml"), yaml);
+        let lint = run_da_in(dir.path(), &["--output", "json", "lint", path_str(&file)]);
+        assert_ne!(
+            exit_code(&lint),
+            Some(0),
+            "da lint must reject `{label}`, got stdout: {}",
+            stdout(&lint)
+        );
+    }
+}
