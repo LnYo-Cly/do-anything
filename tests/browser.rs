@@ -1295,6 +1295,9 @@ fn connect_drives_a_page_in_a_browser_it_does_not_close() {
         "connect.yaml",
         &format!(
             r##"name: connect to the user's browser
+observe:
+  net:
+    browser.network: {{}}
 steps:
   - browser.open:
       connect: "{}"
@@ -1302,6 +1305,8 @@ steps:
     expect:
       - path: $.title
         equals: Browser form
+      - path: "$.observed.net.requests[?(@.url == '{case_url}')].status"
+        equals: 200
   - browser.read:
       css: "#case"
     expect:
