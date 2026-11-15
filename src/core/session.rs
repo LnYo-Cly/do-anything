@@ -215,8 +215,7 @@ impl Sessions {
     ///
     /// A session that fails is reported in its group's `error` instead of
     /// stopping the others. A session that returns no files and no error is
-    /// left out, so a case with no browser session adds no directory to its
-    /// bundle.
+    /// left out, so a case with no evidence adds no directory to its bundle.
     pub fn collect_evidence(&mut self) -> Vec<SessionEvidence> {
         let mut groups = Vec::new();
         for entry in &mut self.entries {
@@ -453,11 +452,11 @@ mod tests {
         let mut sessions = Sessions::new();
 
         let error = sessions
-            .get_or_create::<Tracked>("test.session", || Err("no browser".to_string()))
+            .get_or_create::<Tracked>("test.session", || Err("no resource".to_string()))
             .expect_err("the factory failure must be reported");
 
         assert!(error.contains("test.session"), "got: {error}");
-        assert!(error.contains("no browser"), "got: {error}");
+        assert!(error.contains("no resource"), "got: {error}");
         assert!(
             sessions
                 .get::<Tracked>("test.session")
@@ -513,8 +512,8 @@ mod tests {
             let error = Evidence::text(name, "text").expect_err("a reserved name must be refused");
             assert!(error.contains("reserved"), "got: {error}");
         }
-        assert!(Evidence::text("screenshot.png", "text").is_ok());
-        assert!(Evidence::bytes("DOM.HTML", vec![0]).is_ok());
+        assert!(Evidence::text("page.txt", "text").is_ok());
+        assert!(Evidence::bytes("PAGE.TXT", vec![0]).is_ok());
     }
 
     #[test]

@@ -455,7 +455,7 @@ fn run_case(
 
     // Evidence is collected before the sessions release their resources, and
     // only when the case already did not pass and a bundle will be written.
-    // A passing case never takes a screenshot, even though its sessions are
+    // A passing case never asks for evidence, even though its sessions are
     // still open here.
     let status_before_close = match stopped.as_ref().map(|problem| problem.kind) {
         None => CaseStatus::Passed,

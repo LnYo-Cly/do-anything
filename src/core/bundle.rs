@@ -439,9 +439,9 @@ mod tests {
             SessionEvidence {
                 kind: "test.evidence".to_string(),
                 files: vec![
-                    Evidence::text("dom.html", "<p>s3cr3t-value</p>")
+                    Evidence::text("page.txt", "<p>s3cr3t-value</p>")
                         .expect("the text evidence name is valid"),
-                    Evidence::bytes("screen.bin", vec![0x89, b'P', b'N', b'G'])
+                    Evidence::bytes("frame.bin", vec![0x89, b'P', b'N', b'G'])
                         .expect("the binary evidence name is valid"),
                 ],
                 error: None,
@@ -459,13 +459,13 @@ mod tests {
 
         assert_eq!(
             names(&bundle.join("test.evidence")),
-            vec!["dom.html", "screen.bin"]
+            vec!["frame.bin", "page.txt"]
         );
-        let text = std::fs::read_to_string(bundle.join("test.evidence/dom.html"))
+        let text = std::fs::read_to_string(bundle.join("test.evidence/page.txt"))
             .expect("the text evidence must be readable");
         assert_eq!(text, "<p>***</p>");
         assert_eq!(
-            std::fs::read(bundle.join("test.evidence/screen.bin"))
+            std::fs::read(bundle.join("test.evidence/frame.bin"))
                 .expect("the binary evidence must be readable"),
             vec![0x89, b'P', b'N', b'G']
         );
