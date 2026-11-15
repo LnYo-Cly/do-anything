@@ -631,6 +631,7 @@ fn every_declared_observer_argument_bound_is_enforced_by_validate() {
 #[cfg(all(feature = "log", any(feature = "cli", feature = "http")))]
 fn observer_arguments(observer: &str) -> Value {
     match observer {
+        "browser.network" => json!({}),
         "log.file" => json!({"path": "app.log"}),
         other => panic!("add the valid arguments of `{other}` to this test"),
     }

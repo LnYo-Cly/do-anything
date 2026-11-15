@@ -1825,6 +1825,156 @@ fn a_failed_case_without_a_browser_session_keeps_the_existing_bundle_files() {
 }
 
 #[test]
+fn network_observer_reports_each_request_once_in_the_step_that_completes_it() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-network");
+    let closed = closed_port();
+    let page = server.url(&format!("/browser/network?case=network&closed={closed}"));
+    let ok = server.url("/health?kind=post");
+    let missing = server.url("/nowhere?kind=missing");
+    let failed = format!("http://127.0.0.1:{closed}/closed");
+    let case = dir.write(
+        "network.yaml",
+        &format!(
+            r##"name: network observer
+observe:
+  net:
+    browser.network: {{}}
+steps:
+  - browser.open:
+      url: "{page}"
+    expect:
+      - path: "$.observed.net.requests[?(@.url == '{page}')].status"
+        equals: 200
+      - path: "$.observed.net.requests[?(@.url == '{page}')].type"
+        equals: Document
+      - path: "$.observed.net.requests[?(@.url == '{page}')].method"
+        equals: GET
+  - browser.click:
+      css: "#net-all"
+  - browser.wait:
+      css: "#network-done"
+      timeout_ms: 10000
+    expect:
+      - path: "$.observed.net.requests[?(@.url == '{ok}')].status"
+        equals: 200
+      - path: "$.observed.net.requests[?(@.url == '{ok}')].method"
+        equals: POST
+      - path: "$.observed.net.requests[?(@.url == '{ok}')].type"
+        equals: Fetch
+      - path: "$.observed.net.requests[?(@.url == '{missing}')].status"
+        equals: 404
+      - path: "$.observed.net.requests[?(@.url == '{failed}')].status"
+        equals: null
+      - path: "$.observed.net.requests[?(@.url == '{failed}')].failed"
+        exists: true
+      - path: $.observed.net.pending
+        equals: 0
+  - browser.read:
+      css: "#network-done"
+    expect:
+      - path: $.observed.net.requests
+        equals: []
+"##
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    assert_eq!(
+        value["cases"][0]["status"], "passed",
+        "every network assertion must pass: {value}"
+    );
+}
+
+#[test]
+fn a_network_url_built_from_the_environment_is_redacted() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-network-secret");
+    let secret = "browser-s3cr3t-network-url";
+    let closed = closed_port();
+    let case = dir.write(
+        "secret.yaml",
+        &format!(
+            r##"name: network url secret
+vars:
+  token: "${{env:DA_NETWORK_TEST_SECRET}}"
+observe:
+  net:
+    browser.network: {{}}
+steps:
+  - browser.open:
+      url: "{}/browser/network?case=${{token}}&closed={closed}"
+    expect:
+      - path: "$.observed.net.requests[?(@.type == 'Document')].url"
+        equals: "unexpected"
+"##,
+            server.url("")
+        ),
+    );
+    let environment = [("DA_NETWORK_TEST_SECRET", secret.to_string())];
+
+    for mode in ["text", "json"] {
+        let output = run_da_with_env(
+            dir.path(),
+            &["--output", mode, "run", path_str(&case), "--no-bundle"],
+            &environment,
+        );
+        assert_eq!(
+            exit_code(&output),
+            Some(1),
+            "{mode}: stdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let rendered = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(
+            !rendered.contains(secret),
+            "{mode}: the output leaked the URL secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("***"),
+            "{mode}: the output must show the redaction marker: {rendered}"
+        );
+    }
+
+    let json = run_da_with_env(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        &environment,
+    );
+    let value = json_stdout(&json);
+    let actual = value["cases"][0]["steps"][0]["assertions"][0]["actual"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the observed URL must be the actual value: {value}"));
+    assert!(
+        actual.contains("case=***"),
+        "the observed request URL must be redacted where the environment value was: {actual}"
+    );
+    assert!(
+        actual.contains("/browser/network"),
+        "the observed request URL must still name the page: {actual}"
+    );
+}
+
+#[test]
 fn browser_screenshot_resolves_a_relative_path_against_the_case_file() {
     let server = TestServer::start();
     let Some(_guard) = chrome_test(&server) else {
