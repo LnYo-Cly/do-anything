@@ -3,7 +3,14 @@ name = "do-anything"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+description = "A declarative test runner for HTTP APIs, command-line programs, SQL databases and browsers."
+repository = "https://github.com/LnYo-Cly/do-anything"
+homepage = "https://github.com/LnYo-Cly/do-anything"
+readme = "README.md"
 license = "MIT"
+keywords = ["testing", "test-runner", "yaml", "cli", "browser"]
+categories = ["development-tools::testing", "command-line-utilities"]
+include = ["/src/**", "/README.md", "/README.zh-CN.md", "/LICENSE"]
 
 [[bin]]
 name = "da"
