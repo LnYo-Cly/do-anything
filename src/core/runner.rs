@@ -765,6 +765,7 @@ mod tests {
     use crate::core::case::Case;
     use crate::core::observer::Observer;
     use crate::core::registry::StepDefinition;
+    use crate::core::session::{Evidence, Session};
     use serde_json::json;
 
     /// An observer that reports the arguments it was created with.
@@ -1136,6 +1137,140 @@ mod tests {
         );
 
         assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// Counts how often the runner asks one kind of session for evidence.
+    static EVIDENCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingSession;
+
+    impl Session for CountingSession {
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+            EVIDENCE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![
+                Evidence::text("notes.txt", "the session was asked").expect("the name is valid"),
+            ])
+        }
+    }
+
+    #[test]
+    fn session_evidence_is_collected_only_for_a_failed_case_with_bundles() {
+        let dir = std::env::temp_dir().join(format!("da-runner-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the fixture directory must be created");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: case\nsteps: []\n").expect("the case file must be written");
+
+        let mut registry = registry();
+        registry
+            .register(StepDefinition {
+                name: "test.session",
+                description: "Opens a session that counts its evidence requests.",
+                args_schema: json!({"type": "object"}),
+                validate: |_| Ok(()),
+                run: |_, sessions| {
+                    sessions
+                        .get_or_create("test.session", || Ok(CountingSession))
+                        .map_err(StepError::Environment)?;
+                    Ok(json!({"opened": true}))
+                },
+            })
+            .expect("the session step must register");
+
+        let session_step = |expect| Step {
+            action: "test.session".to_string(),
+            args: json!({}),
+            expect,
+            save: Vec::new(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        };
+        let failing_expectation = || {
+            vec![crate::core::case::Expectation {
+                path: "$.opened".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!(false)),
+            }]
+        };
+
+        let mut cases = loaded(vec![session_step(Vec::new())]);
+        cases[0].path = source.clone();
+        EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let mut bundles = FailureBundles::new(dir.join("passing-failures"));
+        let outcome = run(
+            &cases,
+            &registry,
+            &EventBus::new(),
+            Some(&mut bundles),
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            EVIDENCE_CALLS.load(Ordering::SeqCst),
+            0,
+            "a passing case must not ask for evidence, even when bundles are enabled"
+        );
+
+        let mut failing = loaded(vec![session_step(failing_expectation())]);
+        failing[0].path = source.clone();
+        EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let outcome = run(
+            &failing,
+            &registry,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert_eq!(
+            outcome.exit_code(),
+            crate::exit::ExitCode::TestFailure,
+            "{outcome:?}"
+        );
+        assert_eq!(
+            EVIDENCE_CALLS.load(Ordering::SeqCst),
+            0,
+            "`--no-bundle` must not ask for evidence"
+        );
+
+        EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let mut bundles = FailureBundles::new(dir.join("failures"));
+        let outcome = run(
+            &failing,
+            &registry,
+            &EventBus::new(),
+            Some(&mut bundles),
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        let RunOutcome::Completed(report) = outcome else {
+            panic!("the run must complete");
+        };
+        assert_eq!(
+            EVIDENCE_CALLS.load(Ordering::SeqCst),
+            1,
+            "a failing case with bundles must ask once"
+        );
+        let bundle = report.cases[0]
+            .bundle
+            .as_ref()
+            .expect("the failed case must get a bundle");
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("test.session/notes.txt"))
+                .expect("the evidence must be written"),
+            "the session was asked"
+        );
+        assert!(report.bundle_errors.is_empty(), "{report:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
