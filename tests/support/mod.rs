@@ -239,6 +239,20 @@ fn route(
         (_, "/browser/network") => html_response("200 OK", &browser_network(query)),
         (_, "/browser/locators") => html_response("200 OK", &browser_locators(query)),
         (_, "/browser/actionability") => html_response("200 OK", browser_actionability()),
+        (_, "/browser/probe/iframe") => html_response("200 OK", browser_probe_iframe()),
+        (_, "/browser/probe/iframe-inner") => html_response(
+            "200 OK",
+            "<!doctype html><html><body><button id=\"inside-frame\">Inside Frame</button></body></html>",
+        ),
+        (_, "/browser/probe/shadow") => html_response("200 OK", browser_probe_shadow()),
+        (_, "/browser/probe/new-tab") => html_response("200 OK", browser_probe_new_tab()),
+        (_, "/browser/probe/new-tab-target") => html_response(
+            "200 OK",
+            "<!doctype html><html><head><title>New Tab Target</title></head><body><p id=\"new-tab-marker\">Opened</p></body></html>",
+        ),
+        (_, "/browser/probe/dialog") => html_response("200 OK", browser_probe_dialog()),
+        (_, "/browser/probe/upload") => html_response("200 OK", browser_probe_upload()),
+        (_, "/browser/probe/coords") => html_response("200 OK", browser_probe_coords()),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
         // finishes loading before a short navigation timeout, which is what
@@ -742,6 +756,65 @@ fn browser_actionability() -> &'static str {
 
 <button id="child-btn" type="button"
   onclick="document.getElementById('action-result').textContent = 'child-clicked';"><span id="inner-label">Nested Child</span></button>
+</body></html>"#
+}
+
+fn browser_probe_iframe() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Iframe</title></head>
+<body>
+<iframe id="probe-frame" src="/browser/probe/iframe-inner" width="240" height="80"></iframe>
+</body></html>"#
+}
+
+fn browser_probe_shadow() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Shadow DOM</title></head>
+<body>
+<div id="shadow-host"></div>
+<p id="shadow-status">idle</p>
+<script>
+var root = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
+var btn = document.createElement('button');
+btn.id = 'inside-shadow';
+btn.textContent = 'Inside Shadow';
+btn.onclick = function () { document.getElementById('shadow-status').textContent = 'clicked'; };
+root.appendChild(btn);
+</script>
+</body></html>"#
+}
+
+fn browser_probe_new_tab() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe New Tab</title></head>
+<body>
+<a id="open-new-tab" href="/browser/probe/new-tab-target" target="_blank">Open Tab</a>
+</body></html>"#
+}
+
+fn browser_probe_dialog() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Dialog</title></head>
+<body>
+<button id="trigger-alert" type="button"
+  onclick="window.alert('probe alert'); document.getElementById('dialog-status').textContent = 'after-alert';">Alert</button>
+<p id="dialog-status">before-alert</p>
+</body></html>"#
+}
+
+fn browser_probe_upload() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe File Upload</title></head>
+<body>
+<input id="file-upload" type="file">
+</body></html>"#
+}
+
+fn browser_probe_coords() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Coordinates</title></head>
+<body>
+<canvas id="probe-canvas" width="200" height="100"></canvas>
 </body></html>"#
 }
 

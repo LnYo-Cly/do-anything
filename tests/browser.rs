@@ -2956,3 +2956,195 @@ steps:
         stderr(&output)
     );
 }
+
+#[test]
+fn unsupported_capabilities_probe_current_behavior() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-probes");
+
+    // 1. iframe
+    let iframe_case = dir.write(
+        "probe-iframe.yaml",
+        &format!(
+            "name: probe iframe\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-frame\"\n      timeout_ms: 400\n",
+            server.url("/browser/probe/iframe")
+        ),
+    );
+    let iframe_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&iframe_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&iframe_out), Some(1));
+    let iframe_json = json_stdout(&iframe_out);
+    let iframe_err = case_error(&iframe_json);
+    assert!(
+        iframe_err.contains("could not find CSS selector `#inside-frame`"),
+        "unexpected iframe probe error: {iframe_err}"
+    );
+
+    // 2. shadow DOM (css misses; role finds AX node but light-DOM elementFromPoint sees shadow host)
+    let shadow_css = dir.write(
+        "probe-shadow-css.yaml",
+        &format!(
+            "name: probe shadow css\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-shadow\"\n      timeout_ms: 400\n",
+            server.url("/browser/probe/shadow")
+        ),
+    );
+    let shadow_css_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&shadow_css),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&shadow_css_out), Some(1));
+    let shadow_css_json = json_stdout(&shadow_css_out);
+    let shadow_css_err = case_error(&shadow_css_json);
+    assert!(
+        shadow_css_err.contains("could not find CSS selector `#inside-shadow`"),
+        "unexpected shadow css probe error: {shadow_css_err}"
+    );
+
+    let shadow_role = dir.write(
+        "probe-shadow-role.yaml",
+        &format!(
+            "name: probe shadow role\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      role: button\n      name: Inside Shadow\n      timeout_ms: 400\n",
+            server.url("/browser/probe/shadow")
+        ),
+    );
+    let shadow_role_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&shadow_role),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&shadow_role_out), Some(1));
+    let shadow_role_json = json_stdout(&shadow_role_out);
+    let shadow_role_err = case_error(&shadow_role_json);
+    assert!(
+        shadow_role_err.contains("was occluded by <div#shadow-host>"),
+        "unexpected shadow role probe error: {shadow_role_err}"
+    );
+
+    // 3. new tab (target="_blank" opens a second tab, session stays on original tab)
+    let new_tab_case = dir.write(
+        "probe-new-tab.yaml",
+        &format!(
+            "name: probe new tab\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#open-new-tab\"\n  - browser.read:\n      css: \"#new-tab-marker\"\n      timeout_ms: 400\n",
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+    let new_tab_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&new_tab_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&new_tab_out), Some(1));
+    let new_tab_json = json_stdout(&new_tab_out);
+    let new_tab_err = case_error(&new_tab_json);
+    assert!(
+        new_tab_err.contains("could not find CSS selector `#new-tab-marker`"),
+        "unexpected new-tab probe error: {new_tab_err}"
+    );
+
+    // 4. dialog (window.alert blocks Input.dispatchMouseEvent until timeout)
+    let dialog_case = dir.write(
+        "probe-dialog.yaml",
+        &format!(
+            "name: probe dialog\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#trigger-alert\"\n      timeout_ms: 600\n",
+            server.url("/browser/probe/dialog")
+        ),
+    );
+    let dialog_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&dialog_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&dialog_out), Some(1));
+    let dialog_json = json_stdout(&dialog_out);
+    let dialog_err = case_error(&dialog_json);
+    assert!(
+        dialog_err.contains("Input.dispatchMouseEvent") && dialog_err.contains("did not answer"),
+        "unexpected dialog probe error: {dialog_err}"
+    );
+
+    // 5. file upload (browser.type completes without error, but attaches no file)
+    let upload_case = dir.write(
+        "probe-upload.yaml",
+        &format!(
+            "name: probe file upload\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.type:\n      css: \"#file-upload\"\n      text: \"sample.txt\"\n      timeout_ms: 600\n  - browser.read:\n      css: \"#file-upload\"\n      attribute: value\n    expect:\n      - path: $.value\n        equals: null\n      - path: $.text\n        equals: \"\"\n",
+            server.url("/browser/probe/upload")
+        ),
+    );
+    let upload_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&upload_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&upload_out),
+        Some(0),
+        "unexpected upload probe failure: stdout={}\nstderr={}",
+        stdout(&upload_out),
+        stderr(&upload_out)
+    );
+
+    // 6. coordinate click (rejected by schema / argument parsing as unknown field)
+    let coords_case = dir.write(
+        "probe-coords.yaml",
+        &format!(
+            "name: probe coords\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      x: 100\n      \"y\": 50\n",
+            server.url("/browser/probe/coords")
+        ),
+    );
+    let coords_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&coords_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&coords_out), Some(3));
+    let coords_json = json_stdout(&coords_out);
+    let coords_err = coords_json["errors"][0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        coords_err.contains("unknown field `x`"),
+        "unexpected coords probe error: {coords_err}"
+    );
+}

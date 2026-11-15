@@ -1713,15 +1713,13 @@ impl BrowserSession {
         let (matched, objects) = self.role_objects(target_desc, role, name, root, deadline)?;
         let mut visible_objects = Vec::new();
         for object_id in objects {
-            let visible = self
-                .call_function_on(
-                    target_desc,
-                    &object_id,
-                    VISIBLE_BODY,
-                    "check the visibility of",
-                    deadline,
-                )
-                .map_err(LocateError::Step)?;
+            let visible = self.call_function_poll(
+                target_desc,
+                &object_id,
+                VISIBLE_BODY,
+                "check the visibility of",
+                deadline,
+            )?;
             if visible == Value::Bool(true) {
                 visible_objects.push(object_id);
             }
@@ -1741,15 +1739,13 @@ impl BrowserSession {
                 if visible_objects.len() > 1 {
                     let mut candidates = Vec::with_capacity(visible_objects.len().min(5));
                     for object_id in visible_objects.iter().take(5) {
-                        let summary_val = self
-                            .call_function_on(
-                                target_desc,
-                                object_id,
-                                SUMMARIZE_ELEMENT_BODY,
-                                "summarize",
-                                deadline,
-                            )
-                            .map_err(LocateError::Step)?;
+                        let summary_val = self.call_function_poll(
+                            target_desc,
+                            object_id,
+                            SUMMARIZE_ELEMENT_BODY,
+                            "summarize",
+                            deadline,
+                        )?;
                         let candidate: CandidateInfo = serde_json::from_value(summary_val)
                             .unwrap_or(CandidateInfo {
                                 tag: "element".to_string(),
