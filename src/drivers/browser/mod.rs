@@ -909,7 +909,7 @@ fn text_collect_script(text: &str) -> String {
 }
 
 /// One matched element summary returned for ambiguous-locator and occlusion errors.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 struct CandidateInfo {
     tag: String,
     id: String,
@@ -1497,36 +1497,13 @@ impl BrowserSession {
                     "the browser returned an invalid actionability state for {target_desc}: {error}"
                 )))
             })?;
-            match inspect {
-                ActionableInspect::NotVisible => {
-                    previous_rect = None;
-                    Ok(Err(PendingReason::Hidden))
-                }
-                ActionableInspect::Disabled => {
-                    previous_rect = None;
-                    Ok(Err(PendingReason::Disabled))
-                }
-                ActionableInspect::ReadyCandidate {
-                    rect,
+            match evaluate_actionable_inspect(&mut previous_rect, inspect) {
+                Ok((x, y)) => Ok(Ok(ActionableTarget {
+                    located: Located(object_id),
                     x,
                     y,
-                    hit_ok,
-                    blocker,
-                } => {
-                    let stable = previous_rect.is_some_and(|prev| prev.same_geometry(rect));
-                    previous_rect = Some(rect);
-                    if !stable {
-                        return Ok(Err(PendingReason::Unstable));
-                    }
-                    if !hit_ok {
-                        return Ok(Err(PendingReason::Occluded(blocker)));
-                    }
-                    Ok(Ok(ActionableTarget {
-                        located: Located(object_id),
-                        x,
-                        y,
-                    }))
-                }
+                })),
+                Err(reason) => Ok(Err(reason)),
             }
         })
     }
@@ -2050,6 +2027,7 @@ enum ResolvePoll {
 }
 
 /// Why one poll did not yield an actionable element yet.
+#[derive(Debug, PartialEq, Eq)]
 enum PendingReason {
     Missing,
     Hidden,
@@ -2057,6 +2035,40 @@ enum PendingReason {
     Disabled,
     Unstable,
     Occluded(Option<CandidateInfo>),
+}
+
+/// Evaluates one actionability snapshot against the prior poll's geometry.
+fn evaluate_actionable_inspect(
+    previous_rect: &mut Option<ElementRect>,
+    inspect: ActionableInspect,
+) -> Result<(f64, f64), PendingReason> {
+    match inspect {
+        ActionableInspect::NotVisible => {
+            *previous_rect = None;
+            Err(PendingReason::Hidden)
+        }
+        ActionableInspect::Disabled => {
+            *previous_rect = None;
+            Err(PendingReason::Disabled)
+        }
+        ActionableInspect::ReadyCandidate {
+            rect,
+            x,
+            y,
+            hit_ok,
+            blocker,
+        } => {
+            let stable = previous_rect.is_some_and(|prev| prev.same_geometry(rect));
+            *previous_rect = Some(rect);
+            if !hit_ok {
+                return Err(PendingReason::Occluded(blocker));
+            }
+            if !stable {
+                return Err(PendingReason::Unstable);
+            }
+            Ok((x, y))
+        }
+    }
 }
 
 /// Failure during one non-blocking resolution pass.
@@ -3529,6 +3541,141 @@ mod tests {
         assert_eq!(
             target.describe_with("data-qa"),
             "test id `save` (`data-qa`) (nth: 0) within (CSS selector `form` (nth: 1))"
+        );
+    }
+
+    #[test]
+    fn element_rect_same_geometry_handles_subpixel_jitter() {
+        let base = ElementRect {
+            x: 10.0,
+            y: 20.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        let subpixel = ElementRect {
+            x: 10.5,
+            y: 19.5,
+            width: 160.25,
+            height: 35.75,
+        };
+        let shifted = ElementRect {
+            x: 11.0,
+            y: 20.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        assert!(base.same_geometry(base));
+        assert!(base.same_geometry(subpixel));
+        assert!(!base.same_geometry(shifted));
+    }
+
+    #[test]
+    fn actionable_inspect_reports_occlusion_on_first_poll_and_tracks_stability() {
+        let rect = ElementRect {
+            x: 8.0,
+            y: 8.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        let moved = ElementRect {
+            x: 24.0,
+            y: 8.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        let host = CandidateInfo {
+            tag: "div".to_string(),
+            id: "shadow-host".to_string(),
+            text: String::new(),
+        };
+
+        // First poll observing an occluded element must report Occluded, not Unstable,
+        // so a deadline hit before poll 2 finishes does not mask the blocker.
+        let mut previous = None;
+        let first = evaluate_actionable_inspect(
+            &mut previous,
+            ActionableInspect::ReadyCandidate {
+                rect,
+                x: 88.0,
+                y: 26.0,
+                hit_ok: false,
+                blocker: Some(host.clone()),
+            },
+        );
+        assert_eq!(first, Err(PendingReason::Occluded(Some(host.clone()))));
+        assert!(previous.is_some());
+
+        // Second poll with unchanged geometry still reports Occluded.
+        let second = evaluate_actionable_inspect(
+            &mut previous,
+            ActionableInspect::ReadyCandidate {
+                rect,
+                x: 88.0,
+                y: 26.0,
+                hit_ok: false,
+                blocker: Some(host.clone()),
+            },
+        );
+        assert_eq!(second, Err(PendingReason::Occluded(Some(host))));
+
+        // Second poll with changed geometry reports Unstable even if poll 1 was occluded.
+        let moved_second = evaluate_actionable_inspect(
+            &mut previous,
+            ActionableInspect::ReadyCandidate {
+                rect: moved,
+                x: 104.0,
+                y: 26.0,
+                hit_ok: true,
+                blocker: None,
+            },
+        );
+        assert_eq!(moved_second, Err(PendingReason::Unstable));
+
+        // Unoccluded element still requires two matching polls, and Hidden resets history.
+        let mut fresh = None;
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::ReadyCandidate {
+                    rect,
+                    x: 88.0,
+                    y: 26.0,
+                    hit_ok: true,
+                    blocker: None,
+                },
+            ),
+            Err(PendingReason::Unstable)
+        );
+        assert_eq!(
+            evaluate_actionable_inspect(&mut fresh, ActionableInspect::NotVisible),
+            Err(PendingReason::Hidden)
+        );
+        assert!(fresh.is_none());
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::ReadyCandidate {
+                    rect,
+                    x: 88.0,
+                    y: 26.0,
+                    hit_ok: true,
+                    blocker: None,
+                },
+            ),
+            Err(PendingReason::Unstable)
+        );
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::ReadyCandidate {
+                    rect,
+                    x: 88.0,
+                    y: 26.0,
+                    hit_ok: true,
+                    blocker: None,
+                },
+            ),
+            Ok((88.0, 26.0))
         );
     }
 }
