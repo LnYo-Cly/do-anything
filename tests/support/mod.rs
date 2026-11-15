@@ -244,6 +244,10 @@ fn route(
         // assert on how each JSON scalar is redacted without depending on a
         // duration or a timestamp.
         (_, "/scalars") => json_response("200 OK", r#"{"count":10,"flag":true,"nothing":null}"#),
+        // Encodes a value from the request body into the three forms a service
+        // commonly echoes back: a query string, an authorization header and a
+        // JSON document. The secret never has to be written into a case file.
+        ("POST", "/encoded-secret") => encoded_secret_response(body),
         // Writes a file while the request is answered, so a case can produce
         // log lines during its own step: an observer sees only what changed
         // between its start and its collect call.
@@ -266,6 +270,57 @@ fn route(
         }
         _ => json_response("404 Not Found", r#"{"error":"not found"}"#),
     }
+}
+
+/// Answers `/encoded-secret` with percent-encoded and base64 forms.
+fn encoded_secret_response(body: &str) -> String {
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+        return json_response("400 Bad Request", r#"{"error":"body must be JSON"}"#);
+    };
+    let Some(secret) = request["secret"].as_str() else {
+        return json_response("400 Bad Request", r#"{"error":"secret must be a string"}"#);
+    };
+    let user = request["user"].as_str().unwrap_or("user");
+    let json = serde_json::json!({"token": secret}).to_string();
+    let response = serde_json::json!({
+        "url": format!("http://example.test/?token={}", percent_encode(secret.as_bytes())),
+        "authorization": format!("Basic {}", base64_encode(format!("{user}:{secret}").as_bytes())),
+        "json": base64_encode(json.as_bytes()),
+    });
+    json_response("200 OK", &response.to_string())
+}
+
+/// Encodes every byte with its two hexadecimal digits.
+pub fn percent_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 3);
+    for byte in bytes {
+        encoded.push_str(&format!("%{byte:02X}"));
+    }
+    encoded
+}
+
+/// Encodes bytes with the standard base64 alphabet and padding.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
 }
 
 /// Appends to or rewrites the file named in a `/write-log` request body.
