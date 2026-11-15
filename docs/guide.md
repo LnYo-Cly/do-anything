@@ -261,7 +261,9 @@ unreachable service is never a failed assertion.
 An interface that answers `201` has not necessarily done what it promised. An
 **observer** reads another layer while a step runs — a log file, the requests a
 page sends, or a database later — so a case can assert on the evidence the step
-left behind.
+left behind. The built-in observers are `log.file` for a file and, with the
+`browser` feature, `browser.network` for the page's requests ([Observing the
+network](#observing-the-network)).
 
 `observe:` is optional. It is a mapping: the key is the name you choose for the
 observation, and the value is exactly one registered observer and its arguments,
