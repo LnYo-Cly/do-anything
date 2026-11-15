@@ -675,6 +675,25 @@ FAIL cases/login.yaml [Login returns a token] 6 ms
 Summary: 1 case (0 passed, 1 failed, 0 errors, 0 filtered), 2 steps (1 passed, 1 failed, 0 errors, 0 skipped), 7 ms
 ```
 
+A value of at least 8 bytes is also recognized in two encoded forms:
+
+- **Percent-encoded bytes.** Each byte of the value may appear as itself or as
+  `%XX`, with hexadecimal digits in either case; a space may also appear as
+  `+`. This is the form a URL query string commonly uses. The matcher works byte
+  by byte, so it does not depend on which characters an encoder chose to
+  escape. The whole matched span becomes one `***`.
+- **base64.** Both the standard and URL-safe alphabets are recognized, with or
+  without `=` padding. The value may be encoded by itself or embedded in a
+  longer base64 document; the result depends on where the value starts, so all
+  three byte offsets are checked. The base64 characters at both ends that share
+  bits with the value are replaced as well, together with any padding, so no
+  character carrying value bits is left behind.
+
+Encoded forms are only searched for values of at least 8 bytes. A shorter value
+is replaced only when it appears exactly, because byte-by-byte matching would
+otherwise rewrite too much nearby text. The exact form is still replaced for
+every value.
+
 Redaction has limits that matter when you choose a value:
 
 - **Short secrets hide unrelated text.** A secret of `1` replaces every `1` in
@@ -685,10 +704,13 @@ Redaction has limits that matter when you choose a value:
 - **Only values `da` read are secrets.** A program a case starts inherits the
   whole environment. If it prints a variable that no `${env:NAME}` reference
   read, `da` never saw that value and cannot redact it.
-- **Encoded secrets are not recognized.** If a program base64-encodes,
-  URL-encodes or otherwise transforms the value, the result no longer matches
-  and appears as it is. The same holds for a value a program splits or
-  reassembles.
+- **Other transformations are not recognized.** Encodings other than percent
+  encoding and base64, a second round of either encoding, compression, hashes,
+  and values a program splits, reorders or reassembles still appear as they are.
+- **base64 wrapped at a fixed width is not recognized.** A value that was
+  encoded and then broken across lines at a fixed width, the way MIME and PEM
+  wrap, no longer matches after the first line break, because the newline
+  splits the encoded characters.
 - **A JSON scalar changes type when it contains a secret.** A number, a boolean
   or `null` that is redacted becomes a string, so the type of that one value
   changes in the report.
