@@ -231,6 +231,7 @@ fn route(
         // The browser tests drive real pages. The label in `?case=` lets four
         // cases prove that each one sees its own page and its own browser.
         (_, "/browser/form") => html_response("200 OK", &browser_form(query)),
+        (_, "/browser/mask") => html_response("200 OK", browser_mask()),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
         // finishes loading before a short navigation timeout, which is what
@@ -368,6 +369,79 @@ document.getElementById('later').addEventListener('click', function () {{
 </script>
 </body></html>"#
     )
+}
+
+/// A page whose script records whether every visible editable field was
+/// covered while a screenshot mask existed.
+///
+/// The record is written when the browser driver dispatches the
+/// `da:screenshot-mask` event, which happens after the masks are inserted and
+/// before the screenshot is captured. It is deliberately latched: the cleanup
+/// removes the masks afterwards, but the report keeps what was true during the
+/// screenshot so a later `browser.read` can assert on it.
+fn browser_mask() -> &'static str {
+    r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>Mask probe</title>
+<style>
+body{margin:0;font:16px sans-serif;color:#111;background:#fff}
+input,textarea,select,#editor{border:1px solid #333;background:#fff}
+#name{position:fixed;left:20px;top:80px;width:320px;height:48px;font-size:24px;color:#f00}
+#notes{position:fixed;left:20px;top:150px;width:320px;height:60px;font-size:20px;color:#f00}
+#choice{position:fixed;left:20px;top:230px;width:160px;height:32px}
+#editor{position:fixed;left:20px;top:280px;width:320px;height:48px;font-size:20px;color:#f00}
+#button{position:fixed;left:20px;top:350px;width:100px;height:32px}
+#checkbox{position:fixed;left:20px;top:400px;width:20px;height:20px}
+#range{position:fixed;left:60px;top:400px;width:120px;height:24px}
+#color{position:fixed;left:200px;top:400px;width:40px;height:24px}
+#mask-report{position:fixed;left:20px;top:460px}
+</style></head>
+<body>
+<h1>Mask probe</h1>
+<input id="name" name="name" autocomplete="off">
+<textarea id="notes">visible note</textarea>
+<select id="choice"><option>one</option><option>two</option></select>
+<div id="editor" contenteditable="true">Editor visible</div>
+<button id="button" type="button">Button</button>
+<input id="checkbox" type="checkbox">
+<input id="hidden" type="hidden" value="hidden">
+<input id="range" type="range">
+<input id="color" type="color" value="#ff0000">
+<p id="mask-report">not recorded</p>
+<script>
+function isCovered(el, masks) {
+  var rect = el.getBoundingClientRect();
+  for (var i = 0; i < masks.length; i++) {
+    var mask = masks[i];
+    var box = mask.getBoundingClientRect();
+    var style = window.getComputedStyle(mask);
+    if (style.opacity === '1' &&
+        style.zIndex === '2147483647' &&
+        box.left <= rect.left + 0.5 &&
+        box.top <= rect.top + 0.5 &&
+        box.right >= rect.right - 0.5 &&
+        box.bottom >= rect.bottom - 0.5) {
+      return true;
+    }
+  }
+  return false;
+}
+function recordMasks() {
+  var masks = document.querySelectorAll('[data-da-screenshot-mask]');
+  if (!masks.length) return;
+  var ids = ['name', 'notes', 'choice', 'editor', 'button', 'checkbox', 'hidden', 'range', 'color'];
+  var parts = [];
+  for (var i = 0; i < ids.length; i++) {
+    var el = document.getElementById(ids[i]);
+    if (!el) continue;
+    var rect = el.getBoundingClientRect();
+    var visible = rect.width > 0 && rect.height > 0;
+    parts.push(ids[i] + '=' + (visible && isCovered(el, masks)));
+  }
+  document.getElementById('mask-report').textContent = parts.join(',');
+}
+document.addEventListener('da:screenshot-mask', recordMasks);
+</script>
+</body></html>"##
 }
 
 fn browser_second(query: &str) -> String {

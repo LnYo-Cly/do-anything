@@ -21,7 +21,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use support::{TempDir, TestServer, closed_port};
 
 /// The binary under test, as an absolute path.
@@ -66,6 +66,41 @@ fn path_str(path: &Path) -> &str {
 
 fn json_stdout(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON value")
+}
+
+/// Whether `bytes` starts with the eight-byte PNG signature.
+fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir).expect("the directory must be readable") {
+        let path = entry.expect("the entry must be readable").path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// The file names directly inside `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("the directory must be readable")
+        .map(|entry| {
+            entry
+                .expect("the entry must be readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 /// The message of the one case a run reported, if it failed.
@@ -1524,4 +1559,413 @@ steps:
     );
     let value = json_stdout(&output);
     assert_eq!(value["cases"][0]["status"], "passed", "{value}");
+}
+
+#[test]
+fn a_failed_browser_case_bundles_a_valid_png_and_a_dom_snapshot() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-evidence");
+    let case = dir.write(
+        "evidence.yaml",
+        &format!(
+            r##"name: browser evidence
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.type:
+      css: "#name"
+      text: Ada
+  - browser.read:
+      css: "#greeting"
+    expect:
+      - path: $.text
+        equals: "not set yet"
+"##,
+            server.url("/browser/form?case=evidence")
+        ),
+    );
+    let bundles = dir.path().join("failures");
+
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let bundle = PathBuf::from(
+        value["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must name its bundle"),
+    );
+    let png = fs::read(bundle.join("browser/screenshot.png"))
+        .expect("the bundle must hold the browser screenshot");
+    assert!(
+        is_png(&png),
+        "the screenshot must be a PNG, first bytes: {:?}",
+        &png[..png.len().min(8)]
+    );
+    let dom = fs::read_to_string(bundle.join("browser/dom.html"))
+        .expect("the bundle must hold the DOM snapshot");
+    assert!(dom.contains("<html"), "the snapshot must be HTML: {dom}");
+    assert!(
+        dom.contains("id=\"name\""),
+        "the snapshot must be the page that failed: {dom}"
+    );
+
+    let rendered = stdout(&output);
+    assert!(
+        !rendered.contains("screenshot.png") && !rendered.contains("dom.html"),
+        "evidence paths must not enter the JSON output: {rendered}"
+    );
+}
+
+#[test]
+fn screenshot_covers_every_visible_editable_field_but_not_buttons_or_unsupported_inputs() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-mask");
+    let case = dir.write(
+        "mask.yaml",
+        &format!(
+            r##"name: screenshot masks the form
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.type:
+      css: "#name"
+      text: "must-not-appear-in-pixels"
+  - browser.screenshot:
+      path: shots/masked.png
+  - browser.read:
+      css: "#mask-report"
+    expect:
+      - path: $.text
+        equals: "name=true,notes=true,choice=true,editor=true,button=false,checkbox=false,hidden=false,range=false,color=false"
+"##,
+            server.url("/browser/mask")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "the mask probe must see every editable field covered: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    assert_eq!(value["cases"][0]["status"], "passed", "{value}");
+    let screenshot = dir.path().join("shots/masked.png");
+    assert!(
+        fs::read(&screenshot)
+            .expect("the screenshot step must write its file")
+            .starts_with(b"\x89PNG\r\n\x1a\n"),
+        "the screenshot step must write a PNG"
+    );
+    let result = &value["cases"][0]["steps"][2]["result"];
+    assert_eq!(
+        result["bytes"],
+        json!(
+            fs::metadata(&screenshot)
+                .expect("the screenshot must exist")
+                .len()
+        )
+    );
+    assert!(
+        result["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("shots/masked.png")),
+        "the result must name the written path: {result}"
+    );
+}
+
+#[test]
+fn a_secret_written_into_page_html_is_redacted_from_the_bundle() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-secret-evidence");
+    let secret = "browser-s3cr3t-in-html";
+    let case = dir.write(
+        "secret.yaml",
+        &format!(
+            r##"name: secret in page html
+vars:
+  token: "${{env:DA_BROWSER_EVIDENCE_SECRET}}"
+steps:
+  - browser.open:
+      url: "{}/browser/form?case=${{token}}"
+  - browser.read:
+      css: "#case"
+    expect:
+      - path: $.text
+        equals: "wrong"
+"##,
+            server.url("")
+        ),
+    );
+    let bundles = dir.path().join("failures");
+
+    let output = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_BROWSER_EVIDENCE_SECRET", secret.to_string())],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let bundle = PathBuf::from(
+        value["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must name its bundle"),
+    );
+    let dom = fs::read_to_string(bundle.join("browser/dom.html"))
+        .expect("the bundle must hold the DOM snapshot");
+    assert!(
+        !dom.contains(secret),
+        "the DOM evidence leaked the secret: {dom}"
+    );
+    assert!(
+        dom.contains("***"),
+        "the DOM evidence must show the redaction marker: {dom}"
+    );
+    for file in files_under(&bundle) {
+        let bytes = fs::read(&file).expect("a bundle file must be readable");
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "{} leaked the secret",
+            file.display()
+        );
+    }
+}
+
+#[test]
+fn no_bundle_and_passing_cases_do_not_take_evidence_screenshots() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-no-evidence-shot");
+    let log = dir.path().join("screenshots.log");
+    let failing = dir.write(
+        "failing.yaml",
+        &format!(
+            r##"name: failing
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.read:
+      css: "#greeting"
+    expect:
+      - path: $.text
+        equals: "wrong"
+"##,
+            server.url("/browser/form?case=no-bundle")
+        ),
+    );
+    let passing = dir.write(
+        "passing.yaml",
+        &format!(
+            "name: passing\nsteps:\n  - browser.open:\n      url: \"{}\"\n",
+            server.url("/browser/form?case=passing")
+        ),
+    );
+    let env = [(
+        "DA_TEST_BROWSER_SCREENSHOT_LOG",
+        log.to_string_lossy().into_owned(),
+    )];
+
+    let bundled = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&failing),
+            "--bundle-dir",
+            path_str(&dir.path().join("failures")),
+        ],
+        &env,
+    );
+    assert_eq!(
+        exit_code(&bundled),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&bundled),
+        stderr(&bundled)
+    );
+    let recorded = fs::read_to_string(&log).expect("the bundled run must take a screenshot");
+    assert!(
+        recorded.contains("screenshot"),
+        "the screenshot hook must record the attempt, got: {recorded:?}"
+    );
+
+    fs::remove_file(&log).expect("the screenshot log must be removable");
+    let unbundled = run_da_with_env(
+        dir.path(),
+        &["--output", "json", "run", path_str(&failing), "--no-bundle"],
+        &env,
+    );
+    assert_eq!(
+        exit_code(&unbundled),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&unbundled),
+        stderr(&unbundled)
+    );
+    assert!(
+        !log.exists(),
+        "`--no-bundle` must not take a screenshot for a failed case"
+    );
+
+    let passed = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&passing),
+            "--bundle-dir",
+            path_str(&dir.path().join("passing-failures")),
+        ],
+        &env,
+    );
+    assert_eq!(
+        exit_code(&passed),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&passed),
+        stderr(&passed)
+    );
+    assert!(
+        !log.exists(),
+        "a passing case must not take a screenshot even when bundles are enabled"
+    );
+}
+
+#[test]
+fn a_failed_case_without_a_browser_session_keeps_the_existing_bundle_files() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-no-session-bundle");
+    let case = dir.write(
+        "no-session.yaml",
+        "name: no browser session\nsteps:\n  - browser.read:\n      css: \"#nothing\"\n",
+    );
+    let bundles = dir.path().join("failures");
+
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let bundle = PathBuf::from(
+        value["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must name its bundle"),
+    );
+    assert_eq!(
+        names_in(&bundle),
+        vec!["case.yaml", "meta.json", "report.json"],
+        "a case with no browser session must keep the old bundle layout"
+    );
+}
+
+#[test]
+fn browser_screenshot_resolves_a_relative_path_against_the_case_file() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-screenshot-path");
+    let case = dir.write(
+        "cases/shot.yaml",
+        &format!(
+            "name: relative screenshot\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.screenshot:\n      path: shots/out.png\n",
+            server.url("/browser/form?case=relative")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let result = &value["cases"][0]["steps"][1]["result"];
+    assert!(
+        result["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("cases/shots/out.png")),
+        "the result must name the case-relative path: {result}"
+    );
+    let screenshot = dir.path().join("cases/shots/out.png");
+    assert!(
+        is_png(&fs::read(&screenshot).expect("the screenshot must be written")),
+        "the screenshot must be a PNG"
+    );
 }

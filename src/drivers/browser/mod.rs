@@ -23,6 +23,7 @@ mod connect;
 mod launch;
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use schemars::{JsonSchema, schema_for};
@@ -33,20 +34,22 @@ use serde_json::{Value, json};
 use self::cdp::{CdpError, Connection, Deadline};
 use self::connect::Endpoint;
 use self::launch::Launched;
+use crate::core::paths;
 use crate::core::registry::{Registry, StepDefinition, StepError};
-use crate::core::session::{Session, Sessions};
+use crate::core::session::{Evidence, Session, Sessions};
 
 /// Session kind the browser steps share.
 pub const SESSION_KIND: &str = "browser";
 
 /// Step names, in the order they are registered.
-pub const STEP_NAMES: [&str; 6] = [
+pub const STEP_NAMES: [&str; 7] = [
     "browser.open",
     "browser.click",
     "browser.type",
     "browser.press",
     "browser.wait",
     "browser.read",
+    "browser.screenshot",
 ];
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -87,6 +90,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
             validate_read,
             run_read,
         )?,
+        screenshot_step()?,
     ] {
         registry.register(definition)?;
     }
@@ -125,6 +129,16 @@ fn type_step() -> Result<StepDefinition, String> {
         { "required": ["role"] }
     ]);
     Ok(definition)
+}
+
+/// Builds `browser.screenshot`, which takes only the output path.
+fn screenshot_step() -> Result<StepDefinition, String> {
+    step::<ScreenshotArgs>(
+        STEP_NAMES[6],
+        "Writes a PNG of the page to `path` after covering every visible editable field, and returns the `path` and the number of `bytes` written.",
+        validate_screenshot,
+        run_screenshot,
+    )
 }
 
 /// Builds one step from its argument type.
@@ -334,6 +348,16 @@ struct WaitArgs {
     timeout_ms: u64,
 }
 
+/// Arguments of `browser.screenshot`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ScreenshotArgs {
+    /// File to write. A relative path is resolved against the directory that
+    /// holds the case file.
+    #[schemars(extend("minLength" = 1))]
+    path: String,
+}
+
 /// Arguments of `browser.read`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -382,6 +406,50 @@ fn default_timeout_ms() -> u64 {
 fn default_navigation_timeout_ms() -> u64 {
     DEFAULT_NAVIGATION_TIMEOUT_MS
 }
+
+/// How long all failure evidence of one browser session may take.
+const EVIDENCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one explicit `browser.screenshot` may take.
+const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long removing the masks may take after the screenshot itself.
+const MASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// JavaScript that covers every visible editable field with an opaque box.
+///
+/// `position: fixed` uses the viewport rectangle `getBoundingClientRect`
+/// returns, and `z-index` is the largest value a browser accepts. The element
+/// stays in the page only until the screenshot is captured; cleanup is a
+/// separate call so it can run after a failed capture too.
+const MASK_INPUTS_SCRIPT: &str = r#"(function () {
+  var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
+  var fields = document.querySelectorAll('input, textarea, select, [contenteditable]');
+  var masks = [];
+  for (var i = 0; i < fields.length; i++) {
+    var el = fields[i];
+    if (el.nodeType !== 1) continue;
+    var tag = el.tagName;
+    var field = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    if (!field && !el.isContentEditable) continue;
+    if (tag === 'INPUT' && skipped.indexOf((el.type || 'text').toLowerCase()) !== -1) continue;
+    var style = window.getComputedStyle(el);
+    var rect = el.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || rect.width <= 0 || rect.height <= 0) continue;
+    var mask = document.createElement('div');
+    mask.setAttribute('data-da-screenshot-mask', '');
+    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + rect.left + 'px;top:' + rect.top + 'px;width:' + rect.width + 'px;height:' + rect.height + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
+    document.documentElement.appendChild(mask);
+    masks.push(mask);
+  }
+  document.dispatchEvent(new Event('da:screenshot-mask'));
+  return masks.length;
+})()"#;
+
+/// JavaScript that removes every mask this module added.
+const REMOVE_MASKS_SCRIPT: &str = r#"(function () {
+  var masks = document.querySelectorAll('[data-da-screenshot-mask]');
+  for (var i = 0; i < masks.length; i++) masks[i].remove();
+  return masks.length;
+})()"#;
 
 /// A deterministic way to name one element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1168,6 +1236,58 @@ impl BrowserSession {
             )
         })
     }
+
+    /// Covers every editable field, captures a PNG and removes the covers.
+    ///
+    /// Cleanup runs after a failed capture as well; a browser that has already
+    /// gone cannot be cleaned, and then the capture error is the one reported.
+    fn capture_masked_png(&mut self, deadline: Deadline) -> Result<Vec<u8>, StepError> {
+        let page = self.page.clone();
+        self.connection_mut()?
+            .evaluate(&page, MASK_INPUTS_SCRIPT, deadline)
+            .map_err(|error| {
+                StepError::Environment(format!(
+                    "could not cover the editable fields before the screenshot: {error}"
+                ))
+            })?;
+        record_screenshot(self.port);
+
+        let captured = self.connection_mut()?.call(
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+            Some(&page),
+            deadline,
+        );
+        let cleaned = self.connection_mut()?.evaluate(
+            &page,
+            REMOVE_MASKS_SCRIPT,
+            Deadline::after(MASK_CLEANUP_TIMEOUT),
+        );
+        if let Err(error) = cleaned {
+            let mut message =
+                format!("could not remove the screenshot covers from the page: {error}");
+            if let Err(capture_error) = captured {
+                message.push_str(&format!("; the screenshot also failed: {capture_error}"));
+            }
+            return Err(StepError::Environment(message));
+        }
+
+        let reply = captured.map_err(|error| match error {
+            CdpError::Timeout { .. } => StepError::Timeout(format!(
+                "the screenshot did not finish within {} ms",
+                deadline.timeout_ms()
+            )),
+            error => StepError::Environment(format!("could not capture the screenshot: {error}")),
+        })?;
+        let data = reply.get("data").and_then(Value::as_str).ok_or_else(|| {
+            StepError::Environment(
+                "the browser did not return PNG data for the screenshot".to_string(),
+            )
+        })?;
+        decode_base64(data).map_err(|error| {
+            StepError::Environment(format!("the screenshot data is invalid: {error}"))
+        })
+    }
 }
 
 /// Opens one new tab and attaches it as the session's page.
@@ -1289,6 +1409,73 @@ fn load_error(error: CdpError, url: &str, deadline: Deadline, action: &str) -> S
 }
 
 impl Session for BrowserSession {
+    fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+        if self.connection.is_none() {
+            return Err(
+                "the browser session is already closed; no evidence was collected".to_string(),
+            );
+        }
+        let deadline = Deadline::after(EVIDENCE_TIMEOUT);
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+
+        match self.capture_masked_png(deadline) {
+            Ok(png) => files.push(
+                Evidence::bytes("screenshot.png", png)
+                    .map_err(|error| format!("could not name the screenshot evidence: {error}"))?,
+            ),
+            Err(error) => errors.push(format!(
+                "the screenshot could not be collected: {}",
+                step_error_text(error)
+            )),
+        }
+
+        if deadline.passed() {
+            errors.push(format!(
+                "the DOM snapshot was skipped because the {} ms evidence budget was spent",
+                EVIDENCE_TIMEOUT.as_millis()
+            ));
+        } else {
+            let page = self.page.clone();
+            match self.connection_mut().and_then(|connection| {
+                connection
+                    .evaluate(&page, "document.documentElement.outerHTML", deadline)
+                    .map_err(|error| {
+                        StepError::Environment(format!("could not read the DOM snapshot: {error}"))
+                    })
+            }) {
+                Ok(Value::String(html)) => files.push(
+                    Evidence::text("dom.html", html)
+                        .map_err(|error| format!("could not name the DOM evidence: {error}"))?,
+                ),
+                Ok(_) => errors.push(
+                    "the DOM snapshot was not a string; the page may have navigated".to_string(),
+                ),
+                Err(error) => errors.push(step_error_text(error)),
+            }
+        }
+
+        if files.is_empty() && !errors.is_empty() {
+            return Err(format!(
+                "could not collect browser evidence: {}",
+                errors.join("; ")
+            ));
+        }
+        if !errors.is_empty() {
+            files.push(
+                Evidence::text(
+                    "evidence-error.txt",
+                    format!(
+                        "some browser evidence could not be collected:\n{}\n",
+                        errors.join("\n")
+                    ),
+                )
+                .map_err(|error| format!("could not name the evidence error file: {error}"))?,
+            );
+        }
+        Ok(files)
+    }
+
     fn close(&mut self) -> Result<(), String> {
         let Some(mut connection) = self.connection.take() else {
             return Ok(());
@@ -1365,6 +1552,109 @@ fn record_close(port: u16) {
         .open(path)
     {
         let _ = writeln!(file, "browser session closed port={port}");
+    }
+}
+
+/// The message of a step error, for a session method that reports strings.
+fn step_error_text(error: StepError) -> String {
+    match error {
+        StepError::InvalidArguments(message)
+        | StepError::Environment(message)
+        | StepError::Timeout(message)
+        | StepError::Execution(message) => message,
+    }
+}
+
+/// Records that a screenshot was attempted, with the debug port it used.
+///
+/// This is a test hook for the no-bundle and passing-case checks: the page is
+/// gone after a passing run, so a record is what makes "no screenshot" visible.
+/// It writes nothing unless `DA_TEST_BROWSER_SCREENSHOT_LOG` names a file.
+fn record_screenshot(port: u16) {
+    let Some(path) = std::env::var_os("DA_TEST_BROWSER_SCREENSHOT_LOG") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "screenshot port={port}");
+    }
+}
+
+/// Decodes the base64 body Chrome returns for a screenshot.
+///
+/// The repository has no direct base64 dependency, and a screenshot only needs
+/// this one direction. Padding and alphabet are checked, so corrupt data is an
+/// error rather than a truncated PNG.
+fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return Err("the base64 value is empty".to_string());
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return Err(format!(
+            "the base64 value has {} characters, which is not a multiple of 4",
+            bytes.len()
+        ));
+    }
+
+    let chunks = bytes.len() / 4;
+    let mut output = Vec::with_capacity(chunks * 3);
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        let last = index + 1 == chunks;
+        let mut values = [0_u8; 4];
+        let mut padding = 0;
+        for (position, byte) in chunk.iter().copied().enumerate() {
+            if byte == b'=' {
+                if !last || position < 2 {
+                    return Err("base64 padding is only allowed at the end".to_string());
+                }
+                if padding > 0 && position != 3 {
+                    return Err("base64 padding is not contiguous".to_string());
+                }
+                padding += 1;
+                values[position] = 0;
+            } else {
+                if padding > 0 {
+                    return Err("base64 data follows its padding".to_string());
+                }
+                values[position] = base64_value(byte).ok_or_else(|| {
+                    format!(
+                        "base64 contains `{}`, which is not in its alphabet",
+                        byte as char
+                    )
+                })?;
+            }
+        }
+        if padding > 2 {
+            return Err("base64 ends with more than two padding characters".to_string());
+        }
+
+        output.push((values[0] << 2) | (values[1] >> 4));
+        if padding < 2 {
+            output.push((values[1] << 4) | (values[2] >> 2));
+        }
+        if padding < 1 {
+            output.push((values[2] << 6) | values[3]);
+        }
+    }
+    Ok(output)
+}
+
+/// One base64 alphabet value.
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 
@@ -1465,6 +1755,14 @@ fn validate_wait(args: &Value) -> Result<(), String> {
     let args: WaitArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
     WaitTarget::from_args(&args).map(|_| ())
+}
+
+fn validate_screenshot(args: &Value) -> Result<(), String> {
+    let args: ScreenshotArgs = parse_for_validate(args)?;
+    if args.path.trim().is_empty() {
+        return Err("invalid arguments: `path` must name the PNG file to write".to_string());
+    }
+    Ok(())
 }
 
 fn validate_read(args: &Value) -> Result<(), String> {
@@ -1667,6 +1965,56 @@ fn wait_for_url(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn run_screenshot(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let args: ScreenshotArgs = parse(args)?;
+    if args.path.trim().is_empty() {
+        return Err(StepError::InvalidArguments(
+            "invalid arguments: `path` must name the PNG file to write".to_string(),
+        ));
+    }
+    let path = resolve_path(&args.path, sessions);
+    let session = session(sessions)?;
+    let png = session.capture_masked_png(Deadline::after(SCREENSHOT_TIMEOUT))?;
+    write_png(&path, &png)?;
+    Ok(json!({
+        "path": paths::display(&path),
+        "bytes": png.len(),
+    }))
+}
+
+/// Resolves a relative output path against the directory that holds the case
+/// file, so a case can keep its screenshots beside itself.
+fn resolve_path(path: &str, sessions: &Sessions) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        return path;
+    }
+    match sessions.base_directory() {
+        Some(directory) => directory.join(path),
+        None => path,
+    }
+}
+
+/// Writes one PNG, creating its parent directory when it is missing.
+fn write_png(path: &Path, png: &[u8]) -> Result<(), StepError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            StepError::Environment(format!(
+                "could not create the screenshot directory `{}`: {error}",
+                paths::display(parent)
+            ))
+        })?;
+    }
+    std::fs::write(path, png).map_err(|error| {
+        StepError::Environment(format!(
+            "could not write the screenshot `{}`: {error}",
+            paths::display(path)
+        ))
+    })
 }
 
 fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -2083,6 +2431,25 @@ mod tests {
             assert!(
                 Key::parse(value).is_err(),
                 "`{value}` must not be accepted as a key"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_screenshot_data_is_decoded_and_bad_padding_is_refused() {
+        assert_eq!(decode_base64("TQ==").ok(), Some(vec![b'M']));
+        assert_eq!(decode_base64("TWE=").ok(), Some(b"Ma".to_vec()));
+        assert_eq!(decode_base64("TWFu").ok(), Some(b"Man".to_vec()));
+        assert_eq!(
+            decode_base64("iVBORw0KGgo=").ok(),
+            Some(b"\x89PNG\r\n\x1a\n".to_vec())
+        );
+        for value in [
+            "", "TQ=", "TQ===", "T===", "TQ=A", "TQ==TQ==", "T Q==", "TQ-_",
+        ] {
+            assert!(
+                decode_base64(value).is_err(),
+                "`{value}` must be refused as base64"
             );
         }
     }
