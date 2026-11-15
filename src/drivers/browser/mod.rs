@@ -14,13 +14,15 @@
 //! screenshot. Element lookup waits for the element to appear and to be visible,
 //! so a step does not race the page's own scripts.
 //!
-//! The protocol lives in [`cdp`], the process in [`launch`], and the loopback
-//! DevTools lookup in [`connect`]; this module turns their messages into step
-//! results and step errors.
+//! The protocol lives in [`cdp`], the process in [`launch`], the loopback
+//! DevTools lookup in [`connect`], and the `browser.network` observer in
+//! [`network`]; this module turns their messages into step results and step
+//! errors.
 
 mod cdp;
 mod connect;
 mod launch;
+mod network;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,7 +63,7 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often an element or URL is looked at again.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Registers every browser step.
+/// Registers every browser step and the network observer.
 pub fn register(registry: &mut Registry) -> Result<(), String> {
     for definition in [
         open_step()?,
@@ -94,6 +96,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     ] {
         registry.register(definition)?;
     }
+    network::register(registry)?;
     Ok(())
 }
 
@@ -849,6 +852,8 @@ struct BrowserSession {
     origin: Option<Origin>,
     /// The target session every page command is sent with.
     page: String,
+    /// The requests this page reported, bounded and merged by request id.
+    network: network::NetworkState,
     port: u16,
     headless: bool,
     width: u32,
@@ -892,11 +897,13 @@ impl BrowserSession {
             format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
         })?;
         let (page, _) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
+        let network = network::NetworkState::new(&page);
 
         Ok(Self {
             connection: Some(connection),
             origin: Some(Origin::Launched(browser)),
             page,
+            network,
             port,
             headless: args.headless,
             width: args.width,
@@ -913,11 +920,13 @@ impl BrowserSession {
             endpoint.explain(format!("could not open the DevTools connection: {error}"))
         })?;
         let (page, target_id) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
+        let network = network::NetworkState::new(&page);
 
         Ok(Self {
             connection: Some(connection),
             origin: Some(Origin::Connected { target_id }),
             page,
+            network,
             port: endpoint.port(),
             headless: true,
             width: DEFAULT_WIDTH,
@@ -962,10 +971,42 @@ impl BrowserSession {
         )))
     }
 
+    /// Merges the network events already received into the request table.
+    ///
+    /// Messages that are not network events go back to the queue, so the page
+    /// events a later step waits for are still there.
+    fn absorb_network(&mut self) {
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        self.network.absorb(connection);
+    }
+
+    /// Reads the network events that already arrived, without waiting.
+    fn poll_network(&mut self) -> Result<(), String> {
+        let Some(connection) = self.connection.as_mut() else {
+            return Ok(());
+        };
+        self.network.poll(connection)
+    }
+
+    /// How many network messages and requests this page discarded so far.
+    fn network_dropped(&self) -> u64 {
+        self.network.dropped()
+    }
+
+    /// Takes the requests finished since the last collection.
+    fn take_network_step(&mut self, dropped_baseline: u64) -> Value {
+        self.network.take_step(dropped_baseline)
+    }
+
     /// Navigates the session's page and returns its current URL and title.
     fn navigate(&mut self, url: &str, timeout: Duration) -> Result<(String, String), StepError> {
         let page = self.page.clone();
         let deadline = Deadline::after(timeout);
+        // Network events that arrive before a navigation still belong to a
+        // request of this page, so they are merged before the rest is cleared.
+        self.absorb_network();
         let connection = self.connection_mut()?;
         // Events from the about:blank page must not be mistaken for this
         // navigation's load event.
@@ -1323,6 +1364,12 @@ fn attach(connection: &mut Connection, deadline: Deadline) -> Result<(String, St
     connection
         .call("Runtime.enable", json!({}), Some(&page), deadline)
         .map_err(|error| format!("could not enable page scripts: {error}"))?;
+    // The first navigation may start right after this call, so the network
+    // domain is enabled before the page can issue a request; an observer
+    // enabled later would miss the document request.
+    connection
+        .call("Network.enable", json!({}), Some(&page), deadline)
+        .map_err(|error| format!("could not enable network events: {error}"))?;
     Ok((page, target_id))
 }
 
@@ -2061,6 +2108,10 @@ mod tests {
             registry.names().len(),
             STEP_NAMES.len(),
             "only the browser steps this module declares may be registered by it"
+        );
+        assert!(
+            registry.observer(network::OBSERVER_NAME).is_some(),
+            "the browser module must register its network observer"
         );
     }
 

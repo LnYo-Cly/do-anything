@@ -232,6 +232,11 @@ fn route(
         // cases prove that each one sees its own page and its own browser.
         (_, "/browser/form") => html_response("200 OK", &browser_form(query)),
         (_, "/browser/mask") => html_response("200 OK", browser_mask()),
+        // A page whose button starts three fetches after the click step has
+        // ended: a 200, a 404 and a refused connection. The marker element is
+        // created only after all three settled, so a `browser.wait` step sees
+        // requests that completed during that step.
+        (_, "/browser/network") => html_response("200 OK", &browser_network(query)),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
         // finishes loading before a short navigation timeout, which is what
@@ -509,6 +514,49 @@ var observer = new MutationObserver(function (records) {
 observer.observe(document.documentElement, { childList: true, subtree: true });
 </script>
 </body></html>"##
+}
+
+/// A page that makes the requests a network observer has to report.
+///
+/// The fetches start 300 ms after the click, so they complete in the following
+/// `browser.wait` step instead of inside the click step. The `#network-done`
+/// marker appears 500 ms after every fetch settled, which leaves a slow machine
+/// time to deliver `Network.loadingFinished` and `Network.loadingFailed`
+/// before the wait step collects them. The page never sees the observer: it
+/// only uses ordinary `fetch` calls.
+fn browser_network(query: &str) -> String {
+    let label = escape_html(&query_value(query, "case"));
+    let closed = query_value(query, "closed");
+    let closed = closed.parse::<u16>().unwrap_or(9);
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Network page</title></head>
+<body>
+<h1>Network page</h1>
+<p id="case">{label}</p>
+<button id="net-all" type="button">Load requests</button>
+<div id="network-target"></div>
+<script>
+document.getElementById('net-all').addEventListener('click', function () {{
+  setTimeout(function () {{
+    var requests = [
+      fetch('/health?kind=post', {{ method: 'POST' }}),
+      fetch('/nowhere?kind=missing'),
+      fetch('http://127.0.0.1:{closed}/closed')
+    ];
+    Promise.allSettled(requests).then(function () {{
+      setTimeout(function () {{
+        var p = document.createElement('p');
+        p.id = 'network-done';
+        p.textContent = 'network done';
+        document.getElementById('network-target').appendChild(p);
+      }}, 100);
+    }});
+  }}, 300);
+}});
+</script>
+</body></html>"#
+    )
 }
 
 fn browser_second(query: &str) -> String {
