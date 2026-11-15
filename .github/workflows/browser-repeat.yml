@@ -1,0 +1,43 @@
+name: Browser repeat
+
+on:
+  pull_request:
+    paths:
+      - 'src/drivers/browser/**'
+      - 'tests/browser.rs'
+      - 'tests/support/**'
+      - '.github/workflows/browser-repeat.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    name: Repeat browser tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      DA_TEST_BROWSER: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build browser integration tests
+        run: cargo test --test browser --no-run
+      - name: Run browser tests 30 times consecutively
+        shell: bash
+        run: |
+          for i in $(seq 1 30); do
+            echo "::group::Iteration $i of 30"
+            cargo test --test browser || exit 1
+            echo "::endgroup::"
+          done
