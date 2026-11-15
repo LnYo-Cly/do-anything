@@ -40,6 +40,14 @@ const IMMEDIATE_POLL: Duration = Duration::from_millis(1);
 /// counted instead of the process growing without limit.
 const MAX_QUEUED: usize = 10_000;
 
+/// Maximum time one non-blocking poll spends draining the socket.
+///
+/// A busy page can send events faster than a 1 ms read times out, so without a
+/// budget [`Connection::poll_messages`] could stay inside one step far longer
+/// than the step's own deadline. Once the budget is spent the poll returns and
+/// whatever is still unread stays on the socket for the next collection.
+const POLL_BUDGET: Duration = Duration::from_millis(200);
+
 /// The instant one step must finish by.
 #[derive(Clone, Copy, Debug)]
 pub struct Deadline {
@@ -358,9 +366,13 @@ impl Connection {
         }
     }
 
-    /// Reads messages until the socket has none left.
+    /// Reads messages until the socket has none left or the poll budget is spent.
     fn poll_available(&mut self) -> Result<(), CdpError> {
+        let deadline = Deadline::after(POLL_BUDGET);
         loop {
+            if deadline.passed() {
+                return Ok(());
+            }
             match self.socket.read() {
                 Ok(Message::Text(text)) => {
                     let value = parse_message(text.as_str())?;
@@ -525,7 +537,32 @@ fn describe_error(error: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+
     use super::*;
+
+    /// Stops a mock server thread even when a test assertion panics.
+    struct StopServer(Arc<AtomicBool>);
+
+    impl Drop for StopServer {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Encodes one short unmasked server-to-client WebSocket text frame.
+    fn ws_text_frame(payload: &str) -> Vec<u8> {
+        assert!(payload.len() < 126, "the helper only encodes short frames");
+        let mut frame = Vec::with_capacity(2 + payload.len());
+        frame.push(0x81);
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload.as_bytes());
+        frame
+    }
 
     #[test]
     fn a_websocket_url_yields_its_host_and_port() {
@@ -614,5 +651,123 @@ mod tests {
         let spent = Deadline::after(Duration::ZERO);
         assert!(spent.passed());
         assert!(spent.remaining().is_none());
+    }
+
+    #[test]
+    fn poll_messages_returns_within_its_budget_while_events_keep_arriving() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("must bind a mock CDP port");
+        let port = listener
+            .local_addr()
+            .expect("must read the mock port")
+            .port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        // The guard stops the server even when an assertion below panics, so a
+        // failure cannot leave a thread writing into a socket forever.
+        let _guard = StopServer(Arc::clone(&stop));
+        let server_stop = Arc::clone(&stop);
+        let server_pause = Arc::clone(&pause);
+        let server_started = Arc::clone(&started);
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .expect("the mock CDP must accept a connection");
+            stream
+                .set_nodelay(true)
+                .expect("must disable Nagle on the mock CDP");
+            let mut socket = tungstenite::accept(stream).expect("the mock handshake must succeed");
+            let payload = json!({
+                "method": "Network.loadingFinished",
+                "params": { "requestId": "mock-request" }
+            })
+            .to_string();
+            let frame = ws_text_frame(&payload);
+            // One write syscall carries a whole batch, so the server stays ahead
+            // of a client that parses every frame and the socket never runs dry
+            // while the test polls.
+            let mut batch = Vec::with_capacity(frame.len() * 64);
+            for _ in 0..64 {
+                batch.extend_from_slice(&frame);
+            }
+            let limit = Instant::now() + Duration::from_secs(10);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < limit {
+                if server_pause.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                if socket.get_mut().write_all(&batch).is_err() {
+                    return;
+                }
+                server_started.store(true, Ordering::Release);
+            }
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/devtools/page/1");
+        let mut connection = Connection::connect(&url, Deadline::after(Duration::from_secs(5)))
+            .expect("must connect to the mock CDP");
+
+        let wait_limit = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::Acquire) && Instant::now() < wait_limit {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            started.load(Ordering::Acquire),
+            "the mock server did not start sending"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let begin = Instant::now();
+            let outcome = connection.poll_messages();
+            let _ = tx.send((outcome, begin.elapsed(), connection));
+        });
+
+        // The timeout is the point of the test: without a poll budget this
+        // receive fails instead of the suite hanging on a page that never stops.
+        let (outcome, elapsed, mut connection) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("`poll_messages` did not return while events kept arriving");
+        worker.join().expect("the polling thread must finish");
+        outcome.expect("`poll_messages` must succeed");
+
+        assert!(
+            elapsed >= POLL_BUDGET / 2 && elapsed < POLL_BUDGET * 4,
+            "`poll_messages` took {elapsed:?} with a budget of {POLL_BUDGET:?}"
+        );
+        let timeout = connection
+            .socket
+            .get_ref()
+            .read_timeout()
+            .expect("must read the socket timeout");
+        assert_eq!(
+            timeout,
+            Some(READ_POLL),
+            "`poll_messages` must restore the read timeout"
+        );
+
+        let messages = connection.take_messages();
+        assert!(
+            !messages.is_empty() && messages.len() <= MAX_QUEUED,
+            "expected a bounded batch of messages, got {}",
+            messages.len()
+        );
+
+        // Stop new events while keeping the socket open: what the budget left
+        // unread must still be there for the next collection.
+        pause.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(5));
+        connection
+            .poll_messages()
+            .expect("the second poll must succeed");
+        assert!(
+            !connection.take_messages().is_empty(),
+            "messages left on the socket must remain available to the next read"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(connection);
+        server.join().expect("the mock server thread must join");
     }
 }

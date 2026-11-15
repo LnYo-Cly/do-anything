@@ -1336,13 +1336,17 @@ observation, a report or a failure bundle. URLs are redacted like every other
 value, so a `${env:...}` value that appears in a query string is replaced by the
 redaction marker in output and bundles.
 
-Three bounds keep a long-running case finite: the connection keeps at most
-10,000 received messages, the page tracks at most 1,000 unfinished requests, and
-it keeps at most 1,000 finished requests for the next collection. When a bound
-is reached the oldest entry is discarded and `dropped` grows, so a case can tell
-that its observation may be incomplete instead of failing silently or growing
-without limit. Only the page this case attached to is observed; another tab of
-the same browser contributes nothing.
+Four bounds keep a long-running case finite: the connection keeps at most
+10,000 received messages, one collection spends at most 200 ms reading the
+socket, the page tracks at most 1,000 unfinished requests, and it keeps at most
+1,000 finished requests for the next collection. When a bound is reached the
+oldest entry is discarded and `dropped` grows, so a case can tell that its
+observation may be incomplete instead of failing silently or growing without
+limit. The time bound exists because a page can send events faster than the
+socket read times out; whatever a collection did not read stays on the socket
+and is read by the next one, so a busy page delays an observation rather than
+stalling the step that collects it. Only the page this case attached to is
+observed; another tab of the same browser contributes nothing.
 
 ### `log.file`
 
