@@ -25,6 +25,21 @@ use tungstenite::protocol::WebSocket;
 /// How long one socket read waits before the deadline is checked again.
 const READ_POLL: Duration = Duration::from_millis(100);
 
+/// How long a collection waits for a message that has not arrived yet.
+///
+/// The observer reads the socket without waiting for the browser, so a step
+/// does not pay a full [`READ_POLL`] when nothing is pending. `tungstenite`
+/// keeps a half-read frame across a timed-out read, so this short wait cannot
+/// corrupt the connection.
+const IMMEDIATE_POLL: Duration = Duration::from_millis(1);
+
+/// How many messages a connection keeps while it waits for a reply.
+///
+/// A case may run for minutes and a page may emit far more events than any step
+/// reads. The queue is bounded so that the oldest messages are discarded and
+/// counted instead of the process growing without limit.
+const MAX_QUEUED: usize = 10_000;
+
 /// The instant one step must finish by.
 #[derive(Clone, Copy, Debug)]
 pub struct Deadline {
@@ -98,12 +113,57 @@ impl fmt::Display for CdpError {
     }
 }
 
+/// Messages received while waiting for a reply, oldest first and bounded.
+struct MessageQueue {
+    messages: VecDeque<Value>,
+    /// How many messages were discarded to keep the queue at [`MAX_QUEUED`].
+    dropped: u64,
+}
+
+impl MessageQueue {
+    /// Creates an empty queue.
+    fn new() -> Self {
+        Self {
+            messages: VecDeque::new(),
+            dropped: 0,
+        }
+    }
+
+    /// Appends one message, discarding the oldest when the queue is full.
+    fn push(&mut self, message: Value) {
+        if self.messages.len() == MAX_QUEUED {
+            self.messages.pop_front();
+            self.dropped += 1;
+        }
+        self.messages.push_back(message);
+    }
+
+    /// Removes and returns the first message a call named by `method`.
+    fn take(&mut self, method: &str) -> Option<Value> {
+        let index = self
+            .messages
+            .iter()
+            .position(|message| message.get("method").and_then(Value::as_str) == Some(method))?;
+        self.messages.remove(index)
+    }
+
+    /// Takes every message received so far.
+    fn take_all(&mut self) -> Vec<Value> {
+        self.messages.drain(..).collect()
+    }
+
+    /// How many messages were discarded since the last call, resetting it.
+    fn take_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped)
+    }
+}
+
 /// One connection to a browser's DevTools WebSocket.
 pub struct Connection {
     socket: WebSocket<TcpStream>,
     next_id: u64,
     /// Messages received while waiting for a reply, in arrival order.
-    queued: VecDeque<Value>,
+    queued: MessageQueue,
 }
 
 impl Connection {
@@ -142,7 +202,7 @@ impl Connection {
         Ok(Self {
             socket,
             next_id: 1,
-            queued: VecDeque::new(),
+            queued: MessageQueue::new(),
         })
     }
 
@@ -172,7 +232,7 @@ impl Connection {
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
-            self.queued.push_back(message);
+            self.queued.push(message);
         }
     }
 
@@ -242,25 +302,96 @@ impl Connection {
     /// Waits for one event and returns the whole CDP message.
     pub fn wait_for_event(&mut self, method: &str, deadline: Deadline) -> Result<Value, CdpError> {
         loop {
-            if let Some(index) = self
-                .queued
-                .iter()
-                .position(|message| message.get("method").and_then(Value::as_str) == Some(method))
-                && let Some(event) = self.queued.remove(index)
-            {
+            if let Some(event) = self.queued.take(method) {
                 return Ok(event);
             }
             let message = self.read(method, deadline)?;
-            self.queued.push_back(message);
+            self.queued.push(message);
         }
     }
 
     /// Takes every message received so far that no call consumed.
     ///
-    /// `browser.open` clears stale events before it navigates; S3-T3 reads the
-    /// same queue for network and page events.
+    /// `browser.open` clears stale events before it navigates; the network
+    /// observer reads the same queue for page events.
     pub fn take_messages(&mut self) -> Vec<Value> {
-        self.queued.drain(..).collect()
+        self.queued.take_all()
+    }
+
+    /// Puts messages back, in order, after a caller read and kept them.
+    ///
+    /// The bounded queue may still discard its oldest message, which is what
+    /// makes a long wait finite.
+    pub fn restore_messages(&mut self, messages: impl IntoIterator<Item = Value>) {
+        for message in messages {
+            self.queued.push(message);
+        }
+    }
+
+    /// How many messages the queue discarded to stay within its bound.
+    ///
+    /// The count is read and reset, so every step reports only its own drops.
+    pub fn take_dropped(&mut self) -> u64 {
+        self.queued.take_dropped()
+    }
+
+    /// Reads what has already arrived without waiting for more.
+    ///
+    /// The observer calls this after a step, so a response that arrived while
+    /// no command was waiting is part of that step's observation. The socket
+    /// timeout is shortened for the duration and restored afterwards.
+    pub fn poll_messages(&mut self) -> Result<(), CdpError> {
+        self.socket
+            .get_mut()
+            .set_read_timeout(Some(IMMEDIATE_POLL))
+            .map_err(|error| {
+                CdpError::Transport(format!("could not configure the connection: {error}"))
+            })?;
+        let outcome = self.poll_available();
+        let restored = self.socket.get_mut().set_read_timeout(Some(READ_POLL));
+        match (outcome, restored) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(CdpError::Transport(format!(
+                "could not configure the connection: {error}"
+            ))),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Reads messages until the socket has none left.
+    fn poll_available(&mut self) -> Result<(), CdpError> {
+        loop {
+            match self.socket.read() {
+                Ok(Message::Text(text)) => {
+                    let value = parse_message(text.as_str())?;
+                    self.queued.push(value);
+                }
+                // Pings are answered by tungstenite on the next read or write,
+                // and binary frames are not part of CDP.
+                Ok(Message::Binary(_)) | Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => {
+                    return Err(CdpError::Transport(
+                        "the browser closed the connection while its events were read".to_string(),
+                    ));
+                }
+                Ok(Message::Frame(_)) => {}
+                Err(WebSocketError::Io(error))
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return Ok(());
+                }
+                Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
+                    return Err(CdpError::Transport(
+                        "the browser closed the connection while its events were read".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(CdpError::Transport(format!(
+                        "the browser connection failed while its events were read: {error}"
+                    )));
+                }
+            }
+        }
     }
 
     /// Writes one CDP command.
@@ -292,19 +423,7 @@ impl Connection {
                 });
             }
             match self.socket.read() {
-                Ok(Message::Text(text)) => {
-                    let value: Value = serde_json::from_str(text.as_str()).map_err(|error| {
-                        CdpError::Transport(format!(
-                            "the browser sent a message that is not JSON: {error}"
-                        ))
-                    })?;
-                    if !value.is_object() {
-                        return Err(CdpError::Transport(
-                            "the browser sent a message that is not a JSON object".to_string(),
-                        ));
-                    }
-                    return Ok(value);
-                }
+                Ok(Message::Text(text)) => return parse_message(text.as_str()),
                 // Pings are answered by tungstenite on the next read or write,
                 // and binary frames are not part of CDP.
                 Ok(Message::Binary(_)) | Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
@@ -364,6 +483,21 @@ fn split_ws_url(url: &str) -> Result<(&str, u16), CdpError> {
         .parse::<u16>()
         .map_err(|error| CdpError::Transport(format!("`{url}` has no usable port: {error}")))?;
     Ok((host, port))
+}
+
+/// Parses one text frame as a CDP message.
+fn parse_message(text: &str) -> Result<Value, CdpError> {
+    let value: Value = serde_json::from_str(text).map_err(|error| {
+        CdpError::Transport(format!(
+            "the browser sent a message that is not JSON: {error}"
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(CdpError::Transport(
+            "the browser sent a message that is not a JSON object".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 /// Flattens a CDP `exceptionDetails` member into one message.
@@ -438,6 +572,37 @@ mod tests {
             "No target"
         );
         assert_eq!(describe_error(&json!({})), "the browser reported an error");
+    }
+
+    #[test]
+    fn the_message_queue_keeps_its_bound_and_counts_what_it_dropped() {
+        let mut queue = MessageQueue::new();
+        for index in 0..MAX_QUEUED + 3 {
+            queue.push(json!({ "method": "Network.loadingFinished", "index": index }));
+        }
+
+        let messages = queue.take_all();
+        assert_eq!(
+            messages.len(),
+            MAX_QUEUED,
+            "the queue must not grow past its bound"
+        );
+        assert_eq!(
+            messages.first().map(|message| message["index"].clone()),
+            Some(json!(3)),
+            "the oldest messages must be the ones discarded"
+        );
+        assert_eq!(
+            messages.last().map(|message| message["index"].clone()),
+            Some(json!(MAX_QUEUED + 2)),
+            "the newest message must be kept"
+        );
+        assert_eq!(queue.take_dropped(), 3);
+        assert_eq!(
+            queue.take_dropped(),
+            0,
+            "reading the count must reset it for the next step"
+        );
     }
 
     #[test]
