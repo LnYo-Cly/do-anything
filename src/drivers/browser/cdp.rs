@@ -83,6 +83,20 @@ impl Deadline {
     pub fn timeout_ms(self) -> u128 {
         self.timeout.as_millis()
     }
+
+    /// Returns a deadline no later than `cap` from now, preserving an earlier
+    /// outer deadline.
+    pub fn capped(self, cap: Duration) -> Self {
+        let capped_at = Instant::now() + cap;
+        if capped_at < self.at {
+            Self {
+                at: capped_at,
+                timeout: cap,
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// Why a CDP command did not return a result.
@@ -97,6 +111,8 @@ pub enum CdpError {
         waiting_for: String,
         timeout: Duration,
     },
+    /// A browser event showed the target or session ended while waiting.
+    Aborted { waiting_for: String },
     /// The connection failed, closed, or carried an unreadable message.
     Transport(String),
 }
@@ -116,6 +132,9 @@ impl fmt::Display for CdpError {
                 "`{waiting_for}` did not answer within {} ms",
                 timeout.as_millis()
             ),
+            Self::Aborted { waiting_for } => {
+                write!(formatter, "`{waiting_for}` was aborted by a browser event")
+            }
             Self::Transport(message) => write!(formatter, "{message}"),
         }
     }
@@ -163,6 +182,14 @@ impl MessageQueue {
     /// How many messages were discarded since the last call, resetting it.
     fn take_dropped(&mut self) -> u64 {
         std::mem::take(&mut self.dropped)
+    }
+
+    /// Whether any currently queued message satisfies `predicate`.
+    fn any<F>(&self, predicate: F) -> bool
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        self.messages.iter().any(predicate)
     }
 }
 
@@ -233,6 +260,30 @@ impl Connection {
         session_id: Option<&str>,
         deadline: Deadline,
     ) -> Result<Value, CdpError> {
+        self.call_until(method, params, session_id, deadline, |_| false)
+    }
+
+    /// Sends one command and returns its `result`, aborting early if any
+    /// already-queued or incoming event satisfies `should_abort`.
+    ///
+    /// Any matching event stays in the queue so callers can inspect it for
+    /// diagnostics.
+    pub fn call_until<F>(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        deadline: Deadline,
+        mut should_abort: F,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        if self.queued.any(&mut should_abort) {
+            return Err(CdpError::Aborted {
+                waiting_for: method.to_string(),
+            });
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.write(method, id, params, session_id)?;
@@ -248,7 +299,13 @@ impl Connection {
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
+            let abort = should_abort(&message);
             self.queued.push(message);
+            if abort {
+                return Err(CdpError::Aborted {
+                    waiting_for: method.to_string(),
+                });
+            }
         }
     }
 
@@ -470,9 +527,7 @@ impl Connection {
                     ));
                 }
                 Ok(Message::Frame(_)) => {}
-                Err(WebSocketError::Io(error))
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
+                Err(WebSocketError::Io(error)) if is_read_timeout(&error) => {
                     return Ok(());
                 }
                 Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
@@ -528,8 +583,7 @@ impl Connection {
                     )));
                 }
                 Ok(Message::Frame(_)) => {}
-                Err(WebSocketError::Io(error))
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(WebSocketError::Io(error)) if is_read_timeout(&error) => {}
                 Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
                     return Err(CdpError::Transport(format!(
                         "the browser closed the connection while waiting for `{waiting_for}`"
@@ -543,6 +597,22 @@ impl Connection {
             }
         }
     }
+}
+
+/// Reports whether a socket read error means no data arrived before the poll
+/// slice expired rather than a broken connection.
+fn is_read_timeout(error: &std::io::Error) -> bool {
+    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+        return true;
+    }
+    // On Windows, a blocking `TcpStream` read with `SO_RCVTIMEO` can report
+    // raw OS error 997 (`ERROR_IO_PENDING`) or 10060 (`WSAETIMEDOUT`) instead of
+    // mapping to `ErrorKind::WouldBlock` or `ErrorKind::TimedOut`.
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(997 | 10060)) {
+        return true;
+    }
+    false
 }
 
 /// The loopback address a `ws://` URL names; any other host is refused.
@@ -872,5 +942,238 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         drop(connection);
         server.join().expect("the mock server thread must join");
+    }
+
+    #[test]
+    fn deadline_capped_never_extends_outer_budget() {
+        let short = Deadline::after(Duration::from_millis(80));
+        let capped_by_short = short.capped(Duration::from_secs(5));
+        assert_eq!(capped_by_short.timeout_ms(), 80);
+
+        let long = Deadline::after(Duration::from_secs(30));
+        let capped_by_cap = long.capped(Duration::from_millis(200));
+        assert_eq!(capped_by_cap.timeout_ms(), 200);
+    }
+
+    #[test]
+    fn call_until_aborts_immediately_on_queued_or_arriving_event() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock CDP port");
+        let port = listener
+            .local_addr()
+            .expect("must read mock CDP port")
+            .port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("mock CDP must accept");
+            let mut socket = tungstenite::accept(stream).expect("mock handshake must succeed");
+            // First command receives an aborting event without ever answering.
+            let first = match socket.read().expect("read first command") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(first["method"], "Page.enable");
+            socket
+                .send(Message::text(
+                    json!({
+                        "method": "Inspector.targetCrashed",
+                        "sessionId": "s-1"
+                    })
+                    .to_string(),
+                ))
+                .expect("send aborting event");
+            while socket.read().is_ok() {}
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/test");
+        let mut conn =
+            Connection::connect(&url, Deadline::after(Duration::from_secs(2))).expect("connect");
+
+        let started = Instant::now();
+        let err = conn
+            .call_until(
+                "Page.enable",
+                json!({}),
+                Some("s-1"),
+                Deadline::after(Duration::from_secs(5)),
+                |msg| msg.get("method").and_then(Value::as_str) == Some("Inspector.targetCrashed"),
+            )
+            .expect_err("must abort on matching event");
+        assert!(
+            matches!(err, CdpError::Aborted { .. }),
+            "expected Aborted, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "abort must be fast, took {:?}",
+            started.elapsed()
+        );
+
+        // Calling again while the event is still queued must abort immediately without sending.
+        let second = conn
+            .call_until(
+                "Runtime.enable",
+                json!({}),
+                Some("s-1"),
+                Deadline::after(Duration::from_secs(5)),
+                |msg| msg.get("method").and_then(Value::as_str) == Some("Inspector.targetCrashed"),
+            )
+            .expect_err("must abort on already-queued event");
+        assert!(matches!(second, CdpError::Aborted { .. }));
+        assert_eq!(conn.take_messages().len(), 1);
+
+        drop(conn);
+        server.join().expect("server thread must finish");
+    }
+
+    #[test]
+    fn read_timeout_classifier_accepts_timeout_kinds_and_windows_codes() {
+        use std::io::Error as IoError;
+
+        assert!(is_read_timeout(&IoError::from(ErrorKind::WouldBlock)));
+        assert!(is_read_timeout(&IoError::from(ErrorKind::TimedOut)));
+        assert!(!is_read_timeout(&IoError::from(ErrorKind::ConnectionReset)));
+
+        // Unrelated raw OS code (5: ERROR_ACCESS_DENIED on Windows / EIO on Unix)
+        // must never be misclassified as a read timeout.
+        assert!(!is_read_timeout(&IoError::from_raw_os_error(5)));
+
+        let err_997 = IoError::from_raw_os_error(997);
+        let err_10060 = IoError::from_raw_os_error(10060);
+        #[cfg(windows)]
+        {
+            assert!(
+                is_read_timeout(&err_997),
+                "997 (ERROR_IO_PENDING) must be classified as a read timeout on Windows"
+            );
+            assert!(
+                is_read_timeout(&err_10060),
+                "10060 (WSAETIMEDOUT) must be classified as a read timeout on Windows"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(!is_read_timeout(&err_997));
+            assert!(!is_read_timeout(&err_10060));
+        }
+    }
+
+    #[test]
+    fn stream_remains_usable_after_read_timeout_and_os_error_997() {
+        use std::io::{self, Read, Write};
+        use tungstenite::protocol::Role;
+
+        struct PartialThenErrorStream {
+            step: usize,
+            frame: Vec<u8>,
+        }
+
+        impl Read for PartialThenErrorStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.step += 1;
+                match self.step {
+                    1 => {
+                        let split = 4.min(buf.len());
+                        buf[..split].copy_from_slice(&self.frame[..split]);
+                        Ok(split)
+                    }
+                    2 => Err(io::Error::from_raw_os_error(997)),
+                    _ => {
+                        let rest = &self.frame[4..];
+                        let n = rest.len().min(buf.len());
+                        buf[..n].copy_from_slice(&rest[..n]);
+                        Ok(n)
+                    }
+                }
+            }
+        }
+
+        impl Write for PartialThenErrorStream {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let payload = br#"{"id":1,"result":{"ok":true}}"#;
+        let mut frame = Vec::with_capacity(2 + payload.len());
+        frame.push(0x81);
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload);
+
+        let mut ws = WebSocket::from_raw_socket(
+            PartialThenErrorStream { step: 0, frame },
+            Role::Client,
+            None,
+        );
+        match ws.read() {
+            Err(WebSocketError::Io(err)) => {
+                assert_eq!(err.raw_os_error(), Some(997));
+                #[cfg(windows)]
+                assert!(is_read_timeout(&err));
+            }
+            other => panic!("expected raw OS error 997 on partial read, got {other:?}"),
+        }
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                assert_eq!(text.as_str(), std::str::from_utf8(payload).unwrap());
+            }
+            other => panic!("expected complete frame after 997, got {other:?}"),
+        }
+
+        // Also verify a real TcpStream Connection survives multiple READ_POLL
+        // socket read timeouts and still receives later frames.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock CDP");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut socket = tungstenite::accept(stream).expect("handshake");
+            let first = match socket.read().expect("first cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            thread::sleep(READ_POLL * 2 + Duration::from_millis(50));
+            socket
+                .send(Message::text(
+                    json!({ "id": first["id"], "result": { "delayed": true } }).to_string(),
+                ))
+                .expect("send delayed reply");
+
+            let second = match socket.read().expect("second cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            socket
+                .send(Message::text(
+                    json!({ "id": second["id"], "result": { "next": true } }).to_string(),
+                ))
+                .expect("send second reply");
+            while socket.read().is_ok() {}
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/test");
+        let mut conn =
+            Connection::connect(&url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let first = conn
+            .call(
+                "Page.enable",
+                json!({}),
+                None,
+                Deadline::after(Duration::from_secs(2)),
+            )
+            .expect("delayed reply must succeed after READ_POLL timeouts");
+        assert_eq!(first["delayed"], json!(true));
+        let second = conn
+            .call(
+                "Runtime.enable",
+                json!({}),
+                None,
+                Deadline::after(Duration::from_secs(2)),
+            )
+            .expect("subsequent call must succeed on the same stream");
+        assert_eq!(second["next"], json!(true));
+
+        drop(conn);
+        server.join().expect("server finish");
     }
 }

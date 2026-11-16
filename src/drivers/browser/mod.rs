@@ -1965,47 +1965,423 @@ impl BrowserSession {
     }
 }
 
+/// Maximum number of target/session CDP events summarized on a session-creation failure.
+const MAX_ATTACH_DIAGNOSTIC_EVENTS: usize = 5;
+/// Maximum number of fresh `about:blank` tabs tried during one `attach` call.
+///
+/// The tab is fresh (`about:blank`) and no navigation or user script has run in
+/// it yet, so closing a stalled/crashed tab and opening a replacement is safe
+/// and idempotent inside the existing `LAUNCH_TIMEOUT` budget.
+const MAX_ATTACH_ATTEMPTS: usize = 3;
+/// Per-attempt budget for `Page.enable` / `Runtime.enable` / `Network.enable`.
+///
+/// Healthy targets answer in tens of milliseconds; capping each attempt at 5 s
+/// lets a silent renderer hang abort and retry within the 30 s `LAUNCH_TIMEOUT`.
+const ATTACH_ENABLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `attach` waits for `Target.closeTarget` when cleaning up a failed fresh tab.
+const ATTACH_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Which phase of `attach` failed, used to classify whether target recreation can help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachStep {
+    CreateTarget,
+    AttachToTarget,
+    EnableDomain,
+}
+
+/// Whether a failed `attach` attempt failed at the target/session layer or the browser layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachFailureKind {
+    /// Target/session failed before domains were enabled while the browser WebSocket stayed open.
+    TargetFailed,
+    /// Browser-level WebSocket closed/errored or `Target.createTarget` itself failed.
+    BrowserFailed,
+}
+
+/// Decision after an `attach` attempt fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachRetryDecision {
+    Retry,
+    GiveUp,
+}
+
+/// Outcome of one `attach_once` attempt.
+struct AttachAttemptFailure {
+    target_id: Option<String>,
+    kind: AttachFailureKind,
+    message: String,
+    target_destroyed: bool,
+}
+
 /// Opens one new tab and attaches it as the session's page.
+///
+/// Retries up to [`MAX_ATTACH_ATTEMPTS`] times inside `deadline` if a fresh
+/// `about:blank` target crashes, detaches, or silently stalls before domain
+/// setup completes; never retries once `attach` returns or navigation starts.
 fn attach(connection: &mut Connection, deadline: Deadline) -> Result<(String, String), String> {
-    let target = connection
-        .call(
-            "Target.createTarget",
-            json!({ "url": "about:blank" }),
-            None,
-            deadline,
-        )
-        .map_err(|error| format!("could not open a page in the browser: {error}"))?;
+    attach_with_enable_timeout(connection, deadline, ATTACH_ENABLE_TIMEOUT)
+}
+
+/// Runs bounded target creation and domain setup with a configurable per-attempt
+/// domain-enable timeout (used directly by unit tests without sleeping 5 s).
+fn attach_with_enable_timeout(
+    connection: &mut Connection,
+    deadline: Deadline,
+    enable_timeout: Duration,
+) -> Result<(String, String), String> {
+    let mut attempt_errors = Vec::with_capacity(MAX_ATTACH_ATTEMPTS);
+    for attempt in 1..=MAX_ATTACH_ATTEMPTS {
+        match attach_once(connection, deadline, enable_timeout) {
+            Ok(attached) => return Ok(attached),
+            Err(failure) => {
+                let mut effective_kind = failure.kind;
+                attempt_errors.push(failure.message);
+                if let Some(target_id) = failure.target_id.as_deref()
+                    && !failure.target_destroyed
+                    && effective_kind == AttachFailureKind::TargetFailed
+                    && !deadline.passed()
+                    && attempt < MAX_ATTACH_ATTEMPTS
+                {
+                    if let Err(CdpError::Transport(_)) = connection.call(
+                        "Target.closeTarget",
+                        json!({ "targetId": target_id }),
+                        None,
+                        deadline.capped(ATTACH_CLOSE_TIMEOUT),
+                    ) {
+                        effective_kind = AttachFailureKind::BrowserFailed;
+                    }
+                    let _ = connection.take_messages();
+                }
+                if decide_attach_retry(
+                    attempt,
+                    MAX_ATTACH_ATTEMPTS,
+                    effective_kind,
+                    deadline.passed(),
+                ) == AttachRetryDecision::GiveUp
+                {
+                    return Err(format_attempts_error(&attempt_errors));
+                }
+            }
+        }
+    }
+    Err(format_attempts_error(&attempt_errors))
+}
+
+/// Target and session identifiers known at a given point in `attach`.
+#[derive(Clone, Copy)]
+struct AttachScope<'a> {
+    target_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+}
+
+/// Attempts once to create a fresh `about:blank` target, attach to it, and
+/// enable `Page`, `Runtime`, and `Network`.
+fn attach_once(
+    connection: &mut Connection,
+    deadline: Deadline,
+    enable_timeout: Duration,
+) -> Result<(String, String), AttachAttemptFailure> {
+    let target = attach_call(
+        connection,
+        AttachStep::CreateTarget,
+        "could not open a page in the browser",
+        "Target.createTarget",
+        json!({ "url": "about:blank" }),
+        AttachScope {
+            target_id: None,
+            session_id: None,
+        },
+        deadline,
+    )?;
     let target_id = target
         .get("targetId")
         .and_then(Value::as_str)
-        .ok_or_else(|| "the browser did not return a target id".to_string())?
+        .ok_or_else(|| AttachAttemptFailure {
+            target_id: None,
+            kind: AttachFailureKind::BrowserFailed,
+            message: "the browser did not return a target id".to_string(),
+            target_destroyed: false,
+        })?
         .to_string();
-    let attached = connection
-        .call(
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-            None,
-            deadline,
-        )
-        .map_err(|error| format!("could not attach to the page the browser opened: {error}"))?;
+    let attached = attach_call(
+        connection,
+        AttachStep::AttachToTarget,
+        "could not attach to the page the browser opened",
+        "Target.attachToTarget",
+        json!({ "targetId": target_id, "flatten": true }),
+        AttachScope {
+            target_id: Some(&target_id),
+            session_id: None,
+        },
+        deadline,
+    )?;
     let page = attached
         .get("sessionId")
         .and_then(Value::as_str)
-        .ok_or_else(|| "the browser did not return a page session id".to_string())?
+        .ok_or_else(|| AttachAttemptFailure {
+            target_id: Some(target_id.clone()),
+            kind: AttachFailureKind::TargetFailed,
+            message: "the browser did not return a page session id".to_string(),
+            target_destroyed: false,
+        })?
         .to_string();
-    connection
-        .call("Page.enable", json!({}), Some(&page), deadline)
-        .map_err(|error| format!("could not enable page events: {error}"))?;
-    connection
-        .call("Runtime.enable", json!({}), Some(&page), deadline)
-        .map_err(|error| format!("could not enable page scripts: {error}"))?;
+    let domain_deadline = deadline.capped(enable_timeout);
+    let page_scope = AttachScope {
+        target_id: Some(&target_id),
+        session_id: Some(&page),
+    };
+    attach_call(
+        connection,
+        AttachStep::EnableDomain,
+        "could not enable page events",
+        "Page.enable",
+        json!({}),
+        page_scope,
+        domain_deadline,
+    )?;
+    attach_call(
+        connection,
+        AttachStep::EnableDomain,
+        "could not enable page scripts",
+        "Runtime.enable",
+        json!({}),
+        page_scope,
+        domain_deadline,
+    )?;
     // The first navigation may start right after this call, so the network
     // domain is enabled before the page can issue a request; an observer
     // enabled later would miss the document request.
-    connection
-        .call("Network.enable", json!({}), Some(&page), deadline)
-        .map_err(|error| format!("could not enable network events: {error}"))?;
+    attach_call(
+        connection,
+        AttachStep::EnableDomain,
+        "could not enable network events",
+        "Network.enable",
+        json!({}),
+        page_scope,
+        domain_deadline,
+    )?;
     Ok((page, target_id))
+}
+
+/// Runs one CDP command during session creation, aborting early on terminal
+/// target/session events and enriching any failure with diagnostics.
+fn attach_call(
+    connection: &mut Connection,
+    step: AttachStep,
+    action: &str,
+    method: &str,
+    params: Value,
+    scope: AttachScope<'_>,
+    deadline: Deadline,
+) -> Result<Value, AttachAttemptFailure> {
+    let outcome = match step {
+        AttachStep::CreateTarget => connection.call(method, params, scope.session_id, deadline),
+        AttachStep::AttachToTarget | AttachStep::EnableDomain => {
+            connection.call_until(method, params, scope.session_id, deadline, |event| {
+                is_terminal_target_event(event, scope.target_id, scope.session_id)
+            })
+        }
+    };
+    outcome.map_err(|error| {
+        if matches!(error, CdpError::Aborted { .. }) {
+            let _ = connection.poll_messages();
+        }
+        let events = connection.take_messages();
+        let target_destroyed = events.iter().any(|event| {
+            event_matches_target(event, scope.target_id, scope.session_id)
+                && event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
+        });
+        AttachAttemptFailure {
+            target_id: scope.target_id.map(str::to_string),
+            kind: classify_attach_failure(step, &error),
+            message: format_attach_error(
+                action,
+                &error,
+                scope.target_id,
+                scope.session_id,
+                &events,
+            ),
+            target_destroyed,
+        }
+    })
+}
+
+/// Classifies whether an `attach` error warrants recreating the target or giving up.
+fn classify_attach_failure(step: AttachStep, error: &CdpError) -> AttachFailureKind {
+    match step {
+        AttachStep::CreateTarget => AttachFailureKind::BrowserFailed,
+        AttachStep::AttachToTarget => match error {
+            CdpError::Timeout { .. } | CdpError::Aborted { .. } => AttachFailureKind::TargetFailed,
+            CdpError::Method { message, .. } if message.contains("No target") => {
+                AttachFailureKind::TargetFailed
+            }
+            CdpError::Method { .. } | CdpError::Script(_) | CdpError::Transport(_) => {
+                AttachFailureKind::BrowserFailed
+            }
+        },
+        AttachStep::EnableDomain => match error {
+            CdpError::Timeout { .. } | CdpError::Aborted { .. } | CdpError::Method { .. } => {
+                AttachFailureKind::TargetFailed
+            }
+            CdpError::Script(_) | CdpError::Transport(_) => AttachFailureKind::BrowserFailed,
+        },
+    }
+}
+
+/// Decides whether `attach` should close the failed target and create a fresh one.
+fn decide_attach_retry(
+    attempt: usize,
+    max_attempts: usize,
+    failure_kind: AttachFailureKind,
+    deadline_passed: bool,
+) -> AttachRetryDecision {
+    if failure_kind == AttachFailureKind::TargetFailed && attempt < max_attempts && !deadline_passed
+    {
+        AttachRetryDecision::Retry
+    } else {
+        AttachRetryDecision::GiveUp
+    }
+}
+
+/// Formats one or more failed `attach` attempts into a single error message.
+fn format_attempts_error(attempt_errors: &[String]) -> String {
+    match attempt_errors {
+        [] => "could not attach to a page in the browser".to_string(),
+        [single] => single.clone(),
+        many => many
+            .iter()
+            .enumerate()
+            .map(|(index, message)| format!("attempt {}: {message}", index + 1))
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// Reports whether an event proves that the target or session has crashed or detached.
+fn is_terminal_target_event(
+    event: &Value,
+    target_id: Option<&str>,
+    session_id: Option<&str>,
+) -> bool {
+    if !event_matches_target(event, target_id, session_id) {
+        return false;
+    }
+    matches!(
+        event.get("method").and_then(Value::as_str),
+        Some(
+            "Target.targetCrashed"
+                | "Inspector.targetCrashed"
+                | "Target.detachedFromTarget"
+                | "Inspector.detached"
+                | "Target.targetDestroyed"
+        )
+    )
+}
+
+/// Formats a session-creation CDP error with any diagnostic events received
+/// for the target or session while waiting.
+fn format_attach_error(
+    action: &str,
+    error: &CdpError,
+    target_id: Option<&str>,
+    session_id: Option<&str>,
+    events: &[Value],
+) -> String {
+    let mut matched = Vec::new();
+    for event in events {
+        if !event_matches_target(event, target_id, session_id) {
+            continue;
+        }
+        if let Some(summary) = summarize_attach_event(event)
+            && !matched.contains(&summary)
+        {
+            matched.push(summary);
+        }
+    }
+
+    if matched.is_empty() {
+        return match error {
+            CdpError::Timeout { .. } => format!(
+                "{action}: {error}; browser never answered (no CDP events received for this target or session)"
+            ),
+            _ => format!("{action}: {error}"),
+        };
+    }
+
+    let shown: Vec<&str> = matched
+        .iter()
+        .take(MAX_ATTACH_DIAGNOSTIC_EVENTS)
+        .map(String::as_str)
+        .collect();
+    let extra = matched.len().saturating_sub(MAX_ATTACH_DIAGNOSTIC_EVENTS);
+    let summary = if extra > 0 {
+        format!("{}, +{extra} more", shown.join(", "))
+    } else {
+        shown.join(", ")
+    };
+    format!("{action}: {error}; browser events: {summary}")
+}
+
+/// Reports whether a queued CDP message is an event belonging to `target_id` or `session_id`.
+fn event_matches_target(event: &Value, target_id: Option<&str>, session_id: Option<&str>) -> bool {
+    if event.get("method").and_then(Value::as_str).is_none() {
+        return false;
+    }
+    if let Some(sid) = session_id
+        && (event.get("sessionId").and_then(Value::as_str) == Some(sid)
+            || event.pointer("/params/sessionId").and_then(Value::as_str) == Some(sid))
+    {
+        return true;
+    }
+    if let Some(tid) = target_id
+        && (event.pointer("/params/targetId").and_then(Value::as_str) == Some(tid)
+            || event
+                .pointer("/params/targetInfo/targetId")
+                .and_then(Value::as_str)
+                == Some(tid))
+    {
+        return true;
+    }
+    false
+}
+
+/// Formats one CDP event into a short human-readable diagnostic label.
+fn summarize_attach_event(event: &Value) -> Option<String> {
+    let method = event.get("method").and_then(Value::as_str)?;
+    let params = event.get("params");
+    match method {
+        "Target.targetCrashed" => {
+            let status = params
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str);
+            let error_code = params
+                .and_then(|value| value.get("errorCode"))
+                .and_then(Value::as_i64);
+            match (status, error_code) {
+                (Some(status), Some(code)) => Some(format!(
+                    "target crashed ({method}: status={status}, errorCode={code})"
+                )),
+                (Some(status), None) => Some(format!("target crashed ({method}: status={status})")),
+                (None, Some(code)) => Some(format!("target crashed ({method}: errorCode={code})")),
+                (None, None) => Some(format!("target crashed ({method})")),
+            }
+        }
+        "Inspector.targetCrashed" => Some(format!("target crashed ({method})")),
+        "Target.detachedFromTarget" => Some(format!("target detached ({method})")),
+        "Inspector.detached" => {
+            let reason = params
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str);
+            match reason {
+                Some(reason) if !reason.is_empty() => {
+                    Some(format!("target detached ({method}: {reason})"))
+                }
+                _ => Some(format!("target detached ({method})")),
+            }
+        }
+        "Target.targetDestroyed" => Some(format!("target destroyed ({method})")),
+        _ => Some(method.to_string()),
+    }
 }
 
 /// An actionable target with its verified viewport click coordinates.
@@ -2907,6 +3283,8 @@ fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use crate::core::registry::Registry;
 
@@ -3676,6 +4054,584 @@ mod tests {
                 },
             ),
             Ok((88.0, 26.0))
+        );
+    }
+
+    fn spawn_mock_cdp<F>(handler: F) -> (String, thread::JoinHandle<()>)
+    where
+        F: FnOnce(tungstenite::WebSocket<std::net::TcpStream>) + Send + 'static,
+    {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock CDP listener");
+        let port = listener
+            .local_addr()
+            .expect("must read mock CDP port")
+            .port();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("mock CDP must accept connection");
+            let _ = stream.set_nodelay(true);
+            let socket = tungstenite::accept(stream).expect("mock CDP handshake must succeed");
+            handler(socket);
+        });
+        (
+            format!("ws://127.0.0.1:{port}/devtools/browser/mock"),
+            handle,
+        )
+    }
+
+    fn read_cdp_request(socket: &mut tungstenite::WebSocket<std::net::TcpStream>) -> Value {
+        loop {
+            match socket.read().expect("mock CDP must read command") {
+                tungstenite::Message::Text(text) => {
+                    return serde_json::from_str(text.as_str())
+                        .expect("mock CDP command must be JSON");
+                }
+                tungstenite::Message::Ping(_)
+                | tungstenite::Message::Pong(_)
+                | tungstenite::Message::Binary(_)
+                | tungstenite::Message::Frame(_) => {}
+                tungstenite::Message::Close(_) => panic!("client closed mock CDP unexpectedly"),
+            }
+        }
+    }
+
+    #[test]
+    fn attach_aborts_fast_and_reports_target_crashed_event() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create = read_cdp_request(&mut socket);
+            assert_eq!(create["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": create["id"],
+                        "result": { "targetId": "target-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send createTarget reply");
+
+            let attach_cmd = read_cdp_request(&mut socket);
+            assert_eq!(attach_cmd["method"], "Target.attachToTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": attach_cmd["id"],
+                        "result": { "sessionId": "session-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send attachToTarget reply");
+
+            let page_enable = read_cdp_request(&mut socket);
+            assert_eq!(page_enable["method"], "Page.enable");
+            for event in [
+                json!({
+                    "method": "Target.targetInfoChanged",
+                    "params": { "targetInfo": { "targetId": "other-target" } }
+                }),
+                json!({
+                    "method": "Target.targetCrashed",
+                    "params": {
+                        "targetId": "target-1",
+                        "status": "crashed",
+                        "errorCode": 11
+                    }
+                }),
+            ] {
+                socket
+                    .send(tungstenite::Message::text(event.to_string()))
+                    .expect("send diagnostic CDP event");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let started = std::time::Instant::now();
+        let err = attach(&mut conn, Deadline::after(Duration::from_millis(250)))
+            .expect_err("attach must fail when Page.enable never answers");
+        drop(conn);
+        server.join().expect("mock CDP thread must finish");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "crash event must abort attach fast instead of waiting 30s"
+        );
+        assert!(err.contains("Page.enable"), "missing method name: {err}");
+        assert!(
+            err.contains("Target.targetCrashed") && err.contains("target crashed"),
+            "missing crashed event detail: {err}"
+        );
+        assert!(
+            !err.contains("other-target"),
+            "unrelated target event must not leak into error: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_aborts_fast_and_reports_detached_event() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": create["id"],
+                        "result": { "targetId": "target-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send createTarget reply");
+
+            let attach_cmd = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": attach_cmd["id"],
+                        "result": { "sessionId": "session-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send attachToTarget reply");
+
+            let page_enable = read_cdp_request(&mut socket);
+            assert_eq!(page_enable["method"], "Page.enable");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "method": "Target.detachedFromTarget",
+                        "params": {
+                            "sessionId": "session-1",
+                            "targetId": "target-1"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("send detached event");
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let started = std::time::Instant::now();
+        // Large outer deadline proves we fail fast on the event instead of waiting 30 s.
+        let err = attach(&mut conn, Deadline::after(Duration::from_millis(250)))
+            .expect_err("attach must fail when target detaches");
+        drop(conn);
+        server.join().expect("mock CDP thread must finish");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "detached event must abort attach fast"
+        );
+        assert!(err.contains("Page.enable"), "missing method name: {err}");
+        assert!(
+            err.contains("Target.detachedFromTarget") && err.contains("detached"),
+            "missing detached event detail: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_recovers_by_recreating_target_after_crash_and_silent_timeout() {
+        // Case 1: attempt 1 emits Inspector.targetCrashed during Page.enable;
+        // attach closes target-1, creates target-2, and succeeds fast inside 30s.
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            assert_eq!(create1["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+
+            let attach1 = read_cdp_request(&mut socket);
+            assert_eq!(attach1["method"], "Target.attachToTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach1["id"], "result": { "sessionId": "session-1" } })
+                        .to_string(),
+                ))
+                .expect("attach session-1");
+
+            let page1 = read_cdp_request(&mut socket);
+            assert_eq!(page1["method"], "Page.enable");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "method": "Inspector.targetCrashed", "sessionId": "session-1" })
+                        .to_string(),
+                ))
+                .expect("emit crash on session-1");
+
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            assert_eq!(close1["params"]["targetId"], "target-1");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": close1["id"], "result": { "success": true } }).to_string(),
+                ))
+                .expect("close target-1");
+
+            let create2 = read_cdp_request(&mut socket);
+            assert_eq!(create2["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create2["id"], "result": { "targetId": "target-2" } })
+                        .to_string(),
+                ))
+                .expect("create target-2");
+
+            let attach2 = read_cdp_request(&mut socket);
+            assert_eq!(attach2["method"], "Target.attachToTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach2["id"], "result": { "sessionId": "session-2" } })
+                        .to_string(),
+                ))
+                .expect("attach session-2");
+
+            for expected in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], expected);
+                assert_eq!(cmd["sessionId"], "session-2");
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": cmd["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("reply domain enable on session-2");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let started = std::time::Instant::now();
+        let (page, target) = attach(&mut conn, Deadline::after(Duration::from_secs(10)))
+            .expect("attach must recover on target-2 after target-1 crashed");
+        drop(conn);
+        server.join().expect("mock server finish");
+        assert_eq!((page.as_str(), target.as_str()), ("session-2", "target-2"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "crash recovery must not wait out 30s timeout"
+        );
+
+        // Case 2: attempt 1 hangs silently on Page.enable beyond per-attempt cap;
+        // attach closes target-1, creates target-2, and succeeds.
+        let (ws_url2, server2) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+            let attach1 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach1["id"], "result": { "sessionId": "session-1" } })
+                        .to_string(),
+                ))
+                .expect("attach session-1");
+            let page1 = read_cdp_request(&mut socket);
+            assert_eq!(page1["method"], "Page.enable");
+            // Never answer page1; wait for Target.closeTarget after enable_timeout expires.
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            assert_eq!(close1["params"]["targetId"], "target-1");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": close1["id"], "result": { "success": true } }).to_string(),
+                ))
+                .expect("close target-1");
+
+            let create2 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create2["id"], "result": { "targetId": "target-2" } })
+                        .to_string(),
+                ))
+                .expect("create target-2");
+            let attach2 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach2["id"], "result": { "sessionId": "session-2" } })
+                        .to_string(),
+                ))
+                .expect("attach session-2");
+            for expected in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], expected);
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": cmd["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("reply on session-2");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn2 = Connection::connect(&ws_url2, Deadline::after(Duration::from_secs(2)))
+            .expect("connect");
+        let (page2, target2) = attach_with_enable_timeout(
+            &mut conn2,
+            Deadline::after(Duration::from_secs(5)),
+            Duration::from_millis(120),
+        )
+        .expect("attach must recover on target-2 after silent hang on target-1");
+        drop(conn2);
+        server2.join().expect("mock server 2 finish");
+        assert_eq!(
+            (page2.as_str(), target2.as_str()),
+            ("session-2", "target-2")
+        );
+    }
+
+    #[test]
+    fn attach_gives_up_after_max_attempts_and_reports_all_diagnostics() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            for attempt in 1..=MAX_ATTACH_ATTEMPTS {
+                let tid = format!("target-{attempt}");
+                let sid = format!("session-{attempt}");
+                let create = read_cdp_request(&mut socket);
+                assert_eq!(create["method"], "Target.createTarget");
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": create["id"], "result": { "targetId": tid } }).to_string(),
+                    ))
+                    .expect("create target");
+
+                let attach_cmd = read_cdp_request(&mut socket);
+                assert_eq!(attach_cmd["method"], "Target.attachToTarget");
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": attach_cmd["id"], "result": { "sessionId": sid } })
+                            .to_string(),
+                    ))
+                    .expect("attach target");
+
+                let page_enable = read_cdp_request(&mut socket);
+                assert_eq!(page_enable["method"], "Page.enable");
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({
+                            "method": "Inspector.detached",
+                            "sessionId": sid,
+                            "params": { "reason": "Render process gone." }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("emit detached");
+
+                if attempt < MAX_ATTACH_ATTEMPTS {
+                    let close_cmd = read_cdp_request(&mut socket);
+                    assert_eq!(close_cmd["method"], "Target.closeTarget");
+                    socket
+                        .send(tungstenite::Message::text(
+                            json!({ "id": close_cmd["id"], "result": { "success": true } })
+                                .to_string(),
+                        ))
+                        .expect("close target");
+                }
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let started = std::time::Instant::now();
+        let err = attach(&mut conn, Deadline::after(Duration::from_secs(10)))
+            .expect_err("attach must give up after MAX_ATTACH_ATTEMPTS");
+        drop(conn);
+        server.join().expect("mock server finish");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "all 3 crash/detach attempts must fail fast"
+        );
+        assert!(err.contains("attempt 1:"), "{err}");
+        assert!(err.contains("attempt 3:"), "{err}");
+        assert!(err.contains("Render process gone."), "{err}");
+    }
+
+    #[test]
+    fn attach_retry_decision_handles_target_and_browser_failures() {
+        assert_eq!(
+            decide_attach_retry(1, 3, AttachFailureKind::TargetFailed, false),
+            AttachRetryDecision::Retry
+        );
+        assert_eq!(
+            decide_attach_retry(2, 3, AttachFailureKind::TargetFailed, false),
+            AttachRetryDecision::Retry
+        );
+        assert_eq!(
+            decide_attach_retry(3, 3, AttachFailureKind::TargetFailed, false),
+            AttachRetryDecision::GiveUp
+        );
+        assert_eq!(
+            decide_attach_retry(1, 3, AttachFailureKind::TargetFailed, true),
+            AttachRetryDecision::GiveUp
+        );
+        assert_eq!(
+            decide_attach_retry(1, 3, AttachFailureKind::BrowserFailed, false),
+            AttachRetryDecision::GiveUp
+        );
+
+        let timeout = CdpError::Timeout {
+            waiting_for: "Page.enable".to_string(),
+            timeout: Duration::from_secs(5),
+        };
+        let aborted = CdpError::Aborted {
+            waiting_for: "Page.enable".to_string(),
+        };
+        let transport = CdpError::Transport("socket closed".to_string());
+        let no_target = CdpError::Method {
+            method: "Target.attachToTarget".to_string(),
+            message: "No target with given id found".to_string(),
+        };
+
+        assert_eq!(
+            classify_attach_failure(AttachStep::CreateTarget, &timeout),
+            AttachFailureKind::BrowserFailed
+        );
+        assert_eq!(
+            classify_attach_failure(AttachStep::AttachToTarget, &no_target),
+            AttachFailureKind::TargetFailed
+        );
+        assert_eq!(
+            classify_attach_failure(AttachStep::AttachToTarget, &transport),
+            AttachFailureKind::BrowserFailed
+        );
+        assert_eq!(
+            classify_attach_failure(AttachStep::EnableDomain, &timeout),
+            AttachFailureKind::TargetFailed
+        );
+        assert_eq!(
+            classify_attach_failure(AttachStep::EnableDomain, &aborted),
+            AttachFailureKind::TargetFailed
+        );
+        assert_eq!(
+            classify_attach_failure(AttachStep::EnableDomain, &transport),
+            AttachFailureKind::BrowserFailed
+        );
+    }
+
+    #[test]
+    fn attach_timeout_without_events_reports_browser_never_answered() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": create["id"],
+                        "result": { "targetId": "target-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send createTarget reply");
+
+            let attach_cmd = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": attach_cmd["id"],
+                        "result": { "sessionId": "session-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send attachToTarget reply");
+
+            let page_enable = read_cdp_request(&mut socket);
+            assert_eq!(page_enable["method"], "Page.enable");
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let err = attach(&mut conn, Deadline::after(Duration::from_millis(250)))
+            .expect_err("attach must fail when Page.enable never answers");
+        drop(conn);
+        server.join().expect("mock CDP thread must finish");
+
+        assert!(err.contains("Page.enable"), "missing method name: {err}");
+        assert!(
+            err.contains("never answered") && err.contains("no CDP events"),
+            "bare timeout must explain that the browser never answered and sent no events: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_error_formatter_summarizes_inspector_crash_detach_and_bounds_events() {
+        let timeout = CdpError::Timeout {
+            waiting_for: "Page.enable".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let inspector = format_attach_error(
+            "could not enable page events",
+            &timeout,
+            Some("t-1"),
+            Some("s-1"),
+            &[
+                json!({ "id": 99, "result": {} }),
+                json!({ "method": "Inspector.targetCrashed", "sessionId": "s-1" }),
+                json!({
+                    "method": "Inspector.detached",
+                    "sessionId": "s-1",
+                    "params": { "reason": "Render process gone" }
+                }),
+                json!({
+                    "method": "Target.targetDestroyed",
+                    "params": { "targetId": "t-1" }
+                }),
+            ],
+        );
+        assert!(
+            inspector.contains("target crashed (Inspector.targetCrashed)"),
+            "{inspector}"
+        );
+        assert!(
+            inspector.contains("target detached (Inspector.detached: Render process gone)"),
+            "{inspector}"
+        );
+        assert!(
+            inspector.contains("target destroyed (Target.targetDestroyed)"),
+            "{inspector}"
+        );
+
+        let many_events: Vec<Value> = (0..7)
+            .map(|i| {
+                json!({
+                    "method": format!("Page.event{i}"),
+                    "sessionId": "s-1"
+                })
+            })
+            .collect();
+        let bounded = format_attach_error(
+            "could not enable page events",
+            &timeout,
+            Some("t-1"),
+            Some("s-1"),
+            &many_events,
+        );
+        assert!(bounded.contains("Page.event0"), "{bounded}");
+        assert!(bounded.contains("Page.event4"), "{bounded}");
+        assert!(!bounded.contains("Page.event5"), "{bounded}");
+        assert!(bounded.contains("+2 more"), "{bounded}");
+
+        let transport = CdpError::Transport("socket closed".to_string());
+        let closed = format_attach_error(
+            "could not enable page events",
+            &transport,
+            Some("t-1"),
+            Some("s-1"),
+            &[json!({
+                "method": "Target.targetCrashed",
+                "params": { "targetId": "t-1", "status": "killed" }
+            })],
+        );
+        assert!(
+            closed.contains("socket closed")
+                && closed.contains("target crashed (Target.targetCrashed: status=killed)"),
+            "{closed}"
         );
     }
 }

@@ -3184,3 +3184,237 @@ fn unsupported_capabilities_probe_current_behavior() {
         "unexpected coords probe error: {coords_err}"
     );
 }
+
+fn spawn_mock_devtools<F>(ws_handler: F) -> (u16, thread::JoinHandle<()>)
+where
+    F: FnOnce(tungstenite::WebSocket<TcpStream>) + Send + 'static,
+{
+    let http_listener = TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock HTTP port");
+    let http_port = http_listener
+        .local_addr()
+        .expect("must read mock HTTP port")
+        .port();
+    let ws_listener = TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock WS port");
+    let ws_port = ws_listener
+        .local_addr()
+        .expect("must read mock WS port")
+        .port();
+
+    let handle = thread::spawn(move || {
+        let (mut http_stream, _) = http_listener
+            .accept()
+            .expect("mock DevTools HTTP must accept");
+        let mut buf = [0_u8; 1024];
+        let _ = http_stream.read(&mut buf);
+        let body = json!({
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{ws_port}/devtools/browser/mock")
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        http_stream
+            .write_all(response.as_bytes())
+            .expect("mock HTTP must write /json/version");
+        drop(http_stream);
+
+        let (ws_stream, _) = ws_listener.accept().expect("mock DevTools WS must accept");
+        let _ = ws_stream.set_nodelay(true);
+        let socket = tungstenite::accept(ws_stream).expect("mock WS handshake must succeed");
+        ws_handler(socket);
+    });
+    (http_port, handle)
+}
+
+fn read_mock_cdp(socket: &mut tungstenite::WebSocket<TcpStream>) -> Option<Value> {
+    loop {
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                return Some(
+                    serde_json::from_str(text.as_str()).expect("mock CDP command must be JSON"),
+                );
+            }
+            Ok(
+                tungstenite::Message::Ping(_)
+                | tungstenite::Message::Pong(_)
+                | tungstenite::Message::Binary(_)
+                | tungstenite::Message::Frame(_),
+            ) => {}
+            Ok(tungstenite::Message::Close(_)) | Err(_) => return None,
+        }
+    }
+}
+
+fn send_mock_cdp(socket: &mut tungstenite::WebSocket<TcpStream>, payload: &Value) {
+    socket
+        .send(tungstenite::Message::text(payload.to_string()))
+        .expect("mock CDP must send frame");
+}
+
+#[test]
+fn session_creation_recovers_from_target_crash_and_reports_diagnostics_when_all_fail() {
+    let dir = TempDir::new("browser-attach-mock");
+
+    // 1. Recovery path: target-1 crashes during Page.enable, target-2 succeeds.
+    let (recover_port, recover_server) = spawn_mock_devtools(|mut socket| {
+        let create1 = read_mock_cdp(&mut socket).expect("create1");
+        assert_eq!(create1["method"], "Target.createTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": create1["id"], "result": { "targetId": "t-1" } }),
+        );
+        let attach1 = read_mock_cdp(&mut socket).expect("attach1");
+        assert_eq!(attach1["method"], "Target.attachToTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": attach1["id"], "result": { "sessionId": "s-1" } }),
+        );
+        let page1 = read_mock_cdp(&mut socket).expect("page1");
+        assert_eq!(page1["method"], "Page.enable");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "method": "Inspector.targetCrashed", "sessionId": "s-1" }),
+        );
+        let close1 = read_mock_cdp(&mut socket).expect("close1");
+        assert_eq!(close1["method"], "Target.closeTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": close1["id"], "result": { "success": true } }),
+        );
+
+        let create2 = read_mock_cdp(&mut socket).expect("create2");
+        assert_eq!(create2["method"], "Target.createTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": create2["id"], "result": { "targetId": "t-2" } }),
+        );
+        let attach2 = read_mock_cdp(&mut socket).expect("attach2");
+        assert_eq!(attach2["method"], "Target.attachToTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": attach2["id"], "result": { "sessionId": "s-2" } }),
+        );
+
+        while let Some(cmd) = read_mock_cdp(&mut socket) {
+            let method = cmd["method"].as_str().unwrap_or_default();
+            let result = match method {
+                "Page.enable" | "Runtime.enable" | "Network.enable" | "Page.navigate" => json!({}),
+                "Runtime.evaluate" => {
+                    let expr = cmd["params"]["expression"].as_str().unwrap_or_default();
+                    if expr == "location.href" {
+                        json!({ "result": { "value": "http://127.0.0.1/ok" } })
+                    } else {
+                        json!({ "result": { "value": "Recovered" } })
+                    }
+                }
+                "Target.closeTarget" => {
+                    send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "success": true } }),
+                    );
+                    break;
+                }
+                other => panic!("unexpected CDP command: {other}"),
+            };
+            send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": result }));
+        }
+    });
+
+    let recover_case = dir.write(
+        "recover.yaml",
+        &format!(
+            "name: recover attach\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{recover_port}\"\n      url: \"http://127.0.0.1/ok\"\n    expect:\n      - path: $.title\n        equals: \"Recovered\"\n"
+        ),
+    );
+    let recover_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&recover_case),
+            "--no-bundle",
+        ],
+    );
+    recover_server.join().expect("recover mock server finish");
+    assert_eq!(
+        exit_code(&recover_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&recover_out),
+        stderr(&recover_out)
+    );
+
+    // 2. Failure path: all 3 attempts crash on Page.enable -> fast exit code 4 with diagnostics.
+    let (fail_port, fail_server) = spawn_mock_devtools(|mut socket| {
+        for attempt in 1..=3 {
+            let tid = format!("t-{attempt}");
+            let sid = format!("s-{attempt}");
+            let create = read_mock_cdp(&mut socket).expect("create");
+            send_mock_cdp(
+                &mut socket,
+                &json!({ "id": create["id"], "result": { "targetId": tid } }),
+            );
+            let attach = read_mock_cdp(&mut socket).expect("attach");
+            send_mock_cdp(
+                &mut socket,
+                &json!({ "id": attach["id"], "result": { "sessionId": sid } }),
+            );
+            let page = read_mock_cdp(&mut socket).expect("page");
+            assert_eq!(page["method"], "Page.enable");
+            send_mock_cdp(
+                &mut socket,
+                &json!({
+                    "method": "Target.targetCrashed",
+                    "params": { "targetId": tid, "status": "crashed", "errorCode": 11 }
+                }),
+            );
+            if attempt < 3 {
+                let close = read_mock_cdp(&mut socket).expect("close");
+                send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": close["id"], "result": { "success": true } }),
+                );
+            }
+        }
+        while read_mock_cdp(&mut socket).is_some() {}
+    });
+
+    let fail_case = dir.write(
+        "fail.yaml",
+        &format!(
+            "name: fail attach\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{fail_port}\"\n      url: \"http://127.0.0.1/fail\"\n"
+        ),
+    );
+    let started = Instant::now();
+    let fail_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&fail_case),
+            "--no-bundle",
+        ],
+    );
+    fail_server.join().expect("fail mock server finish");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "crashed attach must fail fast, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        exit_code(&fail_out),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&fail_out),
+        stderr(&fail_out)
+    );
+    let fail_json = json_stdout(&fail_out);
+    let fail_msg = case_error(&fail_json);
+    assert!(
+        fail_msg.contains("Target.targetCrashed") && fail_msg.contains("target crashed"),
+        "expected crash diagnostic in failure message, got: {fail_msg}"
+    );
+}
