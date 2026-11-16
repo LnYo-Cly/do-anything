@@ -1080,7 +1080,7 @@ the user's browser keeps running and the user's other tabs are untouched.
 
 | Step | Arguments | Result |
 | --- | --- | --- |
-| `browser.open` | `url` required; optional `connect`; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title` |
+| `browser.open` | `url` required; optional `connect`, `testid_attribute` (defaults to `data-testid`); `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title` |
 | `browser.click` | locator | `{}`, or the clicked element's `text` when it has one |
 | `browser.type` | locator; `text` required unless `value` is given | `{}` |
 | `browser.press` | `key` required, for example `Enter` or `Tab` | `{}` |
@@ -1088,28 +1088,82 @@ the user's browser keeps running and the user's other tabs are untouched.
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
 | `browser.screenshot` | `path` required | `path`, `bytes` |
 
-A **locator** is exactly one of `css`, `xpath`, `text` and `role`; `name` is an
-optional modifier for `role`. Every locator also accepts an optional
-`timeout_ms` (default 5000) that says how long to wait for the element to appear
-and be visible.
+A **locator** takes **exactly one** of the five ways below, plus any modifiers:
 
 | Locator | Meaning |
 | --- | --- |
-| `css` | A CSS selector. |
-| `xpath` | An XPath expression. |
-| `text` | Visible text. Whitespace is normalized by collapsing every run of whitespace to one space and trimming the ends; the result must equal the given value exactly. The innermost matching element wins, so a paragraph that matches is chosen over its parent that contains the same text. |
-| `role` | An accessibility role, for example `button`, `link` or `textbox`. |
-| `name` | With `role` only: the accessibility name must equal this value exactly. For a native `<button>Greet</button>` the role is `button` and the name is `Greet`; for `<input id="user">` with `<label for="user">User</label>` the role is `textbox` and the name is `User`. |
+| `css: <selector>` | Matches elements with a CSS selector (`querySelectorAll`). |
+| `xpath: <expression>` | Matches elements with an XPath expression (`document.evaluate`). |
+| `text: <text>` | Matches visible text after collapsing runs of whitespace to one space and trimming ends; only the innermost matching visible element counts. |
+| `role: <role>` (optional `name: <name>`) | Matches non-ignored nodes in Chrome's accessibility tree (`Accessibility.queryAXTree`) with that role and exact accessible name. |
+| `testid: <value>` | Matches elements whose test-id attribute equals `<value>`. Defaults to `data-testid`; override per session with `testid_attribute` on `browser.open`. |
 
-`role` and `name` come from Chrome's accessibility tree, so implicit roles work:
-a native `<button>` or `<a href>` does not need a `role` attribute. The element
-must be visible. When more than one element matches, the first in document order
-is used, like `querySelector`.
+| Modifier | Meaning |
+| --- | --- |
+| `within: <locator>` | Narrows the search to elements inside the unique element matched by this container locator; may be nested. |
+| `nth: <integer>` | Selects the zero-based match (`0`, `1`, …) in document order. Explicit `nth` permits multiple matches and waits until that index exists (failing on timeout if still out of range). |
+| `timeout_ms: <ms>` | How long the step polls before timing out (defaults to 5000). |
 
-Giving two locator forms, or none, is a case error that `da lint` reports before
-anything runs; `name` without `role` is refused the same way. `browser.wait`
-accepts the same locator or `url_contains`, which waits until the current URL
-contains that text.
+Giving zero or more than one locator key, passing `name` without `role`, passing
+a negative or non-integer `nth`, giving an empty `testid_attribute`, or giving
+an invalid `within` locator is an argument error reported by `da lint` before
+anything runs. `browser.wait` keeps its `url_contains` form as an alternative to
+an element locator.
+
+#### Choosing a locator
+
+Prefer `testid` and `role` + `name` over `css` or `xpath`:
+
+- Use `testid` when you control the markup: `data-testid` (or a custom
+  `testid_attribute` set on `browser.open`) survives layout and copy changes.
+- Use `role` + `name` when you want to assert the control's accessible contract
+  (for example `role: button` with `name: Submit`, or `role: textbox` with
+  `name: Email`), because implicit roles and `<label for="...">` associations work
+  without extra attributes.
+- Use `text` for static non-interactive copy, and keep `css` or `xpath` for
+  structure that has no test id or accessible role, paired with `within` instead
+  of fragile positional chains.
+
+#### Strict unique matching
+
+Without `nth`, every locator must match **exactly one** candidate element —
+the first match is never silently picked:
+
+- For `css`, `xpath` and `testid`, all matching elements are collected regardless
+  of visibility; for `text` and `role`, #48 candidate filtering applies
+  (innermost visible text matches; visible non-ignored AX nodes).
+- If `0` candidates match, the step keeps polling until an element appears (and,
+  when required, becomes visible) or `timeout_ms` expires.
+- If **more than 1** candidate matches, the step **fails immediately** without
+  waiting, reporting the locator, total match count, and up to 5 candidates
+  (tag name, `id`, and text truncated to 60 characters, redacted with `***` when
+  a secret appears). For example:
+
+```text
+CSS selector `.item` matched 7 elements; narrow the locator or pass `nth` (candidates: 1: <li#item-1> "First item", 2: <li#item-2> "Second item ...", 3: <li#item-3> "Token ***", 4: <li#item-4> "Item 4", 5: <li#item-5> "Item 5" (showing 5 of 7))
+```
+
+When multiple matches are expected (such as rows in a list), narrow the search
+with `within` or pick an explicit zero-based `nth`.
+
+#### Actionability checks
+
+Before clicking or typing, `browser.click` and `browser.type` wait within
+`timeout_ms` for all five checks in order:
+
+1. **Exists**: unique match (or valid `nth` index).
+2. **Visible**: `display` is not `none`, `visibility` is not `hidden` or
+   `collapse`, and `width`/`height` are positive.
+3. **Enabled**: neither the `disabled` attribute (including disabled `<fieldset>`)
+   nor `aria-disabled="true"` applies.
+4. **Stable**: viewport position and dimensions are unchanged across two
+   consecutive polls (`scrollIntoView` brings offscreen elements in first).
+5. **Unoccluded**: `document.elementFromPoint` at the element's center returns
+   the target element or one of its descendants.
+
+If `timeout_ms` expires, the error names the check that failed — and when
+occluded, identifies the blocking element (tag, `id`, and snippet). `browser.read`
+and `browser.wait` only wait for existence and visibility.
 
 `browser.type` keeps its original `text` argument as the text to type. Because
 `text` is also a locator, the two meanings are separated by `value`: when `value`

@@ -2020,3 +2020,1167 @@ fn browser_screenshot_resolves_a_relative_path_against_the_case_file() {
         "the screenshot must be a PNG"
     );
 }
+
+#[test]
+fn schema_and_lint_validate_testid_within_nth_and_testid_attribute() {
+    let dir = TempDir::new("browser-locator-modifiers");
+    let schema_output = run_da_in(dir.path(), &["schema"]);
+    assert_eq!(
+        exit_code(&schema_output),
+        Some(0),
+        "da schema failed: {}",
+        stderr(&schema_output)
+    );
+    let schema_value: Value =
+        serde_json::from_str(&stdout(&schema_output)).expect("da schema must emit valid JSON");
+    let validator =
+        jsonschema::validator_for(&schema_value).expect("da schema must compile as Draft 2020-12");
+
+    let valid_yaml = concat!(
+        "name: Valid new locator modifiers\n",
+        "steps:\n",
+        "  - browser.open:\n",
+        "      url: http://127.0.0.1:8080/\n",
+        "      testid_attribute: data-qa\n",
+        "  - browser.click:\n",
+        "      testid: submit-btn\n",
+        "      nth: 0\n",
+        "      within:\n",
+        "        css: form.checkout\n",
+        "        within:\n",
+        "          role: region\n",
+        "          name: Payment\n",
+        "          nth: 1\n",
+        "  - browser.type:\n",
+        "      testid: card-input\n",
+        "      text: \"4242\"\n",
+        "  - browser.wait:\n",
+        "      testid: confirmation\n",
+        "      within:\n",
+        "        css: main\n",
+        "  - browser.read:\n",
+        "      testid: receipt\n",
+        "      nth: 0\n",
+    );
+    let valid_path = dir.write("valid.yaml", valid_yaml);
+    let valid_instance: Value = serde_saphyr::from_str(valid_yaml).expect("valid YAML must parse");
+    assert!(
+        validator.is_valid(&valid_instance),
+        "schema must accept valid testid/within/nth/testid_attribute: {:?}",
+        validator
+            .iter_errors(&valid_instance)
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+    let valid_lint = run_da_in(
+        dir.path(),
+        &["--output", "json", "lint", path_str(&valid_path)],
+    );
+    assert_eq!(
+        exit_code(&valid_lint),
+        Some(0),
+        "lint must accept valid case: {}",
+        stdout(&valid_lint)
+    );
+
+    let invalid_cases = [
+        (
+            "empty_testid_attribute",
+            "name: Bad\nsteps:\n  - browser.open:\n      url: http://127.0.0.1/\n      testid_attribute: \"\"\n",
+        ),
+        (
+            "space_in_testid_attribute",
+            "name: Bad\nsteps:\n  - browser.open:\n      url: http://127.0.0.1/\n      testid_attribute: \"data qa\"\n",
+        ),
+        (
+            "multiple_locators_with_testid",
+            "name: Bad\nsteps:\n  - browser.click:\n      css: \"#a\"\n      testid: btn\n",
+        ),
+        (
+            "name_without_role_and_testid",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      name: Submit\n",
+        ),
+        (
+            "negative_nth",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      nth: -1\n",
+        ),
+        (
+            "float_nth",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      nth: 1.5\n",
+        ),
+        (
+            "null_nth",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      nth: null\n",
+        ),
+        (
+            "invalid_empty_within",
+            "name: Bad\nsteps:\n  - browser.click:\n      testid: btn\n      within: {}\n",
+        ),
+        (
+            "invalid_within_name_without_role",
+            "name: Bad\nsteps:\n  - browser.read:\n      testid: label\n      within:\n        testid: panel\n        name: Panel\n",
+        ),
+        (
+            "url_contains_with_within",
+            "name: Bad\nsteps:\n  - browser.wait:\n      url_contains: /done\n      within:\n        css: main\n",
+        ),
+        (
+            "url_contains_with_nth",
+            "name: Bad\nsteps:\n  - browser.wait:\n      url_contains: /done\n      nth: 0\n",
+        ),
+        (
+            "url_contains_with_testid",
+            "name: Bad\nsteps:\n  - browser.wait:\n      url_contains: /done\n      testid: done\n",
+        ),
+    ];
+
+    for (label, yaml) in invalid_cases {
+        let instance: Value = serde_saphyr::from_str(yaml).expect("case YAML must parse");
+        assert!(
+            !validator.is_valid(&instance),
+            "da schema must reject `{label}`"
+        );
+        let file = dir.write(&format!("{label}.yaml"), yaml);
+        let lint = run_da_in(dir.path(), &["--output", "json", "lint", path_str(&file)]);
+        assert_ne!(
+            exit_code(&lint),
+            Some(0),
+            "da lint must reject `{label}`, got stdout: {}",
+            stdout(&lint)
+        );
+    }
+}
+
+#[test]
+fn testid_and_custom_testid_attribute_locate_and_act() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-testid");
+    let url = server.url("/browser/locators");
+
+    let default_case = dir.write(
+        "default-testid.yaml",
+        &format!(
+            r##"name: default data-testid
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: solo-btn
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: solo
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&default_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let custom_case = dir.write(
+        "custom-testid.yaml",
+        &format!(
+            r##"name: custom testid_attribute
+steps:
+  - browser.open:
+      url: "{url}"
+      testid_attribute: data-qa
+  - browser.wait:
+      testid: custom-btn
+  - browser.click:
+      testid: custom-btn
+  - browser.type:
+      testid: custom-input
+      text: hello qa
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: qa
+  - browser.read:
+      testid: custom-btn
+      attribute: data-qa
+    expect:
+      - path: $.value
+        equals: custom-btn
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&custom_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let hidden_case = dir.write(
+        "hidden-testid.yaml",
+        &format!(
+            r##"name: hidden testid waits for visibility
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.read:
+      testid: hidden-note
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&hidden_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("not visible"),
+        "expected visibility error, got: {message}"
+    );
+}
+
+#[test]
+fn within_scopes_locators_and_supports_nesting_and_nth() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-within");
+    let url = server.url("/browser/locators");
+
+    let valid_case = dir.write(
+        "within.yaml",
+        &format!(
+            r##"name: within scopes every locator kind
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: save-btn
+      within:
+        css: ".group"
+        within:
+          role: region
+          name: Beta Panel
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: beta
+  - browser.click:
+      xpath: "//button[@data-testid='save-btn']"
+      within:
+        css: "#panel-a"
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: alpha
+  - browser.click:
+      role: button
+      name: Save
+      within:
+        css: "#panel-b"
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: beta
+  - browser.click:
+      text: Save
+      within:
+        css: "#panel-a"
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: alpha
+  - browser.click:
+      testid: save-btn
+      within:
+        css: ".panel"
+        nth: 1
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: beta
+  - browser.type:
+      testid: note-input
+      text: scoped text
+      within:
+        role: region
+        name: Alpha Panel
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&valid_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let ambiguous_within = dir.write(
+        "ambiguous-within.yaml",
+        &format!(
+            r##"name: ambiguous within fails immediately
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: save-btn
+      timeout_ms: 10000
+      within:
+        css: ".panel"
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&ambiguous_within),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("2") && message.contains(".panel"),
+        "ambiguous `within` must report count 2 and container locator, got: {message}"
+    );
+}
+
+#[test]
+fn nth_selects_zero_based_match_waits_for_async_match_and_fails_when_out_of_range() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-nth");
+    let url = server.url("/browser/locators");
+
+    let case = dir.write(
+        "nth.yaml",
+        &format!(
+            r##"name: nth indexing
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      testid: nth-item
+      nth: 1
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: nth-1
+  - browser.click:
+      css: ".nth-btn"
+      nth: 2
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: nth-2
+  - browser.click:
+      css: ".hidden-plus-visible"
+      nth: 1
+  - browser.click:
+      css: "#spawn-second"
+  - browser.click:
+      css: ".async-nth"
+      nth: 1
+      timeout_ms: 2000
+  - browser.read:
+      css: "#locator-result"
+    expect:
+      - path: $.text
+        equals: async-1
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let oob_case = dir.write(
+        "nth-oob.yaml",
+        &format!(
+            r##"name: nth out of range fails
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: ".nth-btn"
+      nth: 5
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&oob_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("5") && message.contains("3") && message.contains("300"),
+        "out-of-range nth must name index 5, count 3, and timeout 300, got: {message}"
+    );
+}
+
+#[test]
+fn multiple_matches_fail_immediately_for_all_five_locators_and_redact_secrets() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-strict-unique");
+    let url = server.url("/browser/locators");
+
+    for (name, locator_yaml, fragment) in [
+        (
+            "dup-css.yaml",
+            "      css: \".dup-gate-btn\"\n",
+            ".dup-gate-btn",
+        ),
+        (
+            "dup-xpath.yaml",
+            "      xpath: \"//button[@class='dup-gate-btn']\"\n",
+            "dup-gate-btn",
+        ),
+        (
+            "dup-text.yaml",
+            "      text: \"Gate Duplicate\"\n",
+            "Gate Duplicate",
+        ),
+        (
+            "dup-role.yaml",
+            "      role: button\n      name: \"Gate Duplicate\"\n",
+            "Gate Duplicate",
+        ),
+        (
+            "dup-testid.yaml",
+            "      testid: \"dup-gate-testid\"\n",
+            "dup-gate-testid",
+        ),
+        (
+            "dup-hidden-css.yaml",
+            "      css: \".hidden-plus-visible\"\n",
+            ".hidden-plus-visible",
+        ),
+        (
+            "dup-hidden-testid.yaml",
+            "      testid: \"hv-btn\"\n",
+            "hv-btn",
+        ),
+    ] {
+        let case = dir.write(
+            name,
+            &format!(
+                "name: strict match {name}\nsteps:\n  - browser.open:\n      url: \"{url}\"\n  - browser.click:\n{locator_yaml}      timeout_ms: 10000\n"
+            ),
+        );
+        let output = run_da_in(
+            dir.path(),
+            &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        );
+        assert_eq!(
+            exit_code(&output),
+            Some(1),
+            "{name} must fail: stdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let value = json_stdout(&output);
+        let message = case_error(&value);
+        assert!(
+            message.contains('2') && message.contains(fragment),
+            "{name}: error must mention count 2 and locator `{fragment}`, got: {message}"
+        );
+        let duration_ms = value["cases"][0]["steps"][1]["duration_ms"]
+            .as_u64()
+            .unwrap_or(u64::MAX);
+        assert!(
+            duration_ms < 5000,
+            "{name}: multi-match must fail immediately instead of waiting for timeout_ms (took {duration_ms} ms)"
+        );
+    }
+
+    let secret = "locator-secret-xyz-987";
+    let many_case = dir.write(
+        "many-redacted.yaml",
+        &format!(
+            r##"name: many candidates truncated and redacted
+steps:
+  - browser.open:
+      url: "{url}?secret=${{env:DA_LOCATOR_SECRET}}"
+  - browser.read:
+      css: ".many-item"
+      timeout_ms: 10000
+"##
+        ),
+    );
+    let output = run_da_with_env(
+        dir.path(),
+        &["--output", "json", "run", path_str(&many_case)],
+        &[("DA_LOCATOR_SECRET", secret.to_string())],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let raw_stdout = stdout(&output);
+    assert!(
+        !raw_stdout.contains(secret),
+        "secret leaked in JSON stdout: {raw_stdout}"
+    );
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains('7')
+            && message.contains("li")
+            && message.contains("many-1")
+            && message.contains("many-2")
+            && message.contains("***"),
+        "expected count 7, tag, ids, and redacted secret in error, got: {message}"
+    );
+    assert!(
+        !message.contains("definitely exceeds sixty characters in length"),
+        "candidate text longer than 60 chars must be truncated, got: {message}"
+    );
+    assert!(
+        !message.contains("Item 6") && !message.contains("Item 7"),
+        "at most 5 candidates may appear in error, got: {message}"
+    );
+
+    let bundle_rel = value["cases"][0]["bundle"]
+        .as_str()
+        .expect("failed case must write a failure bundle");
+    let report_path = dir.path().join(bundle_rel).join("report.json");
+    let report_text = fs::read_to_string(&report_path).expect("report.json must exist");
+    assert!(
+        !report_text.contains(secret),
+        "secret leaked in bundle report.json: {report_text}"
+    );
+}
+
+#[test]
+fn click_and_type_wait_for_enabled_stable_and_unoccluded_elements() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-actionability-wait");
+    let url = server.url("/browser/actionability");
+
+    let case = dir.write(
+        "actionability-wait.yaml",
+        &format!(
+            r##"name: click and type wait for actionability checks to pass
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#start-enable"
+  - browser.click:
+      css: "#enable-later"
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: enabled-clicked
+  - browser.click:
+      css: "#start-enable-input"
+  - browser.type:
+      css: "#enable-input-later"
+      text: now ready
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: aria-typed:now ready
+  - browser.click:
+      css: "#start-move"
+  - browser.click:
+      css: "#settle-later"
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: settle:yes
+  - browser.click:
+      css: "#start-uncover"
+  - browser.click:
+      css: "#uncover-later"
+      timeout_ms: 2000
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: uncovered-clicked
+  - browser.click:
+      css: "#child-btn"
+  - browser.read:
+      css: "#action-result"
+    expect:
+      - path: $.text
+        equals: child-clicked
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn actionability_timeouts_name_failed_check_and_blocker_while_read_and_wait_stay_unchanged() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-actionability-fail");
+    let url = server.url("/browser/actionability");
+
+    // 1. disabled attribute on click -> fails with disabled check name
+    let disabled_click = dir.write(
+        "disabled-click.yaml",
+        &format!(
+            r##"name: disabled click times out naming disabled check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#always-disabled"
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&disabled_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("disabled"),
+        "expected disabled actionability timeout, got: {message}"
+    );
+
+    // 2. aria-disabled="true" on click -> fails with disabled check name
+    let aria_disabled_click = dir.write(
+        "aria-disabled-click.yaml",
+        &format!(
+            r##"name: aria-disabled click times out naming disabled check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#always-aria-disabled"
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&aria_disabled_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("disabled"),
+        "expected aria-disabled actionability timeout, got: {message}"
+    );
+
+    // 3. disabled attribute on type -> fails with disabled check name
+    let disabled_type = dir.write(
+        "disabled-type.yaml",
+        &format!(
+            r##"name: disabled type times out naming disabled check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      css: "#disabled-input"
+      text: ignored
+      timeout_ms: 250
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&disabled_type),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("disabled"),
+        "expected disabled type timeout, got: {message}"
+    );
+
+    // 4. moving element on click -> fails naming unstable / moving position
+    let moving_click = dir.write(
+        "moving-click.yaml",
+        &format!(
+            r##"name: moving element click times out naming stability check
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#always-moving"
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&moving_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("stable") || message.contains("moving"),
+        "expected stability actionability timeout, got: {message}"
+    );
+
+    // 5. occluded click -> fails naming occluding #blocker-overlay element
+    let occluded_click = dir.write(
+        "occluded-click.yaml",
+        &format!(
+            r##"name: occluded click times out naming blocking element
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#occluded-btn"
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&occluded_click),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("blocker-overlay"),
+        "expected occluding element `blocker-overlay` in error, got: {message}"
+    );
+
+    // 6. occluded type -> fails naming occluding #input-blocker element
+    let occluded_type = dir.write(
+        "occluded-type.yaml",
+        &format!(
+            r##"name: occluded type times out naming blocking element
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      css: "#occluded-input"
+      text: blocked
+      timeout_ms: 300
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&occluded_type),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&output), Some(1));
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("input-blocker"),
+        "expected occluding element `input-blocker` in error, got: {message}"
+    );
+
+    // 7. read and wait only check existence + visibility, so disabled/moving/occluded still succeed
+    let read_wait_case = dir.write(
+        "read-and-wait-unchanged.yaml",
+        &format!(
+            r##"name: read and wait ignore disabled moving and occluded checks
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.wait:
+      css: "#always-disabled"
+  - browser.read:
+      css: "#always-disabled"
+    expect:
+      - path: $.text
+        equals: Always Disabled
+  - browser.wait:
+      css: "#always-moving"
+  - browser.wait:
+      css: "#occluded-btn"
+  - browser.read:
+      css: "#occluded-btn"
+    expect:
+      - path: $.text
+        equals: Occluded Target
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&read_wait_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn unsupported_capabilities_probe_current_behavior() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-probes");
+
+    // 1. iframe
+    let iframe_case = dir.write(
+        "probe-iframe.yaml",
+        &format!(
+            "name: probe iframe\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-frame\"\n      timeout_ms: 400\n",
+            server.url("/browser/probe/iframe")
+        ),
+    );
+    let iframe_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&iframe_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&iframe_out),
+        Some(1),
+        "unexpected iframe probe exit code: stdout={}\nstderr={}",
+        stdout(&iframe_out),
+        stderr(&iframe_out)
+    );
+    let iframe_json = json_stdout(&iframe_out);
+    let iframe_err = case_error(&iframe_json);
+    assert!(
+        iframe_err.contains("could not find CSS selector `#inside-frame`"),
+        "unexpected iframe probe error: {iframe_err}"
+    );
+
+    // 2. shadow DOM (css misses; role finds AX node but light-DOM elementFromPoint sees shadow host)
+    let shadow_css = dir.write(
+        "probe-shadow-css.yaml",
+        &format!(
+            "name: probe shadow css\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-shadow\"\n      timeout_ms: 400\n",
+            server.url("/browser/probe/shadow")
+        ),
+    );
+    let shadow_css_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&shadow_css),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&shadow_css_out),
+        Some(1),
+        "unexpected shadow css probe exit code: stdout={}\nstderr={}",
+        stdout(&shadow_css_out),
+        stderr(&shadow_css_out)
+    );
+    let shadow_css_json = json_stdout(&shadow_css_out);
+    let shadow_css_err = case_error(&shadow_css_json);
+    assert!(
+        shadow_css_err.contains("could not find CSS selector `#inside-shadow`"),
+        "unexpected shadow css probe error: {shadow_css_err}"
+    );
+
+    let shadow_role = dir.write(
+        "probe-shadow-role.yaml",
+        &format!(
+            "name: probe shadow role\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      role: button\n      name: Inside Shadow\n      timeout_ms: 5000\n",
+            server.url("/browser/probe/shadow")
+        ),
+    );
+    let shadow_role_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&shadow_role),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&shadow_role_out),
+        Some(1),
+        "unexpected shadow role probe exit code: stdout={}\nstderr={}",
+        stdout(&shadow_role_out),
+        stderr(&shadow_role_out)
+    );
+    let shadow_role_json = json_stdout(&shadow_role_out);
+    let shadow_role_err = case_error(&shadow_role_json);
+    assert!(
+        shadow_role_err.contains("was occluded by <div#shadow-host>"),
+        "unexpected shadow role probe error: {shadow_role_err}"
+    );
+
+    // 3. new tab (target="_blank" opens a second tab, session stays on original tab)
+    let new_tab_case = dir.write(
+        "probe-new-tab.yaml",
+        &format!(
+            "name: probe new tab\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#open-new-tab\"\n  - browser.read:\n      css: \"#new-tab-marker\"\n      timeout_ms: 400\n",
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+    let new_tab_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&new_tab_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&new_tab_out),
+        Some(1),
+        "unexpected new-tab probe exit code: stdout={}\nstderr={}",
+        stdout(&new_tab_out),
+        stderr(&new_tab_out)
+    );
+    let new_tab_json = json_stdout(&new_tab_out);
+    let new_tab_err = case_error(&new_tab_json);
+    assert!(
+        new_tab_err.contains("could not find CSS selector `#new-tab-marker`"),
+        "unexpected new-tab probe error: {new_tab_err}"
+    );
+
+    // 4. dialog (window.alert blocks Input.dispatchMouseEvent until timeout)
+    let dialog_case = dir.write(
+        "probe-dialog.yaml",
+        &format!(
+            "name: probe dialog\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#trigger-alert\"\n      timeout_ms: 5000\n",
+            server.url("/browser/probe/dialog")
+        ),
+    );
+    let dialog_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&dialog_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&dialog_out),
+        Some(1),
+        "unexpected dialog probe exit code: stdout={}\nstderr={}",
+        stdout(&dialog_out),
+        stderr(&dialog_out)
+    );
+    let dialog_json = json_stdout(&dialog_out);
+    let dialog_err = case_error(&dialog_json);
+    assert!(
+        dialog_err.contains("Input.dispatchMouseEvent") && dialog_err.contains("did not answer"),
+        "unexpected dialog probe error: {dialog_err}"
+    );
+
+    // 5. file upload (browser.type completes without error, but attaches no file)
+    let upload_case = dir.write(
+        "probe-upload.yaml",
+        &format!(
+            "name: probe file upload\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.type:\n      css: \"#file-upload\"\n      text: \"sample.txt\"\n      timeout_ms: 5000\n  - browser.read:\n      css: \"#file-upload\"\n      attribute: value\n    expect:\n      - path: $.value\n        equals: null\n      - path: $.text\n        equals: \"\"\n",
+            server.url("/browser/probe/upload")
+        ),
+    );
+    let upload_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&upload_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&upload_out),
+        Some(0),
+        "unexpected upload probe failure: stdout={}\nstderr={}",
+        stdout(&upload_out),
+        stderr(&upload_out)
+    );
+
+    // 6. coordinate click (rejected by schema / argument parsing as unknown field)
+    let coords_case = dir.write(
+        "probe-coords.yaml",
+        &format!(
+            "name: probe coords\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      x: 100\n      \"y\": 50\n",
+            server.url("/browser/probe/coords")
+        ),
+    );
+    let coords_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&coords_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&coords_out),
+        Some(3),
+        "unexpected coords probe exit code: stdout={}\nstderr={}",
+        stdout(&coords_out),
+        stderr(&coords_out)
+    );
+    let coords_json = json_stdout(&coords_out);
+    let coords_err = coords_json["errors"][0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        coords_err.contains("unknown field `x`"),
+        "unexpected coords probe error: {coords_err}"
+    );
+}

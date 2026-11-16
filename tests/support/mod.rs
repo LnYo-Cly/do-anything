@@ -54,9 +54,9 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// Starts a server on a random loopback port.
+    /// Starts a server on a random loopback port that Chrome does not block.
     pub fn start() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind the test server");
+        let listener = bind_browser_safe_listener();
         let port = listener
             .local_addr()
             .expect("failed to read the test server address")
@@ -237,6 +237,22 @@ fn route(
         // created only after all three settled, so a `browser.wait` step sees
         // requests that completed during that step.
         (_, "/browser/network") => html_response("200 OK", &browser_network(query)),
+        (_, "/browser/locators") => html_response("200 OK", &browser_locators(query)),
+        (_, "/browser/actionability") => html_response("200 OK", browser_actionability()),
+        (_, "/browser/probe/iframe") => html_response("200 OK", browser_probe_iframe()),
+        (_, "/browser/probe/iframe-inner") => html_response(
+            "200 OK",
+            "<!doctype html><html><body><button id=\"inside-frame\">Inside Frame</button></body></html>",
+        ),
+        (_, "/browser/probe/shadow") => html_response("200 OK", browser_probe_shadow()),
+        (_, "/browser/probe/new-tab") => html_response("200 OK", browser_probe_new_tab()),
+        (_, "/browser/probe/new-tab-target") => html_response(
+            "200 OK",
+            "<!doctype html><html><head><title>New Tab Target</title></head><body><p id=\"new-tab-marker\">Opened</p></body></html>",
+        ),
+        (_, "/browser/probe/dialog") => html_response("200 OK", browser_probe_dialog()),
+        (_, "/browser/probe/upload") => html_response("200 OK", browser_probe_upload()),
+        (_, "/browser/probe/coords") => html_response("200 OK", browser_probe_coords()),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
         // finishes loading before a short navigation timeout, which is what
@@ -571,6 +587,237 @@ fn browser_second(query: &str) -> String {
     )
 }
 
+/// A page for testing `testid`, `within`, `nth`, and strict unique matching.
+fn browser_locators(query: &str) -> String {
+    let secret = escape_html(&query_value(query, "secret"));
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Locator probe</title></head>
+<body>
+<h1>Locator probe</h1>
+<p id="locator-result">none</p>
+
+<button id="solo-btn" data-testid="solo-btn" type="button"
+  onclick="document.getElementById('locator-result').textContent = 'solo';">Solo</button>
+<button id="qa-btn" data-qa="custom-btn" type="button"
+  onclick="document.getElementById('locator-result').textContent = 'qa';">QA Button</button>
+<input id="qa-input" data-qa="custom-input" autocomplete="off">
+
+<section id="panel-a" class="panel" data-testid="panel" role="region" aria-label="Alpha Panel">
+  <div class="group">
+    <button id="save-a" class="scoped-btn" data-testid="save-btn" type="button"
+      onclick="document.getElementById('locator-result').textContent = 'alpha';">Save</button>
+    <input class="scoped-input" data-testid="note-input" autocomplete="off">
+  </div>
+</section>
+<section id="panel-b" class="panel" data-testid="panel" role="region" aria-label="Beta Panel">
+  <div class="group">
+    <button id="save-b" class="scoped-btn" data-testid="save-btn" type="button"
+      onclick="document.getElementById('locator-result').textContent = 'beta';">Save</button>
+    <input class="scoped-input" data-testid="note-input" autocomplete="off">
+  </div>
+</section>
+
+<div id="nth-list">
+  <button class="nth-btn" data-testid="nth-item" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'nth-0';">Item 0</button>
+  <button class="nth-btn" data-testid="nth-item" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'nth-1';">Item 1</button>
+  <button class="nth-btn" data-testid="nth-item" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'nth-2';">Item 2</button>
+</div>
+
+<div id="delayed-nth">
+  <button class="async-nth" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'async-0';">First</button>
+</div>
+<button id="spawn-second" type="button"
+  onclick="setTimeout(function () {{
+    var b = document.createElement('button');
+    b.className = 'async-nth';
+    b.type = 'button';
+    b.textContent = 'Second';
+    b.onclick = function () {{ document.getElementById('locator-result').textContent = 'async-1'; }};
+    document.getElementById('delayed-nth').appendChild(b);
+  }}, 250);">Spawn second</button>
+
+<div id="hidden-dup-wrap">
+  <button class="hidden-plus-visible" data-testid="hv-btn" type="button" style="display:none">Hidden</button>
+  <button class="hidden-plus-visible" data-testid="hv-btn" type="button">Visible</button>
+</div>
+
+<div id="dup-gate">
+  <button id="dup-one" class="dup-gate-btn" data-testid="dup-gate-testid" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'dup-1';">Gate Duplicate</button>
+  <button id="dup-two" class="dup-gate-btn" data-testid="dup-gate-testid" type="button"
+    onclick="document.getElementById('locator-result').textContent = 'dup-2';">Gate Duplicate</button>
+</div>
+
+<ul id="many-items">
+  <li id="many-1" class="many-item">First candidate</li>
+  <li id="many-2" class="many-item">Second candidate with a very long text payload that definitely exceeds sixty characters in length</li>
+  <li id="many-3" class="many-item">Secret token {secret}</li>
+  <li id="many-4" class="many-item">Item 4</li>
+  <li id="many-5" class="many-item">Item 5</li>
+  <li id="many-6" class="many-item">Item 6</li>
+  <li id="many-7" class="many-item">Item 7</li>
+</ul>
+
+<p id="hidden-note" data-testid="hidden-note" style="display:none">Hidden note</p>
+</body></html>"#
+    )
+}
+
+/// A page for testing actionability checks on `browser.click` and `browser.type`.
+fn browser_actionability() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Actionability probe</title></head>
+<body>
+<h1>Actionability probe</h1>
+<p id="action-result">none</p>
+
+<button id="always-disabled" disabled type="button"
+  onclick="document.getElementById('action-result').textContent = 'always-disabled';">Always Disabled</button>
+<button id="always-aria-disabled" aria-disabled="true" type="button"
+  onclick="document.getElementById('action-result').textContent = 'always-aria-disabled';">Aria Disabled</button>
+<input id="disabled-input" disabled autocomplete="off"
+  oninput="document.getElementById('action-result').textContent = 'typed:' + this.value;">
+
+<button id="start-enable" type="button"
+  onclick="setTimeout(function () {
+    document.getElementById('enable-later').disabled = false;
+  }, 250);">Start Enable</button>
+<button id="enable-later" disabled type="button"
+  onclick="document.getElementById('action-result').textContent = 'enabled-clicked';">Enable Later</button>
+
+<button id="start-enable-input" type="button"
+  onclick="setTimeout(function () {
+    document.getElementById('enable-input-later').removeAttribute('aria-disabled');
+  }, 250);">Start Enable Input</button>
+<input id="enable-input-later" aria-disabled="true" autocomplete="off"
+  oninput="document.getElementById('action-result').textContent = 'aria-typed:' + this.value;">
+
+<div style="height:44px;">
+  <button id="always-moving" type="button" style="position:relative;left:0px;"
+    onclick="document.getElementById('action-result').textContent = 'moving-clicked';">Always Moving</button>
+</div>
+<script>
+(function () {
+  var offset = 0;
+  setInterval(function () {
+    offset = (offset + 7) % 1000;
+    var el = document.getElementById('always-moving');
+    if (el) el.style.left = offset + 'px';
+  }, 15);
+})();
+</script>
+
+<div style="height:44px;">
+  <button id="start-move" type="button"
+    onclick="
+      var step = 0;
+      var btn = document.getElementById('settle-later');
+      var timer = setInterval(function () {
+        step += 1;
+        btn.style.left = (step * 30) + 'px';
+        if (step >= 6) {
+          clearInterval(timer);
+          btn.style.left = '200px';
+          btn.dataset.settled = 'yes';
+        }
+      }, 30);
+    ">Start Move</button>
+  <button id="settle-later" type="button" style="position:relative;left:0px;"
+    onclick="document.getElementById('action-result').textContent = 'settle:' + (this.dataset.settled || 'no');">Settle Later</button>
+</div>
+
+<div style="position:relative;width:220px;height:40px;">
+  <button id="occluded-btn" type="button" style="width:220px;height:40px;"
+    onclick="document.getElementById('action-result').textContent = 'occluded-clicked';">Occluded Target</button>
+  <div id="blocker-overlay" style="position:absolute;inset:0;background:rgba(0,0,0,0.2);"
+    onclick="document.getElementById('action-result').textContent = 'blocker-clicked';">Blocking Overlay</div>
+</div>
+
+<div style="position:relative;width:220px;height:32px;">
+  <input id="occluded-input" style="width:220px;height:30px;" autocomplete="off"
+    oninput="document.getElementById('action-result').textContent = 'occluded-typed:' + this.value;">
+  <div id="input-blocker" style="position:absolute;inset:0;background:rgba(0,0,0,0.2);">Input Blocker</div>
+</div>
+
+<button id="start-uncover" type="button"
+  onclick="setTimeout(function () {
+    document.getElementById('temp-blocker').style.display = 'none';
+  }, 250);">Start Uncover</button>
+<div style="position:relative;width:220px;height:40px;">
+  <button id="uncover-later" type="button" style="width:220px;height:40px;"
+    onclick="document.getElementById('action-result').textContent = 'uncovered-clicked';">Uncover Later</button>
+  <div id="temp-blocker" style="position:absolute;inset:0;background:rgba(0,0,0,0.2);">Temp Blocker</div>
+</div>
+
+<button id="child-btn" type="button"
+  onclick="document.getElementById('action-result').textContent = 'child-clicked';"><span id="inner-label">Nested Child</span></button>
+</body></html>"#
+}
+
+fn browser_probe_iframe() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Iframe</title></head>
+<body>
+<iframe id="probe-frame" src="/browser/probe/iframe-inner" width="240" height="80"></iframe>
+</body></html>"#
+}
+
+fn browser_probe_shadow() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Shadow DOM</title></head>
+<body>
+<div id="shadow-host"></div>
+<p id="shadow-status">idle</p>
+<script>
+var root = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
+var btn = document.createElement('button');
+btn.id = 'inside-shadow';
+btn.textContent = 'Inside Shadow';
+btn.onclick = function () { document.getElementById('shadow-status').textContent = 'clicked'; };
+root.appendChild(btn);
+</script>
+</body></html>"#
+}
+
+fn browser_probe_new_tab() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe New Tab</title></head>
+<body>
+<a id="open-new-tab" href="/browser/probe/new-tab-target" target="_blank">Open Tab</a>
+</body></html>"#
+}
+
+fn browser_probe_dialog() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Dialog</title></head>
+<body>
+<button id="trigger-alert" type="button"
+  onclick="window.alert('probe alert'); document.getElementById('dialog-status').textContent = 'after-alert';">Alert</button>
+<p id="dialog-status">before-alert</p>
+</body></html>"#
+}
+
+fn browser_probe_upload() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe File Upload</title></head>
+<body>
+<input id="file-upload" type="file">
+</body></html>"#
+}
+
+fn browser_probe_coords() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Probe Coordinates</title></head>
+<body>
+<canvas id="probe-canvas" width="200" height="100"></canvas>
+</body></html>"#
+}
+
 /// The value of one `name=value` pair of a query string.
 fn query_value(query: &str, name: &str) -> String {
     query
@@ -646,4 +893,104 @@ pub fn closed_port() -> u16 {
         .port();
     drop(listener);
     port
+}
+
+/// Binds a loopback listener whose port is not on Chrome's restricted-port list
+/// (`ERR_UNSAFE_PORT`). Holds any rejected listener open until a safe port is
+/// acquired so the OS does not hand back the same restricted port.
+fn bind_browser_safe_listener() -> TcpListener {
+    let mut rejected = Vec::new();
+    for _ in 0..32 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind the test server");
+        let port = listener
+            .local_addr()
+            .expect("failed to read the test server address")
+            .port();
+        if !is_chrome_restricted_port(port) {
+            return listener;
+        }
+        rejected.push(listener);
+    }
+    TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind the test server")
+}
+
+/// Ports Chrome refuses with `net::ERR_UNSAFE_PORT` (from Chromium `port_util.cc`).
+fn is_chrome_restricted_port(port: u16) -> bool {
+    matches!(
+        port,
+        1 | 7
+            | 9
+            | 11
+            | 13
+            | 15
+            | 17
+            | 19
+            | 20
+            | 21
+            | 22
+            | 23
+            | 25
+            | 37
+            | 42
+            | 43
+            | 53
+            | 69
+            | 77
+            | 79
+            | 87
+            | 95
+            | 101
+            | 102
+            | 103
+            | 104
+            | 109
+            | 110
+            | 111
+            | 113
+            | 115
+            | 117
+            | 119
+            | 123
+            | 135
+            | 137
+            | 139
+            | 143
+            | 161
+            | 179
+            | 389
+            | 427
+            | 465
+            | 512
+            | 513
+            | 514
+            | 515
+            | 526
+            | 530
+            | 531
+            | 532
+            | 540
+            | 548
+            | 554
+            | 556
+            | 563
+            | 587
+            | 601
+            | 636
+            | 989
+            | 990
+            | 993
+            | 995
+            | 1719
+            | 1720
+            | 1723
+            | 2049
+            | 3659
+            | 4045
+            | 4190
+            | 5060
+            | 5061
+            | 6000
+            | 6566
+            | 6665..=6669 | 6697 | 10080
+    )
 }

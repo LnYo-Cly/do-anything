@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use self::cdp::{CdpError, Connection, Deadline};
+use self::cdp::{CdpError, Connection, Deadline, RemoteResult};
 use self::connect::Endpoint;
 use self::launch::Launched;
 use crate::core::paths;
@@ -100,6 +100,9 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     Ok(())
 }
 
+/// Default HTML attribute matched by `testid` locators.
+const DEFAULT_TESTID_ATTRIBUTE: &str = "data-testid";
+
 /// Builds `browser.open`, whose `connect` is a plain string in the schema.
 fn open_step() -> Result<StepDefinition, String> {
     let mut definition = step::<OpenArgs>(
@@ -109,6 +112,7 @@ fn open_step() -> Result<StepDefinition, String> {
         run_open,
     )?;
     string_property(&mut definition.args_schema, "connect");
+    string_property(&mut definition.args_schema, "testid_attribute");
     Ok(definition)
 }
 
@@ -129,7 +133,8 @@ fn type_step() -> Result<StepDefinition, String> {
         { "required": ["css"] },
         { "required": ["xpath"] },
         { "required": ["text", "value"] },
-        { "required": ["role"] }
+        { "required": ["role"] },
+        { "required": ["testid"] }
     ]);
     Ok(definition)
 }
@@ -162,7 +167,7 @@ fn step<T: JsonSchema>(
     })
 }
 
-/// Builds a step whose locator arguments are exactly one of the four forms.
+/// Builds a step whose locator arguments are exactly one of the five forms.
 fn locator_step<T: JsonSchema>(
     name: &'static str,
     description: &'static str,
@@ -170,12 +175,10 @@ fn locator_step<T: JsonSchema>(
     run: fn(&Value, &mut Sessions) -> Result<Value, StepError>,
 ) -> Result<StepDefinition, String> {
     let mut definition = step::<T>(name, description, validate, run)?;
-    for property in ["css", "xpath", "text", "role", "name"] {
-        string_property(&mut definition.args_schema, property);
-    }
+    apply_locator_schema(&mut definition.args_schema, name);
     exactly_one_of(
         &mut definition.args_schema,
-        &["css", "xpath", "text", "role"],
+        &["css", "xpath", "text", "role", "testid"],
     );
     Ok(definition)
 }
@@ -188,14 +191,78 @@ fn wait_step(
     run: fn(&Value, &mut Sessions) -> Result<Value, StepError>,
 ) -> Result<StepDefinition, String> {
     let mut definition = step::<WaitArgs>(name, description, validate, run)?;
-    for property in ["css", "xpath", "text", "role", "name", "url_contains"] {
-        string_property(&mut definition.args_schema, property);
-    }
-    exactly_one_of(
-        &mut definition.args_schema,
-        &["css", "xpath", "text", "role", "url_contains"],
-    );
+    apply_locator_schema(&mut definition.args_schema, name);
+    string_property(&mut definition.args_schema, "url_contains");
+    definition.args_schema["oneOf"] = json!([
+        { "required": ["css"] },
+        { "required": ["xpath"] },
+        { "required": ["text"] },
+        { "required": ["role"] },
+        { "required": ["testid"] },
+        {
+            "required": ["url_contains"],
+            "not": {
+                "anyOf": [
+                    { "required": ["within"] },
+                    { "required": ["nth"] },
+                    { "required": ["name"] }
+                ]
+            }
+        }
+    ]);
     Ok(definition)
+}
+
+/// Normalizes optional locator properties, `within` embedding, and `name -> role`
+/// dependency on a step schema.
+fn apply_locator_schema(schema: &mut Value, step_name: &str) {
+    for property in ["css", "xpath", "text", "role", "name", "testid"] {
+        string_property(schema, property);
+    }
+    integer_property(schema, "nth");
+    if let Value::Object(entries) = schema {
+        // Root `da schema` embeds step schemas under `$defs[step_name]`, so keep
+        // recursive `within` self-contained with its own `$id` instead of `#/$defs/...`.
+        entries.remove("$defs");
+        entries.insert("dependentRequired".to_string(), json!({ "name": ["role"] }));
+    }
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("within".to_string(), within_schema(step_name));
+    }
+}
+
+/// Self-contained JSON Schema resource for recursive `within` containers.
+fn within_schema(step_name: &str) -> Value {
+    json!({
+        "$id": format!("urn:da:schema:{step_name}:within"),
+        "description": "Container locator to narrow the search to a uniquely matched element subtree.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "css": { "type": "string" },
+            "xpath": { "type": "string" },
+            "text": { "type": "string" },
+            "role": { "type": "string" },
+            "name": { "type": "string" },
+            "testid": { "type": "string", "minLength": 1 },
+            "within": { "$ref": "#" },
+            "nth": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+            }
+        },
+        "oneOf": [
+            { "required": ["css"] },
+            { "required": ["xpath"] },
+            { "required": ["text"] },
+            { "required": ["role"] },
+            { "required": ["testid"] }
+        ],
+        "dependentRequired": {
+            "name": ["role"]
+        }
+    })
 }
 
 /// Makes one optional property a string in the emitted schema.
@@ -212,6 +279,19 @@ fn string_property(schema: &mut Value, field: &str) {
         return;
     };
     property.insert("type".to_string(), json!("string"));
+}
+
+/// Makes one optional property an integer in the emitted schema.
+fn integer_property(schema: &mut Value, field: &str) {
+    let Some(property) = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut(field))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    property.insert("type".to_string(), json!("integer"));
 }
 
 /// Requires exactly one of `fields` to be present.
@@ -258,6 +338,42 @@ struct OpenArgs {
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_navigation_timeout_ms")]
     timeout_ms: u64,
+    /// Attribute name matched by `testid` locators. Defaults to `data-testid`.
+    #[schemars(extend("minLength" = 1, "pattern" = "^\\S+$"))]
+    #[serde(default)]
+    testid_attribute: Option<String>,
+}
+
+/// Container locator used by `within` to narrow a search to a subtree.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WithinArgs {
+    /// CSS selector of the container element.
+    #[serde(default)]
+    css: Option<String>,
+    /// XPath expression of the container element.
+    #[serde(default)]
+    xpath: Option<String>,
+    /// Visible text of the container element, with whitespace normalized.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the container element, for example `region`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the container element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
+    /// Test id attribute value of the container element.
+    #[schemars(extend("minLength" = 1))]
+    #[serde(default)]
+    testid: Option<String>,
+    /// Outer container locator to narrow this container further.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when this container locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
 }
 
 /// Arguments of `browser.click`.
@@ -279,6 +395,16 @@ struct ClickArgs {
     /// Accessibility name of the element; only meaningful with `role`.
     #[serde(default)]
     name: Option<String>,
+    /// Test id attribute value of the element.
+    #[serde(default)]
+    testid: Option<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -305,9 +431,19 @@ struct TypeArgs {
     /// Accessibility name of the element; only meaningful with `role`.
     #[serde(default)]
     name: Option<String>,
+    /// Test id attribute value of the element.
+    #[serde(default)]
+    testid: Option<String>,
     /// Text to type when `text` names the element instead.
     #[serde(default)]
     value: Option<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -342,9 +478,19 @@ struct WaitArgs {
     /// Accessibility name of the element; only meaningful with `role`.
     #[serde(default)]
     name: Option<String>,
+    /// Test id attribute value of the element.
+    #[serde(default)]
+    testid: Option<String>,
     /// Text the current URL must contain.
     #[serde(default)]
     url_contains: Option<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
     /// How long to wait, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -380,6 +526,16 @@ struct ReadArgs {
     /// Accessibility name of the element; only meaningful with `role`.
     #[serde(default)]
     name: Option<String>,
+    /// Test id attribute value of the element.
+    #[serde(default)]
+    testid: Option<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -465,6 +621,67 @@ enum Locator {
     Text(String),
     /// One accessibility role, optionally narrowed by an exact name.
     Role { role: String, name: Option<String> },
+    /// An exact match on the session's configured test-id attribute.
+    TestId(String),
+}
+
+/// One element target: a locator optionally narrowed by `within` and indexed by `nth`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElementTarget {
+    locator: Locator,
+    within: Option<Box<ElementTarget>>,
+    nth: Option<usize>,
+}
+
+impl ElementTarget {
+    /// Builds a target from a parsed locator and its optional `within` / `nth` modifiers.
+    fn from_parts(
+        locator: Locator,
+        within: Option<&WithinArgs>,
+        nth: Option<u64>,
+    ) -> Result<Self, String> {
+        let within = within.map(Self::from_within).transpose()?.map(Box::new);
+        let nth = nth
+            .map(|index| {
+                usize::try_from(index).map_err(|_| {
+                    "invalid arguments: `nth` is too large for this platform".to_string()
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            locator,
+            within,
+            nth,
+        })
+    }
+
+    /// Parses a recursive `within` container into an [`ElementTarget`].
+    fn from_within(args: &WithinArgs) -> Result<Self, String> {
+        let locator = Locator::from_args(
+            &args.css,
+            &args.xpath,
+            &args.text,
+            &args.role,
+            &args.name,
+            &args.testid,
+        )?;
+        Self::from_parts(locator, args.within.as_deref(), args.nth)
+    }
+
+    /// Human-readable description of the target, including modifiers.
+    fn describe_with(&self, testid_attribute: &str) -> String {
+        let mut out = self.locator.describe_with(testid_attribute);
+        if let Some(index) = self.nth {
+            out.push_str(&format!(" (nth: {index})"));
+        }
+        if let Some(container) = &self.within {
+            out.push_str(&format!(
+                " within ({})",
+                container.describe_with(testid_attribute)
+            ));
+        }
+        out
+    }
 }
 
 impl Locator {
@@ -478,6 +695,7 @@ impl Locator {
         text: &Option<String>,
         role: &Option<String>,
         name: &Option<String>,
+        testid: &Option<String>,
     ) -> Result<Self, String> {
         if name.is_some() && role.is_none() {
             return Err(
@@ -490,18 +708,20 @@ impl Locator {
             xpath.is_some(),
             text.is_some(),
             role.is_some(),
+            testid.is_some(),
         ]
         .into_iter()
         .filter(|present| *present)
         .count();
         if given == 0 {
             return Err(
-                "invalid arguments: give one locator: `css`, `xpath`, `text` or `role`".to_string(),
+                "invalid arguments: give one locator: `css`, `xpath`, `text`, `role` or `testid`"
+                    .to_string(),
             );
         }
         if given > 1 {
             return Err(
-                "invalid arguments: locator fields cannot both be set; give exactly one of `css`, `xpath`, `text` and `role`"
+                "invalid arguments: locator fields cannot both be set; give exactly one of `css`, `xpath`, `text`, `role` and `testid`"
                     .to_string(),
             );
         }
@@ -523,9 +743,16 @@ impl Locator {
             }
             return Ok(Self::Text(value.to_string()));
         }
+        if let Some(value) = testid {
+            if value.trim().is_empty() {
+                return Err("invalid arguments: `testid` must not be empty".to_string());
+            }
+            return Ok(Self::TestId(value.to_string()));
+        }
         let Some(role) = role else {
             return Err(
-                "invalid arguments: give one locator: `css`, `xpath`, `text` or `role`".to_string(),
+                "invalid arguments: give one locator: `css`, `xpath`, `text`, `role` or `testid`"
+                    .to_string(),
             );
         };
         if role.trim().is_empty() {
@@ -542,8 +769,8 @@ impl Locator {
         })
     }
 
-    /// The locator as an error message names it.
-    fn describe(&self) -> String {
+    /// The locator as an error message names it, using `testid_attribute` for `TestId`.
+    fn describe_with(&self, testid_attribute: &str) -> String {
         match self {
             Self::Css(selector) => format!("CSS selector `{selector}`"),
             Self::Xpath(expression) => format!("XPath `{expression}`"),
@@ -553,51 +780,45 @@ impl Locator {
                 name: Some(name),
             } => format!("role `{role}` named `{name}`"),
             Self::Role { role, name: None } => format!("role `{role}`"),
+            Self::TestId(id) => format!("test id `{id}` (`{testid_attribute}`)"),
         }
     }
 
-    /// A JavaScript expression that evaluates to the element or to `null`.
+    /// A JavaScript function body that resolves all candidates inside `root`
+    /// (`document` or a `within` element) and returns either the selected
+    /// element or a JSON status string (`missing`, `ambiguous`, `out_of_range`).
     ///
     /// Every user string is passed through `serde_json` so a quote or a
     /// backslash in it can never end the string literal or add code.
-    fn element_expression(&self) -> Option<String> {
-        match self {
-            Self::Css(selector) => {
-                Some(format!("document.querySelector({})", json_string(selector)))
-            }
-            Self::Xpath(expression) => Some(format!(
-                "document.evaluate({}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue",
+    fn resolve_body_with(&self, testid_attribute: &str, nth: Option<usize>) -> Option<String> {
+        let collect = match self {
+            Self::Css(selector) => format!(
+                "var matches = Array.prototype.slice.call(root.querySelectorAll({}));\nvar hiddenFound = false;",
+                json_string(selector)
+            ),
+            Self::Xpath(expression) => format!(
+                "var snap = document.evaluate({}, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\nvar matches = [];\nfor (var i = 0; i < snap.snapshotLength; i++) {{\n  var node = snap.snapshotItem(i);\n  if (node && node.nodeType === 1 && (root === document || (node !== root && root.contains(node)))) matches.push(node);\n}}\nvar hiddenFound = false;",
                 json_string(expression)
-            )),
-            Self::Text(text) => Some(text_search_expression(text)),
+            ),
+            Self::TestId(id) => format!(
+                "var attr = {};\nvar wanted = {};\nvar all = root.getElementsByTagName('*');\nvar matches = [];\nfor (var i = 0; i < all.length; i++) {{\n  if (all[i].getAttribute(attr) === wanted) matches.push(all[i]);\n}}\nvar hiddenFound = false;",
+                json_string(testid_attribute),
+                json_string(id)
+            ),
+            Self::Text(text) => text_collect_script(text),
             // The accessibility tree names this element; there is no selector
             // to evaluate in the page.
-            Self::Role { .. } => None,
-        }
-    }
-
-    /// An expression that reports whether the element exists and is visible.
-    ///
-    /// Text reports a hidden match as found-but-not-visible so its failure says
-    /// the element exists instead of claiming the page has no such text.
-    fn locate_expression(&self) -> Option<String> {
-        if let Self::Text(text) = self {
-            return Some(text_locate_expression(text));
-        }
-        let element = self.element_expression()?;
+            Self::Role { .. } => return None,
+        };
+        let wanted_nth = match nth {
+            Some(index) => index.to_string(),
+            None => "null".to_string(),
+        };
         Some(format!(
-            "(function () {{ var el = {element}; if (!el || el.nodeType !== 1) return {{ found: false }}; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return {{ found: true, visible: style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0 }}; }})()"
+            "{collect}\nvar wantedNth = {wanted_nth};\n{RESOLVE_CANDIDATES_HELPER}"
         ))
     }
-
-    /// A step failure that names the locator and what was attempted.
-    fn action_error(&self, action: &str, error: impl std::fmt::Display) -> StepError {
-        StepError::Execution(format!("could not {action} {}: {error}", self.describe()))
-    }
 }
-
-/// The body of a center lookup, run with the located element as `el`.
-const CENTER_BODY: &str = "if (!el) return null; el.scrollIntoView({ block: 'center', inline: 'center' }); var rect = el.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };";
 
 /// The body of a focus lookup, run with the located element as `el`.
 const FOCUS_BODY: &str = "if (!el) return false; el.focus(); return document.activeElement === el;";
@@ -609,77 +830,245 @@ const TEXT_BODY: &str =
 /// The body of a visibility read, run with the located element as `el`.
 const VISIBLE_BODY: &str = "if (!el || el.nodeType !== 1) return false; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;";
 
-/// JavaScript that returns the innermost visible element whose normalized text
-/// equals `__DA_WANTED__`.
-const TEXT_SEARCH_TEMPLATE: &str = r#"(function () {
-  var wanted = __DA_WANTED__;
-  var normalize = function (value) {
-    return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
-  };
-  var visible = function (el) {
-    var style = window.getComputedStyle(el);
-    var rect = el.getBoundingClientRect();
-    return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
-  };
-  var all = document.querySelectorAll('*');
-  var matches = [];
-  for (var i = 0; i < all.length; i++) {
-    var el = all[i];
-    if (visible(el) && normalize(el.innerText) === wanted) matches.push(el);
-  }
-  for (var j = 0; j < matches.length; j++) {
-    var candidate = matches[j];
-    var innermost = true;
-    for (var k = 0; k < matches.length; k++) {
-      if (k !== j && candidate.contains(matches[k])) { innermost = false; break; }
-    }
-    if (innermost) return candidate;
-  }
-  return null;
-})()"#;
+/// Summarizes one DOM element (`el`) as `{ tag, id, text }` for multi-match diagnostics.
+const SUMMARIZE_ELEMENT_BODY: &str = r#"
+if (!el || el.nodeType !== 1) return { tag: 'element', id: '', text: '' };
+var tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+var id = el.id ? String(el.id) : '';
+var raw = (el.innerText && el.innerText.trim()) ? el.innerText : el.textContent;
+var text = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ').trim();
+if (text.length > 240) text = text.slice(0, 240);
+return { tag: tag, id: id, text: text };
+"#;
 
-/// JavaScript that reports whether any element's normalized text matches and
-/// whether an innermost visible one exists.
-const TEXT_LOCATE_TEMPLATE: &str = r#"(function () {
-  var wanted = __DA_WANTED__;
-  var normalize = function (value) {
-    return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
-  };
-  var visible = function (el) {
-    var style = window.getComputedStyle(el);
-    var rect = el.getBoundingClientRect();
-    return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
-  };
-  var all = document.querySelectorAll('*');
-  var matched = false;
-  var matches = [];
-  for (var i = 0; i < all.length; i++) {
-    var el = all[i];
-    if (normalize(el.innerText) === wanted) {
-      matched = true;
-      if (visible(el)) matches.push(el);
-    }
+/// Shared tail for `resolve_body_with`: checks candidate count / `nth` and
+/// returns either the matched `Element` or a JSON status string.
+const RESOLVE_CANDIDATES_HELPER: &str = r#"
+var summarize = function (list) {
+  var out = [];
+  for (var i = 0; i < list.length && i < 5; i++) {
+    var el = list[i];
+    var tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+    var id = el.id ? String(el.id) : '';
+    var raw = (el.innerText && el.innerText.trim()) ? el.innerText : el.textContent;
+    var text = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ').trim();
+    if (text.length > 240) text = text.slice(0, 240);
+    out.push({ tag: tag, id: id, text: text });
   }
-  if (!matches.length) return { found: matched };
-  for (var j = 0; j < matches.length; j++) {
-    var candidate = matches[j];
-    var innermost = true;
-    for (var k = 0; k < matches.length; k++) {
-      if (k !== j && candidate.contains(matches[k])) { innermost = false; break; }
-    }
-    if (innermost) return { found: true, visible: true };
+  return out;
+};
+if (matches.length === 0) {
+  return JSON.stringify({ status: 'missing', hidden_found: hiddenFound });
+}
+if (wantedNth === null) {
+  if (matches.length > 1) {
+    return JSON.stringify({ status: 'ambiguous', count: matches.length, candidates: summarize(matches) });
   }
-  return { found: false };
-})()"#;
+  return matches[0];
+}
+if (wantedNth >= matches.length) {
+  return JSON.stringify({ status: 'out_of_range', count: matches.length, hidden_found: hiddenFound });
+}
+return matches[wantedNth];
+"#;
 
-/// Builds the text search script for one value.
-fn text_search_expression(text: &str) -> String {
-    TEXT_SEARCH_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
+/// JavaScript that collects every innermost visible element inside `root`
+/// whose normalized `innerText` equals `__DA_WANTED__`.
+const TEXT_COLLECT_TEMPLATE: &str = r#"var wanted = __DA_WANTED__;
+var normalize = function (value) {
+  return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
+};
+var visible = function (el) {
+  var style = window.getComputedStyle(el);
+  var rect = el.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
+};
+var all = root.querySelectorAll('*');
+var hiddenFound = false;
+var visibleMatches = [];
+for (var i = 0; i < all.length; i++) {
+  var el = all[i];
+  if (normalize(el.innerText) === wanted) {
+    if (visible(el)) visibleMatches.push(el);
+    else hiddenFound = true;
+  }
+}
+var matches = [];
+for (var j = 0; j < visibleMatches.length; j++) {
+  var candidate = visibleMatches[j];
+  var innermost = true;
+  for (var k = 0; k < visibleMatches.length; k++) {
+    if (k !== j && candidate.contains(visibleMatches[k])) { innermost = false; break; }
+  }
+  if (innermost) matches.push(candidate);
+}"#;
+
+/// Builds the text candidate collection snippet for one value.
+fn text_collect_script(text: &str) -> String {
+    TEXT_COLLECT_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
 }
 
-/// Builds the text locate script for one value.
-fn text_locate_expression(text: &str) -> String {
-    TEXT_LOCATE_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
+/// One matched element summary returned for ambiguous-locator and occlusion errors.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct CandidateInfo {
+    tag: String,
+    id: String,
+    text: String,
+}
+
+impl CandidateInfo {
+    /// Formats `<tag#id> "text"` with text truncated to at most 60 characters.
+    fn format_label(&self) -> String {
+        let mut label = format!("<{}", self.tag);
+        if !self.id.is_empty() {
+            label.push('#');
+            label.push_str(&self.id);
+        }
+        label.push('>');
+        let text = truncate_chars(self.text.trim(), 60);
+        if !text.is_empty() {
+            label.push_str(&format!(" \"{text}\""));
+        }
+        label
+    }
+}
+
+/// Inspects an element (`el`) for visibility, disabled state, geometry, and hit-test.
+const ACTIONABLE_INSPECT_BODY: &str = r#"
+var summarizeNode = function (node) {
+  var tag = node.tagName ? node.tagName.toLowerCase() : 'element';
+  var id = node.id ? String(node.id) : '';
+  var raw = (node.innerText && node.innerText.trim()) ? node.innerText : node.textContent;
+  var text = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ').trim();
+  if (text.length > 240) text = text.slice(0, 240);
+  return { tag: tag, id: id, text: text };
+};
+if (!el || el.nodeType !== 1) return { status: 'not_visible' };
+var style = window.getComputedStyle(el);
+var rect = el.getBoundingClientRect();
+if (
+  style.display === 'none' ||
+  style.visibility === 'hidden' ||
+  style.visibility === 'collapse' ||
+  rect.width <= 0 ||
+  rect.height <= 0
+) {
+  return { status: 'not_visible' };
+}
+var fs = typeof el.closest === 'function' ? el.closest('fieldset[disabled]') : null;
+var inDisabledFieldset = false;
+if (fs) {
+  var legend = fs.querySelector('legend');
+  if (!legend || !legend.contains(el)) inDisabledFieldset = true;
+}
+var ariaNode = typeof el.closest === 'function' ? el.closest('[aria-disabled]') : null;
+var ariaDisabled = ariaNode !== null && String(ariaNode.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+if (el.disabled === true || el.hasAttribute('disabled') || inDisabledFieldset || ariaDisabled) {
+  return { status: 'disabled' };
+}
+var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+var cx0 = rect.left + rect.width / 2;
+var cy0 = rect.top + rect.height / 2;
+if (cx0 < 0 || cx0 >= vw || cy0 < 0 || cy0 >= vh) {
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  rect = el.getBoundingClientRect();
+}
+var cx = rect.left + rect.width / 2;
+var cy = rect.top + rect.height / 2;
+var hit = document.elementFromPoint(cx, cy);
+var hitOk = hit !== null && (hit === el || el.contains(hit));
+var blocker = !hitOk && hit ? summarizeNode(hit) : null;
+return {
+  status: 'ready_candidate',
+  rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+  x: cx,
+  y: cy,
+  hit_ok: hitOk,
+  blocker: blocker
+};
+"#;
+
+/// Viewport rectangle used to check stability across consecutive polls.
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ElementRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl ElementRect {
+    fn same_geometry(self, other: Self) -> bool {
+        (self.x - other.x).abs() <= 0.5
+            && (self.y - other.y).abs() <= 0.5
+            && (self.width - other.width).abs() <= 0.5
+            && (self.height - other.height).abs() <= 0.5
+    }
+}
+
+/// JSON result returned by `ACTIONABLE_INSPECT_BODY`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ActionableInspect {
+    NotVisible,
+    Disabled,
+    ReadyCandidate {
+        rect: ElementRect,
+        x: f64,
+        y: f64,
+        hit_ok: bool,
+        blocker: Option<CandidateInfo>,
+    },
+}
+
+/// Status returned by the page candidate-resolution script when no single element was picked.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum PageResolveStatus {
+    Missing {
+        hidden_found: bool,
+    },
+    Ambiguous {
+        count: usize,
+        candidates: Vec<CandidateInfo>,
+    },
+    OutOfRange {
+        count: usize,
+        hidden_found: bool,
+    },
+}
+
+/// Formats up to 5 candidates with tag name, id, and `<= 60`-char text.
+fn format_candidates(candidates: &[CandidateInfo], total: usize) -> String {
+    let mut parts = Vec::with_capacity(candidates.len().min(5));
+    for (index, candidate) in candidates.iter().take(5).enumerate() {
+        parts.push(format!("{}: {}", index + 1, candidate.format_label()));
+    }
+    if total > 5 {
+        format!("{} (showing 5 of {total})", parts.join(", "))
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Truncates `text` to at most `max_chars` Unicode scalar values.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
+/// Builds the immediate failure error when a locator without `nth` matches multiple elements.
+fn ambiguous_error(target_desc: &str, total: usize, candidates: &[CandidateInfo]) -> StepError {
+    StepError::Execution(format!(
+        "{target_desc} matched {total} elements; narrow the locator or pass `nth` (candidates: {})",
+        format_candidates(candidates, total)
+    ))
 }
 
 /// Encodes text as a JavaScript string literal.
@@ -691,7 +1080,7 @@ fn json_string(value: &str) -> String {
 /// What `browser.wait` waits for.
 enum WaitTarget {
     /// An element.
-    Element(Locator),
+    Element(ElementTarget),
     /// The current URL containing some text.
     Url(String),
 }
@@ -702,11 +1091,12 @@ impl WaitTarget {
         let has_locator = args.css.is_some()
             || args.xpath.is_some()
             || args.text.is_some()
-            || args.role.is_some();
+            || args.role.is_some()
+            || args.testid.is_some();
         if let Some(text) = args.url_contains.as_deref() {
-            if has_locator || args.name.is_some() {
+            if has_locator || args.name.is_some() || args.within.is_some() || args.nth.is_some() {
                 return Err(
-                    "invalid arguments: `url_contains` cannot be combined with a locator; give exactly one of `css`, `xpath`, `text`, `role` and `url_contains`"
+                    "invalid arguments: `url_contains` cannot be combined with a locator or modifier (`within`, `nth`, `name`); give exactly one of `css`, `xpath`, `text`, `role`, `testid` and `url_contains`"
                         .to_string(),
                 );
             }
@@ -717,12 +1107,19 @@ impl WaitTarget {
         }
         if !has_locator && args.name.is_none() {
             return Err(
-                "invalid arguments: give exactly one of `css`, `xpath`, `text`, `role` and `url_contains`"
+                "invalid arguments: give exactly one of `css`, `xpath`, `text`, `role`, `testid` and `url_contains`"
                     .to_string(),
             );
         }
-        Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
-            .map(Self::Element)
+        let locator = Locator::from_args(
+            &args.css,
+            &args.xpath,
+            &args.text,
+            &args.role,
+            &args.name,
+            &args.testid,
+        )?;
+        ElementTarget::from_parts(locator, args.within.as_deref(), args.nth).map(Self::Element)
     }
 }
 
@@ -861,21 +1258,18 @@ struct BrowserSession {
     /// The connected endpoint, as `connect` named it; `None` when the case
     /// started its own browser.
     connect: Option<String>,
+    /// Attribute name matched by `testid` locators in this session.
+    testid_attribute: String,
 }
 
-/// One element resolved from a locator.
-enum Located {
-    /// An expression that evaluates to the element again.
-    Expression(String),
-    /// A DOM node handle produced from the accessibility tree.
-    Object(String),
-}
+/// One element resolved from a target, held as a CDP DOM `objectId`.
+struct Located(String);
 
 impl BrowserSession {
     /// Creates the session described by `browser.open`.
     fn open(args: &OpenArgs, connect: Option<&Endpoint>) -> Result<Self, String> {
         match connect {
-            Some(endpoint) => Self::connect_to(endpoint),
+            Some(endpoint) => Self::connect_to(endpoint, args.testid_attribute.as_deref()),
             None => Self::launch(args),
         }
     }
@@ -909,11 +1303,15 @@ impl BrowserSession {
             width: args.width,
             height: args.height,
             connect: None,
+            testid_attribute: args
+                .testid_attribute
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TESTID_ATTRIBUTE.to_string()),
         })
     }
 
     /// Attaches a page in a browser the user already runs.
-    fn connect_to(endpoint: &Endpoint) -> Result<Self, String> {
+    fn connect_to(endpoint: &Endpoint, testid_attribute: Option<&str>) -> Result<Self, String> {
         let websocket_url = endpoint.websocket_url(connect::CONNECT_TIMEOUT)?;
         let mut connection = Connection::connect(&websocket_url, Deadline::after(LAUNCH_TIMEOUT))
             .map_err(|error| {
@@ -932,6 +1330,9 @@ impl BrowserSession {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             connect: Some(endpoint.name()),
+            testid_attribute: testid_attribute
+                .unwrap_or(DEFAULT_TESTID_ATTRIBUTE)
+                .to_string(),
         })
     }
 
@@ -1047,93 +1448,312 @@ impl BrowserSession {
         Ok((current, title))
     }
 
-    /// Waits for the element the locator names to exist and be visible.
-    fn locate(&mut self, locator: &Locator, deadline: Deadline) -> Result<Located, StepError> {
-        if let Locator::Role { role, name } = locator {
-            return self.locate_role(locator, role, name.as_deref(), deadline);
-        }
-        let expression = locator.locate_expression().ok_or_else(|| {
-            StepError::Execution(format!(
-                "could not use {}: the locator has no page expression",
-                locator.describe()
-            ))
-        })?;
-        let element = locator.element_expression().ok_or_else(|| {
-            StepError::Execution(format!(
-                "could not use {}: the locator has no page expression",
-                locator.describe()
-            ))
-        })?;
-        let page = self.page.clone();
+    /// Waits for the target element to exist, match uniquely (or `nth`), and be visible.
+    fn locate_target(
+        &mut self,
+        target: &ElementTarget,
+        deadline: Deadline,
+    ) -> Result<Located, StepError> {
+        let is_locator_visible_only =
+            matches!(target.locator, Locator::Text(_) | Locator::Role { .. });
+        self.poll_target(target, deadline, |session, target_desc, object_id| {
+            let visible = if is_locator_visible_only {
+                true
+            } else {
+                session.call_function_poll(
+                    target_desc,
+                    &object_id,
+                    VISIBLE_BODY,
+                    "check the visibility of",
+                    deadline,
+                )? == Value::Bool(true)
+            };
+            if visible {
+                Ok(Ok(Located(object_id)))
+            } else {
+                Ok(Err(PendingReason::Hidden))
+            }
+        })
+    }
+
+    /// Waits for the target element to exist, be visible, enabled, stable across
+    /// two consecutive polls, and unoccluded at its click point.
+    fn locate_actionable_target(
+        &mut self,
+        target: &ElementTarget,
+        deadline: Deadline,
+    ) -> Result<ActionableTarget, StepError> {
+        let mut previous_rect: Option<ElementRect> = None;
+        self.poll_target(target, deadline, |session, target_desc, object_id| {
+            let raw = session.call_function_poll(
+                target_desc,
+                &object_id,
+                ACTIONABLE_INSPECT_BODY,
+                "inspect the actionability of",
+                deadline,
+            )?;
+            let inspect: ActionableInspect = serde_json::from_value(raw).map_err(|error| {
+                LocateError::Step(StepError::Environment(format!(
+                    "the browser returned an invalid actionability state for {target_desc}: {error}"
+                )))
+            })?;
+            match evaluate_actionable_inspect(&mut previous_rect, inspect) {
+                Ok((x, y)) => Ok(Ok(ActionableTarget {
+                    located: Located(object_id),
+                    x,
+                    y,
+                })),
+                Err(reason) => Ok(Err(reason)),
+            }
+        })
+    }
+
+    /// Shared polling loop for `locate_target` and `locate_actionable_target`.
+    fn poll_target<T>(
+        &mut self,
+        target: &ElementTarget,
+        deadline: Deadline,
+        mut check: impl FnMut(&mut Self, &str, String) -> Result<Result<T, PendingReason>, LocateError>,
+    ) -> Result<T, StepError> {
+        let target_desc = target.describe_with(&self.testid_attribute);
+        let mut last_pending = (target_desc.clone(), PendingReason::Missing);
         loop {
-            let outcome = self
-                .connection_mut()?
-                .evaluate(&page, &expression, deadline);
-            match outcome {
-                Ok(value) => {
-                    if value.get("found").and_then(Value::as_bool) == Some(true) {
-                        if value.get("visible").and_then(Value::as_bool) == Some(true) {
-                            return Ok(Located::Expression(element));
-                        }
-                        if deadline.passed() {
-                            return Err(StepError::Execution(format!(
-                                "{} was found but not visible within {} ms; check the page and the locator",
-                                locator.describe(),
-                                deadline.timeout_ms()
-                            )));
-                        }
-                    } else if deadline.passed() {
-                        return Err(StepError::Execution(format!(
-                            "could not find {} within {} ms; check the page and the locator",
-                            locator.describe(),
-                            deadline.timeout_ms()
-                        )));
-                    }
+            let poll = match self.resolve_target_once(target, deadline) {
+                Ok(poll) => poll,
+                Err(LocateError::Timeout) => {
+                    return Err(pending_timeout_error(
+                        &last_pending.0,
+                        last_pending.1,
+                        deadline,
+                    ));
                 }
-                Err(error) => return Err(locate_error(locator, error, deadline)),
+                Err(LocateError::Step(error)) => return Err(error),
+            };
+            match poll {
+                ResolvePoll::Found(object_id) => match check(self, &target_desc, object_id) {
+                    Ok(Ok(ready)) => return Ok(ready),
+                    Ok(Err(reason)) => {
+                        last_pending = (target_desc.clone(), reason);
+                    }
+                    Err(LocateError::Timeout) => {
+                        return Err(pending_timeout_error(
+                            &last_pending.0,
+                            last_pending.1,
+                            deadline,
+                        ));
+                    }
+                    Err(LocateError::Step(error)) => return Err(error),
+                },
+                ResolvePoll::Pending {
+                    target_desc: desc,
+                    reason,
+                } => {
+                    last_pending = (desc, reason);
+                }
+            }
+            if deadline.passed() {
+                return Err(pending_timeout_error(
+                    &last_pending.0,
+                    last_pending.1,
+                    deadline,
+                ));
             }
             std::thread::sleep(POLL_INTERVAL);
         }
     }
 
-    /// Waits for an accessibility node with `role` and `name` to be visible.
-    fn locate_role(
+    /// Runs one action body inside a poll loop, preserving `LocateError::Timeout`.
+    fn call_function_poll(
         &mut self,
-        locator: &Locator,
-        role: &str,
-        name: Option<&str>,
+        target_desc: &str,
+        object_id: &str,
+        body: &str,
+        action: &str,
         deadline: Deadline,
-    ) -> Result<Located, StepError> {
-        loop {
-            let (matched, objects) = self.role_objects(locator, role, name, deadline)?;
-            for object_id in objects {
-                let visible = self.call_function_on(
-                    locator,
-                    &object_id,
-                    VISIBLE_BODY,
-                    "check the visibility of",
-                    deadline,
-                )?;
-                if visible == Value::Bool(true) {
-                    return Ok(Located::Object(object_id));
+    ) -> Result<Value, LocateError> {
+        let page = self.page.clone();
+        let function = format!("function () {{ var el = this; {body} }}");
+        self.connection_mut()
+            .map_err(LocateError::Step)?
+            .call_function(&page, object_id, &function, deadline)
+            .map_err(|error| match error {
+                CdpError::Timeout { .. } => LocateError::Timeout,
+                other => LocateError::Step(action_error(target_desc, action, other)),
+            })
+    }
+
+    /// Runs one non-blocking resolution pass over `target` and its `within` chain.
+    fn resolve_target_once(
+        &mut self,
+        target: &ElementTarget,
+        deadline: Deadline,
+    ) -> Result<ResolvePoll, LocateError> {
+        let root = match &target.within {
+            Some(container) => match self.resolve_target_once(container, deadline)? {
+                ResolvePoll::Found(container_id) => Some(container_id),
+                pending @ ResolvePoll::Pending { .. } => return Ok(pending),
+            },
+            None => None,
+        };
+        let testid_attribute = self.testid_attribute.clone();
+        let target_desc = target.describe_with(&testid_attribute);
+        if let Locator::Role { role, name } = &target.locator {
+            return self.resolve_role_once(
+                &target_desc,
+                role,
+                name.as_deref(),
+                target.nth,
+                root.as_deref(),
+                deadline,
+            );
+        }
+        let body = target
+            .locator
+            .resolve_body_with(&testid_attribute, target.nth)
+            .ok_or_else(|| {
+                LocateError::Step(StepError::Execution(format!(
+                    "could not use {target_desc}: the locator has no page expression"
+                )))
+            })?;
+        let page = self.page.clone();
+        let remote = match root.as_deref() {
+            Some(root_id) => {
+                let fn_decl = format!("function () {{ var root = this; {body} }}");
+                self.connection_mut()
+                    .map_err(LocateError::Step)?
+                    .call_function_remote(&page, root_id, &fn_decl, deadline)
+            }
+            None => {
+                let expr = format!("(function () {{ var root = document; {body} }})()");
+                self.connection_mut()
+                    .map_err(LocateError::Step)?
+                    .evaluate_remote(&page, &expr, deadline)
+            }
+        }
+        .map_err(|error| locate_error(&target_desc, error))?;
+
+        match remote {
+            RemoteResult::Object(object_id) => Ok(ResolvePoll::Found(object_id)),
+            RemoteResult::Value(Value::String(raw_json)) => {
+                let status: PageResolveStatus = serde_json::from_str(&raw_json).map_err(|error| {
+                    LocateError::Step(StepError::Environment(format!(
+                        "the browser returned an invalid resolution status for {target_desc}: {error}"
+                    )))
+                })?;
+                match status {
+                    PageResolveStatus::Missing { hidden_found } => Ok(ResolvePoll::Pending {
+                        target_desc,
+                        reason: if hidden_found {
+                            PendingReason::Hidden
+                        } else {
+                            PendingReason::Missing
+                        },
+                    }),
+                    PageResolveStatus::OutOfRange {
+                        count,
+                        hidden_found,
+                    } => {
+                        let index = target.nth.unwrap_or(0);
+                        let reason = if count == 0 && hidden_found {
+                            PendingReason::Hidden
+                        } else if count == 0 {
+                            PendingReason::Missing
+                        } else {
+                            PendingReason::OutOfRange { index, count }
+                        };
+                        Ok(ResolvePoll::Pending {
+                            target_desc,
+                            reason,
+                        })
+                    }
+                    PageResolveStatus::Ambiguous { count, candidates } => Err(LocateError::Step(
+                        ambiguous_error(&target_desc, count, &candidates),
+                    )),
                 }
             }
-            if deadline.passed() {
-                return Err(if matched {
-                    StepError::Execution(format!(
-                        "{} was found but not visible within {} ms; check the page and the locator",
-                        locator.describe(),
-                        deadline.timeout_ms()
-                    ))
-                } else {
-                    StepError::Execution(format!(
-                        "could not find {} within {} ms; check the page and the locator",
-                        locator.describe(),
-                        deadline.timeout_ms()
-                    ))
-                });
+            RemoteResult::Value(other) => Err(LocateError::Step(StepError::Environment(format!(
+                "the browser returned an unexpected value while looking up {target_desc}: {other}"
+            )))),
+        }
+    }
+
+    /// Runs one non-blocking resolution pass for a `role` locator inside `root`.
+    fn resolve_role_once(
+        &mut self,
+        target_desc: &str,
+        role: &str,
+        name: Option<&str>,
+        nth: Option<usize>,
+        root: Option<&str>,
+        deadline: Deadline,
+    ) -> Result<ResolvePoll, LocateError> {
+        let (matched, objects) = self.role_objects(target_desc, role, name, root, deadline)?;
+        let mut visible_objects = Vec::new();
+        for object_id in objects {
+            let visible = self.call_function_poll(
+                target_desc,
+                &object_id,
+                VISIBLE_BODY,
+                "check the visibility of",
+                deadline,
+            )?;
+            if visible == Value::Bool(true) {
+                visible_objects.push(object_id);
             }
-            std::thread::sleep(POLL_INTERVAL);
+        }
+        if visible_objects.is_empty() {
+            return Ok(ResolvePoll::Pending {
+                target_desc: target_desc.to_string(),
+                reason: if matched {
+                    PendingReason::Hidden
+                } else {
+                    PendingReason::Missing
+                },
+            });
+        }
+        match nth {
+            None => {
+                if visible_objects.len() > 1 {
+                    let mut candidates = Vec::with_capacity(visible_objects.len().min(5));
+                    for object_id in visible_objects.iter().take(5) {
+                        let summary_val = self.call_function_poll(
+                            target_desc,
+                            object_id,
+                            SUMMARIZE_ELEMENT_BODY,
+                            "summarize",
+                            deadline,
+                        )?;
+                        let candidate: CandidateInfo = serde_json::from_value(summary_val)
+                            .unwrap_or(CandidateInfo {
+                                tag: "element".to_string(),
+                                id: String::new(),
+                                text: String::new(),
+                            });
+                        candidates.push(candidate);
+                    }
+                    return Err(LocateError::Step(ambiguous_error(
+                        target_desc,
+                        visible_objects.len(),
+                        &candidates,
+                    )));
+                }
+                Ok(ResolvePoll::Found(
+                    visible_objects.into_iter().next().unwrap_or_default(),
+                ))
+            }
+            Some(index) => {
+                if index >= visible_objects.len() {
+                    Ok(ResolvePoll::Pending {
+                        target_desc: target_desc.to_string(),
+                        reason: PendingReason::OutOfRange {
+                            index,
+                            count: visible_objects.len(),
+                        },
+                    })
+                } else {
+                    Ok(ResolvePoll::Found(visible_objects.swap_remove(index)))
+                }
+            }
         }
     }
 
@@ -1144,37 +1764,45 @@ impl BrowserSession {
     /// name. Only non-ignored nodes count.
     fn role_objects(
         &mut self,
-        locator: &Locator,
+        target_desc: &str,
         role: &str,
         name: Option<&str>,
+        root: Option<&str>,
         deadline: Deadline,
-    ) -> Result<(bool, Vec<String>), StepError> {
+    ) -> Result<(bool, Vec<String>), LocateError> {
         let page = self.page.clone();
-        let connection = self.connection_mut()?;
-        let document = connection
-            .call(
-                "DOM.getDocument",
-                json!({ "depth": 0 }),
-                Some(&page),
-                deadline,
-            )
-            .map_err(|error| locate_error(locator, error, deadline))?;
-        let node_id = document
-            .pointer("/root/nodeId")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| {
-                StepError::Environment(
-                    "the browser did not return the document root while looking up a role"
-                        .to_string(),
+        let mut params = if let Some(root_id) = root {
+            json!({ "objectId": root_id, "role": role })
+        } else {
+            let document = self
+                .connection_mut()
+                .map_err(LocateError::Step)?
+                .call(
+                    "DOM.getDocument",
+                    json!({ "depth": 0 }),
+                    Some(&page),
+                    deadline,
                 )
-            })?;
-        let mut params = json!({ "nodeId": node_id, "role": role });
+                .map_err(|error| locate_error(target_desc, error))?;
+            let node_id = document
+                .pointer("/root/nodeId")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    LocateError::Step(StepError::Environment(
+                        "the browser did not return the document root while looking up a role"
+                            .to_string(),
+                    ))
+                })?;
+            json!({ "nodeId": node_id, "role": role })
+        };
         if let Some(name) = name {
             params["accessibleName"] = json!(name);
         }
-        let reply = connection
+        let reply = self
+            .connection_mut()
+            .map_err(LocateError::Step)?
             .call("Accessibility.queryAXTree", params, Some(&page), deadline)
-            .map_err(|error| locate_error(locator, error, deadline))?;
+            .map_err(|error| locate_error(target_desc, error))?;
         let nodes = reply
             .get("nodes")
             .and_then(Value::as_array)
@@ -1195,19 +1823,37 @@ impl BrowserSession {
             {
                 continue;
             }
-            matched = true;
             let Some(backend_node_id) = node.get("backendDOMNodeId").and_then(Value::as_i64) else {
                 continue;
             };
-            let resolved = connection
+            let resolved = self
+                .connection_mut()
+                .map_err(LocateError::Step)?
                 .call(
                     "DOM.resolveNode",
                     json!({ "backendNodeId": backend_node_id }),
                     Some(&page),
                     deadline,
                 )
-                .map_err(|error| locate_error(locator, error, deadline))?;
+                .map_err(|error| locate_error(target_desc, error))?;
             if let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str) {
+                if let Some(root_id) = root {
+                    let inside = self
+                        .connection_mut()
+                        .map_err(LocateError::Step)?
+                        .call_function_with_object(
+                            &page,
+                            root_id,
+                            object_id,
+                            "function (el) { return Boolean(el) && this !== el && this.contains(el); }",
+                            deadline,
+                        )
+                        .map_err(|error| locate_error(target_desc, error))?;
+                    if inside != Value::Bool(true) {
+                        continue;
+                    }
+                }
+                matched = true;
                 objects.push(object_id.to_string());
             }
         }
@@ -1217,30 +1863,19 @@ impl BrowserSession {
     /// Runs one action body on a located element and maps its errors.
     fn run_on(
         &mut self,
-        locator: &Locator,
+        target_desc: &str,
         located: &Located,
         body: &str,
         action: &str,
         deadline: Deadline,
     ) -> Result<Value, StepError> {
-        match located {
-            Located::Expression(expression) => {
-                let page = self.page.clone();
-                let script = format!("(function () {{ var el = {expression}; {body} }})()");
-                self.connection_mut()?
-                    .evaluate(&page, &script, deadline)
-                    .map_err(|error| evaluate_error(locator, error, action, deadline))
-            }
-            Located::Object(object_id) => {
-                self.call_function_on(locator, object_id, body, action, deadline)
-            }
-        }
+        self.call_function_on(target_desc, &located.0, body, action, deadline)
     }
 
     /// Runs one action body with a resolved DOM node as `this`.
     fn call_function_on(
         &mut self,
-        locator: &Locator,
+        target_desc: &str,
         object_id: &str,
         body: &str,
         action: &str,
@@ -1250,13 +1885,13 @@ impl BrowserSession {
         let function = format!("function () {{ var el = this; {body} }}");
         self.connection_mut()?
             .call_function(&page, object_id, &function, deadline)
-            .map_err(|error| evaluate_error(locator, error, action, deadline))
+            .map_err(|error| evaluate_error(target_desc, error, action, deadline))
     }
 
     /// Sends one page command for a step and maps its errors.
     fn dispatch(
         &mut self,
-        locator: &Locator,
+        target_desc: &str,
         method: &str,
         params: Value,
         action: &str,
@@ -1266,7 +1901,7 @@ impl BrowserSession {
         self.connection_mut()?
             .call(method, params, Some(&page), deadline)
             .map(|_| ())
-            .map_err(|error| locator.action_error(action, error))
+            .map_err(|error| action_error(target_desc, action, error))
     }
 
     /// The open connection, or the error a step reports after a close.
@@ -1373,38 +2008,142 @@ fn attach(connection: &mut Connection, deadline: Deadline) -> Result<(String, St
     Ok((page, target_id))
 }
 
-/// Maps a failure while looking for an element to the error class a step uses.
-fn locate_error(locator: &Locator, error: CdpError, deadline: Deadline) -> StepError {
-    match error {
-        CdpError::Script(message) => {
-            StepError::Execution(format!("could not use {}: {message}", locator.describe()))
+/// An actionable target with its verified viewport click coordinates.
+struct ActionableTarget {
+    located: Located,
+    x: f64,
+    y: f64,
+}
+
+/// Outcome of one resolution poll for an [`ElementTarget`].
+enum ResolvePoll {
+    /// A single element (or the `nth`-indexed element) resolved to a DOM `objectId`.
+    Found(String),
+    /// The target (or one of its `within` containers) is not ready yet.
+    Pending {
+        target_desc: String,
+        reason: PendingReason,
+    },
+}
+
+/// Why one poll did not yield an actionable element yet.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingReason {
+    Missing,
+    Hidden,
+    OutOfRange { index: usize, count: usize },
+    Disabled,
+    Unstable,
+    Occluded(Option<CandidateInfo>),
+}
+
+/// Evaluates one actionability snapshot against the prior poll's geometry.
+fn evaluate_actionable_inspect(
+    previous_rect: &mut Option<ElementRect>,
+    inspect: ActionableInspect,
+) -> Result<(f64, f64), PendingReason> {
+    match inspect {
+        ActionableInspect::NotVisible => {
+            *previous_rect = None;
+            Err(PendingReason::Hidden)
         }
-        CdpError::Timeout { .. } => StepError::Execution(format!(
-            "could not find {} within {} ms; check the page and the locator",
-            locator.describe(),
-            deadline.timeout_ms()
+        ActionableInspect::Disabled => {
+            *previous_rect = None;
+            Err(PendingReason::Disabled)
+        }
+        ActionableInspect::ReadyCandidate {
+            rect,
+            x,
+            y,
+            hit_ok,
+            blocker,
+        } => {
+            let stable = previous_rect.is_some_and(|prev| prev.same_geometry(rect));
+            *previous_rect = Some(rect);
+            if !hit_ok {
+                return Err(PendingReason::Occluded(blocker));
+            }
+            if !stable {
+                return Err(PendingReason::Unstable);
+            }
+            Ok((x, y))
+        }
+    }
+}
+
+/// Failure during one non-blocking resolution pass.
+enum LocateError {
+    Timeout,
+    Step(StepError),
+}
+
+/// Maps a pending resolution reason at deadline expiry into a step error.
+fn pending_timeout_error(
+    target_desc: &str,
+    reason: PendingReason,
+    deadline: Deadline,
+) -> StepError {
+    let ms = deadline.timeout_ms();
+    match reason {
+        PendingReason::Missing => StepError::Execution(format!(
+            "could not find {target_desc} within {ms} ms; check the page and the locator"
         )),
-        error => StepError::Environment(format!(
-            "the browser failed while waiting for {}: {error}",
-            locator.describe()
+        PendingReason::Hidden => StepError::Execution(format!(
+            "{target_desc} was found but not visible within {ms} ms; check the page and the locator"
         )),
+        PendingReason::OutOfRange { index, count } => {
+            let noun = if count == 1 { "element" } else { "elements" };
+            StepError::Execution(format!(
+                "could not find {target_desc} within {ms} ms: `nth` index {index} is out of range for {count} matched {noun}"
+            ))
+        }
+        PendingReason::Disabled => StepError::Execution(format!(
+            "{target_desc} remained disabled (`disabled` or `aria-disabled=\"true\"`) within {ms} ms"
+        )),
+        PendingReason::Unstable => StepError::Execution(format!(
+            "{target_desc} position or size was not stable across consecutive polls within {ms} ms"
+        )),
+        PendingReason::Occluded(Some(blocker)) => StepError::Execution(format!(
+            "{target_desc} was occluded by {} at its click point within {ms} ms",
+            blocker.format_label()
+        )),
+        PendingReason::Occluded(None) => StepError::Execution(format!(
+            "{target_desc} was not hit-testable (`elementFromPoint` returned nothing) within {ms} ms"
+        )),
+    }
+}
+
+/// Builds a step failure that names the target and what was attempted.
+fn action_error(target_desc: &str, action: &str, error: impl std::fmt::Display) -> StepError {
+    StepError::Execution(format!("could not {action} {target_desc}: {error}"))
+}
+
+/// Maps a failure while looking for an element into a poll-time error.
+fn locate_error(target_desc: &str, error: CdpError) -> LocateError {
+    match error {
+        CdpError::Script(message) => LocateError::Step(StepError::Execution(format!(
+            "could not use {target_desc}: {message}"
+        ))),
+        CdpError::Timeout { .. } => LocateError::Timeout,
+        error => LocateError::Step(StepError::Environment(format!(
+            "the browser failed while waiting for {target_desc}: {error}"
+        ))),
     }
 }
 
 /// Maps a failure of one element action to the error class a step uses.
 fn evaluate_error(
-    locator: &Locator,
+    target_desc: &str,
     error: CdpError,
     action: &str,
     deadline: Deadline,
 ) -> StepError {
     match error {
         CdpError::Timeout { .. } => StepError::Timeout(format!(
-            "could not {action} {} within {} ms",
-            locator.describe(),
+            "could not {action} {target_desc} within {} ms",
             deadline.timeout_ms()
         )),
-        error => locator.action_error(action, error),
+        error => action_error(target_desc, action, error),
     }
 }
 
@@ -1683,14 +2422,33 @@ fn base64_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Rejects explicit `null` values in step arguments (including nested `within`),
+/// because `serde` otherwise maps `null` into `Option::None` while JSON Schema refuses it.
+fn reject_null_fields(value: &Value) -> Result<(), String> {
+    let Some(entries) = value.as_object() else {
+        return Ok(());
+    };
+    for (key, field) in entries {
+        if field.is_null() {
+            return Err(format!("invalid arguments: `{key}` must not be null"));
+        }
+        if key == "within" {
+            reject_null_fields(field)?;
+        }
+    }
+    Ok(())
+}
+
 /// Parses a step's arguments.
 fn parse<T: DeserializeOwned>(args: &Value) -> Result<T, StepError> {
+    reject_null_fields(args).map_err(StepError::InvalidArguments)?;
     serde_json::from_value(args.clone())
         .map_err(|error| StepError::InvalidArguments(format!("invalid arguments: {error}")))
 }
 
 /// Parses a step's arguments for `validate`.
 fn parse_for_validate<T: DeserializeOwned>(args: &Value) -> Result<T, String> {
+    reject_null_fields(args)?;
     serde_json::from_value(args.clone()).map_err(|error| format!("invalid arguments: {error}"))
 }
 
@@ -1724,6 +2482,14 @@ fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
         }
         Endpoint::parse(connect)?;
     }
+    if let Some(attribute) = &args.testid_attribute
+        && (attribute.trim().is_empty() || attribute.chars().any(char::is_whitespace))
+    {
+        return Err(
+            "invalid arguments: `testid_attribute` must not be empty or contain whitespace"
+                .to_string(),
+        );
+    }
     if args.width == 0 {
         return Err("invalid arguments: `width` must be at least 1".to_string());
     }
@@ -1741,7 +2507,15 @@ fn validate_open(raw: &Value) -> Result<(), String> {
 fn validate_click(args: &Value) -> Result<(), String> {
     let args: ClickArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
-    Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name).map(|_| ())
+    let locator = Locator::from_args(
+        &args.css,
+        &args.xpath,
+        &args.text,
+        &args.role,
+        &args.name,
+        &args.testid,
+    )?;
+    ElementTarget::from_parts(locator, args.within.as_deref(), args.nth).map(|_| ())
 }
 
 /// The text `browser.type` sends.
@@ -1755,20 +2529,35 @@ fn type_text(args: &TypeArgs) -> Result<&str, String> {
     })
 }
 
-/// The locator `browser.type` uses.
-fn type_locator(args: &TypeArgs) -> Result<Locator, String> {
-    if args.value.is_some() {
-        Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
+/// The target locator `browser.type` uses.
+fn type_target(args: &TypeArgs) -> Result<ElementTarget, String> {
+    let locator = if args.value.is_some() {
+        Locator::from_args(
+            &args.css,
+            &args.xpath,
+            &args.text,
+            &args.role,
+            &args.name,
+            &args.testid,
+        )?
     } else {
-        Locator::from_args(&args.css, &args.xpath, &None, &args.role, &args.name)
-    }
+        Locator::from_args(
+            &args.css,
+            &args.xpath,
+            &None,
+            &args.role,
+            &args.name,
+            &args.testid,
+        )?
+    };
+    ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
 }
 
 fn validate_type(args: &Value) -> Result<(), String> {
     let args: TypeArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
     type_text(&args)?;
-    type_locator(&args).map(|_| ())
+    type_target(&args).map(|_| ())
 }
 
 fn validate_press(args: &Value) -> Result<(), String> {
@@ -1793,7 +2582,15 @@ fn validate_screenshot(args: &Value) -> Result<(), String> {
 fn validate_read(args: &Value) -> Result<(), String> {
     let args: ReadArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
-    Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)?;
+    let locator = Locator::from_args(
+        &args.css,
+        &args.xpath,
+        &args.text,
+        &args.role,
+        &args.name,
+        &args.testid,
+    )?;
+    ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)?;
     if let Some(attribute) = &args.attribute
         && attribute.trim().is_empty()
     {
@@ -1835,6 +2632,9 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         .map_err(StepError::Environment)?;
     if existing {
         session.ensure_same_options(&args, connect.as_ref())?;
+        if let Some(attribute) = &args.testid_attribute {
+            session.testid_attribute = attribute.clone();
+        }
     }
     let (url, title) = session.navigate(&args.url, Duration::from_millis(args.timeout_ms))?;
     Ok(json!({ "url": url, "title": title }))
@@ -1843,23 +2643,26 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
 fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: ClickArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
-    let locator = Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
+    let locator = Locator::from_args(
+        &args.css,
+        &args.xpath,
+        &args.text,
+        &args.role,
+        &args.name,
+        &args.testid,
+    )
+    .map_err(StepError::InvalidArguments)?;
+    let target = ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
         .map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    let located = session.locate(&locator, deadline)?;
-    let center = session.run_on(&locator, &located, CENTER_BODY, "click", deadline)?;
-    let x = center
-        .get("x")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| locator.action_error("click", "the element has no position"))?;
-    let y = center
-        .get("y")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| locator.action_error("click", "the element has no position"))?;
+    let target_desc = target.describe_with(&session.testid_attribute);
+    let actionable = session.locate_actionable_target(&target, deadline)?;
+    let located = actionable.located;
+    let (x, y) = (actionable.x, actionable.y);
     for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
         session.dispatch(
-            &locator,
+            &target_desc,
             "Input.dispatchMouseEvent",
             json!({
                 "type": event_type,
@@ -1876,7 +2679,13 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     // A click may navigate, which detaches the element. The click itself
     // succeeded, so a text that can no longer be read is not a failure.
     let text = session
-        .run_on(&locator, &located, TEXT_BODY, "read the text of", deadline)
+        .run_on(
+            &target_desc,
+            &located,
+            TEXT_BODY,
+            "read the text of",
+            deadline,
+        )
         .ok()
         .and_then(|value| value.as_str().map(str::to_string));
     match text {
@@ -1891,16 +2700,27 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let text = type_text(&args)
         .map_err(StepError::InvalidArguments)?
         .to_string();
-    let locator = type_locator(&args).map_err(StepError::InvalidArguments)?;
+    let target = type_target(&args).map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    let located = session.locate(&locator, deadline)?;
-    let focused = session.run_on(&locator, &located, FOCUS_BODY, "focus", deadline)?;
+    let target_desc = target.describe_with(&session.testid_attribute);
+    let actionable = session.locate_actionable_target(&target, deadline)?;
+    let focused = session.run_on(
+        &target_desc,
+        &actionable.located,
+        FOCUS_BODY,
+        "focus",
+        deadline,
+    )?;
     if focused != Value::Bool(true) {
-        return Err(locator.action_error("focus", "the element did not take focus"));
+        return Err(action_error(
+            &target_desc,
+            "focus",
+            "the element did not take focus",
+        ));
     }
     session.dispatch(
-        &locator,
+        &target_desc,
         "Input.insertText",
         json!({ "text": text }),
         "type into",
@@ -1938,8 +2758,8 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
     let url = match target {
-        WaitTarget::Element(locator) => {
-            session.locate(&locator, deadline)?;
+        WaitTarget::Element(target) => {
+            session.locate_target(&target, deadline)?;
             let page = session.page.clone();
             session
                 .connection_mut()?
@@ -2045,19 +2865,41 @@ fn write_png(path: &Path, png: &[u8]) -> Result<(), StepError> {
 fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: ReadArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
-    let locator = Locator::from_args(&args.css, &args.xpath, &args.text, &args.role, &args.name)
+    let locator = Locator::from_args(
+        &args.css,
+        &args.xpath,
+        &args.text,
+        &args.role,
+        &args.name,
+        &args.testid,
+    )
+    .map_err(StepError::InvalidArguments)?;
+    let target = ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
         .map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let session = session(sessions)?;
-    let located = session.locate(&locator, deadline)?;
-    let text = session.run_on(&locator, &located, TEXT_BODY, "read the text of", deadline)?;
+    let target_desc = target.describe_with(&session.testid_attribute);
+    let located = session.locate_target(&target, deadline)?;
+    let text = session.run_on(
+        &target_desc,
+        &located,
+        TEXT_BODY,
+        "read the text of",
+        deadline,
+    )?;
     let mut result = json!({ "text": text.as_str().unwrap_or_default() });
     if let Some(attribute) = &args.attribute {
         let body = format!(
             "if (!el) return null; return el.getAttribute({});",
             json_string(attribute)
         );
-        let value = session.run_on(&locator, &located, &body, "read the attribute of", deadline)?;
+        let value = session.run_on(
+            &target_desc,
+            &located,
+            &body,
+            "read the attribute of",
+            deadline,
+        )?;
         result["value"] = value;
     }
     Ok(result)
@@ -2182,14 +3024,14 @@ mod tests {
     }
 
     #[test]
-    fn a_locator_is_exactly_one_of_four_forms() {
+    fn a_locator_is_exactly_one_of_five_forms() {
         for step in ["browser.click", "browser.type", "browser.read"] {
             let definition = definition(step);
             let branches = definition.args_schema["oneOf"]
                 .as_array()
                 .unwrap_or_else(|| panic!("`{step}` must declare oneOf"));
-            assert_eq!(branches.len(), 4, "`{step}`: {branches:?}");
-            for property in ["css", "xpath", "text", "role", "name"] {
+            assert_eq!(branches.len(), 5, "`{step}`: {branches:?}");
+            for property in ["css", "xpath", "text", "role", "name", "testid"] {
                 assert_eq!(
                     definition.args_schema["properties"][property]["type"], "string",
                     "`{step}`: `{property}` must be a string"
@@ -2255,13 +3097,14 @@ mod tests {
         let branches = definition.args_schema["oneOf"]
             .as_array()
             .expect("`browser.wait` must declare oneOf");
-        assert_eq!(branches.len(), 5, "{branches:?}");
+        assert_eq!(branches.len(), 6, "{branches:?}");
 
         for args in [
             json!({"css": "#late"}),
             json!({"xpath": "//*[@id='late']"}),
             json!({"text": "late result"}),
             json!({"role": "button", "name": "Later"}),
+            json!({"testid": "late"}),
             json!({"url_contains": "/done"}),
         ] {
             assert!(
@@ -2344,50 +3187,94 @@ mod tests {
     #[test]
     fn a_locator_names_itself_in_an_error_and_in_its_script() {
         assert_eq!(
-            Locator::Css("#name".to_string()).describe(),
+            Locator::Css("#name".to_string()).describe_with(DEFAULT_TESTID_ATTRIBUTE),
             "CSS selector `#name`"
         );
         assert_eq!(
-            Locator::Xpath("//*[@id='name']".to_string()).describe(),
+            Locator::Xpath("//*[@id='name']".to_string()).describe_with(DEFAULT_TESTID_ATTRIBUTE),
             "XPath `//*[@id='name']`"
         );
         assert_eq!(
-            Locator::Text("Later".to_string()).describe(),
+            Locator::Text("Later".to_string()).describe_with(DEFAULT_TESTID_ATTRIBUTE),
             "visible text `Later`"
+        );
+        assert_eq!(
+            Locator::TestId("save".to_string()).describe_with("data-qa"),
+            "test id `save` (`data-qa`)"
         );
         assert_eq!(
             Locator::Role {
                 role: "button".to_string(),
                 name: Some("Later".to_string()),
             }
-            .describe(),
+            .describe_with(DEFAULT_TESTID_ATTRIBUTE),
             "role `button` named `Later`"
         );
 
         let quoted = Locator::Css("a\"b\\c".to_string())
-            .element_expression()
+            .resolve_body_with(DEFAULT_TESTID_ATTRIBUTE, None)
             .expect("a CSS locator has a page expression");
         assert!(
-            quoted.contains(r#"document.querySelector("a\"b\\c")"#),
+            quoted.contains(r#"root.querySelectorAll("a\"b\\c")"#),
             "a selector must be passed as a JSON string literal: {quoted}"
         );
 
         let text = Locator::Text("a\"b\\c".to_string())
-            .element_expression()
+            .resolve_body_with(DEFAULT_TESTID_ATTRIBUTE, Some(2))
             .expect("a text locator has a page expression");
         assert!(
-            text.contains(r#""a\"b\\c""#),
-            "the wanted text must be passed as a JSON string literal: {text}"
+            text.contains(r#""a\"b\\c""#) && text.contains("var wantedNth = 2;"),
+            "the wanted text and nth must be encoded safely: {text}"
         );
+
+        let testid = Locator::TestId("a\"b\\c".to_string())
+            .resolve_body_with("data-qa", None)
+            .expect("a testid locator has a page expression");
+        assert!(
+            testid.contains(r#""data-qa""#) && testid.contains(r#""a\"b\\c""#),
+            "the testid attribute and value must be encoded safely: {testid}"
+        );
+
         assert!(
             Locator::Role {
                 role: "button".to_string(),
                 name: None,
             }
-            .element_expression()
+            .resolve_body_with(DEFAULT_TESTID_ATTRIBUTE, None)
             .is_none(),
             "a role locator has no page expression"
         );
+    }
+
+    #[test]
+    fn candidate_formatting_caps_at_five_and_sixty_characters() {
+        let long_text = "x".repeat(75);
+        let candidates: Vec<CandidateInfo> = (1..=7)
+            .map(|index| CandidateInfo {
+                tag: "button".to_string(),
+                id: if index == 2 {
+                    "two".to_string()
+                } else {
+                    String::new()
+                },
+                text: if index == 1 {
+                    long_text.clone()
+                } else {
+                    format!("Btn {index}")
+                },
+            })
+            .collect();
+
+        let truncated = truncate_chars(&long_text, 60);
+        assert_eq!(truncated.chars().count(), 60);
+        assert!(truncated.ends_with("..."));
+
+        let summary = format_candidates(&candidates, 7);
+        assert!(summary.contains("1: <button> \""));
+        assert!(summary.contains("2: <button#two> \"Btn 2\""));
+        assert!(summary.contains("5: <button> \"Btn 5\""));
+        assert!(!summary.contains("Btn 6"));
+        assert!(summary.contains("showing 5 of 7"));
     }
 
     #[test]
@@ -2398,12 +3285,15 @@ mod tests {
             text: Some("Ada".to_string()),
             role: None,
             name: None,
+            testid: None,
             value: None,
+            within: None,
+            nth: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         };
         assert_eq!(type_text(&typed).ok(), Some("Ada"));
         assert_eq!(
-            type_locator(&typed).ok(),
+            type_target(&typed).ok().map(|target| target.locator),
             Some(Locator::Css("#name".to_string()))
         );
 
@@ -2413,12 +3303,15 @@ mod tests {
             text: Some("Editor".to_string()),
             role: None,
             name: None,
+            testid: None,
             value: Some(" typed".to_string()),
+            within: None,
+            nth: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         };
         assert_eq!(type_text(&located).ok(), Some(" typed"));
         assert_eq!(
-            type_locator(&located).ok(),
+            type_target(&located).ok().map(|target| target.locator),
             Some(Locator::Text("Editor".to_string()))
         );
 
@@ -2428,7 +3321,10 @@ mod tests {
             text: None,
             role: None,
             name: None,
+            testid: None,
             value: None,
+            within: None,
+            nth: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         };
         assert!(type_text(&missing).is_err());
@@ -2481,5 +3377,305 @@ mod tests {
                 "`{value}` must be refused as base64"
             );
         }
+    }
+
+    #[test]
+    fn locator_modifiers_testid_within_nth_and_testid_attribute_are_validated() {
+        let open = definition("browser.open");
+        assert_eq!(
+            open.args_schema["properties"]["testid_attribute"]["type"],
+            "string"
+        );
+        assert!(
+            (open.validate)(&json!({"url": "http://x/", "testid_attribute": "data-qa"})).is_ok()
+        );
+        for bad_open in [
+            json!({"url": "http://x/", "testid_attribute": ""}),
+            json!({"url": "http://x/", "testid_attribute": "   "}),
+            json!({"url": "http://x/", "testid_attribute": "data qa"}),
+            json!({"url": "http://x/", "testid_attribute": null}),
+        ] {
+            assert!(
+                (open.validate)(&bad_open).is_err(),
+                "invalid open args must be refused: {bad_open}"
+            );
+        }
+
+        for step in [
+            "browser.click",
+            "browser.type",
+            "browser.read",
+            "browser.wait",
+        ] {
+            let def = definition(step);
+            let branches = def.args_schema["oneOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{step}` must declare oneOf"));
+            let expected_branches = if step == "browser.wait" { 6 } else { 5 };
+            assert_eq!(branches.len(), expected_branches, "`{step}`: {branches:?}");
+            assert_eq!(def.args_schema["properties"]["testid"]["type"], "string");
+            assert_eq!(def.args_schema["properties"]["nth"]["type"], "integer");
+            assert_eq!(def.args_schema["properties"]["nth"]["minimum"], 0);
+            assert_eq!(def.args_schema["properties"]["within"]["type"], "object");
+            assert!(
+                def.args_schema["properties"]["within"]["$id"].is_string(),
+                "`{step}` within schema must declare an embedded $id: {}",
+                def.args_schema["properties"]["within"]
+            );
+
+            let valid_testid = if step == "browser.type" {
+                json!({"testid": "submit-btn", "text": "hello"})
+            } else {
+                json!({"testid": "submit-btn"})
+            };
+            assert!(
+                (def.validate)(&valid_testid).is_ok(),
+                "`{step}` must accept testid: {valid_testid}"
+            );
+
+            let valid_nested = if step == "browser.type" {
+                json!({
+                    "role": "textbox",
+                    "name": "Email",
+                    "text": "ada@example.com",
+                    "nth": 0,
+                    "within": {
+                        "css": "section.card",
+                        "nth": 1,
+                        "within": {
+                            "testid": "auth-panel"
+                        }
+                    }
+                })
+            } else {
+                json!({
+                    "testid": "save",
+                    "nth": 0,
+                    "within": {
+                        "css": "section.card",
+                        "nth": 1,
+                        "within": {
+                            "role": "dialog",
+                            "name": "Settings"
+                        }
+                    }
+                })
+            };
+            assert!(
+                (def.validate)(&valid_nested).is_ok(),
+                "`{step}` must accept nested within + nth: {valid_nested}"
+            );
+
+            let mut invalid_cases = vec![
+                ("empty testid", json!({"testid": ""})),
+                ("blank testid", json!({"testid": "  "})),
+                ("null testid", json!({"testid": null})),
+                ("css + testid", json!({"css": "#a", "testid": "b"})),
+                ("name + testid", json!({"testid": "b", "name": "Ok"})),
+                ("negative nth", json!({"testid": "b", "nth": -1})),
+                ("float nth", json!({"testid": "b", "nth": 1.5})),
+                ("string nth", json!({"testid": "b", "nth": "0"})),
+                ("null nth", json!({"testid": "b", "nth": null})),
+                ("null within", json!({"testid": "b", "within": null})),
+                ("empty within", json!({"testid": "b", "within": {}})),
+                (
+                    "within two locators",
+                    json!({"testid": "b", "within": {"css": "#a", "testid": "c"}}),
+                ),
+                (
+                    "within name without role",
+                    json!({"testid": "b", "within": {"css": "#a", "name": "Ok"}}),
+                ),
+                (
+                    "within negative nth",
+                    json!({"testid": "b", "within": {"css": "#a", "nth": -1}}),
+                ),
+            ];
+            for (label, mut args) in invalid_cases.drain(..) {
+                if step == "browser.type"
+                    && !args.as_object().is_some_and(|o| o.contains_key("text"))
+                {
+                    args["text"] = json!("hello");
+                }
+                assert!(
+                    (def.validate)(&args).is_err(),
+                    "`{step}` must refuse {label}: {args}"
+                );
+            }
+        }
+
+        let wait = definition("browser.wait");
+        for (label, args) in [
+            (
+                "url_contains + within",
+                json!({"url_contains": "/done", "within": {"css": "#a"}}),
+            ),
+            (
+                "url_contains + nth",
+                json!({"url_contains": "/done", "nth": 0}),
+            ),
+            (
+                "url_contains + testid",
+                json!({"url_contains": "/done", "testid": "ok"}),
+            ),
+            (
+                "url_contains + name",
+                json!({"url_contains": "/done", "name": "Ok"}),
+            ),
+        ] {
+            assert!(
+                (wait.validate)(&args).is_err(),
+                "`browser.wait` must refuse {label}: {args}"
+            );
+        }
+
+        let target = ElementTarget {
+            locator: Locator::TestId("save".to_string()),
+            within: Some(Box::new(ElementTarget {
+                locator: Locator::Css("form".to_string()),
+                within: None,
+                nth: Some(1),
+            })),
+            nth: Some(0),
+        };
+        assert_eq!(
+            target.describe_with("data-qa"),
+            "test id `save` (`data-qa`) (nth: 0) within (CSS selector `form` (nth: 1))"
+        );
+    }
+
+    #[test]
+    fn element_rect_same_geometry_handles_subpixel_jitter() {
+        let base = ElementRect {
+            x: 10.0,
+            y: 20.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        let subpixel = ElementRect {
+            x: 10.5,
+            y: 19.5,
+            width: 160.25,
+            height: 35.75,
+        };
+        let shifted = ElementRect {
+            x: 11.0,
+            y: 20.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        assert!(base.same_geometry(base));
+        assert!(base.same_geometry(subpixel));
+        assert!(!base.same_geometry(shifted));
+    }
+
+    #[test]
+    fn actionable_inspect_reports_occlusion_on_first_poll_and_tracks_stability() {
+        let rect = ElementRect {
+            x: 8.0,
+            y: 8.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        let moved = ElementRect {
+            x: 24.0,
+            y: 8.0,
+            width: 160.0,
+            height: 36.0,
+        };
+        let host = CandidateInfo {
+            tag: "div".to_string(),
+            id: "shadow-host".to_string(),
+            text: String::new(),
+        };
+
+        // First poll observing an occluded element must report Occluded, not Unstable,
+        // so a deadline hit before poll 2 finishes does not mask the blocker.
+        let mut previous = None;
+        let first = evaluate_actionable_inspect(
+            &mut previous,
+            ActionableInspect::ReadyCandidate {
+                rect,
+                x: 88.0,
+                y: 26.0,
+                hit_ok: false,
+                blocker: Some(host.clone()),
+            },
+        );
+        assert_eq!(first, Err(PendingReason::Occluded(Some(host.clone()))));
+        assert!(previous.is_some());
+
+        // Second poll with unchanged geometry still reports Occluded.
+        let second = evaluate_actionable_inspect(
+            &mut previous,
+            ActionableInspect::ReadyCandidate {
+                rect,
+                x: 88.0,
+                y: 26.0,
+                hit_ok: false,
+                blocker: Some(host.clone()),
+            },
+        );
+        assert_eq!(second, Err(PendingReason::Occluded(Some(host))));
+
+        // Second poll with changed geometry reports Unstable even if poll 1 was occluded.
+        let moved_second = evaluate_actionable_inspect(
+            &mut previous,
+            ActionableInspect::ReadyCandidate {
+                rect: moved,
+                x: 104.0,
+                y: 26.0,
+                hit_ok: true,
+                blocker: None,
+            },
+        );
+        assert_eq!(moved_second, Err(PendingReason::Unstable));
+
+        // Unoccluded element still requires two matching polls, and Hidden resets history.
+        let mut fresh = None;
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::ReadyCandidate {
+                    rect,
+                    x: 88.0,
+                    y: 26.0,
+                    hit_ok: true,
+                    blocker: None,
+                },
+            ),
+            Err(PendingReason::Unstable)
+        );
+        assert_eq!(
+            evaluate_actionable_inspect(&mut fresh, ActionableInspect::NotVisible),
+            Err(PendingReason::Hidden)
+        );
+        assert!(fresh.is_none());
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::ReadyCandidate {
+                    rect,
+                    x: 88.0,
+                    y: 26.0,
+                    hit_ok: true,
+                    blocker: None,
+                },
+            ),
+            Err(PendingReason::Unstable)
+        );
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::ReadyCandidate {
+                    rect,
+                    x: 88.0,
+                    y: 26.0,
+                    hit_ok: true,
+                    blocker: None,
+                },
+            ),
+            Ok((88.0, 26.0))
+        );
     }
 }
