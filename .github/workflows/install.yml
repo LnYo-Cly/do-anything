@@ -1,0 +1,78 @@
+name: Install
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - install.ps1
+      - .github/workflows/install.yml
+  pull_request:
+    paths:
+      - install.sh
+      - install.ps1
+      - .github/workflows/install.yml
+  schedule:
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs the published install commands against the real GitHub Releases.
+  install:
+    name: Install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Lint install.sh
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
+        shell: sh
+        run: |
+          set -eu
+          DA_INSTALL_DIR="$RUNNER_TEMP/latest" sh install.sh
+          "$RUNNER_TEMP/latest/da" --version | grep '^da [0-9]'
+          DA_VERSION=v0.1.0 DA_INSTALL_DIR="$RUNNER_TEMP/pinned" sh install.sh
+          test "$("$RUNNER_TEMP/pinned/da" --version)" = "da 0.1.0"
+          if DA_VERSION=v9.9.9 DA_INSTALL_DIR="$RUNNER_TEMP/missing" sh install.sh; then
+            echo "installing a missing version must fail"; exit 1
+          fi
+          test ! -e "$RUNNER_TEMP/missing/da"
+      - name: Install with install.ps1 (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:DA_NO_MODIFY_PATH = '1'
+          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\latest"
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          & "$env:RUNNER_TEMP\latest\da.exe" --version
+          $env:DA_VERSION = 'v0.1.0'
+          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\pinned"
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          if ((& "$env:RUNNER_TEMP\pinned\da.exe" --version) -ne 'da 0.1.0') { throw 'expected da 0.1.0' }
+          $env:DA_VERSION = 'v9.9.9'
+          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\missing"
+          $failed = $false
+          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $failed = $true }
+          if (-not $failed) { throw 'installing a missing version must fail' }
+          if (Test-Path "$env:RUNNER_TEMP\missing\da.exe") { throw 'a failed install left da.exe behind' }
+      - name: Install with install.ps1 (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:DA_NO_MODIFY_PATH = '1'
+          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\ps51"
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          & "$env:RUNNER_TEMP\ps51\da.exe" --version

@@ -17,9 +17,61 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
 jobs:
-  check:
-    name: Check (${{ matrix.os }})
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --check
+
+  # Verify the exact package that would be uploaded, including a build from
+  # the packaged sources. One Linux runner is enough: the package contents
+  # and the verification build do not depend on the operating system.
+  package:
+    name: Package (crates.io dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package (crates.io dry run)
+        run: cargo publish --dry-run --locked
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Clippy (db only)
+        run: cargo clippy --all-targets --no-default-features --features db -- -D warnings
+      - name: Clippy (log only)
+        run: cargo clippy --all-targets --no-default-features --features log -- -D warnings
+      - name: Clippy (browser only)
+        run: cargo clippy --all-targets --no-default-features --features browser -- -D warnings
+
+  browser:
+    name: Browser tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     env:
       # The browser tests launch the Chrome that the runner already has. A
@@ -32,37 +84,45 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - name: Clippy (db only)
-        run: cargo clippy --all-targets --no-default-features --features db -- -D warnings
-      - name: Clippy (log only)
-        run: cargo clippy --all-targets --no-default-features --features log -- -D warnings
-      - name: Clippy (browser only)
-        run: cargo clippy --all-targets --no-default-features --features browser -- -D warnings
+      - name: Test (browser)
+        run: cargo test --test browser
+
+  other_tests:
+    name: Other tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Select non-browser test targets
+        id: targets
+        shell: bash
+        run: |
+          args="--lib --bins"
+          for f in tests/*.rs; do
+            name=$(basename "$f" .rs)
+            if [ "$name" != "browser" ]; then
+              args="$args --test $name"
+            fi
+          done
+          echo "args=$args" >> "$GITHUB_OUTPUT"
       - name: Test
-        run: cargo test
+        run: cargo test ${{ steps.targets.outputs.args }}
       - name: Test (no default features)
-        run: cargo test --no-default-features
+        run: cargo test --no-default-features ${{ steps.targets.outputs.args }}
       - name: Test (db only)
-        run: cargo test --no-default-features --features db
+        run: cargo test --no-default-features --features db ${{ steps.targets.outputs.args }}
       - name: Test (log only)
-        run: cargo test --no-default-features --features log
+        run: cargo test --no-default-features --features log ${{ steps.targets.outputs.args }}
       - name: Test (browser only)
-        run: cargo test --no-default-features --features browser
-      # Verify the exact package that would be uploaded, including a build from
-      # the packaged sources. One Linux runner is enough: the package contents
-      # and the verification build do not depend on the operating system.
-      - name: Package (crates.io dry run)
-        if: runner.os == 'Linux'
-        run: cargo publish --dry-run --locked
+        run: cargo test --no-default-features --features browser ${{ steps.targets.outputs.args }}
+      - name: Doctests
+        run: cargo test --doc
 
   # The PostgreSQL half of `db.query` needs a server, which the check job does
   # not have: there the tests skip and print why. This job runs them for real
@@ -90,11 +150,65 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Test against PostgreSQL
-        run: cargo test
+        run: cargo test --test db
+
+  check_ubuntu:
+    name: Check (ubuntu-latest)
+    runs-on: ubuntu-latest
+    needs: [fmt, package, clippy, browser, other_tests]
+    if: always()
+    steps:
+      - name: Verify split jobs
+        run: |
+          for result in \
+            "${{ needs.fmt.result }}" \
+            "${{ needs.package.result }}" \
+            "${{ needs.clippy.result }}" \
+            "${{ needs.browser.result }}" \
+            "${{ needs.other_tests.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::Required job did not succeed (result: $result)"
+              exit 1
+            fi
+          done
+
+  check_windows:
+    name: Check (windows-latest)
+    runs-on: ubuntu-latest
+    needs: [clippy, browser, other_tests]
+    if: always()
+    steps:
+      - name: Verify split jobs
+        run: |
+          for result in \
+            "${{ needs.clippy.result }}" \
+            "${{ needs.browser.result }}" \
+            "${{ needs.other_tests.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::Required job did not succeed (result: $result)"
+              exit 1
+            fi
+          done
+
+  check_macos:
+    name: Check (macos-latest)
+    runs-on: ubuntu-latest
+    needs: [clippy, browser, other_tests]
+    if: always()
+    steps:
+      - name: Verify split jobs
+        run: |
+          for result in \
+            "${{ needs.clippy.result }}" \
+            "${{ needs.browser.result }}" \
+            "${{ needs.other_tests.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::Required job did not succeed (result: $result)"
+              exit 1
+            fi
+          done
 
   deny:
     name: Dependencies
@@ -102,56 +216,3 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
-
-  # Runs the published install commands against the real GitHub Releases.
-  install:
-    name: Install script (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
-    steps:
-      - uses: actions/checkout@v7
-      - name: Lint install.sh
-        if: runner.os == 'Linux'
-        run: shellcheck install.sh
-      - name: Install with install.sh
-        if: runner.os != 'Windows'
-        shell: sh
-        run: |
-          set -eu
-          DA_INSTALL_DIR="$RUNNER_TEMP/latest" sh install.sh
-          "$RUNNER_TEMP/latest/da" --version | grep '^da [0-9]'
-          DA_VERSION=v0.1.0 DA_INSTALL_DIR="$RUNNER_TEMP/pinned" sh install.sh
-          test "$("$RUNNER_TEMP/pinned/da" --version)" = "da 0.1.0"
-          if DA_VERSION=v9.9.9 DA_INSTALL_DIR="$RUNNER_TEMP/missing" sh install.sh; then
-            echo "installing a missing version must fail"; exit 1
-          fi
-          test ! -e "$RUNNER_TEMP/missing/da"
-      - name: Install with install.ps1 (PowerShell 7)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $env:DA_NO_MODIFY_PATH = '1'
-          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\latest"
-          Get-Content install.ps1 -Raw | Invoke-Expression
-          & "$env:RUNNER_TEMP\latest\da.exe" --version
-          $env:DA_VERSION = 'v0.1.0'
-          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\pinned"
-          Get-Content install.ps1 -Raw | Invoke-Expression
-          if ((& "$env:RUNNER_TEMP\pinned\da.exe" --version) -ne 'da 0.1.0') { throw 'expected da 0.1.0' }
-          $env:DA_VERSION = 'v9.9.9'
-          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\missing"
-          $failed = $false
-          try { Get-Content install.ps1 -Raw | Invoke-Expression } catch { $failed = $true }
-          if (-not $failed) { throw 'installing a missing version must fail' }
-          if (Test-Path "$env:RUNNER_TEMP\missing\da.exe") { throw 'a failed install left da.exe behind' }
-      - name: Install with install.ps1 (Windows PowerShell 5.1)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $env:DA_NO_MODIFY_PATH = '1'
-          $env:DA_INSTALL_DIR = "$env:RUNNER_TEMP\ps51"
-          Get-Content install.ps1 -Raw | Invoke-Expression
-          & "$env:RUNNER_TEMP\ps51\da.exe" --version
