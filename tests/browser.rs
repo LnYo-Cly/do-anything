@@ -2983,7 +2983,13 @@ fn unsupported_capabilities_probe_current_behavior() {
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&iframe_out), Some(1));
+    assert_eq!(
+        exit_code(&iframe_out),
+        Some(1),
+        "unexpected iframe probe exit code: stdout={}\nstderr={}",
+        stdout(&iframe_out),
+        stderr(&iframe_out)
+    );
     let iframe_json = json_stdout(&iframe_out);
     let iframe_err = case_error(&iframe_json);
     assert!(
@@ -3009,7 +3015,13 @@ fn unsupported_capabilities_probe_current_behavior() {
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&shadow_css_out), Some(1));
+    assert_eq!(
+        exit_code(&shadow_css_out),
+        Some(1),
+        "unexpected shadow css probe exit code: stdout={}\nstderr={}",
+        stdout(&shadow_css_out),
+        stderr(&shadow_css_out)
+    );
     let shadow_css_json = json_stdout(&shadow_css_out);
     let shadow_css_err = case_error(&shadow_css_json);
     assert!(
@@ -3020,7 +3032,7 @@ fn unsupported_capabilities_probe_current_behavior() {
     let shadow_role = dir.write(
         "probe-shadow-role.yaml",
         &format!(
-            "name: probe shadow role\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      role: button\n      name: Inside Shadow\n      timeout_ms: 400\n",
+            "name: probe shadow role\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      role: button\n      name: Inside Shadow\n      timeout_ms: 5000\n",
             server.url("/browser/probe/shadow")
         ),
     );
@@ -3034,7 +3046,13 @@ fn unsupported_capabilities_probe_current_behavior() {
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&shadow_role_out), Some(1));
+    assert_eq!(
+        exit_code(&shadow_role_out),
+        Some(1),
+        "unexpected shadow role probe exit code: stdout={}\nstderr={}",
+        stdout(&shadow_role_out),
+        stderr(&shadow_role_out)
+    );
     let shadow_role_json = json_stdout(&shadow_role_out);
     let shadow_role_err = case_error(&shadow_role_json);
     assert!(
@@ -3060,7 +3078,13 @@ fn unsupported_capabilities_probe_current_behavior() {
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&new_tab_out), Some(1));
+    assert_eq!(
+        exit_code(&new_tab_out),
+        Some(1),
+        "unexpected new-tab probe exit code: stdout={}\nstderr={}",
+        stdout(&new_tab_out),
+        stderr(&new_tab_out)
+    );
     let new_tab_json = json_stdout(&new_tab_out);
     let new_tab_err = case_error(&new_tab_json);
     assert!(
@@ -3072,7 +3096,7 @@ fn unsupported_capabilities_probe_current_behavior() {
     let dialog_case = dir.write(
         "probe-dialog.yaml",
         &format!(
-            "name: probe dialog\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#trigger-alert\"\n      timeout_ms: 600\n",
+            "name: probe dialog\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#trigger-alert\"\n      timeout_ms: 5000\n",
             server.url("/browser/probe/dialog")
         ),
     );
@@ -3086,7 +3110,13 @@ fn unsupported_capabilities_probe_current_behavior() {
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&dialog_out), Some(1));
+    assert_eq!(
+        exit_code(&dialog_out),
+        Some(1),
+        "unexpected dialog probe exit code: stdout={}\nstderr={}",
+        stdout(&dialog_out),
+        stderr(&dialog_out)
+    );
     let dialog_json = json_stdout(&dialog_out);
     let dialog_err = case_error(&dialog_json);
     assert!(
@@ -3098,7 +3128,7 @@ fn unsupported_capabilities_probe_current_behavior() {
     let upload_case = dir.write(
         "probe-upload.yaml",
         &format!(
-            "name: probe file upload\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.type:\n      css: \"#file-upload\"\n      text: \"sample.txt\"\n      timeout_ms: 600\n  - browser.read:\n      css: \"#file-upload\"\n      attribute: value\n    expect:\n      - path: $.value\n        equals: null\n      - path: $.text\n        equals: \"\"\n",
+            "name: probe file upload\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.type:\n      css: \"#file-upload\"\n      text: \"sample.txt\"\n      timeout_ms: 5000\n  - browser.read:\n      css: \"#file-upload\"\n      attribute: value\n    expect:\n      - path: $.value\n        equals: null\n      - path: $.text\n        equals: \"\"\n",
             server.url("/browser/probe/upload")
         ),
     );
@@ -3138,7 +3168,13 @@ fn unsupported_capabilities_probe_current_behavior() {
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&coords_out), Some(3));
+    assert_eq!(
+        exit_code(&coords_out),
+        Some(3),
+        "unexpected coords probe exit code: stdout={}\nstderr={}",
+        stdout(&coords_out),
+        stderr(&coords_out)
+    );
     let coords_json = json_stdout(&coords_out);
     let coords_err = coords_json["errors"][0]["message"]
         .as_str()
