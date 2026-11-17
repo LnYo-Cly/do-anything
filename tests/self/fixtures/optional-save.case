@@ -1,0 +1,7 @@
+name: Optional step that saves
+steps:
+  - cli.run:
+      command: da
+    optional: true
+    save:
+      version: $.stdout

@@ -60,6 +60,13 @@ pub struct Step {
     pub action: String,
     /// Arguments passed to the step.
     pub args: Value,
+    /// Whether the step may be skipped instead of stopping the case.
+    ///
+    /// A failed assertion, a `StepError::Execution` or a `StepError::Timeout`
+    /// leaves an optional step `skipped` and the case continues; an environment
+    /// or input error still stops the case. Only a step that is not optional may
+    /// `save`, because a skipped step would leave the variable undefined.
+    pub optional: bool,
     /// Assertions evaluated against the step result.
     pub expect: Vec<Expectation>,
     /// Values copied out of the step result into case variables.
@@ -370,13 +377,16 @@ impl<'de> Deserialize<'de> for RawObservation {
 /// name.
 #[derive(Debug)]
 struct RawStep {
-    /// Keys other than `expect` and `save`, each with the location of the key
-    /// and of its value. A valid step has exactly one: the step name.
+    /// Keys other than `optional`, `expect` and `save`, each with the location
+    /// of the key and of its value. A valid step has exactly one: the step name.
     fields: Vec<(String, Location, Spanned<RawArgs>)>,
+    /// The `optional` value, if the step has one.
+    optional: Option<Spanned<Value>>,
     /// The `expect` value, if the step has one.
     expect: Option<Spanned<RawNodes>>,
-    /// The `save` value, if the step has one.
-    save: Option<Spanned<RawNodes>>,
+    /// The `save` value, if the step has one, with the location of the key.
+    /// The key is where a message points when the field itself has to go.
+    save: Option<(Location, Spanned<RawNodes>)>,
 }
 
 impl<'de> Deserialize<'de> for RawStep {
@@ -398,26 +408,30 @@ impl<'de> Deserialize<'de> for RawStep {
                 A: MapAccess<'de>,
             {
                 let mut fields = Vec::new();
+                let mut optional = None;
                 let mut expect = None;
                 let mut save = None;
                 // The step name is chosen by the case, so the value type of each
-                // key is decided here rather than by a struct: `expect` and
-                // `save` must keep the location of every entry they contain.
-                // The keys keep their own location, because an unregistered
-                // step has to point at its name even when it is not the first
-                // entry of the mapping.
+                // key is decided here rather than by a struct: `optional`,
+                // `expect` and `save` must keep the location of the node they
+                // hold. The keys keep their own location, because an
+                // unregistered step has to point at its name even when it is
+                // not the first entry of the mapping.
                 while let Some(key) = map.next_key::<Spanned<String>>()? {
                     let name = key.value;
-                    if name == "expect" {
+                    if name == "optional" {
+                        optional = Some(map.next_value()?);
+                    } else if name == "expect" {
                         expect = Some(map.next_value()?);
                     } else if name == "save" {
-                        save = Some(map.next_value()?);
+                        save = Some((key.referenced, map.next_value()?));
                     } else {
                         fields.push((name, key.referenced, map.next_value()?));
                     }
                 }
                 Ok(RawStep {
                     fields,
+                    optional,
                     expect,
                     save,
                 })
@@ -966,9 +980,26 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
     let location = step.referenced;
     let RawStep {
         mut fields,
+        optional,
         expect,
         save,
     } = step.value;
+
+    let optional = match optional {
+        None => false,
+        Some(node) => match node.value {
+            Value::Bool(flag) => flag,
+            other => {
+                return Err(Problem {
+                    location: node.referenced,
+                    message: format!(
+                        "step {index}: `optional` must be true or false, found {}",
+                        kind_name(&other)
+                    ),
+                });
+            }
+        },
+    };
 
     let (action, name_location, args) = match fields.len() {
         1 => {
@@ -1036,9 +1067,10 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
         },
     };
 
+    let save_location = save.as_ref().map(|(location, _)| *location);
     let save = match save {
         None => Vec::new(),
-        Some(node) => match node.value {
+        Some((_, node)) => match node.value {
             RawNodes::Map(entries) => {
                 let mut saved = Vec::with_capacity(entries.len());
                 for (name, value) in entries {
@@ -1073,9 +1105,22 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
         },
     };
 
+    // A skipped step never reaches its result, so a variable saved from one
+    // would be undefined for every later step. Refusing the combination while
+    // parsing keeps that failure out of the middle of a run.
+    if optional && let Some(save_location) = save_location {
+        return Err(Problem {
+            location: save_location,
+            message: format!(
+                "step {index}: `optional: true` cannot be combined with `save`; remove `save`, or drop `optional` so the step always sets the variable"
+            ),
+        });
+    }
+
     Ok(Step {
         action,
         args,
+        optional,
         expect,
         save,
         location: name_location,
@@ -1585,6 +1630,55 @@ steps:
     }
 
     #[test]
+    fn a_step_is_not_optional_unless_it_says_so() {
+        let case = parse("name: Example\nsteps:\n  - sample.call:\n      target: local\n")
+            .expect("the case must parse");
+
+        assert!(!case.steps[0].optional);
+    }
+
+    #[test]
+    fn reads_the_optional_field_of_a_step() {
+        let case = parse(
+            "name: Example\nsteps:\n  - sample.call:\n      target: local\n    optional: true\n  - sample.call:\n      target: local\n    optional: false\n",
+        )
+        .expect("the case must parse");
+
+        assert!(case.steps[0].optional);
+        assert!(!case.steps[1].optional);
+    }
+
+    #[test]
+    fn a_step_may_not_be_optional_and_save_a_variable() {
+        let error = parse(&step_with(
+            "    optional: true\n    save:\n      code: $.exit_code\n",
+        ))
+        .expect_err("the combination must be refused");
+
+        assert!(error.contains("`optional: true`"), "got: {error}");
+        assert!(error.contains("`save`"), "got: {error}");
+        assert!(
+            error.contains("remove"),
+            "the message must say what to change, got: {error}"
+        );
+        assert!(
+            error.starts_with("line 6 column 5: "),
+            "the error must point at the `save` block, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_step_that_is_not_optional_may_still_save() {
+        let case = parse(&step_with(
+            "    optional: false\n    save:\n      code: $.exit_code\n",
+        ))
+        .expect("an explicit false must not be refused");
+
+        assert!(!case.steps[0].optional);
+        assert_eq!(case.steps[0].save.len(), 1);
+    }
+
+    #[test]
     fn parses_the_optional_classification() {
         let case = parse(
             "name: Example\nproject: shop\nsuite: smoke\nlayer: api\ntags:\n  - smoke\n  - fast\nsteps:\n  - sample.call:\n      target: local\n",
@@ -1963,6 +2057,12 @@ steps:
                 5,
                 11,
                 "`save` must be a mapping",
+            ),
+            (
+                step_with("    optional: \"true\"\n"),
+                5,
+                15,
+                "`optional` must be true or false",
             ),
         ]
     }

@@ -310,6 +310,7 @@ fn step_with(action: &str, args: Value) -> Step {
     Step {
         action: action.to_string(),
         args,
+        optional: false,
         expect: Vec::new(),
         save: Vec::new(),
         location: Location::UNKNOWN,

@@ -10,7 +10,9 @@ use serde_json::{Map, Value, json};
 use crate::core::assert::AssertionReport;
 use crate::core::case::{CaseError, LoadedCase};
 use crate::core::paths;
-use crate::core::report::{CaseReport, CaseStatus, Problem, RunOutcome, StepReport, Summary};
+use crate::core::report::{
+    CaseReport, CaseStatus, Problem, RunOutcome, StepReport, StepStatus, Summary,
+};
 use crate::core::secrets::Secrets;
 
 /// How results are rendered.
@@ -221,7 +223,16 @@ fn text_report(outcome: &RunOutcome, secrets: &Secrets) -> Rendered {
         ));
         for step in &case.steps {
             if let Some(problem) = &step.error {
-                stdout.push_str(&format!("  {}: {}\n", step.name, problem.message));
+                // A skipped step keeps the problem that skipped it. The note
+                // says the case went on, so a reader does not take the line for
+                // a failure of the run. A step that never ran has no problem
+                // and still prints nothing.
+                let note = if step.status == StepStatus::Skipped {
+                    " (optional)"
+                } else {
+                    ""
+                };
+                stdout.push_str(&format!("  {}{note}: {}\n", step.name, problem.message));
             }
             for assertion in &step.assertions {
                 if !assertion.passed {
@@ -487,6 +498,138 @@ mod tests {
             duration: Duration::from_millis(4),
             bundle_errors: Vec::new(),
         })
+    }
+
+    /// A passing case whose first, optional step could not find its target.
+    fn optional_skip_outcome() -> RunOutcome {
+        RunOutcome::Completed(crate::core::report::RunReport {
+            cases: vec![CaseReport {
+                file: PathBuf::from("cases/banner.yaml"),
+                name: "Banner".to_string(),
+                project: None,
+                suite: None,
+                layer: None,
+                tags: Vec::new(),
+                status: CaseStatus::Passed,
+                duration: Duration::from_millis(5),
+                steps: vec![
+                    StepReport {
+                        name: "sample.click".to_string(),
+                        status: StepStatus::Skipped,
+                        duration: Duration::from_millis(2),
+                        result: Some(json!({"found": false})),
+                        assertions: vec![AssertionReport {
+                            path: "$.found".to_string(),
+                            comparison: "equals".to_string(),
+                            expected: json!(true),
+                            actual: Some(json!(false)),
+                            passed: false,
+                            message: None,
+                        }],
+                        error: Some(Problem {
+                            kind: ProblemKind::Assertion,
+                            message: "1 of 1 assertions failed".to_string(),
+                        }),
+                    },
+                    StepReport {
+                        name: "sample.after".to_string(),
+                        status: StepStatus::Passed,
+                        duration: Duration::from_millis(1),
+                        result: Some(json!({"ok": true})),
+                        assertions: Vec::new(),
+                        error: None,
+                    },
+                ],
+                error: None,
+                close_errors: Vec::new(),
+                bundle: None,
+            }],
+            filtered: 0,
+            duration: Duration::from_millis(5),
+            bundle_errors: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_skipped_optional_step_keeps_its_evidence_in_json() {
+        let rendered = render(&optional_skip_outcome(), Format::Json, &Secrets::new());
+        let value: Value = serde_json::from_str(&rendered.stdout).expect("stdout must be JSON");
+
+        let case = &value["cases"][0];
+        assert_eq!(case["status"], "passed");
+        assert_eq!(case["error"], Value::Null);
+        assert_eq!(case["steps"][0]["status"], "skipped");
+        assert_eq!(
+            case["steps"][0]["error"]["kind"], "assertion",
+            "the reason it was skipped must stay readable, got: {case}"
+        );
+        assert_eq!(case["steps"][0]["result"], json!({"found": false}));
+        assert_eq!(case["steps"][0]["assertions"][0]["passed"], false);
+        assert_eq!(case["steps"][0]["assertions"][0]["expected"], true);
+        assert_eq!(value["summary"]["steps_skipped"], 1);
+        assert_eq!(value["summary"]["cases_passed"], 1);
+        assert_eq!(value["ok"], true);
+    }
+
+    #[test]
+    fn text_names_an_optional_step_that_was_skipped() {
+        let rendered = render(&optional_skip_outcome(), Format::Text, &Secrets::new());
+
+        assert!(
+            rendered
+                .stdout
+                .contains("  sample.click (optional): 1 of 1 assertions failed"),
+            "got: {}",
+            rendered.stdout
+        );
+        assert!(
+            rendered
+                .stdout
+                .contains("    $.found equals true (actual false)"),
+            "the failed assertion must stay visible, got: {}",
+            rendered.stdout
+        );
+        assert!(
+            rendered.stdout.contains("1 skipped"),
+            "the summary must count the skipped step, got: {}",
+            rendered.stdout
+        );
+        assert!(
+            !rendered.stdout.contains("sample.after"),
+            "a step that passed prints no line, got: {}",
+            rendered.stdout
+        );
+    }
+
+    #[test]
+    fn text_stays_quiet_about_a_step_that_never_ran() {
+        let RunOutcome::Completed(mut report) = failing_outcome() else {
+            panic!("the fixture must be a completed run");
+        };
+        report.cases[0].steps.push(StepReport {
+            name: "sample.never".to_string(),
+            status: StepStatus::Skipped,
+            duration: Duration::ZERO,
+            result: None,
+            assertions: Vec::new(),
+            error: None,
+        });
+        let rendered = render(
+            &RunOutcome::Completed(report),
+            Format::Text,
+            &Secrets::new(),
+        );
+
+        assert!(
+            !rendered.stdout.contains("sample.never"),
+            "an unexecuted step prints nothing, got: {}",
+            rendered.stdout
+        );
+        assert!(
+            !rendered.stdout.contains("(optional)"),
+            "only a skipped optional step carries the note, got: {}",
+            rendered.stdout
+        );
     }
 
     #[test]

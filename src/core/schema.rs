@@ -3,10 +3,11 @@
 //! The schema mirrors the rules `case::parse` enforces: the top level has
 //! exactly `name`, the four classification fields, `vars`, `observe` and
 //! `steps`; a step carries exactly one registered step name plus optional
-//! `expect` and `save`; an observation carries exactly one registered observer
-//! plus its arguments; and every assertion uses one of the four comparisons.
-//! Step and observer argument schemas come from the registry, so a declared
-//! schema and the exported schema cannot drift apart.
+//! `optional`, `expect` and `save`, and a `save` needs a step that is not
+//! optional; an observation carries exactly one registered observer plus its
+//! arguments; and every assertion uses one of the four comparisons. Step and
+//! observer argument schemas come from the registry, so a declared schema and
+//! the exported schema cannot drift apart.
 
 use serde_json::{Map, Value, json};
 
@@ -123,12 +124,20 @@ pub fn case_schema(registry: &Registry) -> Value {
     })
 }
 
-/// One allowed shape of a step: exactly one step name plus `expect` and `save`.
+/// One allowed shape of a step: exactly one step name plus `optional`, `expect`
+/// and `save`.
 fn step_branch(name: &str) -> Value {
     let mut properties = Map::new();
     properties.insert(
         name.to_string(),
         json!({ "$ref": format!("#/$defs/{name}") }),
+    );
+    properties.insert(
+        "optional".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Skips the step instead of stopping the case when it fails an assertion, cannot finish or times out."
+        }),
     );
     properties.insert("expect".to_string(), json!({ "$ref": "#/$defs/expect" }));
     properties.insert("save".to_string(), json!({ "$ref": "#/$defs/save" }));
@@ -138,6 +147,14 @@ fn step_branch(name: &str) -> Value {
         "description": format!("A step that runs `{name}`."),
         "additionalProperties": false,
         "required": [name],
+        // A skipped optional step never reaches its result, so the parser
+        // refuses to save a variable from one. Expressing that here keeps
+        // `da schema` from accepting a case `da lint` rejects. An explicit
+        // `optional: false` still saves, because the step always runs.
+        "not": {
+            "required": ["optional", "save"],
+            "properties": {"optional": {"const": true}}
+        },
         "properties": Value::Object(properties)
     })
 }
@@ -345,6 +362,34 @@ mod tests {
             "classification must stay optional: {}",
             schema["required"]
         );
+    }
+
+    #[test]
+    fn every_step_branch_allows_an_optional_boolean() {
+        let schema = case_schema(&registry());
+        let branches = schema["properties"]["steps"]["items"]["oneOf"]
+            .as_array()
+            .expect("registered steps must produce a oneOf");
+
+        for branch in branches {
+            assert_eq!(branch["properties"]["optional"]["type"], "boolean");
+            assert!(
+                branch["required"]
+                    .as_array()
+                    .is_some_and(|required| !required.iter().any(|field| field == "optional")),
+                "`optional` must stay optional: {}",
+                branch["required"]
+            );
+            // A step that saves needs a step that always runs; the parser
+            // refuses the combination and the schema must not promise it.
+            assert_eq!(
+                branch["not"],
+                json!({
+                    "required": ["optional", "save"],
+                    "properties": {"optional": {"const": true}}
+                })
+            );
+        }
     }
 
     #[test]
