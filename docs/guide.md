@@ -1182,7 +1182,10 @@ equivalent except for how the element is found:
 
 `browser.open` returns the URL the page actually reached, after redirects, and
 its title. Its own `timeout_ms` bounds how long the page may take to finish
-loading; exceeding it is a timeout (exit 5).
+loading; exceeding it is a timeout (exit 5). When Chrome reports that the page's
+target crashed or detached while the navigation is waiting, the step fails at
+once as an environment error (exit 4) and the message names the event; when the
+browser sends no such event, the timeout message says that none arrived.
 
 `browser.press` accepts `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, the four
 arrow keys, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one printable
