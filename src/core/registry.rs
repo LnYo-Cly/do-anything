@@ -116,14 +116,14 @@ impl Registry {
 }
 
 /// Field names every step already gives a meaning to.
-const RESERVED_NAMES: [&str; 2] = ["expect", "save"];
+const RESERVED_NAMES: [&str; 3] = ["expect", "optional", "save"];
 
 /// Checks the name a step registers under.
 ///
 /// A name is written in every case that uses the step and becomes a key of the
 /// schema's `$defs`, so it is limited to characters that need no escaping and
-/// that read the same on every platform. The two fields a step already carries,
-/// `expect` and `save`, cannot also name a step.
+/// that read the same on every platform. The fields a step already carries,
+/// `expect`, `optional` and `save`, cannot also name a step.
 fn validate_name(name: &str) -> Result<(), String> {
     if RESERVED_NAMES.contains(&name) {
         return Err(format!(
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn refuses_the_names_the_case_format_already_uses() {
-        for name in ["expect", "save"] {
+        for name in ["expect", "optional", "save"] {
             let mut registry = Registry::new();
             let error = registry
                 .register(definition(name))

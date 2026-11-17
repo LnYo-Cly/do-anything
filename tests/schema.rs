@@ -455,6 +455,48 @@ fn every_declared_argument_bound_is_enforced_by_validate() {
 
 #[cfg(feature = "cli")]
 #[test]
+fn an_optional_step_takes_a_boolean_and_cannot_save() {
+    let validator = validator(schema());
+    let optional = json!({
+        "name": "Optional",
+        "steps": [{
+            "cli.run": {"command": "da"},
+            "optional": true,
+            "expect": [{"path": "$.exit_code", "equals": 0}]
+        }]
+    });
+    assert!(
+        validator.is_valid(&optional),
+        "the parser accepts an optional step, so the schema must too: {optional}"
+    );
+
+    let mut explicit = optional.clone();
+    explicit["steps"][0]["optional"] = json!(false);
+    explicit["steps"][0]["save"] = json!({"version": "$.stdout"});
+    assert!(
+        validator.is_valid(&explicit),
+        "`optional: false` always runs, so it may save: {explicit}"
+    );
+
+    let mut saving = optional.clone();
+    saving["steps"][0]["save"] = json!({"version": "$.stdout"});
+    assert!(
+        !validator.is_valid(&saving),
+        "the parser refuses an optional step that saves, so the schema must too: {saving}"
+    );
+
+    for wrong in [json!("true"), json!(1), json!(null), json!(["true"])] {
+        let mut instance = optional.clone();
+        instance["steps"][0]["optional"] = wrong.clone();
+        assert!(
+            !validator.is_valid(&instance),
+            "`optional: {wrong}` is not a boolean, so it must not validate"
+        );
+    }
+}
+
+#[cfg(feature = "cli")]
+#[test]
 fn an_unknown_step_argument_is_rejected() {
     let validator = validator(schema());
     let instance = json!({

@@ -219,6 +219,12 @@ impl RunReport {
                 kinds.push(problem.kind);
             }
             for step in &case.steps {
+                // A skipped step keeps the problem that skipped it, so that the
+                // reader can see why an optional step did not run. That problem
+                // is not part of the run's verdict: the case continued past it.
+                if step.status == StepStatus::Skipped {
+                    continue;
+                }
                 if let Some(problem) = &step.error {
                     kinds.push(problem.kind);
                 }
@@ -368,6 +374,30 @@ mod tests {
             bundle_errors: Vec::new(),
         };
 
+        assert_eq!(RunOutcome::Completed(report).exit_code(), ExitCode::Success);
+    }
+
+    #[test]
+    fn a_skipped_step_does_not_decide_the_exit_code() {
+        // An optional step that did not reach its assertions keeps its problem
+        // in the report, so the reader can see why it was skipped. That problem
+        // must not turn a passing case into a failed run.
+        let mut case = report_with(ProblemKind::Assertion).cases.remove(0);
+        case.status = CaseStatus::Passed;
+        case.error = None;
+        case.steps[0].status = StepStatus::Skipped;
+        let report = RunReport {
+            cases: vec![case],
+            filtered: 0,
+            duration: Duration::ZERO,
+            bundle_errors: Vec::new(),
+        };
+
+        assert_eq!(
+            report.summary().steps_skipped,
+            1,
+            "the skipped step is still counted"
+        );
         assert_eq!(RunOutcome::Completed(report).exit_code(), ExitCode::Success);
     }
 

@@ -439,6 +439,22 @@ fn run_case(
             }
         }
 
+        // An optional step that ran but did not reach its assertions is allowed
+        // to be absent: it becomes `skipped` and the case continues. The
+        // problem stays in the report so a reader still sees why. Only an
+        // environment or input error means the case cannot go on, and that is
+        // exactly the distinction `ProblemKind` already draws.
+        let skipped = step.optional
+            && report.error.as_ref().is_some_and(|problem| {
+                matches!(
+                    problem.kind,
+                    ProblemKind::Assertion | ProblemKind::Execution | ProblemKind::Timeout
+                )
+            });
+        if skipped {
+            report.status = StepStatus::Skipped;
+        }
+
         report.duration = step_started.elapsed();
         bus.emit(Event::StepFinished {
             case: index,
@@ -447,7 +463,9 @@ fn run_case(
             status: report.status,
             duration: report.duration,
         });
-        if let Some(problem) = &report.error {
+        if let Some(problem) = &report.error
+            && !skipped
+        {
             stopped = Some(problem.clone());
         }
         steps.push(report);
@@ -864,6 +882,45 @@ mod tests {
             })
             .expect("the scalar test step must register");
         registry
+            .register(StepDefinition {
+                name: "test.execution",
+                description: "Fails its own work.",
+                args_schema: json!({"type": "object"}),
+                validate: |_| Ok(()),
+                run: |_, _| {
+                    Err(StepError::Execution(
+                        "the step could not finish its work".to_string(),
+                    ))
+                },
+            })
+            .expect("the failing test step must register");
+        registry
+            .register(StepDefinition {
+                name: "test.timeout",
+                description: "Exceeds its time budget.",
+                args_schema: json!({"type": "object"}),
+                validate: |_| Ok(()),
+                run: |_, _| {
+                    Err(StepError::Timeout(
+                        "the step did not finish within 10 ms".to_string(),
+                    ))
+                },
+            })
+            .expect("the timing-out test step must register");
+        registry
+            .register(StepDefinition {
+                name: "test.invalid",
+                description: "Refuses its arguments at run time.",
+                args_schema: json!({"type": "object"}),
+                validate: |_| Ok(()),
+                run: |_, _| {
+                    Err(StepError::InvalidArguments(
+                        "invalid arguments: `value` is required".to_string(),
+                    ))
+                },
+            })
+            .expect("the invalid test step must register");
+        registry
             .register_observer(crate::core::observer::ObserverDefinition {
                 name: "test.watch",
                 description: "Reports its arguments.",
@@ -906,6 +963,7 @@ mod tests {
             action: "test.wait".to_string(),
             args: json!({ "ms": millis, "value": value }),
             expect: Vec::new(),
+            optional: false,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
@@ -918,6 +976,7 @@ mod tests {
             action: "test.echo".to_string(),
             args: json!({ "value": value }),
             expect,
+            optional: false,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
@@ -930,6 +989,35 @@ mod tests {
             path: "case.yaml".into(),
             case: test_case("case", steps),
         }]
+    }
+
+    /// A step that calls one of the test steps that fails without arguments.
+    fn failing(action: &str) -> Step {
+        Step {
+            action: action.to_string(),
+            args: json!({}),
+            optional: false,
+            expect: Vec::new(),
+            save: Vec::new(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        }
+    }
+
+    /// The same step, marked as optional.
+    fn optional(mut step: Step) -> Step {
+        step.optional = true;
+        step
+    }
+
+    /// The single case of a run that must have completed.
+    fn one_case(outcome: RunOutcome) -> CaseReport {
+        let RunOutcome::Completed(mut report) = outcome else {
+            panic!("the run must complete, got: {outcome:?}");
+        };
+        assert_eq!(report.cases.len(), 1, "{report:?}");
+        report.cases.remove(0)
     }
 
     #[test]
@@ -977,6 +1065,175 @@ mod tests {
     }
 
     #[test]
+    fn an_optional_step_that_fails_an_assertion_is_skipped_and_the_case_continues() {
+        let mut failing = echo(json!("wrong"), Vec::new());
+        failing.optional = true;
+        failing.expect = vec![crate::core::case::Expectation {
+            path: "$".to_string(),
+            matcher: crate::core::case::Matcher::Equals(json!("right")),
+        }];
+
+        let outcome = run(
+            &loaded(vec![failing, echo(json!("after"), Vec::new())]),
+            &registry(),
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert_eq!(
+            outcome.exit_code(),
+            crate::exit::ExitCode::Success,
+            "a skipped optional step must not fail the run: {outcome:?}"
+        );
+        let RunOutcome::Completed(report) = outcome else {
+            panic!("the run must complete");
+        };
+        assert_eq!(report.summary().steps_skipped, 1);
+        assert_eq!(report.summary().steps_passed, 1);
+        let case = &report.cases[0];
+        assert_eq!(case.status, CaseStatus::Passed);
+        let skipped = &case.steps[0];
+        assert_eq!(skipped.status, StepStatus::Skipped);
+        assert_eq!(
+            skipped.error.as_ref().map(|problem| problem.kind),
+            Some(ProblemKind::Assertion),
+            "the problem stays in the report for a reader"
+        );
+        assert_eq!(skipped.result, Some(json!("wrong")));
+        assert_eq!(skipped.assertions.len(), 1);
+        assert!(!skipped.assertions[0].passed);
+        assert_eq!(
+            case.steps[1].status,
+            StepStatus::Passed,
+            "the step after a skipped optional step must run"
+        );
+        assert_eq!(case.steps[1].result, Some(json!("after")));
+    }
+
+    #[test]
+    fn an_optional_step_that_cannot_finish_is_skipped() {
+        for action in ["test.execution", "test.timeout"] {
+            let outcome = run(
+                &loaded(vec![
+                    optional(failing(action)),
+                    echo(json!("after"), Vec::new()),
+                ]),
+                &registry(),
+                &EventBus::new(),
+                None,
+                &Filters::default(),
+                &mut Secrets::new(),
+                1,
+            );
+
+            assert_eq!(
+                outcome.exit_code(),
+                crate::exit::ExitCode::Success,
+                "`{action}` on an optional step must be skipped: {outcome:?}"
+            );
+            let case = one_case(outcome);
+            assert_eq!(case.status, CaseStatus::Passed, "{action}");
+            assert_eq!(case.steps[0].status, StepStatus::Skipped, "{action}");
+            assert!(
+                case.steps[0].error.is_some(),
+                "`{action}`: the cause must stay in the report"
+            );
+            assert_eq!(case.steps[1].status, StepStatus::Passed, "{action}");
+            assert_eq!(case.steps[1].result, Some(json!("after")), "{action}");
+        }
+    }
+
+    #[test]
+    fn an_optional_step_with_an_environment_error_stops_the_case() {
+        let outcome = run(
+            &loaded(vec![
+                optional(failing("test.fail")),
+                echo(json!("after"), Vec::new()),
+            ]),
+            &registry(),
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert_eq!(
+            outcome.exit_code(),
+            crate::exit::ExitCode::Environment,
+            "an environment error must not be skipped: {outcome:?}"
+        );
+        let case = one_case(outcome);
+        assert_eq!(case.status, CaseStatus::Error);
+        assert_eq!(case.steps[0].status, StepStatus::Error);
+        assert_eq!(
+            case.error.as_ref().map(|problem| problem.kind),
+            Some(ProblemKind::Environment)
+        );
+        assert_eq!(
+            case.steps[1].status,
+            StepStatus::Skipped,
+            "the case must stop after an environment error"
+        );
+        assert_eq!(case.steps[1].result, None);
+    }
+
+    #[test]
+    fn an_optional_step_with_invalid_input_stops_the_case() {
+        let outcome = run(
+            &loaded(vec![
+                optional(failing("test.invalid")),
+                echo(json!("after"), Vec::new()),
+            ]),
+            &registry(),
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert_eq!(
+            outcome.exit_code(),
+            crate::exit::ExitCode::InvalidCase,
+            "invalid input must not be skipped: {outcome:?}"
+        );
+        let case = one_case(outcome);
+        assert_eq!(case.status, CaseStatus::Error);
+        assert_eq!(case.steps[0].status, StepStatus::Error);
+        assert_eq!(case.steps[1].status, StepStatus::Skipped);
+    }
+
+    #[test]
+    fn a_step_without_optional_keeps_its_old_outcome() {
+        for (action, exit) in [
+            ("test.execution", crate::exit::ExitCode::TestFailure),
+            ("test.timeout", crate::exit::ExitCode::Timeout),
+            ("test.fail", crate::exit::ExitCode::Environment),
+            ("test.invalid", crate::exit::ExitCode::InvalidCase),
+        ] {
+            let outcome = run(
+                &loaded(vec![failing(action), echo(json!("after"), Vec::new())]),
+                &registry(),
+                &EventBus::new(),
+                None,
+                &Filters::default(),
+                &mut Secrets::new(),
+                1,
+            );
+
+            assert_eq!(outcome.exit_code(), exit, "`{action}`: {outcome:?}");
+            let case = one_case(outcome);
+            assert_eq!(case.status, CaseStatus::Error, "`{action}`");
+            assert_eq!(case.steps[0].status, StepStatus::Error, "`{action}`");
+            assert_eq!(case.steps[1].status, StepStatus::Skipped, "`{action}`");
+        }
+    }
+
+    #[test]
     fn an_environment_error_wins_over_a_failed_assertion() {
         let bus = EventBus::new();
         let mut failing = echo(json!("wrong"), Vec::new());
@@ -988,6 +1245,7 @@ mod tests {
             action: "test.fail".to_string(),
             args: json!({}),
             expect: Vec::new(),
+            optional: false,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
@@ -1120,6 +1378,7 @@ mod tests {
                 path: "$".to_string(),
                 matcher: crate::core::case::Matcher::Equals(json!("abc")),
             }],
+            optional: false,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
@@ -1185,6 +1444,7 @@ mod tests {
             action: "test.session".to_string(),
             args: json!({}),
             expect,
+            optional: false,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
@@ -1399,6 +1659,7 @@ mod tests {
                     action: "no.such.step".to_string(),
                     args: json!({}),
                     expect: Vec::new(),
+                    optional: false,
                     save: Vec::new(),
                     location: Location::UNKNOWN,
                     args_location: Location::UNKNOWN,
@@ -1706,6 +1967,7 @@ mod tests {
                         matcher: crate::core::case::Matcher::Equals(json!("hello")),
                     },
                 ],
+                optional: false,
                 save: Vec::new(),
                 location: Location::UNKNOWN,
                 args_location: Location::UNKNOWN,

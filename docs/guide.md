@@ -21,6 +21,7 @@ The complete reference for `da`: installation options, building from source, the
 - [Case files](#case-files)
   - [Variables](#variables)
   - [Assertions](#assertions)
+  - [Optional steps](#optional-steps)
   - [`http.request`](#httprequest)
   - [`cli.run`](#clirun)
   - [`db.query`](#dbquery)
@@ -158,7 +159,9 @@ da --output json schema > da-case.schema.json
 step and every observation is validated before the first case runs: if anything
 is invalid, no case runs and the exit code is 3. A step that fails an assertion
 stops its own case; the remaining steps of that case are reported as skipped and
-the other cases still run.
+the other cases still run. A step marked `optional: true` is the exception: it is
+reported as `skipped` and the case continues (see
+[Optional steps](#optional-steps)).
 
 `--var name=value` defines a variable for every case of the run and may be
 repeated. It overrides a variable of the same name in the case's `vars:`. A
@@ -724,7 +727,8 @@ Redaction has limits that matter when you choose a value:
 `da schema` prints a [JSON Schema](https://json-schema.org/) (draft 2020-12) for
 one case file. The schema follows the parser: only `name`, `project`, `suite`,
 `layer`, `tags`, `vars`, `observe` and `steps` at the top level; one registered
-step name per step, plus optional `expect` and `save`; one registered observer
+step name per step, plus optional `optional`, `expect` and `save`, where a step
+that saves may not be optional; one registered observer
 and its arguments per entry of `observe`; the four comparisons with their value
 types; and each step's and observer's argument schema under `$defs`, together
 with its description. The classification fields are optional strings that cannot
@@ -767,7 +771,7 @@ but no step is registered, so the step item accepts nothing.
 
 A case is a YAML file with a name, optional variables, optional observations and
 a list of steps. Each step is a mapping with exactly one step name, optionally
-followed by `expect` and `save`:
+followed by `optional`, `expect` and `save`:
 
 ```yaml
 name: Login returns a token
@@ -860,6 +864,60 @@ Except for `exists`, the path must select exactly one value; a path that matches
 nothing fails the assertion and is reported as such instead of being compared
 with `null`. Member names that are not plain identifiers need bracket notation,
 for example `$.body.headers['content-type']`.
+
+### Optional steps
+
+`optional: true` marks a step whose work is allowed to be absent: a banner that
+only sometimes appears, a probe for a feature that may not be deployed, or a
+cleanup step for data an earlier step may not have created.
+
+```yaml
+name: A banner that only sometimes appears
+steps:
+  - http.request:
+      url: http://127.0.0.1:8080/banner
+    optional: true
+    expect:
+      - path: $.status
+        equals: 200
+  - http.request:
+      url: http://127.0.0.1:8080/health
+    expect:
+      - path: $.status
+        equals: 200
+```
+
+An optional step is reported as `skipped`, and the case continues with the next
+step, when it did not reach its assertions:
+
+- an assertion did not pass;
+- the step reported an execution error, meaning it ran but could not finish its
+  work;
+- the step exceeded its timeout.
+
+The step keeps its `result`, its `assertions` and the `error` that skipped it, so
+a reader can still see why the work was absent; `--output json` carries all
+three, and text output prints the problem with an `(optional)` note. A case whose
+only failures are skipped optional steps passes, and the summary counts those
+steps under `skipped`.
+
+An environment error or an invalid-input error is **not** skipped: it is reported
+as `error` and ends the case, with the exit code that error always has (4 for an
+environment error, 3 for invalid input). Those errors say the environment is
+broken — an unreachable target, a browser that died, a log file that cannot be
+read — and a broken environment must never look like a feature that is simply
+absent. In the example above a 404 fails an assertion and is skipped, while a
+refused connection is an environment error and stops the case.
+
+An optional step may not also declare `save`. A skipped step has no result to
+copy, so a later `${name}` would be undefined; a case that combines the two is
+refused while it is parsed, with the location of `save`, by `da lint` and by
+`da run` before any case runs. Remove `save`, or drop `optional` so the step
+always runs. `optional: false` is allowed and changes nothing.
+
+`optional` takes a literal `true` or `false`; a quoted string such as
+`optional: "true"` is a case error. The field name is reserved, so no step can be
+registered as `optional`.
 
 ### `http.request`
 
