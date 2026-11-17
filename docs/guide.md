@@ -1287,6 +1287,16 @@ debugger that listens on a loopback port the operating system chooses, so two
 cases at the same time cannot share a profile or a port. Connected cases share
 the user's browser but each one opens and closes its own tab.
 
+A headless browser runs without GPU acceleration: it composites in software and
+WebGL uses a software ANGLE renderer, so a page that depends on the GPU can draw
+more slowly and its pixels can differ from the hardware path. That is a
+deliberate trade. On a machine that runs several browsers at once, the GPU
+process was using about 9 s of a CPU core for four cases, and the first
+navigation could spend its whole 30 s budget before the request was written;
+without GPU acceleration the same four cases used about 1 s of a core for it and
+finished. A browser with a visible window keeps its GPU. Neither mode changes how
+the system proxy is resolved, so a case behind a corporate proxy works the same.
+
 When no browser is found, or it cannot start, the step is an environment error
 (exit 4) whose message names `DA_CHROME`. An element that does not appear within
 `timeout_ms` fails the step like a failed assertion (exit 1) and the message
