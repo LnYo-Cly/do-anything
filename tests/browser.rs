@@ -3418,3 +3418,156 @@ fn session_creation_recovers_from_target_crash_and_reports_diagnostics_when_all_
         "expected crash diagnostic in failure message, got: {fail_msg}"
     );
 }
+
+#[test]
+fn connect_navigate_aborts_on_target_death_and_reports_diagnostics() {
+    let dir = TempDir::new("browser-navigate-mock");
+
+    // 1. Target dies during Page.navigate -> must abort immediately without waiting
+    //    for the full timeout and report the received target/session event.
+    let (crash_port, crash_server) = spawn_mock_devtools(|mut socket| {
+        while let Some(cmd) = read_mock_cdp(&mut socket) {
+            let method = cmd["method"].as_str().unwrap_or_default();
+            match method {
+                "Target.createTarget" => send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": cmd["id"], "result": { "targetId": "t-nav-1" } }),
+                ),
+                "Target.attachToTarget" => send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": cmd["id"], "result": { "sessionId": "s-nav-1" } }),
+                ),
+                "Page.enable" | "Runtime.enable" | "Network.enable" => {
+                    send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
+                }
+                "Page.navigate" => {
+                    send_mock_cdp(
+                        &mut socket,
+                        &json!({
+                            "method": "Target.targetCrashed",
+                            "params": {
+                                "targetId": "t-nav-1",
+                                "status": "crashed",
+                                "errorCode": 11
+                            }
+                        }),
+                    );
+                }
+                "Target.closeTarget" => {
+                    send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "success": true } }),
+                    );
+                    break;
+                }
+                other => panic!("unexpected CDP command during crash test: {other}"),
+            }
+        }
+    });
+
+    let crash_case = dir.write(
+        "navigate-crash.yaml",
+        &format!(
+            "name: navigate crash\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{crash_port}\"\n      url: \"http://127.0.0.1/crash\"\n      timeout_ms: 10000\n"
+        ),
+    );
+    let crash_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&crash_case),
+            "--no-bundle",
+        ],
+    );
+    crash_server.join().expect("crash mock server finish");
+    assert_eq!(
+        exit_code(&crash_out),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&crash_out),
+        stderr(&crash_out)
+    );
+    let crash_json = json_stdout(&crash_out);
+    // The runner measures the step, so process start-up does not blur the
+    // difference between an immediate abort and the 10 s navigation timeout.
+    let crash_ms = crash_json["cases"][0]["steps"][0]["duration_ms"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    assert!(
+        crash_ms < 5000,
+        "crashed Page.navigate must fail fast instead of waiting 10 s (step took {crash_ms} ms): {}",
+        stdout(&crash_out)
+    );
+    let crash_msg = case_error(&crash_json);
+    assert!(
+        crash_msg.contains("Page.navigate")
+            && crash_msg.contains("Target.targetCrashed")
+            && crash_msg.contains("target crashed"),
+        "expected Page.navigate crash diagnostic, got: {crash_msg}"
+    );
+
+    // 2. Page.navigate never answers and emits no events -> timeout reports that
+    //    no CDP events arrived for the target or session.
+    let (silent_port, silent_server) = spawn_mock_devtools(|mut socket| {
+        while let Some(cmd) = read_mock_cdp(&mut socket) {
+            let method = cmd["method"].as_str().unwrap_or_default();
+            match method {
+                "Target.createTarget" => send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": cmd["id"], "result": { "targetId": "t-nav-2" } }),
+                ),
+                "Target.attachToTarget" => send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": cmd["id"], "result": { "sessionId": "s-nav-2" } }),
+                ),
+                "Page.enable" | "Runtime.enable" | "Network.enable" => {
+                    send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
+                }
+                "Page.navigate" => {}
+                "Target.closeTarget" => {
+                    send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "success": true } }),
+                    );
+                    break;
+                }
+                other => panic!("unexpected CDP command during silent timeout test: {other}"),
+            }
+        }
+    });
+
+    let silent_case = dir.write(
+        "navigate-silent.yaml",
+        &format!(
+            "name: navigate silent timeout\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{silent_port}\"\n      url: \"http://127.0.0.1/silent\"\n      timeout_ms: 500\n"
+        ),
+    );
+    let silent_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&silent_case),
+            "--no-bundle",
+        ],
+    );
+    silent_server.join().expect("silent mock server finish");
+    assert_eq!(
+        exit_code(&silent_out),
+        Some(5),
+        "stdout: {}\nstderr: {}",
+        stdout(&silent_out),
+        stderr(&silent_out)
+    );
+    let silent_json = json_stdout(&silent_out);
+    let silent_msg = case_error(&silent_json);
+    assert!(
+        silent_msg.contains("Page.navigate")
+            && silent_msg.contains("never answered")
+            && silent_msg.contains("no CDP events"),
+        "expected silent timeout diagnostic, got: {silent_msg}"
+    );
+}

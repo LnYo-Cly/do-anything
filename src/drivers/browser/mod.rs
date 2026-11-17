@@ -1238,7 +1238,7 @@ enum Origin {
     /// The case started this browser process and ends it when the case ends.
     Launched(Launched),
     /// The case connected to the user's browser and closes only its own tab.
-    Connected { target_id: String },
+    Connected,
 }
 
 /// One case's browser, its page, and the options that created it.
@@ -1247,6 +1247,8 @@ struct BrowserSession {
     /// written. `Drop` only matters on the fallback path.
     connection: Option<Connection>,
     origin: Option<Origin>,
+    /// The CDP target id attached for this session's page.
+    target_id: String,
     /// The target session every page command is sent with.
     page: String,
     /// The requests this page reported, bounded and merged by request id.
@@ -1290,12 +1292,13 @@ impl BrowserSession {
         .map_err(|error| {
             format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
         })?;
-        let (page, _) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
+        let (page, target_id) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
         let network = network::NetworkState::new(&page);
 
         Ok(Self {
             connection: Some(connection),
             origin: Some(Origin::Launched(browser)),
+            target_id,
             page,
             network,
             port,
@@ -1322,7 +1325,8 @@ impl BrowserSession {
 
         Ok(Self {
             connection: Some(connection),
-            origin: Some(Origin::Connected { target_id }),
+            origin: Some(Origin::Connected),
+            target_id,
             page,
             network,
             port: endpoint.port(),
@@ -1404,28 +1408,44 @@ impl BrowserSession {
     /// Navigates the session's page and returns its current URL and title.
     fn navigate(&mut self, url: &str, timeout: Duration) -> Result<(String, String), StepError> {
         let page = self.page.clone();
+        let target_id = self.target_id.clone();
         let deadline = Deadline::after(timeout);
         // Network events that arrive before a navigation still belong to a
         // request of this page, so they are merged before the rest is cleared.
         self.absorb_network();
         let connection = self.connection_mut()?;
         // Events from the about:blank page must not be mistaken for this
-        // navigation's load event.
-        connection.take_messages();
-        let reply = connection
-            .call(
-                "Page.navigate",
-                json!({ "url": url }),
-                Some(&page),
-                deadline,
-            )
-            .map_err(|error| match error {
-                CdpError::Timeout { .. } => StepError::Timeout(format!(
-                    "could not open `{url}` within {} ms: {error}",
-                    timeout.as_millis()
-                )),
-                error => StepError::Environment(format!("could not open `{url}`: {error}")),
-            })?;
+        // navigation's load event, while any terminal target/session event that
+        // already arrived stays queued so `call_watching_target` aborts immediately.
+        let terminal_events: Vec<Value> = connection
+            .take_messages()
+            .into_iter()
+            .filter(|event| is_terminal_target_event(event, Some(&target_id), Some(&page)))
+            .collect();
+        connection.restore_messages(terminal_events);
+        let reply = call_watching_target(
+            connection,
+            "Page.navigate",
+            json!({ "url": url }),
+            Some(&target_id),
+            Some(&page),
+            deadline,
+        )
+        .map_err(|(error, events)| {
+            let is_timeout = matches!(error, CdpError::Timeout { .. });
+            let action = if is_timeout {
+                format!("could not open `{url}` within {} ms", timeout.as_millis())
+            } else {
+                format!("could not open `{url}`")
+            };
+            let message =
+                format_target_error(&action, &error, Some(&target_id), Some(&page), &events);
+            if is_timeout {
+                StepError::Timeout(message)
+            } else {
+                StepError::Environment(message)
+            }
+        })?;
         if let Some(error_text) = reply.get("errorText").and_then(Value::as_str) {
             return Err(StepError::Environment(format!(
                 "could not open `{url}`: {error_text}"
@@ -1965,8 +1985,8 @@ impl BrowserSession {
     }
 }
 
-/// Maximum number of target/session CDP events summarized on a session-creation failure.
-const MAX_ATTACH_DIAGNOSTIC_EVENTS: usize = 5;
+/// Maximum number of target/session CDP events summarized on a target/session failure.
+const MAX_TARGET_DIAGNOSTIC_EVENTS: usize = 5;
 /// Maximum number of fresh `about:blank` tabs tried during one `attach` call.
 ///
 /// The tab is fresh (`about:blank`) and no navigation or user script has run in
@@ -2163,6 +2183,31 @@ fn attach_once(
     Ok((page, target_id))
 }
 
+/// Runs one CDP command while watching for terminal target/session events.
+///
+/// On failure, drains any burst sibling events after an abort and returns the
+/// raw [`CdpError`] together with all queued messages for diagnostic formatting.
+fn call_watching_target(
+    connection: &mut Connection,
+    method: &str,
+    params: Value,
+    target_id: Option<&str>,
+    session_id: Option<&str>,
+    deadline: Deadline,
+) -> Result<Value, (CdpError, Vec<Value>)> {
+    connection
+        .call_until(method, params, session_id, deadline, |event| {
+            is_terminal_target_event(event, target_id, session_id)
+        })
+        .map_err(|error| {
+            if matches!(error, CdpError::Aborted { .. }) {
+                let _ = connection.poll_messages();
+            }
+            let events = connection.take_messages();
+            (error, events)
+        })
+}
+
 /// Runs one CDP command during session creation, aborting early on terminal
 /// target/session events and enriching any failure with diagnostics.
 fn attach_call(
@@ -2175,18 +2220,19 @@ fn attach_call(
     deadline: Deadline,
 ) -> Result<Value, AttachAttemptFailure> {
     let outcome = match step {
-        AttachStep::CreateTarget => connection.call(method, params, scope.session_id, deadline),
-        AttachStep::AttachToTarget | AttachStep::EnableDomain => {
-            connection.call_until(method, params, scope.session_id, deadline, |event| {
-                is_terminal_target_event(event, scope.target_id, scope.session_id)
-            })
-        }
+        AttachStep::CreateTarget => connection
+            .call(method, params, scope.session_id, deadline)
+            .map_err(|error| (error, connection.take_messages())),
+        AttachStep::AttachToTarget | AttachStep::EnableDomain => call_watching_target(
+            connection,
+            method,
+            params,
+            scope.target_id,
+            scope.session_id,
+            deadline,
+        ),
     };
-    outcome.map_err(|error| {
-        if matches!(error, CdpError::Aborted { .. }) {
-            let _ = connection.poll_messages();
-        }
-        let events = connection.take_messages();
+    outcome.map_err(|(error, events)| {
         let target_destroyed = events.iter().any(|event| {
             event_matches_target(event, scope.target_id, scope.session_id)
                 && event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
@@ -2194,7 +2240,7 @@ fn attach_call(
         AttachAttemptFailure {
             target_id: scope.target_id.map(str::to_string),
             kind: classify_attach_failure(step, &error),
-            message: format_attach_error(
+            message: format_target_error(
                 action,
                 &error,
                 scope.target_id,
@@ -2278,9 +2324,9 @@ fn is_terminal_target_event(
     )
 }
 
-/// Formats a session-creation CDP error with any diagnostic events received
+/// Formats a target/session CDP error with any diagnostic events received
 /// for the target or session while waiting.
-fn format_attach_error(
+fn format_target_error(
     action: &str,
     error: &CdpError,
     target_id: Option<&str>,
@@ -2292,7 +2338,7 @@ fn format_attach_error(
         if !event_matches_target(event, target_id, session_id) {
             continue;
         }
-        if let Some(summary) = summarize_attach_event(event)
+        if let Some(summary) = summarize_target_event(event)
             && !matched.contains(&summary)
         {
             matched.push(summary);
@@ -2310,10 +2356,10 @@ fn format_attach_error(
 
     let shown: Vec<&str> = matched
         .iter()
-        .take(MAX_ATTACH_DIAGNOSTIC_EVENTS)
+        .take(MAX_TARGET_DIAGNOSTIC_EVENTS)
         .map(String::as_str)
         .collect();
-    let extra = matched.len().saturating_sub(MAX_ATTACH_DIAGNOSTIC_EVENTS);
+    let extra = matched.len().saturating_sub(MAX_TARGET_DIAGNOSTIC_EVENTS);
     let summary = if extra > 0 {
         format!("{}, +{extra} more", shown.join(", "))
     } else {
@@ -2346,7 +2392,7 @@ fn event_matches_target(event: &Value, target_id: Option<&str>, session_id: Opti
 }
 
 /// Formats one CDP event into a short human-readable diagnostic label.
-fn summarize_attach_event(event: &Value) -> Option<String> {
+fn summarize_target_event(event: &Value) -> Option<String> {
     let method = event.get("method").and_then(Value::as_str)?;
     let params = event.get("params");
     match method {
@@ -2666,12 +2712,12 @@ impl Session for BrowserSession {
                     errors.push(error);
                 }
             }
-            Some(Origin::Connected { target_id }) => {
+            Some(Origin::Connected) => {
                 // Only this case's tab is ours. `Browser.close` is never sent:
                 // the browser belongs to the user and must keep running.
                 if let Err(error) = connection.call(
                     "Target.closeTarget",
-                    json!({ "targetId": target_id }),
+                    json!({ "targetId": self.target_id }),
                     None,
                     Deadline::after(Duration::from_secs(2)),
                 ) {
@@ -4560,12 +4606,12 @@ mod tests {
     }
 
     #[test]
-    fn attach_error_formatter_summarizes_inspector_crash_detach_and_bounds_events() {
+    fn target_error_formatter_summarizes_inspector_crash_detach_and_bounds_events() {
         let timeout = CdpError::Timeout {
             waiting_for: "Page.enable".to_string(),
             timeout: Duration::from_secs(30),
         };
-        let inspector = format_attach_error(
+        let inspector = format_target_error(
             "could not enable page events",
             &timeout,
             Some("t-1"),
@@ -4605,7 +4651,7 @@ mod tests {
                 })
             })
             .collect();
-        let bounded = format_attach_error(
+        let bounded = format_target_error(
             "could not enable page events",
             &timeout,
             Some("t-1"),
@@ -4618,7 +4664,7 @@ mod tests {
         assert!(bounded.contains("+2 more"), "{bounded}");
 
         let transport = CdpError::Transport("socket closed".to_string());
-        let closed = format_attach_error(
+        let closed = format_target_error(
             "could not enable page events",
             &transport,
             Some("t-1"),
@@ -4633,5 +4679,201 @@ mod tests {
                 && closed.contains("target crashed (Target.targetCrashed: status=killed)"),
             "{closed}"
         );
+    }
+
+    fn mock_session(connection: Connection, target_id: &str, session_id: &str) -> BrowserSession {
+        BrowserSession {
+            connection: Some(connection),
+            origin: Some(Origin::Connected),
+            target_id: target_id.to_string(),
+            page: session_id.to_string(),
+            network: network::NetworkState::new(session_id),
+            port: 9222,
+            headless: true,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            connect: Some("http://127.0.0.1:9222".to_string()),
+            testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
+        }
+    }
+
+    #[test]
+    fn navigate_aborts_fast_on_arriving_detach_and_reports_events() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let nav = read_cdp_request(&mut socket);
+            assert_eq!(nav["method"], "Page.navigate");
+            for event in [
+                json!({
+                    "method": "Target.targetInfoChanged",
+                    "params": { "targetInfo": { "targetId": "other-target" } }
+                }),
+                json!({
+                    "method": "Inspector.detached",
+                    "sessionId": "session-1",
+                    "params": { "reason": "target closed" }
+                }),
+                json!({
+                    "method": "Target.targetDestroyed",
+                    "params": { "targetId": "target-1" }
+                }),
+            ] {
+                socket
+                    .send(tungstenite::Message::text(event.to_string()))
+                    .expect("send diagnostic CDP event");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let mut session = mock_session(conn, "target-1", "session-1");
+        let started = std::time::Instant::now();
+        let err = session
+            .navigate("http://127.0.0.1/page", Duration::from_secs(5))
+            .expect_err("navigate must abort when session detaches");
+        drop(session);
+        server.join().expect("mock CDP thread must finish");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "detach event must abort navigate fast, took {:?}",
+            started.elapsed()
+        );
+        match err {
+            StepError::Environment(message) => {
+                assert!(message.contains("Page.navigate"), "{message}");
+                assert!(
+                    message.contains("target detached (Inspector.detached: target closed)"),
+                    "{message}"
+                );
+                assert!(
+                    !message.contains("other-target"),
+                    "unrelated target event must not appear: {message}"
+                );
+            }
+            other => panic!("expected environment error on target death, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn navigate_preserves_already_queued_terminal_event_across_stale_clear() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let enable = read_cdp_request(&mut socket);
+            assert_eq!(enable["method"], "Page.enable");
+            for payload in [
+                json!({ "method": "Page.loadEventFired", "sessionId": "session-1" }),
+                json!({
+                    "method": "Target.targetCrashed",
+                    "params": { "targetId": "target-1", "status": "killed", "errorCode": 9 }
+                }),
+                json!({ "id": enable["id"], "result": {} }),
+            ] {
+                socket
+                    .send(tungstenite::Message::text(payload.to_string()))
+                    .expect("send queued events and reply");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        conn.call(
+            "Page.enable",
+            json!({}),
+            Some("session-1"),
+            Deadline::after(Duration::from_secs(2)),
+        )
+        .expect("Page.enable completes after emitting queued events");
+        let mut session = mock_session(conn, "target-1", "session-1");
+        let started = std::time::Instant::now();
+        let err = session
+            .navigate("http://127.0.0.1/page", Duration::from_secs(5))
+            .expect_err("navigate must abort immediately on queued crash event");
+        drop(session);
+        server.join().expect("mock CDP thread must finish");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "already-queued crash event must abort navigate fast, took {:?}",
+            started.elapsed()
+        );
+        match err {
+            StepError::Environment(message) => {
+                assert!(
+                    message.contains(
+                        "target crashed (Target.targetCrashed: status=killed, errorCode=9)"
+                    ),
+                    "{message}"
+                );
+                assert!(
+                    !message.contains("Page.loadEventFired"),
+                    "stale load event must remain cleared: {message}"
+                );
+            }
+            other => panic!("expected environment error on queued crash event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn navigate_timeout_reports_non_terminal_events_or_none_received() {
+        // 1. Silent timeout: no events received for this target or session.
+        let (silent_url, silent_server) = spawn_mock_cdp(|mut socket| {
+            let nav = read_cdp_request(&mut socket);
+            assert_eq!(nav["method"], "Page.navigate");
+            while socket.read().is_ok() {}
+        });
+        let silent_conn = Connection::connect(&silent_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let mut silent_session = mock_session(silent_conn, "target-1", "session-1");
+        let silent_err = silent_session
+            .navigate("http://127.0.0.1/silent", Duration::from_millis(250))
+            .expect_err("silent navigate must time out");
+        drop(silent_session);
+        silent_server.join().expect("silent server must finish");
+        match silent_err {
+            StepError::Timeout(message) => {
+                assert!(message.contains("Page.navigate"), "{message}");
+                assert!(
+                    message.contains("never answered") && message.contains("no CDP events"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+
+        // 2. Timeout with non-terminal events: names the events received while waiting.
+        let (noisy_url, noisy_server) = spawn_mock_cdp(|mut socket| {
+            let nav = read_cdp_request(&mut socket);
+            assert_eq!(nav["method"], "Page.navigate");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "method": "Page.frameStartedLoading",
+                        "sessionId": "session-1",
+                        "params": { "frameId": "frame-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send frameStartedLoading");
+            while socket.read().is_ok() {}
+        });
+        let noisy_conn = Connection::connect(&noisy_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let mut noisy_session = mock_session(noisy_conn, "target-1", "session-1");
+        let noisy_err = noisy_session
+            .navigate("http://127.0.0.1/noisy", Duration::from_millis(250))
+            .expect_err("non-terminal event must not abort before timeout");
+        drop(noisy_session);
+        noisy_server.join().expect("noisy server must finish");
+        match noisy_err {
+            StepError::Timeout(message) => {
+                assert!(message.contains("Page.navigate"), "{message}");
+                assert!(
+                    message.contains("browser events: Page.frameStartedLoading"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
     }
 }
