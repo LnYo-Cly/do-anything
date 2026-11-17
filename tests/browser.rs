@@ -497,6 +497,71 @@ fn page_id(page: &Value) -> &str {
 }
 
 #[test]
+fn the_test_server_reports_when_a_request_arrived_and_was_answered() {
+    let server = TestServer::start();
+    // A connection the browser opens and never uses, which is what its
+    // speculative sockets look like from the server: it proves the browser
+    // reached the server even when it asks for nothing.
+    let idle = TcpStream::connect(("127.0.0.1", server.port())).expect("the probe must connect");
+    let mut request =
+        TcpStream::connect(("127.0.0.1", server.port())).expect("the request must connect");
+    request
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("the probe must bound its read");
+    request
+        .write_all(b"GET /health HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n")
+        .expect("the probe must send its request");
+    let mut response = String::new();
+    request
+        .read_to_string(&mut response)
+        .expect("the probe must read the response");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    drop(idle);
+
+    let timings = server.timings();
+    let answered = timings
+        .iter()
+        .find_map(|timing| timing.request.as_ref())
+        .expect("the connection that sent a request must report it");
+    assert_eq!(answered.target, "GET /health", "{timings:?}");
+    let arrival = answered.arrived;
+    let written = answered
+        .answered
+        .expect("an answered request must name when it was answered");
+    assert!(
+        arrival
+            >= timings
+                .iter()
+                .map(|timing| timing.accepted)
+                .min()
+                .expect("a connection must be recorded"),
+        "a request cannot arrive before its connection was accepted: {arrival:?}"
+    );
+    assert!(
+        written >= arrival,
+        "a response cannot be written before its request arrived: {written:?} < {arrival:?}"
+    );
+    assert!(
+        timings.iter().any(|timing| timing.request.is_none()),
+        "the connection that asked for nothing must be reported too: {timings:?}"
+    );
+
+    let report = server.timing_report();
+    assert!(
+        report.contains("accepted 2 connection(s)") && report.contains("answered 1 request(s)"),
+        "the report must count what the server saw: {report}"
+    );
+    assert!(
+        report.contains("request `GET /health`"),
+        "the report must name the request: {report}"
+    );
+    assert!(
+        report.contains(", no request"),
+        "the report must mark the connection that asked for nothing: {report}"
+    );
+}
+
+#[test]
 fn a_case_can_drive_a_page_through_every_step() {
     let server = TestServer::start();
     let Some(_guard) = chrome_test(&server) else {
@@ -800,12 +865,17 @@ steps:
         ],
     );
 
+    // A navigation that stalls says only that the page did not load. The
+    // server's own timings say whether the request reached it late or it
+    // answered late, which is the difference between the Chrome and the server
+    // being at fault.
     assert_eq!(
         exit_code(&output),
         Some(0),
-        "stdout: {}\nstderr: {}",
+        "stdout: {}\nstderr: {}\n{}",
         stdout(&output),
-        stderr(&output)
+        stderr(&output),
+        server.timing_report()
     );
     let value = json_stdout(&output);
     let cases = value["cases"]
@@ -814,8 +884,10 @@ steps:
     assert_eq!(cases.len(), 4, "{value}");
     for case in cases {
         assert_eq!(
-            case["status"], "passed",
-            "every case must drive its own page: {case}"
+            case["status"],
+            "passed",
+            "every case must drive its own page: {case}\n{}",
+            server.timing_report()
         );
     }
 }
@@ -888,9 +960,10 @@ fn browser_open_honours_its_navigation_timeout() {
     assert_eq!(
         exit_code(&output),
         Some(5),
-        "a navigation that exceeds `timeout_ms` is a timeout: stdout: {}\nstderr: {}",
+        "a navigation that exceeds `timeout_ms` is a timeout: stdout: {}\nstderr: {}\n{}",
         stdout(&output),
-        stderr(&output)
+        stderr(&output),
+        server.timing_report()
     );
     let value = json_stdout(&output);
     let message = case_error(&value);
@@ -1330,9 +1403,10 @@ steps:
     assert_eq!(
         exit_code(&output),
         Some(0),
-        "stdout: {}\nstderr: {}",
+        "stdout: {}\nstderr: {}\n{}",
         stdout(&output),
-        stderr(&output)
+        stderr(&output),
+        server.timing_report()
     );
     let value = json_stdout(&output);
     assert_eq!(value["cases"][0]["status"], "passed", "{value}");

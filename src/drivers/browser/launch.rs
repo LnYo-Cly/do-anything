@@ -47,15 +47,7 @@ impl Launched {
         let executable = find_browser()?;
         let profile = create_profile()?;
         let mut command = Command::new(&executable);
-        command
-            .arg(format!("--user-data-dir={}", profile.display()))
-            .arg("--remote-debugging-port=0")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg(format!("--window-size={width},{height}"));
-        if headless {
-            command.arg("--headless=new");
-        }
+        command.args(launch_args(headless, width, height, &profile));
         command
             .arg("about:blank")
             .stdin(Stdio::null())
@@ -196,6 +188,36 @@ fn remove_profile(profile: &Path) -> Result<(), String> {
         "could not remove the temporary browser profile `{}`: {error}",
         profile.display()
     ))
+}
+
+/// The switches that start the browser for one case, before `about:blank`.
+///
+/// A headless launch turns GPU acceleration off, and that has a cost: the page is
+/// composited in software and WebGL falls back to a software ANGLE renderer
+/// (WARP, or SwiftShader where ANGLE asks for one), so a GPU-heavy page draws more
+/// slowly than on the hardware path and its pixels can differ. It buys CPU for the
+/// machine that runs the cases, which is what issue #59 is about: with four cases
+/// on one CPU the GPU process spent 8.4 s of that core on a hardware GPU and
+/// 8.8-9.3 s on the software one, and next to it the browser processes could not
+/// write their first navigation request until the 30 s navigation budget was gone.
+/// With this switch the same GPU process used 0.8 s and 1.0-1.4 s, the whole tree
+/// used 25-40% less CPU, and ten of ten starved runs finished on both hosts where
+/// six of ten (hardware) and three of ten (software) had failed. A visible window
+/// keeps its GPU. No switch here touches the system proxy, so a case behind a
+/// corporate proxy still reaches its pages.
+fn launch_args(headless: bool, width: u32, height: u32, profile: &Path) -> Vec<String> {
+    let mut args = vec![
+        format!("--user-data-dir={}", profile.display()),
+        "--remote-debugging-port=0".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        format!("--window-size={width},{height}"),
+    ];
+    if headless {
+        args.push("--headless=new".to_string());
+        args.push("--disable-gpu".to_string());
+    }
+    args
 }
 
 /// Creates an empty profile directory with a unique name.
@@ -360,5 +382,51 @@ mod tests {
             !known_install_paths().is_empty(),
             "a browser install location must be checked on every supported platform"
         );
+    }
+
+    #[test]
+    fn a_headless_launch_turns_gpu_acceleration_off_and_a_visible_one_keeps_it() {
+        let profile = Path::new("profile");
+        let headless = launch_args(true, 1280, 800, profile);
+        let visible = launch_args(false, 1280, 800, profile);
+
+        assert!(
+            headless.iter().any(|arg| arg == "--headless=new"),
+            "a headless launch must ask for the new headless mode: {headless:?}"
+        );
+        assert!(
+            headless.iter().any(|arg| arg == "--disable-gpu"),
+            "a headless launch must composite in software: {headless:?}"
+        );
+        assert!(
+            !visible.iter().any(|arg| arg == "--disable-gpu"),
+            "a visible window must keep its GPU: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn a_launch_keeps_the_system_proxy() {
+        let profile = Path::new("profile");
+        for headless in [true, false] {
+            let args = launch_args(headless, 1280, 800, profile);
+            for forbidden in ["--no-proxy-server", "--proxy-server", "--proxy-pac-url"] {
+                assert!(
+                    !args.iter().any(|arg| arg.starts_with(forbidden)),
+                    "`{forbidden}` would break a case behind a corporate proxy: {args:?}"
+                );
+            }
+            for required in [
+                "--user-data-dir=profile",
+                "--remote-debugging-port=0",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--window-size=1280,800",
+            ] {
+                assert!(
+                    args.iter().any(|arg| arg == required),
+                    "a launch must keep `{required}`: {args:?}"
+                );
+            }
+        }
     }
 }

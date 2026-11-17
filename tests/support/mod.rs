@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A request the test server received.
 #[derive(Debug, Clone)]
@@ -45,10 +45,38 @@ impl Request {
 /// How long the `/sleep` route waits before it answers.
 pub const SLEEP_ROUTE_DELAY: Duration = Duration::from_millis(1000);
 
+/// How many connections [`TestServer::timing_report`] describes.
+const MAX_TIMING_LINES: usize = 32;
+
+/// When one connection and the request it carried crossed the test server.
+///
+/// A navigation that reaches the server 30 s late and one the server answers
+/// 30 s late are different defects; these times tell them apart.
+#[derive(Debug, Clone)]
+pub struct Timing {
+    /// The server accepted the connection this long after it started.
+    pub accepted: Duration,
+    /// The request read on this connection, if it ever sent one.
+    pub request: Option<RequestTiming>,
+}
+
+/// When the request of one connection arrived and when it was answered.
+#[derive(Debug, Clone)]
+pub struct RequestTiming {
+    /// The request target, as `method target`.
+    pub target: String,
+    /// The complete request head and body had arrived this long after the start.
+    pub arrived: Duration,
+    /// The response had been handed to the operating system this long after the
+    /// start. `None` while the server is still answering, or when it gave up.
+    pub answered: Option<Duration>,
+}
+
 /// A minimal HTTP server bound to a loopback port, started by the test.
 pub struct TestServer {
     port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
+    connections: Arc<Mutex<Vec<Arc<Mutex<Timing>>>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -65,9 +93,12 @@ impl TestServer {
             .set_nonblocking(true)
             .expect("failed to make the test server non-blocking");
 
+        let started = Instant::now();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let connections: Arc<Mutex<Vec<Arc<Mutex<Timing>>>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let server_requests = Arc::clone(&requests);
+        let server_connections = Arc::clone(&connections);
         let server_stop = Arc::clone(&stop);
 
         let handle = thread::spawn(move || {
@@ -81,7 +112,19 @@ impl TestServer {
                     // request log, which outlives them.
                     Ok((stream, _)) => {
                         let requests = Arc::clone(&server_requests);
-                        thread::spawn(move || handle_connection(stream, &requests));
+                        let timing = Arc::new(Mutex::new(Timing {
+                            accepted: started.elapsed(),
+                            request: None,
+                        }));
+                        // The connection is recorded before it is read, so a
+                        // report taken while a request is still pending names it.
+                        server_connections
+                            .lock()
+                            .expect("test server timings mutex is poisoned")
+                            .push(Arc::clone(&timing));
+                        thread::spawn(move || {
+                            handle_connection(stream, &requests, &timing, started)
+                        });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -94,6 +137,7 @@ impl TestServer {
         Self {
             port,
             requests,
+            connections,
             stop,
             handle: Some(handle),
         }
@@ -124,6 +168,79 @@ impl TestServer {
             .expect("test server requests mutex is poisoned")
             .len()
     }
+
+    /// When every connection the server accepted arrived, and when it answered.
+    pub fn timings(&self) -> Vec<Timing> {
+        self.connections
+            .lock()
+            .expect("test server timings mutex is poisoned")
+            .iter()
+            .map(|timing| {
+                timing
+                    .lock()
+                    .expect("test server timing mutex is poisoned")
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// A short report of the server's side of a test, for a failure message.
+    ///
+    /// Every time is milliseconds since the server started. A connection with no
+    /// request is what Chrome's speculative socket looks like: the browser
+    /// reached the server, but that connection never asked for anything.
+    pub fn timing_report(&self) -> String {
+        let timings = self.timings();
+        if timings.is_empty() {
+            return "the test server accepted no connection".to_string();
+        }
+        let answered = timings
+            .iter()
+            .filter(|timing| {
+                timing
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request.answered.is_some())
+            })
+            .count();
+        let mut lines = vec![format!(
+            "the test server accepted {} connection(s) and answered {answered} request(s), \
+             in milliseconds since it started:",
+            timings.len()
+        )];
+        for timing in timings.iter().take(MAX_TIMING_LINES) {
+            lines.push(describe_timing(timing));
+        }
+        if timings.len() > MAX_TIMING_LINES {
+            lines.push(format!(
+                "... and {} more connection(s)",
+                timings.len() - MAX_TIMING_LINES
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// One line of [`TestServer::timing_report`].
+fn describe_timing(timing: &Timing) -> String {
+    let accepted = timing.accepted.as_millis();
+    match &timing.request {
+        Some(request) => {
+            let arrived = request.arrived.as_millis();
+            match request.answered {
+                Some(answered) => format!(
+                    "  +{accepted} ms accepted, +{arrived} ms request `{}`, +{} ms answered",
+                    request.target,
+                    answered.as_millis()
+                ),
+                None => format!(
+                    "  +{accepted} ms accepted, +{arrived} ms request `{}`, not answered",
+                    request.target
+                ),
+            }
+        }
+        None => format!("  +{accepted} ms accepted, no request"),
+    }
 }
 
 impl Drop for TestServer {
@@ -135,7 +252,12 @@ impl Drop for TestServer {
     }
 }
 
-fn handle_connection(stream: TcpStream, requests: &Mutex<Vec<Request>>) {
+fn handle_connection(
+    stream: TcpStream,
+    requests: &Mutex<Vec<Request>>,
+    timing: &Mutex<Timing>,
+    started: Instant,
+) {
     // Accepting from a non-blocking listener yields a non-blocking socket on
     // some platforms, so the connection mode is set back to blocking here.
     let _ = stream.set_nonblocking(false);
@@ -176,6 +298,15 @@ fn handle_connection(stream: TcpStream, requests: &Mutex<Vec<Request>>) {
     }
     let body = String::from_utf8_lossy(&body).into_owned();
 
+    {
+        let mut timing = timing.lock().expect("test server timing mutex is poisoned");
+        timing.request = Some(RequestTiming {
+            target: format!("{method} {target}"),
+            arrived: started.elapsed(),
+            answered: None,
+        });
+    }
+
     requests
         .lock()
         .expect("test server requests mutex is poisoned")
@@ -194,6 +325,14 @@ fn handle_connection(stream: TcpStream, requests: &Mutex<Vec<Request>>) {
     let mut stream = reader.into_inner();
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+    if let Some(request) = timing
+        .lock()
+        .expect("test server timing mutex is poisoned")
+        .request
+        .as_mut()
+    {
+        request.answered = Some(started.elapsed());
+    }
 }
 
 fn route(
