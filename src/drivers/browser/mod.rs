@@ -1450,10 +1450,10 @@ impl BrowserSession {
 
         let current = page_evaluate(connection, &scope, "location.href", deadline)
             .map(|value| value.as_str().unwrap_or(url).to_string())
-            .map_err(|failure| load_error(failure, url, "read the URL of"))?;
+            .map_err(|failure| load_error(failure, url, "read the URL of", deadline))?;
         let title = page_evaluate(connection, &scope, "document.title", deadline)
             .map(|value| value.as_str().unwrap_or_default().to_string())
-            .map_err(|failure| load_error(failure, url, "read the title of"))?;
+            .map_err(|failure| load_error(failure, url, "read the title of", deadline))?;
         Ok((current, title))
     }
 
@@ -1889,7 +1889,7 @@ impl BrowserSession {
         let function = format!("function () {{ var el = this; {body} }}");
         let connection = self.connection_mut()?;
         page_call_function(connection, &scope, object_id, &function, deadline)
-            .map_err(|failure| evaluate_error(target_desc, failure, action))
+            .map_err(|failure| evaluate_error(target_desc, failure, action, deadline))
     }
 
     /// Sends one page command for a step and maps its errors.
@@ -1968,14 +1968,15 @@ impl BrowserSession {
         }
 
         let reply = captured.map_err(|failure| {
-            if failure.is_timeout() {
-                StepError::Timeout(format!(
+            let prefix = if failure.is_timeout() {
+                format!(
                     "the screenshot did not finish within {} ms",
                     deadline.timeout_ms()
-                ))
+                )
             } else {
-                failure.environment("could not capture the screenshot")
-            }
+                "could not capture the screenshot".to_string()
+            };
+            failure.step(&prefix, timeout_or_environment)
         })?;
         let data = reply.get("data").and_then(Value::as_str).ok_or_else(|| {
             StepError::Environment(
@@ -2815,11 +2816,24 @@ fn action_poll_error(target_desc: &str, action: &str, failure: PageFailure) -> L
 }
 
 /// Maps a failure of one element action to the error class a step uses.
-fn evaluate_error(target_desc: &str, failure: PageFailure, action: &str) -> StepError {
-    failure.step(
-        &format!("could not {action} {target_desc}"),
-        timeout_or_execution,
-    )
+///
+/// A timeout keeps the message this step reported before the watch existed and
+/// gains the watch note from [`PageFailure::describe`].
+fn evaluate_error(
+    target_desc: &str,
+    failure: PageFailure,
+    action: &str,
+    deadline: Deadline,
+) -> StepError {
+    let prefix = if failure.is_timeout() {
+        format!(
+            "could not {action} {target_desc} within {} ms",
+            deadline.timeout_ms()
+        )
+    } else {
+        format!("could not {action} {target_desc}")
+    };
+    failure.step(&prefix, timeout_or_execution)
 }
 
 /// Waits for the loaded document, skipping an event that belongs to the page
@@ -2835,16 +2849,19 @@ fn wait_for_load(
             page_wait_for_event(connection, scope, "Page.loadEventFired", deadline)
         {
             let prefix = if failure.is_timeout() {
-                format!("the page `{url}` did not finish loading")
+                format!(
+                    "the page `{url}` did not finish loading within {} ms",
+                    deadline.timeout_ms()
+                )
             } else {
                 format!("the browser failed while loading `{url}`")
             };
             return Err(failure.step(&prefix, timeout_or_environment));
         }
         let current = page_evaluate(connection, scope, "location.href", deadline)
-            .map_err(|failure| load_error(failure, url, "read the URL of"))?;
+            .map_err(|failure| load_error(failure, url, "read the URL of", deadline))?;
         let ready = page_evaluate(connection, scope, "document.readyState", deadline)
-            .map_err(|failure| load_error(failure, url, "read the state of"))?;
+            .map_err(|failure| load_error(failure, url, "read the state of", deadline))?;
         if current.as_str() != Some("about:blank") && ready.as_str() == Some("complete") {
             return Ok(());
         }
@@ -2852,9 +2869,15 @@ fn wait_for_load(
 }
 
 /// Maps a failed read after navigation to the error class the step reports.
-fn load_error(failure: PageFailure, url: &str, action: &str) -> StepError {
+///
+/// A timeout keeps the message this step reported before the watch existed and
+/// gains the watch note from [`PageFailure::describe`].
+fn load_error(failure: PageFailure, url: &str, action: &str, deadline: Deadline) -> StepError {
     let prefix = if failure.is_timeout() {
-        format!("the page `{url}` did not finish loading")
+        format!(
+            "the page `{url}` did not finish loading within {} ms",
+            deadline.timeout_ms()
+        )
     } else {
         format!("could not {action} `{url}`")
     };
@@ -3415,10 +3438,16 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             deadline,
         )
         .map_err(|failure| {
-            failure.step(
-                &format!("could not press `{}`", args.key),
-                timeout_or_execution,
-            )
+            let prefix = if failure.is_timeout() {
+                format!(
+                    "could not press `{}` within {} ms",
+                    args.key,
+                    deadline.timeout_ms()
+                )
+            } else {
+                format!("could not press `{}`", args.key)
+            };
+            failure.step(&prefix, timeout_or_execution)
         })?;
     }
     Ok(json!({}))
@@ -5133,7 +5162,142 @@ mod tests {
 
         match err {
             StepError::Timeout(message) => {
-                assert!(message.contains("did not finish loading"), "{message}");
+                assert!(
+                    message.contains(
+                        "the page `http://127.0.0.1/page` did not finish loading within 250 ms"
+                    ),
+                    "{message}"
+                );
+                assert!(message.contains("no CDP events"), "{message}");
+            }
+            other => panic!("expected a timeout error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locator_action_timeout_keeps_its_wording_and_notes_no_events() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let evaluate = read_cdp_request(&mut socket);
+            assert_eq!(evaluate["method"], "Runtime.evaluate");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": evaluate["id"],
+                        "result": { "result": { "objectId": "element-1" } }
+                    })
+                    .to_string(),
+                ))
+                .expect("send locator reply");
+
+            let visible = read_cdp_request(&mut socket);
+            assert_eq!(visible["method"], "Runtime.callFunctionOn");
+            assert!(
+                visible["params"]["functionDeclaration"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("getComputedStyle"),
+                "the first action must be the visibility check: {visible}"
+            );
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": visible["id"], "result": { "result": { "value": true } } })
+                        .to_string(),
+                ))
+                .expect("send visibility reply");
+
+            // The text read never answers; only the session close follows.
+            let text = read_cdp_request(&mut socket);
+            assert_eq!(text["method"], "Runtime.callFunctionOn");
+            loop {
+                match socket.read() {
+                    Ok(tungstenite::Message::Text(frame)) => {
+                        let command: Value = serde_json::from_str(frame.as_str())
+                            .expect("mock CDP command must be JSON");
+                        if command["method"] == "Target.closeTarget" {
+                            socket
+                                .send(tungstenite::Message::text(
+                                    json!({ "id": command["id"], "result": { "success": true } })
+                                        .to_string(),
+                                ))
+                                .expect("send close reply");
+                        }
+                    }
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let mut sessions = Sessions::new();
+        sessions
+            .get_or_create(SESSION_KIND, || {
+                Ok(mock_session(conn, "target-1", "session-1"))
+            })
+            .expect("must store the mock browser session");
+        let err = run_read(&json!({ "css": "#go", "timeout_ms": 250 }), &mut sessions)
+            .expect_err("a silent text read must time out");
+        drop(sessions);
+        server.join().expect("mock CDP thread must finish");
+
+        match err {
+            StepError::Timeout(message) => {
+                assert!(
+                    message.contains("could not read the text of CSS selector `#go` within 250 ms"),
+                    "{message}"
+                );
+                assert!(message.contains("no CDP events"), "{message}");
+            }
+            other => panic!("expected a timeout error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn press_timeout_keeps_its_wording_and_notes_no_events() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let press = read_cdp_request(&mut socket);
+            assert_eq!(press["method"], "Input.dispatchKeyEvent");
+            // The key event never answers; the press waits out its 5 s budget.
+            loop {
+                match socket.read() {
+                    Ok(tungstenite::Message::Text(frame)) => {
+                        let command: Value = serde_json::from_str(frame.as_str())
+                            .expect("mock CDP command must be JSON");
+                        if command["method"] == "Target.closeTarget" {
+                            socket
+                                .send(tungstenite::Message::text(
+                                    json!({ "id": command["id"], "result": { "success": true } })
+                                        .to_string(),
+                                ))
+                                .expect("send close reply");
+                        }
+                    }
+                    Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let mut sessions = Sessions::new();
+        sessions
+            .get_or_create(SESSION_KIND, || {
+                Ok(mock_session(conn, "target-1", "session-1"))
+            })
+            .expect("must store the mock browser session");
+        let err = run_press(&json!({ "key": "Enter" }), &mut sessions)
+            .expect_err("a silent press must time out");
+        drop(sessions);
+        server.join().expect("mock CDP thread must finish");
+
+        match err {
+            StepError::Timeout(message) => {
+                assert!(
+                    message.contains("could not press `Enter` within 5000 ms"),
+                    "{message}"
+                );
                 assert!(message.contains("no CDP events"), "{message}");
             }
             other => panic!("expected a timeout error, got {other:?}"),
