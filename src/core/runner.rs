@@ -52,6 +52,27 @@ pub fn run(
     secrets: &mut Secrets,
     jobs: usize,
 ) -> RunOutcome {
+    run_with_record(cases, registry, bus, bundles, None, filters, secrets, jobs)
+}
+
+/// Runs the selected cases and writes every one of them to `record`.
+///
+/// `record` is the `--record` writer. Its presence makes the runner collect a
+/// passing case's session evidence before the sessions close; `bundles` keeps
+/// its own failure-only behavior. A case that fails may therefore be written
+/// twice, once to each writer, from the same evidence. A writer error is
+/// reported in [`RunReport::bundle_errors`] and never changes the verdict.
+#[allow(clippy::too_many_arguments)] // The two writers are independent and must stay explicit.
+pub fn run_with_record(
+    cases: &[LoadedCase],
+    registry: &Registry,
+    bus: &EventBus,
+    bundles: Option<&mut FailureBundles>,
+    record: Option<&mut FailureBundles>,
+    filters: &Filters,
+    secrets: &mut Secrets,
+    jobs: usize,
+) -> RunOutcome {
     let errors = preflight(cases, registry, secrets);
     if !errors.is_empty() {
         return RunOutcome::Rejected { errors };
@@ -81,6 +102,7 @@ pub fn run(
     let collected = Mutex::new(Collected::new(selected.len()));
     let secrets = Mutex::new(secrets);
     let bundles = bundles.map(Mutex::new);
+    let record = record.map(Mutex::new);
     let workers = jobs.max(1).min(selected.len());
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -91,7 +113,10 @@ pub fn run(
                         selected[index],
                         registry,
                         bus,
-                        bundles.as_ref(),
+                        BundleWriters {
+                            failures: bundles.as_ref(),
+                            record: record.as_ref(),
+                        },
                         &collected,
                         &secrets,
                     );
@@ -162,13 +187,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The two independent bundle writers of a run.
+struct BundleWriters<'a> {
+    failures: Option<&'a Mutex<&'a mut FailureBundles>>,
+    record: Option<&'a Mutex<&'a mut FailureBundles>>,
+}
+
 /// Runs one selected case and stores its report at its own position.
 fn run_one(
     index: usize,
     loaded: &LoadedCase,
     registry: &Registry,
     bus: &EventBus,
-    bundles: Option<&Mutex<&mut FailureBundles>>,
+    writers: BundleWriters<'_>,
     collected: &Mutex<Collected>,
     secrets: &Mutex<&mut Secrets>,
 ) {
@@ -179,9 +210,17 @@ fn run_one(
     let CaseRun {
         mut report,
         evidence,
-    } = run_case(index, loaded, registry, bus, secrets, bundles.is_some());
+    } = run_case(
+        index,
+        loaded,
+        registry,
+        bus,
+        secrets,
+        writers.failures.is_some(),
+        writers.record.is_some(),
+    );
     if report.status != CaseStatus::Passed
-        && let Some(writer) = bundles
+        && let Some(writer) = writers.failures
     {
         // The bundle writer keeps one run directory and a staging counter, so
         // the workers take turns. The case directories themselves already
@@ -191,6 +230,15 @@ fn run_one(
         match writer.write_with_evidence(index, &report, &secrets, &evidence) {
             Ok(directory) => report.bundle = Some(directory),
             Err(message) => lock(collected).bundle_errors.push((index, message)),
+        }
+    }
+    if let Some(writer) = writers.record {
+        // A recording writer has one directory and a staging counter too, so
+        // its workers take turns the same way.
+        let mut writer = lock(writer);
+        let secrets = lock(secrets);
+        if let Err(message) = writer.write_with_evidence(index, &report, &secrets, &evidence) {
+            lock(collected).bundle_errors.push((index, message));
         }
     }
     bus.emit(Event::CaseFinished {
@@ -364,7 +412,8 @@ fn run_case(
     registry: &Registry,
     bus: &EventBus,
     secrets: &Mutex<&mut Secrets>,
-    bundles_enabled: bool,
+    collect_failure_evidence: bool,
+    collect_passing_evidence: bool,
 ) -> CaseRun {
     let started = Instant::now();
     let mut vars = loaded.case.vars.clone();
@@ -471,16 +520,18 @@ fn run_case(
         steps.push(report);
     }
 
-    // Evidence is collected before the sessions release their resources, and
-    // only when the case already did not pass and a bundle will be written.
-    // A passing case never asks for evidence, even though its sessions are
-    // still open here.
+    // Evidence is collected before the sessions release their resources. A
+    // failure bundle asks only for a case that did not pass; the record writer
+    // asks for every case, which is what `--record` adds. An ordinary passing
+    // case never asks, even though its sessions are still open here.
     let status_before_close = match stopped.as_ref().map(|problem| problem.kind) {
         None => CaseStatus::Passed,
         Some(ProblemKind::Assertion) => CaseStatus::Failed,
         Some(_) => CaseStatus::Error,
     };
-    let evidence = if bundles_enabled && status_before_close != CaseStatus::Passed {
+    let evidence = if (collect_failure_evidence && status_before_close != CaseStatus::Passed)
+        || collect_passing_evidence
+    {
         sessions.collect_evidence()
     } else {
         Vec::new()
@@ -1416,6 +1467,24 @@ mod tests {
         }
     }
 
+    /// A second counter, because Rust runs tests in one module concurrently.
+    static RECORD_EVIDENCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct RecordCountingSession;
+
+    impl Session for RecordCountingSession {
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+            RECORD_EVIDENCE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![
+                Evidence::text("notes.txt", "the session was asked").expect("the name is valid"),
+            ])
+        }
+    }
+
     #[test]
     fn session_evidence_is_collected_only_for_a_failed_case_with_bundles() {
         let dir = std::env::temp_dir().join(format!("da-runner-evidence-{}", std::process::id()));
@@ -1528,6 +1597,151 @@ mod tests {
                 .expect("the evidence must be written"),
             "the session was asked"
         );
+        assert!(report.bundle_errors.is_empty(), "{report:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_collects_evidence_for_a_passing_case_and_an_ordinary_run_does_not() {
+        let dir = std::env::temp_dir().join(format!("da-runner-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the fixture directory must be created");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: case\nsteps: []\n").expect("the case file must be written");
+
+        let mut registry = registry();
+        registry
+            .register(StepDefinition {
+                name: "test.session",
+                description: "Opens a session that counts its evidence requests.",
+                args_schema: json!({"type": "object"}),
+                validate: |_| Ok(()),
+                run: |_, sessions| {
+                    sessions
+                        .get_or_create("test.session", || Ok(RecordCountingSession))
+                        .map_err(StepError::Environment)?;
+                    Ok(json!({"opened": true}))
+                },
+            })
+            .expect("the session step must register");
+
+        let mut cases = loaded(vec![Step {
+            action: "test.session".to_string(),
+            args: json!({}),
+            optional: false,
+            expect: Vec::new(),
+            save: Vec::new(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        }]);
+        cases[0].path = source;
+
+        RECORD_EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let mut record = FailureBundles::record(dir.join("record"));
+        let outcome = run_with_record(
+            &cases,
+            &registry,
+            &EventBus::new(),
+            None,
+            Some(&mut record),
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            RECORD_EVIDENCE_CALLS.load(Ordering::SeqCst),
+            1,
+            "a recorded passing case must ask for evidence once"
+        );
+
+        let recorded: Vec<_> = std::fs::read_dir(dir.join("record"))
+            .expect("the record directory must exist")
+            .map(|entry| entry.expect("the entry must be readable").path())
+            .collect();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(recorded[0].join("meta.json"))
+                .expect("the recorded meta must be readable"),
+        )
+        .expect("the recorded meta must be JSON");
+        assert_eq!(meta["status"], json!("passed"));
+        assert_eq!(
+            std::fs::read_to_string(recorded[0].join("test.session/notes.txt"))
+                .expect("the recorded evidence must be readable"),
+            "the session was asked"
+        );
+
+        RECORD_EVIDENCE_CALLS.store(0, Ordering::SeqCst);
+        let outcome = run(
+            &cases,
+            &registry,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            RECORD_EVIDENCE_CALLS.load(Ordering::SeqCst),
+            0,
+            "an ordinary passing run must not collect evidence"
+        );
+        assert!(
+            !dir.join("record/test.session").exists(),
+            "the ordinary run must not write into the record"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_and_failure_bundle_are_written_independently() {
+        let dir =
+            std::env::temp_dir().join(format!("da-runner-record-both-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the fixture directory must be created");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: case\nsteps: []\n").expect("the case file must be written");
+
+        let mut failing = echo(json!("wrong"), Vec::new());
+        failing.expect = vec![crate::core::case::Expectation {
+            path: "$".to_string(),
+            matcher: crate::core::case::Matcher::Equals(json!("right")),
+        }];
+        let mut cases = loaded(vec![failing]);
+        cases[0].path = source;
+
+        let mut bundles = FailureBundles::new(dir.join("failures"));
+        let mut record = FailureBundles::record(dir.join("record"));
+        let outcome = run_with_record(
+            &cases,
+            &registry(),
+            &EventBus::new(),
+            Some(&mut bundles),
+            Some(&mut record),
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        let RunOutcome::Completed(report) = outcome else {
+            panic!("the run must complete");
+        };
+        let bundle = report.cases[0]
+            .bundle
+            .as_ref()
+            .expect("the failing case must keep its failure bundle");
+        assert!(bundle.starts_with(dir.join("failures")), "{bundle:?}");
+        assert!(bundle.join("meta.json").is_file());
+        let recorded: Vec<_> = std::fs::read_dir(dir.join("record"))
+            .expect("the record directory must exist")
+            .map(|entry| entry.expect("the entry must be readable").path())
+            .collect();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert!(recorded[0].join("meta.json").is_file());
         assert!(report.bundle_errors.is_empty(), "{report:?}");
 
         let _ = std::fs::remove_dir_all(&dir);

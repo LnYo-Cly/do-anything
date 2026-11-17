@@ -105,6 +105,15 @@ $ echo $?
 
 失败的用例指出了哪条断言失败、实际值是什么，证据保存在 `.da/failures/…` 中。加上 `--output json` 可得到单个 JSON 对象而不是文本。
 
+如果想连通过的用例也留下证据，并把整次运行变成一个可以直接阅读的文件：
+
+```sh
+da run cases/ --record evidence/
+da report evidence/                 # 生成 evidence/report.html
+```
+
+HTML 是自包含的，离线可打开。`--shareable` 不嵌入任何截图，`-o <file.html>` 可指定其他输出路径。详见[运行录制与 HTML 报告](docs/guide.md#run-records-and-html-reports)。
+
 用例只对已经运行的程序或服务发起调用：`da` 不负责启动、重启或停止它们。[被测服务](docs/guide.md#the-service-under-test)一节给出“先启动、再运行、最后停止”的模式，[在 Windows 上保存 JSON](docs/guide.md#capturing-json-on-windows)一节说明如何避免被 shell 重新编码。
 
 ## 现在能测什么
@@ -135,6 +144,7 @@ $ echo $?
 | 结论 | 退出码：`0` 通过、`1` 失败、`2` 用法错误、`3` 用例无效、`4` 环境错误、`5` 超时 |
 | 细节 | `da --output json run …`：一个 JSON 对象，包含每个步骤的结果和每条断言 |
 | 运行后的证据 | 每个失败用例一个失败包：`case.yaml`、`report.json`、`meta.json`（最后写入） |
+| 每个用例的证据 | `da run --record evidence/` 记录通过、失败与出错的用例；`da report evidence/` 渲染成一个离线 HTML 文件 |
 | 外部输入 | 用 `--var name=value` 传入地址、令牌和路径 |
 | 不执行就检查用例 | `da lint cases/`：与 `da run` 相同的校验，一次报出所有文件的所有问题，不执行任何步骤 |
 | 机器可读的用例格式 | `da schema`：包含所有已注册步骤的 JSON Schema，编辑器也能直接使用 |

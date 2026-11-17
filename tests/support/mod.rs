@@ -392,6 +392,7 @@ fn route(
         (_, "/browser/probe/dialog") => html_response("200 OK", browser_probe_dialog()),
         (_, "/browser/probe/upload") => html_response("200 OK", browser_probe_upload()),
         (_, "/browser/probe/coords") => html_response("200 OK", browser_probe_coords()),
+        (_, "/browser/record") => html_response("200 OK", &browser_record(query)),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
         // finishes loading before a short navigation timeout, which is what
@@ -722,6 +723,21 @@ fn browser_second(query: &str) -> String {
 <body>
 <p id="case">{label}</p>
 <p id="second">second page</p>
+</body></html>"#
+    )
+}
+
+/// A page for the record/report gate: it echoes a secret and carries markup
+/// that would be dangerous if the report embedded it without escaping.
+fn browser_record(query: &str) -> String {
+    let secret = escape_html(&query_value(query, "secret"));
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Record probe</title></head>
+<body>
+<h1>Record probe</h1>
+<p id="secret">{secret}</p>
+<pre id="evil">&lt;img src="https://evil.example/x"&gt;</pre>
 </body></html>"#
     )
 }

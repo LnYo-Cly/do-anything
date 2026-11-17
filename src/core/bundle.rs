@@ -24,15 +24,27 @@ pub const DEFAULT_DIRECTORY: &str = ".da/failures";
 /// Longest part of a directory name taken from a case name.
 const MAX_NAME: usize = 40;
 
-/// Writes the failure bundles of one run.
+/// How a writer names the directory that holds its case directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// One new timestamped run directory under the root, for failures only.
+    Run,
+    /// The root itself, for a complete run record.
+    Record,
+}
+
+/// Writes the evidence bundles of a run.
 ///
 /// The run directory is created with the first bundle, so a run where every
-/// case passes leaves the file system untouched.
+/// case passes leaves the file system untouched. A writer created by
+/// [`Self::record`] writes directly into its root instead and expects a bundle
+/// for every case.
 #[derive(Debug)]
 pub struct FailureBundles {
     root: PathBuf,
     run: Option<PathBuf>,
     sequence: u64,
+    layout: Layout,
 }
 
 impl FailureBundles {
@@ -42,7 +54,27 @@ impl FailureBundles {
             root,
             run: None,
             sequence: 0,
+            layout: Layout::Run,
         }
+    }
+
+    /// Creates a writer that puts every case directory directly into `root`.
+    ///
+    /// This is the writer behind `da run --record`: the given directory is the
+    /// run directory, so a reader can render it without knowing a timestamp.
+    /// [`Self::write`] still writes `meta.json` last.
+    pub fn record(root: PathBuf) -> Self {
+        Self {
+            root,
+            run: None,
+            sequence: 0,
+            layout: Layout::Record,
+        }
+    }
+
+    /// Whether this writer expects a bundle for a passing case too.
+    pub fn records_all(&self) -> bool {
+        self.layout == Layout::Record
     }
 
     /// Writes the bundle of one failed case and returns its final directory.
@@ -77,7 +109,7 @@ impl FailureBundles {
         // Checked before anything is created, so a case file that vanished
         // leaves no empty directory behind.
         std::fs::metadata(&case.file).map_err(|error| {
-            failure(
+            self.failure_message(
                 case,
                 format!("could not read `{}`: {error}", paths::display(&case.file)),
             )
@@ -85,7 +117,7 @@ impl FailureBundles {
 
         let run = self
             .run_directory()
-            .map_err(|detail| failure(case, detail))?;
+            .map_err(|detail| self.failure_message(case, detail))?;
         let final_dir = run.join(format!("{position}-{}", safe_name(&case.name)));
         let staging = run.join(format!(".tmp-{}-{}", std::process::id(), self.sequence));
         self.sequence += 1;
@@ -93,7 +125,7 @@ impl FailureBundles {
         // An earlier attempt that failed may have left its staging directory.
         let _ = std::fs::remove_dir_all(&staging);
         if let Err(error) = std::fs::create_dir(&staging) {
-            return Err(failure(
+            return Err(self.failure_message(
                 case,
                 format!("could not create `{}`: {error}", paths::display(&staging)),
             ));
@@ -101,11 +133,11 @@ impl FailureBundles {
 
         if let Err(detail) = stage(&staging, case, &final_dir, secrets, evidence) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(failure(case, detail));
+            return Err(self.failure_message(case, detail));
         }
         if let Err(error) = std::fs::rename(&staging, &final_dir) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(failure(
+            return Err(self.failure_message(
                 case,
                 format!(
                     "could not move `{}` to `{}`: {error}",
@@ -118,7 +150,7 @@ impl FailureBundles {
         // the directory is complete.
         if let Err(detail) = write_meta(&final_dir, case, secrets) {
             let _ = std::fs::remove_dir_all(&final_dir);
-            return Err(failure(case, detail));
+            return Err(self.failure_message(case, detail));
         }
         Ok(final_dir)
     }
@@ -127,9 +159,31 @@ impl FailureBundles {
         if let Some(dir) = &self.run {
             return Ok(dir.clone());
         }
-        let dir = create_run_directory(&self.root)?;
+        let dir = match self.layout {
+            Layout::Run => create_run_directory(&self.root)?,
+            Layout::Record => {
+                std::fs::create_dir_all(&self.root).map_err(|error| {
+                    format!("could not create `{}`: {error}", paths::display(&self.root))
+                })?;
+                self.root.clone()
+            }
+        };
         self.run = Some(dir.clone());
         Ok(dir)
+    }
+
+    /// The message a caller reports without changing the run's exit code.
+    fn failure_message(&self, case: &CaseReport, detail: String) -> String {
+        match self.layout {
+            Layout::Run => format!(
+                "could not write the failure bundle for `{}`: {detail}; the run result is unchanged, and `--no-bundle` turns failure bundles off",
+                case.name
+            ),
+            Layout::Record => format!(
+                "could not write the recorded evidence for `{}`: {detail}; the run result is unchanged, and `--record` names the directory to check",
+                case.name
+            ),
+        }
     }
 }
 
@@ -305,14 +359,6 @@ fn safe_name(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-/// The message a caller reports without changing the run's exit code.
-fn failure(case: &CaseReport, detail: String) -> String {
-    format!(
-        "could not write the failure bundle for `{}`: {detail}; the run result is unchanged, and `--no-bundle` turns failure bundles off",
-        case.name
-    )
 }
 
 #[cfg(test)]
@@ -534,6 +580,30 @@ mod tests {
             names(&first).contains(&"meta.json".to_string()),
             "the last file must be the metadata"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_writes_case_directories_into_the_given_directory() {
+        let dir = fixture("record");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: One\nsteps: []\n").expect("the case file must be written");
+        let record = dir.join("record");
+        let mut bundles = FailureBundles::record(record.clone());
+        assert!(bundles.records_all());
+
+        let bundle = bundles
+            .write(0, &failing_case(source), &Secrets::new())
+            .expect("the record must be written");
+
+        assert_eq!(bundle.parent(), Some(record.as_path()));
+        assert_eq!(
+            bundle.file_name().and_then(|name| name.to_str()),
+            Some("0-Wrong-exit-code")
+        );
+        assert!(bundle.join("meta.json").is_file());
+        assert_eq!(names(&record), vec!["0-Wrong-exit-code"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
