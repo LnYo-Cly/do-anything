@@ -3571,3 +3571,102 @@ fn connect_navigate_aborts_on_target_death_and_reports_diagnostics() {
         "expected silent timeout diagnostic, got: {silent_msg}"
     );
 }
+
+#[test]
+fn connect_click_aborts_on_target_death_and_reports_diagnostics() {
+    let dir = TempDir::new("browser-click-mock");
+
+    // The page dies while `browser.click` is resolving its locator, so the
+    // click must fail at once instead of waiting out its 5 s timeout.
+    let (port, server) = spawn_mock_devtools(|mut socket| {
+        while let Some(cmd) = read_mock_cdp(&mut socket) {
+            let method = cmd["method"].as_str().unwrap_or_default();
+            match method {
+                "Target.createTarget" => send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": cmd["id"], "result": { "targetId": "t-click-1" } }),
+                ),
+                "Target.attachToTarget" => send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": cmd["id"], "result": { "sessionId": "s-click-1" } }),
+                ),
+                "Page.enable" | "Runtime.enable" | "Network.enable" => {
+                    send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
+                }
+                // No `loaderId`: a same-document navigation, so the session
+                // reads the URL and title instead of waiting for a load event.
+                "Page.navigate" => {
+                    send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
+                }
+                "Runtime.evaluate" => {
+                    if cmd["params"]["returnByValue"] == json!(true) {
+                        let value = if cmd["params"]["expression"] == json!("location.href") {
+                            json!("http://127.0.0.1/ok")
+                        } else {
+                            json!("Click target")
+                        };
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({ "id": cmd["id"], "result": { "result": { "value": value } } }),
+                        );
+                    } else {
+                        // The locator expression never answers; the page dies.
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({
+                                "method": "Target.targetCrashed",
+                                "params": {
+                                    "targetId": "t-click-1",
+                                    "status": "crashed",
+                                    "errorCode": 11
+                                }
+                            }),
+                        );
+                    }
+                }
+                "Target.closeTarget" => {
+                    send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "success": true } }),
+                    );
+                    break;
+                }
+                other => panic!("unexpected CDP command during click crash test: {other}"),
+            }
+        }
+    });
+
+    let case = dir.write(
+        "click-crash.yaml",
+        &format!(
+            "name: click crash\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{port}\"\n      url: \"http://127.0.0.1/ok\"\n  - browser.click:\n      css: \"#go\"\n      timeout_ms: 5000\n"
+        ),
+    );
+    let out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    server.join().expect("click crash mock server finish");
+
+    assert_eq!(
+        exit_code(&out),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let report = json_stdout(&out);
+    let click_ms = report["cases"][0]["steps"][1]["duration_ms"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    assert!(
+        click_ms < 5000,
+        "a dead page must fail the click at once instead of waiting 5 s (step took {click_ms} ms): {}",
+        stdout(&out)
+    );
+    let message = case_error(&report);
+    assert!(
+        message.contains("Target.targetCrashed") && message.contains("target crashed"),
+        "expected crash diagnostic in the click error, got: {message}"
+    );
+}

@@ -1182,10 +1182,15 @@ equivalent except for how the element is found:
 
 `browser.open` returns the URL the page actually reached, after redirects, and
 its title. Its own `timeout_ms` bounds how long the page may take to finish
-loading; exceeding it is a timeout (exit 5). When Chrome reports that the page's
-target crashed or detached while the navigation is waiting, the step fails at
-once as an environment error (exit 4) and the message names the event; when the
-browser sends no such event, the timeout message says that none arrived.
+loading; exceeding it is a timeout (exit 5).
+
+Every wait a browser step makes on the page — navigation, the load event, the
+locator and actionability polls, `Input.*`, `browser.wait`, the screenshot and
+the evidence snapshot — ends at once as an environment error (exit 4) when Chrome
+reports that the page's target crashed or detached, and the message names the
+event. A tab that dies while loading is therefore not reported as a slow page.
+Without such an event the wait still ends at `timeout_ms` with the same exit code
+as before, and the timeout message says that no target/session event arrived.
 
 `browser.press` accepts `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, the four
 arrow keys, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one printable

@@ -312,14 +312,20 @@ impl Connection {
     /// Evaluates a JavaScript expression in the page and returns its value.
     ///
     /// The expression must produce a JSON value; `returnByValue` makes Chrome
-    /// serialize it instead of returning an object handle.
-    pub fn evaluate(
+    /// serialize it instead of returning an object handle. `should_abort`
+    /// receives every event that arrives while the page does not answer, so the
+    /// driver can end the wait as soon as the page dies.
+    pub fn evaluate<F>(
         &mut self,
         session_id: &str,
         expression: &str,
         deadline: Deadline,
-    ) -> Result<Value, CdpError> {
-        let reply = self.call(
+        should_abort: F,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let reply = self.call_until(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
@@ -328,6 +334,7 @@ impl Connection {
             }),
             Some(session_id),
             deadline,
+            should_abort,
         )?;
         if let Some(details) = reply.get("exceptionDetails") {
             return Err(CdpError::Script(exception_message(details)));
@@ -343,15 +350,20 @@ impl Connection {
     ///
     /// The accessibility tree names a node by its backend id; after
     /// `DOM.resolveNode` this form runs the action on that exact element rather
-    /// than searching for it again by a selector.
-    pub fn call_function(
+    /// than searching for it again by a selector. `should_abort` watches the
+    /// wait for a terminal page event the same way [`Self::evaluate`] does.
+    pub fn call_function<F>(
         &mut self,
         session_id: &str,
         object_id: &str,
         function: &str,
         deadline: Deadline,
-    ) -> Result<Value, CdpError> {
-        let reply = self.call(
+        should_abort: F,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let reply = self.call_until(
             "Runtime.callFunctionOn",
             json!({
                 "objectId": object_id,
@@ -361,6 +373,7 @@ impl Connection {
             }),
             Some(session_id),
             deadline,
+            should_abort,
         )?;
         if let Some(details) = reply.get("exceptionDetails") {
             return Err(CdpError::Script(exception_message(details)));
@@ -374,13 +387,17 @@ impl Connection {
 
     /// Evaluates a JavaScript expression and returns either a remote `objectId`
     /// (for a DOM node or object) or a primitive JSON value.
-    pub fn evaluate_remote(
+    pub fn evaluate_remote<F>(
         &mut self,
         session_id: &str,
         expression: &str,
         deadline: Deadline,
-    ) -> Result<RemoteResult, CdpError> {
-        let reply = self.call(
+        should_abort: F,
+    ) -> Result<RemoteResult, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let reply = self.call_until(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
@@ -389,20 +406,25 @@ impl Connection {
             }),
             Some(session_id),
             deadline,
+            should_abort,
         )?;
         parse_remote_result(&reply)
     }
 
     /// Calls a JavaScript function with a DOM node as `this` and returns either
     /// a remote `objectId` or a primitive JSON value.
-    pub fn call_function_remote(
+    pub fn call_function_remote<F>(
         &mut self,
         session_id: &str,
         object_id: &str,
         function: &str,
         deadline: Deadline,
-    ) -> Result<RemoteResult, CdpError> {
-        let reply = self.call(
+        should_abort: F,
+    ) -> Result<RemoteResult, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let reply = self.call_until(
             "Runtime.callFunctionOn",
             json!({
                 "objectId": object_id,
@@ -412,20 +434,25 @@ impl Connection {
             }),
             Some(session_id),
             deadline,
+            should_abort,
         )?;
         parse_remote_result(&reply)
     }
 
     /// Calls a JavaScript function with `this` and one `objectId` argument, returning a value.
-    pub fn call_function_with_object(
+    pub fn call_function_with_object<F>(
         &mut self,
         session_id: &str,
         object_id: &str,
         arg_object_id: &str,
         function: &str,
         deadline: Deadline,
-    ) -> Result<Value, CdpError> {
-        let reply = self.call(
+        should_abort: F,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let reply = self.call_until(
             "Runtime.callFunctionOn",
             json!({
                 "objectId": object_id,
@@ -436,6 +463,7 @@ impl Connection {
             }),
             Some(session_id),
             deadline,
+            should_abort,
         )?;
         if let Some(details) = reply.get("exceptionDetails") {
             return Err(CdpError::Script(exception_message(details)));
@@ -448,13 +476,36 @@ impl Connection {
     }
 
     /// Waits for one event and returns the whole CDP message.
-    pub fn wait_for_event(&mut self, method: &str, deadline: Deadline) -> Result<Value, CdpError> {
+    ///
+    /// `should_abort` receives every event that arrives before `method` does, so
+    /// a caller can end the wait as soon as the page dies. A matching event stays
+    /// in the queue so callers can inspect it for diagnostics.
+    pub fn wait_for_event_until<F>(
+        &mut self,
+        method: &str,
+        deadline: Deadline,
+        mut should_abort: F,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
         loop {
             if let Some(event) = self.queued.take(method) {
                 return Ok(event);
             }
+            if self.queued.any(&mut should_abort) {
+                return Err(CdpError::Aborted {
+                    waiting_for: method.to_string(),
+                });
+            }
             let message = self.read(method, deadline)?;
+            let abort = should_abort(&message);
             self.queued.push(message);
+            if abort {
+                return Err(CdpError::Aborted {
+                    waiting_for: method.to_string(),
+                });
+            }
         }
     }
 
@@ -1018,6 +1069,70 @@ mod tests {
             )
             .expect_err("must abort on already-queued event");
         assert!(matches!(second, CdpError::Aborted { .. }));
+        assert_eq!(conn.take_messages().len(), 1);
+
+        drop(conn);
+        server.join().expect("server thread must finish");
+    }
+
+    #[test]
+    fn wait_for_event_until_aborts_on_a_terminal_event_and_keeps_it_queued() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock CDP port");
+        let port = listener
+            .local_addr()
+            .expect("must read mock CDP port")
+            .port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("mock CDP must accept");
+            let mut socket = tungstenite::accept(stream).expect("mock handshake must succeed");
+            // The awaited event never arrives; a terminal event does.
+            socket
+                .send(Message::text(
+                    json!({
+                        "method": "Inspector.targetCrashed",
+                        "sessionId": "s-1"
+                    })
+                    .to_string(),
+                ))
+                .expect("send aborting event");
+            while socket.read().is_ok() {}
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/test");
+        let mut conn =
+            Connection::connect(&url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let abort = |message: &Value| {
+            message.get("method").and_then(Value::as_str) == Some("Inspector.targetCrashed")
+        };
+
+        let started = Instant::now();
+        let err = conn
+            .wait_for_event_until(
+                "Page.loadEventFired",
+                Deadline::after(Duration::from_secs(5)),
+                abort,
+            )
+            .expect_err("must abort on the arriving terminal event");
+        assert!(
+            matches!(err, CdpError::Aborted { .. }),
+            "expected Aborted, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "abort must be fast, took {:?}",
+            started.elapsed()
+        );
+
+        // Waiting again finds the same event in the queue and aborts without
+        // reading another message.
+        let queued = conn
+            .wait_for_event_until(
+                "Page.loadEventFired",
+                Deadline::after(Duration::from_secs(5)),
+                abort,
+            )
+            .expect_err("must abort on the already-queued terminal event");
+        assert!(matches!(queued, CdpError::Aborted { .. }));
         assert_eq!(conn.take_messages().len(), 1);
 
         drop(conn);
