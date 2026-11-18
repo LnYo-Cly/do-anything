@@ -26,6 +26,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         description: "Sends an HTTP request and returns `status`, `headers` and `body`.",
         args_schema,
         validate,
+        check_retry,
         run,
     })
 }
@@ -69,6 +70,23 @@ fn default_timeout_ms() -> u64 {
 
 fn validate(args: &Value) -> Result<(), String> {
     check(&parse(args)?)
+}
+
+fn check_retry(args: &Value) -> Result<(), String> {
+    let method = match args.get("method") {
+        None => DEFAULT_METHOD,
+        Some(Value::String(method)) => method.as_str(),
+        Some(_) => {
+            return Err("requires `method` to be `GET` or `HEAD` to use `retry`".to_string());
+        }
+    };
+    if matches!(method, "GET" | "HEAD") {
+        Ok(())
+    } else {
+        Err(format!(
+            "with method `{method}` cannot use `retry`; only `GET` and `HEAD` requests may be retried"
+        ))
+    }
 }
 
 fn parse(args: &Value) -> Result<HttpRequestArgs, String> {
@@ -325,5 +343,22 @@ mod tests {
             with_query("http://x/search", &BTreeMap::new()),
             "http://x/search"
         );
+    }
+
+    #[test]
+    fn check_retry_allows_only_get_and_head_methods() {
+        assert!(check_retry(&json!({"url": "http://x/"})).is_ok());
+        for method in ["GET", "HEAD"] {
+            assert!(
+                check_retry(&json!({"method": method, "url": "http://x/"})).is_ok(),
+                "{method} must allow retry"
+            );
+        }
+        for method in ["POST", "PUT", "PATCH", "DELETE", "get", "head", "post"] {
+            let error = check_retry(&json!({"method": method, "url": "http://x/"}))
+                .expect_err("non-uppercase GET/HEAD HTTP method must reject retry");
+            assert!(error.contains("cannot use `retry`"), "got: {error}");
+        }
+        assert!(check_retry(&json!({"method": 123, "url": "http://x/"})).is_err());
     }
 }

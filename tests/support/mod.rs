@@ -307,20 +307,26 @@ fn handle_connection(
         });
     }
 
-    requests
-        .lock()
-        .expect("test server requests mutex is poisoned")
-        .push(Request {
+    let poll_attempt = {
+        let mut guard = requests
+            .lock()
+            .expect("test server requests mutex is poisoned");
+        guard.push(Request {
             method: method.clone(),
             target: target.clone(),
             headers: headers.clone(),
             body: body.clone(),
         });
+        guard
+            .iter()
+            .filter(|request| request.path() == "/poll")
+            .count()
+    };
 
     let (path, query) = target
         .split_once('?')
         .map_or((target.as_str(), ""), |(path, query)| (path, query));
-    let response = route(&method, path, query, &headers, &body);
+    let response = route(&method, path, query, &headers, &body, poll_attempt);
 
     let mut stream = reader.into_inner();
     let _ = stream.write_all(response.as_bytes());
@@ -341,8 +347,28 @@ fn route(
     query: &str,
     headers: &BTreeMap<String, String>,
     body: &str,
+    poll_attempt: usize,
 ) -> String {
     match (method, path) {
+        ("HEAD", "/poll") => {
+            let ready_at = query_usize(query, "ready_at").unwrap_or(1);
+            if poll_attempt >= ready_at {
+                head_response("200 OK")
+            } else {
+                head_response("404 Not Found")
+            }
+        }
+        (_, "/poll") => {
+            let ready_at = query_usize(query, "ready_at").unwrap_or(1);
+            let ready = poll_attempt >= ready_at;
+            let state = if ready { "done" } else { "pending" };
+            let payload = serde_json::json!({
+                "attempt": poll_attempt,
+                "ready": ready,
+                "state": state,
+            });
+            json_response("200 OK", &payload.to_string())
+        }
         (_, "/health") => json_response("200 OK", r#"{"status":"ok"}"#),
         ("POST", "/login") => json_response("200 OK", r#"{"token":"t-123","user":"alice"}"#),
         (_, "/me") => {
@@ -395,6 +421,7 @@ fn route(
         (_, "/browser/dialogs/beforeunload") => {
             html_response("200 OK", browser_dialogs_beforeunload())
         }
+        (_, "/browser/dialogs/retry") => html_response("200 OK", browser_dialogs_retry()),
         (_, "/browser/dialogs/left") => html_response(
             "200 OK",
             "<!doctype html><html><head><title>Left Page</title></head><body><p id=\"left-status\">left</p></body></html>",
@@ -522,6 +549,10 @@ fn write_log(body: &str) -> Result<(), String> {
         .map_err(|error| format!("could not write {path}: {error}"))?;
     file.flush()
         .map_err(|error| format!("could not flush {path}: {error}"))
+}
+
+fn head_response(status: &str) -> String {
+    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
 }
 
 fn json_response(status: &str, body: &str) -> String {
@@ -1016,6 +1047,21 @@ window.addEventListener('beforeunload', function (e) {
 </body></html>"#
 }
 
+fn browser_dialogs_retry() -> &'static str {
+    // Both buttons arm a timer that is comfortably longer than the click that
+    // arms it, so the dialog can only open after that step finished; a retried
+    // step is then the one that meets it.
+    r#"<!doctype html>
+<html><head><title>Retry Dialog</title></head>
+<body>
+<button id="arm-confirm" type="button"
+  onclick="setTimeout(function() { document.getElementById('status').textContent = window.confirm('Ready now?') ? 'confirmed' : 'cancelled'; }, 1500);">Confirm Later</button>
+<button id="arm-unexpected" type="button"
+  onclick="setTimeout(function() { window.alert('surprise'); document.getElementById('status').textContent = 'after-alert'; }, 2000);">Alert Later</button>
+<p id="status">idle</p>
+</body></html>"#
+}
+
 fn browser_probe_upload() -> &'static str {
     r#"<!doctype html>
 <html><head><title>Probe File Upload</title></head>
@@ -1040,6 +1086,10 @@ fn query_value(query: &str, name: &str) -> String {
         .find(|(key, _)| *key == name)
         .map(|(_, value)| value.to_string())
         .unwrap_or_default()
+}
+
+fn query_usize(query: &str, name: &str) -> Option<usize> {
+    query_value(query, name).parse::<usize>().ok()
 }
 
 /// Escapes text for HTML text and double-quoted attribute values.

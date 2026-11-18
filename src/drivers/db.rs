@@ -12,7 +12,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::core::registry::{Registry, StepDefinition, StepError};
+use crate::core::registry::{Registry, StepDefinition, StepError, allow_retry};
 use crate::core::session::Sessions;
 
 /// Name of the step this module registers.
@@ -33,6 +33,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         description: "Runs one read-only SQL query on SQLite or PostgreSQL and returns `columns`, `rows`, `row_count` and `truncated`.",
         args_schema,
         validate,
+        check_retry: allow_retry,
         run,
     })
 }

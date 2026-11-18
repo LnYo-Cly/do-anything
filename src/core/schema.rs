@@ -3,14 +3,15 @@
 //! The schema mirrors the rules `case::parse` enforces: the top level has
 //! exactly `name`, the four classification fields, `vars`, `observe` and
 //! `steps`; a step carries exactly one registered step name plus optional
-//! `optional`, `expect` and `save`, and a `save` needs a step that is not
-//! optional; an observation carries exactly one registered observer plus its
-//! arguments; and every assertion uses one of the four comparisons. Step and
-//! observer argument schemas come from the registry, so a declared schema and
-//! the exported schema cannot drift apart.
+//! `optional`, `retry`, `expect` and `save`, and a `save` needs a step that is
+//! not optional; an observation carries exactly one registered observer plus
+//! its arguments; and every assertion uses one of the four comparisons. Step
+//! and observer argument schemas come from the registry, so a declared schema
+//! and the exported schema cannot drift apart.
 
 use serde_json::{Map, Value, json};
 
+use crate::core::case::DEFAULT_RETRY_INTERVAL_MS;
 use crate::core::observer::ObserverDefinition;
 use crate::core::registry::{Registry, StepDefinition};
 
@@ -22,6 +23,7 @@ use crate::core::registry::{Registry, StepDefinition};
 pub fn case_schema(registry: &Registry) -> Value {
     let mut definitions = Map::new();
     definitions.insert("expect".to_string(), expectation_schema());
+    definitions.insert("retry".to_string(), retry_schema());
     definitions.insert("save".to_string(), save_schema());
 
     let mut branches = Vec::new();
@@ -124,8 +126,8 @@ pub fn case_schema(registry: &Registry) -> Value {
     })
 }
 
-/// One allowed shape of a step: exactly one step name plus `optional`, `expect`
-/// and `save`.
+/// One allowed shape of a step: exactly one step name plus `optional`,
+/// `retry`, `expect` and `save`.
 fn step_branch(name: &str) -> Value {
     let mut properties = Map::new();
     properties.insert(
@@ -139,6 +141,7 @@ fn step_branch(name: &str) -> Value {
             "description": "Skips the step instead of stopping the case when it fails an assertion, cannot finish or times out."
         }),
     );
+    properties.insert("retry".to_string(), json!({ "$ref": "#/$defs/retry" }));
     properties.insert("expect".to_string(), json!({ "$ref": "#/$defs/expect" }));
     properties.insert("save".to_string(), json!({ "$ref": "#/$defs/save" }));
 
@@ -204,24 +207,58 @@ fn observer_arguments_schema(definition: &ObserverDefinition) -> Value {
     arguments_schema(definition.description, &definition.args_schema)
 }
 
+/// One assertion entry allowed in `expect` and `retry.until`.
+fn expectation_item_schema() -> Value {
+    json!({
+        "oneOf": [
+            comparison_branch("equals", Value::Bool(true)),
+            comparison_branch("not_equals", Value::Bool(true)),
+            comparison_branch("contains", json!({
+                "type": ["string", "array"],
+                "description": "A substring of a string or an element of an array."
+            })),
+            comparison_branch("exists", json!({
+                "type": "boolean",
+                "description": "`true` requires a value, `false` requires none."
+            }))
+        ]
+    })
+}
+
 /// The list of assertions allowed in `expect`.
 fn expectation_schema() -> Value {
     json!({
         "type": "array",
         "description": "Assertions evaluated against the step result.",
-        "items": {
-            "oneOf": [
-                comparison_branch("equals", Value::Bool(true)),
-                comparison_branch("not_equals", Value::Bool(true)),
-                comparison_branch("contains", json!({
-                    "type": ["string", "array"],
-                    "description": "A substring of a string or an element of an array."
-                })),
-                comparison_branch("exists", json!({
-                    "type": "boolean",
-                    "description": "`true` requires a value, `false` requires none."
-                }))
-            ]
+        "items": expectation_item_schema()
+    })
+}
+
+/// Polling policy schema for `retry`.
+fn retry_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Polls a read-only step until `until` assertions pass or `timeout_ms` expires.",
+        "additionalProperties": false,
+        "required": ["until", "timeout_ms"],
+        "properties": {
+            "until": {
+                "type": "array",
+                "description": "Assertions polled on every attempt until all pass.",
+                "minItems": 1,
+                "items": expectation_item_schema()
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Total polling budget in milliseconds for starting new attempts; an already in-flight attempt is allowed to finish."
+            },
+            "interval_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "default": DEFAULT_RETRY_INTERVAL_MS,
+                "description": "Wait between failed polling attempts, in milliseconds. Defaults to 250."
+            }
         }
     })
 }
@@ -279,6 +316,7 @@ mod tests {
                     "properties": {"value": {"type": "string"}}
                 }),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, _| Ok(Value::Null),
             })
             .expect("the test step must register");
@@ -404,7 +442,41 @@ mod tests {
         );
         assert_eq!(
             schema["$defs"],
-            json!({"expect": expectation_schema(), "save": save_schema()})
+            json!({
+                "expect": expectation_schema(),
+                "retry": retry_schema(),
+                "save": save_schema()
+            })
+        );
+    }
+
+    #[test]
+    fn every_step_branch_allows_a_retry_policy() {
+        let schema = case_schema(&registry());
+        let branches = schema["properties"]["steps"]["items"]["oneOf"]
+            .as_array()
+            .expect("registered steps must produce a oneOf");
+
+        for branch in branches {
+            assert_eq!(branch["properties"]["retry"]["$ref"], "#/$defs/retry");
+            assert!(
+                branch["required"]
+                    .as_array()
+                    .is_some_and(|required| !required.iter().any(|field| field == "retry")),
+                "`retry` must stay optional: {}",
+                branch["required"]
+            );
+        }
+
+        let retry = &schema["$defs"]["retry"];
+        assert_eq!(retry["additionalProperties"], false);
+        assert_eq!(retry["required"], json!(["until", "timeout_ms"]));
+        assert_eq!(retry["properties"]["until"]["minItems"], 1);
+        assert_eq!(retry["properties"]["timeout_ms"]["minimum"], 1);
+        assert_eq!(retry["properties"]["interval_ms"]["minimum"], 1);
+        assert_eq!(
+            retry["properties"]["interval_ms"]["default"],
+            DEFAULT_RETRY_INTERVAL_MS
         );
     }
 

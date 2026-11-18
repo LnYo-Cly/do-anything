@@ -53,6 +53,20 @@ pub struct Observation {
     pub args_location: Location,
 }
 
+/// Default polling pause between failed `retry` attempts, in milliseconds.
+pub const DEFAULT_RETRY_INTERVAL_MS: u64 = 250;
+
+/// Polling policy for a read-only step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryPolicy {
+    /// Assertions polled on every attempt until all pass.
+    pub until: Vec<Expectation>,
+    /// Maximum total time budget for polling, in milliseconds.
+    pub timeout_ms: u64,
+    /// Wait between failed attempts, in milliseconds. Defaults to 250.
+    pub interval_ms: u64,
+}
+
 /// One step of a case.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
@@ -67,6 +81,8 @@ pub struct Step {
     /// or input error still stops the case. Only a step that is not optional may
     /// `save`, because a skipped step would leave the variable undefined.
     pub optional: bool,
+    /// Optional polling policy for read-only steps.
+    pub retry: Option<RetryPolicy>,
     /// Assertions evaluated against the step result.
     pub expect: Vec<Expectation>,
     /// Values copied out of the step result into case variables.
@@ -76,6 +92,8 @@ pub struct Step {
     pub location: Location,
     /// Where the step's arguments start. An argument error points here.
     pub args_location: Location,
+    /// Where `retry` is written, if present. A `check_retry` error points here.
+    pub retry_location: Location,
     /// Where every string of `args` is written, by JSON pointer. A reference
     /// that does not expand points at the value that holds it.
     pub arg_locations: Vec<(String, Location)>,
@@ -377,11 +395,14 @@ impl<'de> Deserialize<'de> for RawObservation {
 /// name.
 #[derive(Debug)]
 struct RawStep {
-    /// Keys other than `optional`, `expect` and `save`, each with the location
-    /// of the key and of its value. A valid step has exactly one: the step name.
+    /// Keys other than `optional`, `retry`, `expect` and `save`, each with the
+    /// location of the key and of its value. A valid step has exactly one: the
+    /// step name.
     fields: Vec<(String, Location, Spanned<RawArgs>)>,
     /// The `optional` value, if the step has one.
     optional: Option<Spanned<Value>>,
+    /// The `retry` value, if the step has one, with the location of the key.
+    retry: Option<(Location, Spanned<RawRetry>)>,
     /// The `expect` value, if the step has one.
     expect: Option<Spanned<RawNodes>>,
     /// The `save` value, if the step has one, with the location of the key.
@@ -409,18 +430,21 @@ impl<'de> Deserialize<'de> for RawStep {
             {
                 let mut fields = Vec::new();
                 let mut optional = None;
+                let mut retry = None;
                 let mut expect = None;
                 let mut save = None;
                 // The step name is chosen by the case, so the value type of each
                 // key is decided here rather than by a struct: `optional`,
-                // `expect` and `save` must keep the location of the node they
-                // hold. The keys keep their own location, because an
+                // `retry`, `expect` and `save` must keep the location of the
+                // node they hold. The keys keep their own location, because an
                 // unregistered step has to point at its name even when it is
                 // not the first entry of the mapping.
                 while let Some(key) = map.next_key::<Spanned<String>>()? {
                     let name = key.value;
                     if name == "optional" {
                         optional = Some(map.next_value()?);
+                    } else if name == "retry" {
+                        retry = Some((key.referenced, map.next_value()?));
                     } else if name == "expect" {
                         expect = Some(map.next_value()?);
                     } else if name == "save" {
@@ -432,6 +456,7 @@ impl<'de> Deserialize<'de> for RawStep {
                 Ok(RawStep {
                     fields,
                     optional,
+                    retry,
                     expect,
                     save,
                 })
@@ -439,6 +464,107 @@ impl<'de> Deserialize<'de> for RawStep {
         }
 
         deserializer.deserialize_map(StepVisitor)
+    }
+}
+
+/// A raw `retry` block, keeping the location of every field inside it.
+#[derive(Debug)]
+struct RawRetryMap {
+    until: Option<Spanned<RawNodes>>,
+    timeout_ms: Option<Spanned<Value>>,
+    interval_ms: Option<Spanned<Value>>,
+    unknown: Vec<(String, Location)>,
+}
+
+/// A raw `retry` value before structural validation.
+#[derive(Debug)]
+enum RawRetry {
+    Map(Box<RawRetryMap>),
+    Other(&'static str),
+}
+
+impl<'de> Deserialize<'de> for RawRetry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RetryVisitor;
+
+        impl<'de> Visitor<'de> for RetryVisitor {
+            type Value = RawRetry;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a retry mapping with `until` and `timeout_ms`")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<RawRetry, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut until = None;
+                let mut timeout_ms = None;
+                let mut interval_ms = None;
+                let mut unknown = Vec::new();
+                while let Some(key) = map.next_key::<Spanned<String>>()? {
+                    match key.value.as_str() {
+                        "until" => until = Some(map.next_value()?),
+                        "timeout_ms" => timeout_ms = Some(map.next_value()?),
+                        "interval_ms" => interval_ms = Some(map.next_value()?),
+                        other => {
+                            let _: Value = map.next_value()?;
+                            unknown.push((other.to_string(), key.referenced));
+                        }
+                    }
+                }
+                Ok(RawRetry::Map(Box::new(RawRetryMap {
+                    until,
+                    timeout_ms,
+                    interval_ms,
+                    unknown,
+                })))
+            }
+
+            fn visit_seq<A>(self, _: A) -> Result<RawRetry, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Ok(RawRetry::Other("a list"))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("a boolean"))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("a number"))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("a number"))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("a number"))
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("a string"))
+            }
+
+            fn visit_string<E>(self, _: String) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("a string"))
+            }
+
+            fn visit_unit<E>(self) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("null"))
+            }
+
+            fn visit_none<E>(self) -> Result<RawRetry, E> {
+                Ok(RawRetry::Other("null"))
+            }
+        }
+
+        deserializer.deserialize_any(RetryVisitor)
     }
 }
 
@@ -981,6 +1107,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
     let RawStep {
         mut fields,
         optional,
+        retry,
         expect,
         save,
     } = step.value;
@@ -1045,26 +1172,17 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
     let mut arg_locations = Vec::new();
     let args = args.value.into_json("", args_location, &mut arg_locations);
 
+    let (retry, retry_location) = match retry {
+        None => (None, Location::UNKNOWN),
+        Some((retry_location, node)) => (
+            Some(parse_retry(index, retry_location, node)?),
+            retry_location,
+        ),
+    };
+
     let expect = match expect {
         None => Vec::new(),
-        Some(node) => match node.value {
-            RawNodes::List(items) => {
-                let mut expectations = Vec::with_capacity(items.len());
-                for (position, item) in items.iter().enumerate() {
-                    expectations.push(parse_expectation(index, position + 1, item)?);
-                }
-                expectations
-            }
-            other => {
-                return Err(Problem {
-                    location: node.referenced,
-                    message: format!(
-                        "step {index}: `expect` must be a list of assertions, found {}",
-                        other.kind()
-                    ),
-                });
-            }
-        },
+        Some(node) => parse_expectation_list(index, "`expect`", node)?,
     };
 
     let save_location = save.as_ref().map(|(location, _)| *location);
@@ -1121,12 +1239,119 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
         action,
         args,
         optional,
+        retry,
         expect,
         save,
         location: name_location,
         args_location,
+        retry_location,
         arg_locations,
     })
+}
+
+fn parse_expectation_list(
+    step: usize,
+    field: &str,
+    node: Spanned<RawNodes>,
+) -> Result<Vec<Expectation>, Problem> {
+    match node.value {
+        RawNodes::List(items) => {
+            let mut expectations = Vec::with_capacity(items.len());
+            for (position, item) in items.iter().enumerate() {
+                expectations.push(parse_expectation(step, position + 1, item)?);
+            }
+            Ok(expectations)
+        }
+        other => Err(Problem {
+            location: node.referenced,
+            message: format!(
+                "step {step}: {field} must be a list of assertions, found {}",
+                other.kind()
+            ),
+        }),
+    }
+}
+
+fn parse_retry(
+    step: usize,
+    key_location: Location,
+    node: Spanned<RawRetry>,
+) -> Result<RetryPolicy, Problem> {
+    let (until, timeout_ms, interval_ms, unknown) = match node.value {
+        RawRetry::Map(map) => (map.until, map.timeout_ms, map.interval_ms, map.unknown),
+        RawRetry::Other(kind) => {
+            return Err(Problem {
+                location: node.referenced,
+                message: format!(
+                    "step {step}: `retry` must be a mapping with `until` and `timeout_ms`, found {kind}"
+                ),
+            });
+        }
+    };
+
+    if let Some((field, location)) = unknown.into_iter().next() {
+        return Err(Problem {
+            location,
+            message: format!(
+                "step {step}: unknown field `{field}` in `retry`; expected `until`, `timeout_ms` or `interval_ms`"
+            ),
+        });
+    }
+
+    let until_node = until.ok_or_else(|| Problem {
+        location: key_location,
+        message: format!("step {step}: `retry` requires `until`"),
+    })?;
+    let until_location = until_node.referenced;
+    let until = parse_expectation_list(step, "`retry.until`", until_node)?;
+    if until.is_empty() {
+        return Err(Problem {
+            location: until_location,
+            message: format!("step {step}: `retry.until` must contain at least one assertion"),
+        });
+    }
+
+    let timeout_node = timeout_ms.ok_or_else(|| Problem {
+        location: key_location,
+        message: format!("step {step}: `retry` requires `timeout_ms`"),
+    })?;
+    let timeout_ms = parse_positive_ms(step, "timeout_ms", timeout_node)?;
+
+    let interval_ms = match interval_ms {
+        None => DEFAULT_RETRY_INTERVAL_MS,
+        Some(node) => parse_positive_ms(step, "interval_ms", node)?,
+    };
+
+    Ok(RetryPolicy {
+        until,
+        timeout_ms,
+        interval_ms,
+    })
+}
+
+fn parse_positive_ms(step: usize, field: &str, node: Spanned<Value>) -> Result<u64, Problem> {
+    match node.value {
+        Value::Number(number) => match number.as_u64() {
+            Some(0) => Err(Problem {
+                location: node.referenced,
+                message: format!("step {step}: `retry.{field}` must be at least 1"),
+            }),
+            Some(ms) => Ok(ms),
+            None => Err(Problem {
+                location: node.referenced,
+                message: format!(
+                    "step {step}: `retry.{field}` must be a positive integer, found {number}"
+                ),
+            }),
+        },
+        other => Err(Problem {
+            location: node.referenced,
+            message: format!(
+                "step {step}: `retry.{field}` must be a positive integer, found {}",
+                kind_name(&other)
+            ),
+        }),
+    }
 }
 
 const COMPARISONS: [&str; 4] = ["equals", "not_equals", "contains", "exists"];
@@ -2064,7 +2289,79 @@ steps:
                 15,
                 "`optional` must be true or false",
             ),
+            (
+                step_with("    retry: 3\n"),
+                5,
+                12,
+                "`retry` must be a mapping",
+            ),
+            (
+                step_with("    retry:\n      until: []\n      timeout_ms: 100\n"),
+                6,
+                14,
+                "`retry.until` must contain at least one assertion",
+            ),
+            (
+                step_with(
+                    "    retry:\n      until:\n        - path: $.a\n          equals: 1\n      timeout_ms: 0\n",
+                ),
+                9,
+                19,
+                "`retry.timeout_ms` must be at least 1",
+            ),
+            (
+                step_with(
+                    "    retry:\n      until:\n        - path: $.a\n          equals: 1\n      timeout_ms: 100\n      interval_ms: 0\n",
+                ),
+                10,
+                20,
+                "`retry.interval_ms` must be at least 1",
+            ),
+            (
+                step_with(
+                    "    retry:\n      until:\n        - path: $.a\n          equals: 1\n      timeout_ms: 100\n      extra: 1\n",
+                ),
+                10,
+                7,
+                "unknown field `extra` in `retry`",
+            ),
         ]
+    }
+
+    #[test]
+    fn parses_retry_with_default_and_explicit_interval() {
+        let case = parse(
+            "name: Retry\nsteps:\n  - sample.call:\n      target: local\n    retry:\n      until:\n        - path: $.ready\n          equals: true\n      timeout_ms: 1500\n  - sample.call:\n      target: local\n    retry:\n      until:\n        - path: $.ok\n          exists: true\n      timeout_ms: 500\n      interval_ms: 50\n",
+        )
+        .expect("retry must parse");
+
+        let first = case.steps[0].retry.as_ref().expect("first retry");
+        assert_eq!(first.until.len(), 1);
+        assert_eq!(first.timeout_ms, 1500);
+        assert_eq!(first.interval_ms, DEFAULT_RETRY_INTERVAL_MS);
+
+        let second = case.steps[1].retry.as_ref().expect("second retry");
+        assert_eq!(second.timeout_ms, 500);
+        assert_eq!(second.interval_ms, 50);
+    }
+
+    #[test]
+    fn rejects_retry_without_until_or_timeout_ms() {
+        let missing_until = parse(&step_with("    retry:\n      timeout_ms: 100\n"))
+            .expect_err("missing until must be rejected");
+        assert!(
+            missing_until.contains("`retry` requires `until`"),
+            "got: {missing_until}"
+        );
+
+        let missing_timeout = parse(&step_with(
+            "    retry:\n      until:\n        - path: $.a\n          equals: 1\n",
+        ))
+        .expect_err("missing timeout_ms must be rejected");
+        assert!(
+            missing_timeout.contains("`retry` requires `timeout_ms`"),
+            "got: {missing_timeout}"
+        );
     }
 
     #[test]
