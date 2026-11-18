@@ -1171,6 +1171,119 @@ fn stale_ref_snapshot_scoping_truncation_and_concurrent_browser_step() {
 }
 
 #[test]
+fn session_step_dismisses_unhandled_dialog_and_stays_usable() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let server = PageServer::start(BTreeMap::from([(
+        "/dialog".to_string(),
+        r#"<!doctype html>
+<html>
+<head><title>Dialog page</title></head>
+<body>
+  <h1>Dialog page</h1>
+  <button data-testid="alert-button" onclick="alert('session dialog')">Show alert</button>
+  <p id="status">ready</p>
+</body>
+</html>"#
+            .to_string(),
+    )]));
+    let dir = TempDir::new("browser-session-dialog");
+
+    let started = json_stdout(&run_da_in(dir.path(), &["session", "start"]));
+    let id = started["session_id"].as_str().unwrap().to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/dialog")),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{:?}", open);
+    let open_json = json_stdout(&open);
+    let tree = open_json["snapshot"]["tree"].as_array().unwrap();
+    let button_ref = find_ref_by_role_and_name(tree, "button", "Show alert")
+        .expect("alert button ref must exist");
+    let heading_ref =
+        find_ref_by_role_and_name(tree, "heading", "Dialog page").expect("heading ref must exist");
+
+    // An unhandled dialog fails the step fast instead of waiting for the timeout.
+    let click = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.click",
+            "--arg",
+            &format!("ref={button_ref}"),
+        ],
+    );
+    assert_ne!(click.status.code(), Some(0), "dialog must fail the step");
+    let click_json = json_stdout(&click);
+    let message = click_json["step"]["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("alert") && message.contains("session dialog"),
+        "step error must name the dialog type and message: {click_json}"
+    );
+
+    // The browser is still usable: a fresh snapshot and a ref read both work.
+    let snapshot = run_da_in(dir.path(), &["session", "snapshot", &id]);
+    assert_eq!(snapshot.status.code(), Some(0), "{:?}", snapshot);
+    let snapshot_json = json_stdout(&snapshot);
+    assert!(
+        snapshot_json["snapshot"]["tree"]
+            .as_array()
+            .is_some_and(|tree| !tree.is_empty()),
+        "snapshot after a dismissed dialog must still return elements: {snapshot_json}"
+    );
+    let read = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.read",
+            "--arg",
+            &format!("ref={heading_ref}"),
+        ],
+    );
+    assert_eq!(read.status.code(), Some(0), "{:?}", read);
+    assert_eq!(json_stdout(&read)["step"]["result"]["text"], "Dialog page");
+
+    // Export keeps the successful steps and reports the failed one.
+    let exported = run_da_in(dir.path(), &["session", "export", &id]);
+    assert_eq!(exported.status.code(), Some(0), "{:?}", exported);
+    let export_json = json_stdout(&exported);
+    let skipped = export_json["skipped_steps"].as_array().unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|step| step["action"].as_str() == Some("browser.click")),
+        "the failed click must be listed in skipped_steps: {export_json}"
+    );
+    let yaml = export_json["yaml"].as_str().unwrap_or_default();
+    assert!(
+        !yaml.contains("alert-button") && !yaml.contains("Show alert"),
+        "the failed dialog step must not be exported: {yaml}"
+    );
+
+    assert_eq!(
+        run_da_in(dir.path(), &["session", "stop", &id])
+            .status
+            .code(),
+        Some(0)
+    );
+}
+
+#[test]
 fn stop_kills_live_chrome_even_when_debug_port_handle_is_closed() {
     let Some(_guard) = chrome_guard() else {
         return;
