@@ -39,7 +39,7 @@ use self::cdp::{
 use self::connect::Endpoint;
 use self::launch::Launched;
 use crate::core::paths;
-use crate::core::registry::{Registry, StepDefinition, StepError};
+use crate::core::registry::{Registry, StepDefinition, StepError, allow_retry, disallow_retry};
 use crate::core::session::{Evidence, Session, Sessions};
 
 /// Session kind the browser steps share.
@@ -78,12 +78,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
             validate_wait,
             run_wait,
         )?,
-        locator_step::<ReadArgs>(
-            STEP_NAMES[5],
-            "Returns the `text` of the element the locator names, plus its `value` when `attribute` is given.",
-            validate_read,
-            run_read,
-        )?,
+        read_step()?,
         screenshot_step()?,
     ] {
         registry.register(definition)?;
@@ -157,6 +152,18 @@ fn press_step() -> Result<StepDefinition, String> {
     Ok(definition)
 }
 
+/// Builds `browser.read`, which is read-only and allows `retry`.
+fn read_step() -> Result<StepDefinition, String> {
+    let mut definition = locator_step::<ReadArgs>(
+        STEP_NAMES[5],
+        "Returns the `text` of the element the locator names, plus its `value` when `attribute` is given.",
+        validate_read,
+        run_read,
+    )?;
+    definition.check_retry = allow_retry;
+    Ok(definition)
+}
+
 /// Builds `browser.screenshot`, which takes only the output path.
 fn screenshot_step() -> Result<StepDefinition, String> {
     step::<ScreenshotArgs>(
@@ -181,6 +188,7 @@ fn step<T: JsonSchema>(
         description,
         args_schema,
         validate,
+        check_retry: disallow_retry,
         run,
     })
 }
@@ -209,6 +217,7 @@ fn wait_step(
     run: fn(&Value, &mut Sessions) -> Result<Value, StepError>,
 ) -> Result<StepDefinition, String> {
     let mut definition = step::<WaitArgs>(name, description, validate, run)?;
+    definition.check_retry = allow_retry;
     apply_locator_schema(&mut definition.args_schema, name);
     string_property(&mut definition.args_schema, "url_contains");
     apply_dialog_schema(&mut definition.args_schema);
@@ -4012,6 +4021,30 @@ mod tests {
     }
 
     #[test]
+    fn only_read_and_wait_allow_retry() {
+        for name in ["browser.read", "browser.wait"] {
+            let def = definition(name);
+            assert!(
+                (def.check_retry)(&json!({})).is_ok(),
+                "`{name}` must allow retry"
+            );
+        }
+        for name in [
+            "browser.open",
+            "browser.click",
+            "browser.type",
+            "browser.press",
+            "browser.screenshot",
+        ] {
+            let def = definition(name);
+            let error = (def.check_retry)(&json!({}))
+                .err()
+                .unwrap_or_else(|| panic!("`{name}` must reject retry"));
+            assert!(error.contains("cannot use `retry`"), "{name}: {error}");
+        }
+    }
+
+    #[test]
     fn open_defaults_and_bounds_are_in_the_schema_and_in_validate() {
         let definition = definition("browser.open");
         assert_eq!(
@@ -5976,6 +6009,697 @@ mod tests {
                 message: String::new(),
                 accepted: false,
             })
+        );
+    }
+
+    type MockSocket = tungstenite::WebSocket<std::net::TcpStream>;
+
+    fn send_mock_reply(socket: &mut MockSocket, id: &Value, result: Value) {
+        socket
+            .send(tungstenite::Message::text(
+                json!({ "id": id, "result": result }).to_string(),
+            ))
+            .expect("send mock CDP reply");
+    }
+
+    fn send_mock_dialog(socket: &mut MockSocket, dialog_type: &str, message: &str) {
+        socket
+            .send(tungstenite::Message::text(
+                json!({
+                    "sessionId": "session-1",
+                    "method": "Page.javascriptDialogOpening",
+                    "params": { "type": dialog_type, "message": message }
+                })
+                .to_string(),
+            ))
+            .expect("send mock dialog opening");
+    }
+
+    fn mock_open_handshake(socket: &mut MockSocket, on_navigate: impl FnOnce(&mut MockSocket)) {
+        let create = read_cdp_request(socket);
+        assert_eq!(create["method"], "Target.createTarget");
+        send_mock_reply(socket, &create["id"], json!({ "targetId": "target-1" }));
+
+        let attach_cmd = read_cdp_request(socket);
+        assert_eq!(attach_cmd["method"], "Target.attachToTarget");
+        send_mock_reply(
+            socket,
+            &attach_cmd["id"],
+            json!({ "sessionId": "session-1" }),
+        );
+
+        for expected in ["Page.enable", "Runtime.enable", "Network.enable"] {
+            let cmd = read_cdp_request(socket);
+            assert_eq!(cmd["method"], expected);
+            send_mock_reply(socket, &cmd["id"], json!({}));
+        }
+
+        let nav = read_cdp_request(socket);
+        assert_eq!(nav["method"], "Page.navigate");
+        on_navigate(socket);
+        socket
+            .send(tungstenite::Message::text(
+                json!({ "sessionId": "session-1", "method": "Page.loadEventFired" }).to_string(),
+            ))
+            .expect("send loadEventFired");
+        send_mock_reply(socket, &nav["id"], json!({ "loaderId": "loader-1" }));
+
+        for expected_val in [
+            "http://127.0.0.1/app",
+            "complete",
+            "http://127.0.0.1/app",
+            "App",
+        ] {
+            let req = read_cdp_request(socket);
+            assert_eq!(req["method"], "Runtime.evaluate");
+            send_mock_reply(
+                socket,
+                &req["id"],
+                json!({ "result": { "value": expected_val } }),
+            );
+        }
+    }
+
+    fn mock_close_loop(socket: &mut MockSocket) {
+        loop {
+            match socket.read() {
+                Ok(tungstenite::Message::Text(frame)) => {
+                    let cmd: Value = serde_json::from_str(frame.as_str())
+                        .expect("mock CDP command must be JSON");
+                    if cmd["method"] == "Target.closeTarget" {
+                        send_mock_reply(socket, &cmd["id"], json!({ "success": true }));
+                        break;
+                    }
+                }
+                Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    fn run_mock_browser_retry_case(
+        name: &str,
+        observe: Vec<crate::core::case::Observation>,
+        second_step: crate::core::case::Step,
+        cdp_handler: impl FnOnce(MockSocket) + Send + 'static,
+    ) -> crate::core::report::RunReport {
+        use std::collections::BTreeMap;
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        use crate::core::case::{Case, LoadedCase, Step};
+        use crate::core::events::EventBus;
+        use crate::core::filter::Filters;
+        use crate::core::report::RunOutcome;
+        use crate::core::runner;
+        use crate::core::secrets::Secrets;
+        use serde_saphyr::Location;
+
+        let (ws_url, cdp_server) = spawn_mock_cdp(cdp_handler);
+        let http_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock /json/version");
+        let http_port = http_listener.local_addr().expect("http port").port();
+        let http_server = thread::spawn(move || {
+            let (mut stream, _) = http_listener.accept().expect("accept /json/version");
+            let mut buf = [0_u8; 512];
+            let _ = stream.read(&mut buf);
+            let body = json!({ "webSocketDebuggerUrl": ws_url }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write /json/version response");
+        });
+
+        let mut reg = Registry::new();
+        register(&mut reg).expect("browser module must register");
+
+        let case = Case {
+            name: name.to_string(),
+            vars: BTreeMap::new(),
+            project: None,
+            suite: None,
+            layer: None,
+            tags: Vec::new(),
+            observe,
+            steps: vec![
+                Step {
+                    action: "browser.open".to_string(),
+                    args: json!({
+                        "connect": format!("http://127.0.0.1:{http_port}"),
+                        "url": "http://127.0.0.1/app",
+                    }),
+                    optional: false,
+                    retry: None,
+                    expect: Vec::new(),
+                    save: Vec::new(),
+                    location: Location::UNKNOWN,
+                    args_location: Location::UNKNOWN,
+                    retry_location: Location::UNKNOWN,
+                    arg_locations: Vec::new(),
+                },
+                second_step,
+            ],
+        };
+
+        let outcome = runner::run(
+            &[LoadedCase {
+                path: "mock-browser-retry.yaml".into(),
+                case,
+            }],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        http_server
+            .join()
+            .expect("mock /json/version server must finish");
+        cdp_server.join().expect("mock CDP server must finish");
+
+        let RunOutcome::Completed(report) = outcome else {
+            panic!("expected completed run, got {outcome:?}");
+        };
+        report
+    }
+
+    fn mock_read_step(
+        timeout_ms: u64,
+        retry: crate::core::case::RetryPolicy,
+    ) -> crate::core::case::Step {
+        use serde_saphyr::Location;
+        crate::core::case::Step {
+            action: "browser.read".to_string(),
+            args: json!({ "css": "#status", "timeout_ms": timeout_ms }),
+            optional: false,
+            retry: Some(retry),
+            expect: Vec::new(),
+            save: Vec::new(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        }
+    }
+
+    fn mock_wait_step(
+        dialog: Option<Value>,
+        timeout_ms: u64,
+        retry: crate::core::case::RetryPolicy,
+    ) -> crate::core::case::Step {
+        use serde_saphyr::Location;
+        let mut args = json!({ "css": "#status", "timeout_ms": timeout_ms });
+        if let Some(dialog) = dialog {
+            args["dialog"] = dialog;
+        }
+        crate::core::case::Step {
+            action: "browser.wait".to_string(),
+            args,
+            optional: false,
+            retry: Some(retry),
+            expect: Vec::new(),
+            save: Vec::new(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn retry_with_browser_network_discards_failed_attempt_requests() {
+        use crate::core::case::{Expectation, Matcher, Observation, RetryPolicy};
+        use crate::core::report::CaseStatus;
+        use serde_saphyr::Location;
+
+        let send_request = |socket: &mut MockSocket, request_id: &str, url: &str, status: i64| {
+            for payload in [
+                json!({
+                    "sessionId": "session-1",
+                    "method": "Network.requestWillBeSent",
+                    "params": {
+                        "requestId": request_id,
+                        "type": "Fetch",
+                        "request": { "method": "GET", "url": url }
+                    }
+                }),
+                json!({
+                    "sessionId": "session-1",
+                    "method": "Network.responseReceived",
+                    "params": {
+                        "requestId": request_id,
+                        "type": "Fetch",
+                        "response": { "url": url, "status": status }
+                    }
+                }),
+                json!({
+                    "sessionId": "session-1",
+                    "method": "Network.loadingFinished",
+                    "params": { "requestId": request_id }
+                }),
+            ] {
+                socket
+                    .send(tungstenite::Message::text(payload.to_string()))
+                    .expect("send mock network event");
+            }
+        };
+
+        let mut step = mock_read_step(
+            20,
+            RetryPolicy {
+                until: vec![Expectation {
+                    path: "$.text".to_string(),
+                    matcher: Matcher::Equals(json!("ready")),
+                }],
+                timeout_ms: 3000,
+                interval_ms: 10,
+            },
+        );
+        step.expect = vec![Expectation {
+            path: "$.observed.net.requests".to_string(),
+            matcher: Matcher::Equals(json!([{
+                "method": "GET",
+                "url": "http://127.0.0.1/attempt3-ok",
+                "status": 200,
+                "type": "Fetch",
+                "failed": null
+            }])),
+        }];
+
+        let report = run_mock_browser_retry_case(
+            "browser network retry isolation",
+            vec![Observation {
+                name: "net".to_string(),
+                kind: network::OBSERVER_NAME.to_string(),
+                args: json!({}),
+                location: Location::UNKNOWN,
+                args_location: Location::UNKNOWN,
+            }],
+            step,
+            move |mut socket| {
+                mock_open_handshake(&mut socket, |sock| {
+                    send_request(sock, "req-doc", "http://127.0.0.1/app", 200);
+                });
+
+                // attempt 1: Execution (ambiguous)
+                let attempt1 = read_cdp_request(&mut socket);
+                assert_eq!(attempt1["method"], "Runtime.evaluate");
+                send_request(
+                    &mut socket,
+                    "req-exec",
+                    "http://127.0.0.1/attempt1-exec",
+                    500,
+                );
+                send_mock_reply(
+                    &mut socket,
+                    &attempt1["id"],
+                    json!({
+                        "result": {
+                            "type": "string",
+                            "value": serde_json::to_string(&json!({
+                                "status": "ambiguous",
+                                "count": 2,
+                                "candidates": []
+                            })).expect("serialize status")
+                        }
+                    }),
+                );
+
+                // attempt 2: Timeout
+                let attempt2_loc = read_cdp_request(&mut socket);
+                assert_eq!(attempt2_loc["method"], "Runtime.evaluate");
+                send_request(
+                    &mut socket,
+                    "req-timeout",
+                    "http://127.0.0.1/attempt2-timeout",
+                    504,
+                );
+                thread::sleep(Duration::from_millis(30));
+                send_mock_reply(
+                    &mut socket,
+                    &attempt2_loc["id"],
+                    json!({
+                        "result": {
+                            "type": "string",
+                            "value": serde_json::to_string(&json!({
+                                "status": "missing",
+                                "hidden_found": false
+                            })).expect("serialize missing status")
+                        }
+                    }),
+                );
+
+                // attempt 3: succeeds
+                let attempt3_loc = read_cdp_request(&mut socket);
+                assert_eq!(attempt3_loc["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt3_loc["id"],
+                    json!({ "result": { "objectId": "elem-3" } }),
+                );
+                let attempt3_vis = read_cdp_request(&mut socket);
+                assert_eq!(attempt3_vis["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt3_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let attempt3_text = read_cdp_request(&mut socket);
+                assert_eq!(attempt3_text["method"], "Runtime.callFunctionOn");
+                send_request(&mut socket, "req-ok", "http://127.0.0.1/attempt3-ok", 200);
+                send_mock_reply(
+                    &mut socket,
+                    &attempt3_text["id"],
+                    json!({ "result": { "value": "ready" } }),
+                );
+
+                mock_close_loop(&mut socket);
+            },
+        );
+        assert_eq!(
+            report.cases[0].status,
+            CaseStatus::Passed,
+            "stale failed-attempt network requests leaked into final observation: {report:?}"
+        );
+        let net = &report.cases[0].steps[1]
+            .result
+            .as_ref()
+            .expect("browser.read result must exist")["observed"]["net"];
+        assert_eq!(
+            net["requests"],
+            json!([{
+                "method": "GET",
+                "url": "http://127.0.0.1/attempt3-ok",
+                "status": 200,
+                "type": "Fetch",
+                "failed": null
+            }]),
+            "only attempt 3's request may appear in observed.net: {net}"
+        );
+    }
+
+    #[test]
+    fn retry_browser_read_fails_fast_on_unexpected_dialog_and_recovers() {
+        use crate::core::case::{Expectation, Matcher, RetryPolicy};
+        use crate::core::report::CaseStatus;
+
+        let started = std::time::Instant::now();
+        let report = run_mock_browser_retry_case(
+            "read retry dialog recovery",
+            Vec::new(),
+            mock_read_step(
+                5000,
+                RetryPolicy {
+                    until: vec![Expectation {
+                        path: "$.text".to_string(),
+                        matcher: Matcher::Equals(json!("ready")),
+                    }],
+                    timeout_ms: 2000,
+                    interval_ms: 10,
+                },
+            ),
+            |mut socket| {
+                mock_open_handshake(&mut socket, |_| {});
+
+                // Attempt 1: unexpected alert opens -> driver must dismiss (accept: false) and fail fast
+                let attempt1 = read_cdp_request(&mut socket);
+                assert_eq!(attempt1["method"], "Runtime.evaluate");
+                send_mock_dialog(&mut socket, "alert", "transient");
+                let handle = read_cdp_request(&mut socket);
+                assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+                assert_eq!(handle["params"]["accept"], false);
+                send_mock_reply(&mut socket, &handle["id"], json!({}));
+                // Send late reply for the abandoned Runtime.evaluate so `ignored_reply_ids` is exercised.
+                send_mock_reply(
+                    &mut socket,
+                    &attempt1["id"],
+                    json!({ "result": { "value": null } }),
+                );
+
+                // Attempt 2: element resolves and reads "ready"
+                let attempt2_loc = read_cdp_request(&mut socket);
+                assert_eq!(attempt2_loc["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt2_loc["id"],
+                    json!({ "result": { "objectId": "elem-2" } }),
+                );
+                let attempt2_vis = read_cdp_request(&mut socket);
+                assert_eq!(attempt2_vis["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt2_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let attempt2_text = read_cdp_request(&mut socket);
+                assert_eq!(attempt2_text["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt2_text["id"],
+                    json!({ "result": { "value": "ready" } }),
+                );
+
+                mock_close_loop(&mut socket);
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "unexpected dialog must fail fast instead of waiting step timeout_ms"
+        );
+        assert_eq!(report.cases[0].status, CaseStatus::Passed, "{report:?}");
+        assert_eq!(
+            report.cases[0].steps[1].result,
+            Some(json!({ "text": "ready" }))
+        );
+    }
+
+    #[test]
+    fn retry_browser_read_expires_fast_reporting_unexpected_dialog_error() {
+        use crate::core::case::{Expectation, Matcher, RetryPolicy};
+        use crate::core::report::{CaseStatus, ProblemKind, StepStatus};
+
+        let started = std::time::Instant::now();
+        let report = run_mock_browser_retry_case(
+            "read retry dialog expiry",
+            Vec::new(),
+            mock_read_step(
+                5000,
+                RetryPolicy {
+                    until: vec![Expectation {
+                        path: "$.text".to_string(),
+                        matcher: Matcher::Equals(json!("ready")),
+                    }],
+                    timeout_ms: 80,
+                    interval_ms: 10,
+                },
+            ),
+            |mut socket| {
+                mock_open_handshake(&mut socket, |_| {});
+                loop {
+                    let cmd = match socket.read() {
+                        Ok(tungstenite::Message::Text(frame)) => {
+                            serde_json::from_str::<Value>(frame.as_str()).expect("valid JSON")
+                        }
+                        Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                        Ok(_) => continue,
+                    };
+                    match cmd["method"].as_str() {
+                        Some("Runtime.evaluate") => {
+                            send_mock_dialog(&mut socket, "confirm", "still blocked");
+                            let handle = read_cdp_request(&mut socket);
+                            assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+                            assert_eq!(handle["params"]["accept"], false);
+                            send_mock_reply(&mut socket, &handle["id"], json!({}));
+                            send_mock_reply(
+                                &mut socket,
+                                &cmd["id"],
+                                json!({ "result": { "value": null } }),
+                            );
+                        }
+                        Some("Target.closeTarget") => {
+                            send_mock_reply(&mut socket, &cmd["id"], json!({ "success": true }));
+                            break;
+                        }
+                        other => panic!("unexpected CDP command: {other:?}"),
+                    }
+                }
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "retry expiry with unexpected dialogs must not wait 5000ms step timeout"
+        );
+        assert_eq!(report.cases[0].status, CaseStatus::Error, "{report:?}");
+        let step = &report.cases[0].steps[1];
+        assert_eq!(step.status, StepStatus::Error);
+        let err = step.error.as_ref().expect("step error must exist");
+        assert_eq!(err.kind, ProblemKind::Execution);
+        assert!(
+            err.message.contains("confirm") && err.message.contains("still blocked"),
+            "unexpected dialog detail missing from error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn retry_browser_wait_without_dialog_fails_fast_on_unexpected_dialog_and_recovers() {
+        use crate::core::case::{Expectation, Matcher, RetryPolicy};
+        use crate::core::report::CaseStatus;
+
+        let report = run_mock_browser_retry_case(
+            "wait retry without dialog",
+            Vec::new(),
+            mock_wait_step(
+                None,
+                5000,
+                RetryPolicy {
+                    until: vec![Expectation {
+                        path: "$.url".to_string(),
+                        matcher: Matcher::Equals(json!("http://127.0.0.1/ready")),
+                    }],
+                    timeout_ms: 2000,
+                    interval_ms: 10,
+                },
+            ),
+            |mut socket| {
+                mock_open_handshake(&mut socket, |_| {});
+
+                // Attempt 1: unexpected alert during wait
+                let attempt1 = read_cdp_request(&mut socket);
+                assert_eq!(attempt1["method"], "Runtime.evaluate");
+                send_mock_dialog(&mut socket, "alert", "wait-alert");
+                let handle = read_cdp_request(&mut socket);
+                assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+                assert_eq!(handle["params"]["accept"], false);
+                send_mock_reply(&mut socket, &handle["id"], json!({}));
+
+                // Attempt 2: locates element and reads location.href
+                let attempt2_loc = read_cdp_request(&mut socket);
+                assert_eq!(attempt2_loc["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt2_loc["id"],
+                    json!({ "result": { "objectId": "elem-2" } }),
+                );
+                let attempt2_vis = read_cdp_request(&mut socket);
+                assert_eq!(attempt2_vis["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt2_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let attempt2_href = read_cdp_request(&mut socket);
+                assert_eq!(attempt2_href["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &attempt2_href["id"],
+                    json!({ "result": { "value": "http://127.0.0.1/ready" } }),
+                );
+
+                mock_close_loop(&mut socket);
+            },
+        );
+        assert_eq!(report.cases[0].status, CaseStatus::Passed, "{report:?}");
+        assert_eq!(
+            report.cases[0].steps[1].result,
+            Some(json!({ "url": "http://127.0.0.1/ready" }))
+        );
+    }
+
+    #[test]
+    fn retry_browser_wait_with_dialog_handles_delayed_dialog_for_until() {
+        use crate::core::case::{Expectation, Matcher, RetryPolicy};
+        use crate::core::report::CaseStatus;
+
+        let report = run_mock_browser_retry_case(
+            "wait retry with dialog",
+            Vec::new(),
+            mock_wait_step(
+                Some(json!({ "action": "accept", "prompt_text": "ok-token" })),
+                200,
+                RetryPolicy {
+                    until: vec![
+                        Expectation {
+                            path: "$.dialog.type".to_string(),
+                            matcher: Matcher::Equals(json!("prompt")),
+                        },
+                        Expectation {
+                            path: "$.dialog.accepted".to_string(),
+                            matcher: Matcher::Equals(json!(true)),
+                        },
+                    ],
+                    timeout_ms: 2000,
+                    interval_ms: 10,
+                },
+            ),
+            |mut socket| {
+                mock_open_handshake(&mut socket, |_| {});
+
+                // Attempt 1: element exists before dialog arrives -> returns without `dialog`
+                let a1_loc = read_cdp_request(&mut socket);
+                send_mock_reply(
+                    &mut socket,
+                    &a1_loc["id"],
+                    json!({ "result": { "objectId": "elem-1" } }),
+                );
+                let a1_vis = read_cdp_request(&mut socket);
+                send_mock_reply(
+                    &mut socket,
+                    &a1_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let a1_href = read_cdp_request(&mut socket);
+                send_mock_reply(
+                    &mut socket,
+                    &a1_href["id"],
+                    json!({ "result": { "value": "http://127.0.0.1/app" } }),
+                );
+
+                // Attempt 2: prompt dialog opens while waiting -> accept with prompt_text
+                let a2_loc = read_cdp_request(&mut socket);
+                send_mock_dialog(&mut socket, "prompt", "enter");
+                let handle = read_cdp_request(&mut socket);
+                assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+                assert_eq!(handle["params"]["accept"], true);
+                assert_eq!(handle["params"]["promptText"], "ok-token");
+                send_mock_reply(&mut socket, &handle["id"], json!({}));
+                send_mock_reply(
+                    &mut socket,
+                    &a2_loc["id"],
+                    json!({ "result": { "objectId": "elem-2" } }),
+                );
+                let a2_vis = read_cdp_request(&mut socket);
+                send_mock_reply(
+                    &mut socket,
+                    &a2_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let a2_href = read_cdp_request(&mut socket);
+                send_mock_reply(
+                    &mut socket,
+                    &a2_href["id"],
+                    json!({ "result": { "value": "http://127.0.0.1/app" } }),
+                );
+
+                mock_close_loop(&mut socket);
+            },
+        );
+        assert_eq!(report.cases[0].status, CaseStatus::Passed, "{report:?}");
+        assert_eq!(
+            report.cases[0].steps[1].result,
+            Some(json!({
+                "url": "http://127.0.0.1/app",
+                "dialog": {
+                    "type": "prompt",
+                    "message": "enter",
+                    "accepted": true
+                }
+            }))
         );
     }
 }

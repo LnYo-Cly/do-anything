@@ -11,11 +11,11 @@ use serde_saphyr::Location;
 
 use crate::core::assert::{self, AssertionReport};
 use crate::core::bundle::FailureBundles;
-use crate::core::case::{self, CaseError, LoadedCase, Observation, SavedValue, Step};
+use crate::core::case::{self, CaseError, Expectation, LoadedCase, Observation, SavedValue, Step};
 use crate::core::events::{Event, EventBus};
 use crate::core::filter::{self, Filters};
 use crate::core::observer::{Observer, ObserverError};
-use crate::core::registry::{Registry, StepError};
+use crate::core::registry::{Registry, StepDefinition, StepError};
 use crate::core::report::{
     CaseReport, CaseStatus, Problem, ProblemKind, RunOutcome, RunReport, StepReport, StepStatus,
 };
@@ -308,6 +308,15 @@ pub fn preflight(
                             errors.push(positioned(
                                 loaded,
                                 step.args_location,
+                                format!("step {position}: `{}` {message}", step.action),
+                            ));
+                        }
+                        if step.retry.is_some()
+                            && let Err(message) = (definition.check_retry)(&args)
+                        {
+                            errors.push(positioned(
+                                loaded,
+                                step.retry_location,
                                 format!("step {position}: `{}` {message}", step.action),
                             ));
                         }
@@ -681,44 +690,114 @@ fn execute_step(
         message: error.message,
     })?;
 
+    let Some(policy) = &step.retry else {
+        let result = run_attempt(definition, &args, observations, sessions)?;
+        let assertions = evaluate_all(&step.expect, &result);
+        // A case that already failed an assertion is not allowed to change the
+        // variables that later steps would see.
+        if assertions.iter().all(|item| item.passed) {
+            save_values(&step.save, &result, vars)?;
+        }
+        return Ok((result, assertions));
+    };
+
+    if let Err(message) = (definition.check_retry)(&args) {
+        return Err(Problem {
+            kind: ProblemKind::InvalidInput,
+            message: format!("`{}` {message}", step.action),
+        });
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(policy.timeout_ms);
+    let interval = Duration::from_millis(policy.interval_ms);
+    loop {
+        match run_attempt(definition, &args, observations, sessions) {
+            Ok(result) => {
+                let until_assertions = evaluate_all(&policy.until, &result);
+                if until_assertions.iter().all(|item| item.passed) {
+                    let mut assertions = until_assertions;
+                    assertions.extend(evaluate_all(&step.expect, &result));
+                    if assertions.iter().all(|item| item.passed) {
+                        save_values(&step.save, &result, vars)?;
+                    }
+                    return Ok((result, assertions));
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok((result, until_assertions));
+                }
+                std::thread::sleep(interval.min(deadline.saturating_duration_since(now)));
+            }
+            Err(problem) => {
+                if matches!(problem.kind, ProblemKind::Execution | ProblemKind::Timeout) {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(problem);
+                    }
+                    std::thread::sleep(interval.min(deadline.saturating_duration_since(now)));
+                } else {
+                    return Err(problem);
+                }
+            }
+        }
+    }
+}
+
+fn run_attempt(
+    definition: &StepDefinition,
+    args: &Value,
+    observations: &mut [ObservationSlot],
+    sessions: &mut Sessions,
+) -> Result<Value, Problem> {
     // Every observation starts before the step, so what it reports is the
-    // change this one step made.
+    // change this one attempt made.
     for slot in observations.iter_mut() {
         slot.observer
             .start(sessions)
             .map_err(|error| observer_problem(slot, &error))?;
     }
 
-    let result = (definition.run)(&args, sessions).map_err(problem_from_step_error)?;
-
-    // Collection happens before the assertions are evaluated: an `expect` entry
-    // that names `$.observed.<name>` must see the values of this step.
-    let observed: Map<String, Value> = {
-        let mut observed = Map::new();
-        for slot in observations.iter_mut() {
-            let value = slot
-                .observer
-                .collect(sessions)
-                .map_err(|error| observer_problem(slot, &error))?;
-            observed.insert(slot.name.clone(), value);
+    match (definition.run)(args, sessions) {
+        Ok(result) => {
+            // Collection happens before assertions are evaluated: an `until` or
+            // `expect` entry that names `$.observed.<name>` must see the values of this
+            // attempt.
+            let observed = collect_observations(observations, sessions)?;
+            Ok(merge_observations(result, observed))
         }
-        observed
-    };
-    let result = merge_observations(result, observed);
-
-    let assertions: Vec<AssertionReport> = step
-        .expect
-        .iter()
-        .map(|expectation| assert::evaluate(expectation, &result))
-        .collect();
-
-    // A case that already failed an assertion is not allowed to change the
-    // variables that later steps would see.
-    if assertions.iter().all(|item| item.passed) {
-        save_values(&step.save, &result, vars)?;
+        Err(error) => {
+            // Drain stateful observers after retryable or optional-skipped failures so
+            // buffered events cannot leak into the next attempt or step. On fatal step
+            // errors (`Environment` / `InvalidArguments`) the case stops immediately, so
+            // preserve the original step error instead of masking it with a broken observer.
+            if matches!(error, StepError::Execution(_) | StepError::Timeout(_)) {
+                let _ = collect_observations(observations, sessions)?;
+            }
+            Err(problem_from_step_error(error))
+        }
     }
+}
 
-    Ok((result, assertions))
+fn collect_observations(
+    observations: &mut [ObservationSlot],
+    sessions: &mut Sessions,
+) -> Result<Map<String, Value>, Problem> {
+    let mut observed = Map::new();
+    for slot in observations.iter_mut() {
+        let value = slot
+            .observer
+            .collect(sessions)
+            .map_err(|error| observer_problem(slot, &error))?;
+        observed.insert(slot.name.clone(), value);
+    }
+    Ok(observed)
+}
+
+fn evaluate_all(expectations: &[Expectation], result: &Value) -> Vec<AssertionReport> {
+    expectations
+        .iter()
+        .map(|expectation| assert::evaluate(expectation, result))
+        .collect()
 }
 
 /// Adds the collected values to a step result as `observed.<name>`.
@@ -892,6 +971,7 @@ mod tests {
                         Err("invalid arguments: `value` is required".to_string())
                     }
                 },
+                check_retry: crate::core::registry::disallow_retry,
                 run: |args: &Value, _sessions| {
                     Ok(args.get("value").cloned().unwrap_or(Value::Null))
                 },
@@ -903,6 +983,7 @@ mod tests {
                 description: "Fails the environment.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, _| {
                     Err(StepError::Environment(
                         "the target refused the connection".to_string(),
@@ -916,6 +997,7 @@ mod tests {
                 description: "Waits `ms` milliseconds, then returns `value`.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |args: &Value, _sessions| {
                     let millis = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
                     std::thread::sleep(Duration::from_millis(millis));
@@ -929,6 +1011,7 @@ mod tests {
                 description: "Returns a number.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, _| Ok(json!(5)),
             })
             .expect("the scalar test step must register");
@@ -938,6 +1021,7 @@ mod tests {
                 description: "Fails its own work.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, _| {
                     Err(StepError::Execution(
                         "the step could not finish its work".to_string(),
@@ -951,6 +1035,7 @@ mod tests {
                 description: "Exceeds its time budget.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, _| {
                     Err(StepError::Timeout(
                         "the step did not finish within 10 ms".to_string(),
@@ -964,6 +1049,7 @@ mod tests {
                 description: "Refuses its arguments at run time.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, _| {
                     Err(StepError::InvalidArguments(
                         "invalid arguments: `value` is required".to_string(),
@@ -1015,9 +1101,11 @@ mod tests {
             args: json!({ "ms": millis, "value": value }),
             expect: Vec::new(),
             optional: false,
+            retry: None,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
             arg_locations: Vec::new(),
         }
     }
@@ -1028,9 +1116,11 @@ mod tests {
             args: json!({ "value": value }),
             expect,
             optional: false,
+            retry: None,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
             arg_locations: Vec::new(),
         }
     }
@@ -1048,10 +1138,12 @@ mod tests {
             action: action.to_string(),
             args: json!({}),
             optional: false,
+            retry: None,
             expect: Vec::new(),
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
             arg_locations: Vec::new(),
         }
     }
@@ -1297,9 +1389,11 @@ mod tests {
             args: json!({}),
             expect: Vec::new(),
             optional: false,
+            retry: None,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
             arg_locations: Vec::new(),
         };
         let mut cases = loaded(vec![failing]);
@@ -1430,9 +1524,11 @@ mod tests {
                 matcher: crate::core::case::Matcher::Equals(json!("abc")),
             }],
             optional: false,
+            retry: None,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
             arg_locations: Vec::new(),
         };
 
@@ -1500,6 +1596,7 @@ mod tests {
                 description: "Opens a session that counts its evidence requests.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, sessions| {
                     sessions
                         .get_or_create("test.session", || Ok(CountingSession))
@@ -1514,9 +1611,11 @@ mod tests {
             args: json!({}),
             expect,
             optional: false,
+            retry: None,
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
             arg_locations: Vec::new(),
         };
         let failing_expectation = || {
@@ -1617,6 +1716,7 @@ mod tests {
                 description: "Opens a session that counts its evidence requests.",
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
                 run: |_, sessions| {
                     sessions
                         .get_or_create("test.session", || Ok(RecordCountingSession))
@@ -1630,10 +1730,12 @@ mod tests {
             action: "test.session".to_string(),
             args: json!({}),
             optional: false,
+            retry: None,
             expect: Vec::new(),
             save: Vec::new(),
             location: Location::UNKNOWN,
             args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
             arg_locations: Vec::new(),
         }]);
         cases[0].path = source;
@@ -1874,9 +1976,11 @@ mod tests {
                     args: json!({}),
                     expect: Vec::new(),
                     optional: false,
+                    retry: None,
                     save: Vec::new(),
                     location: Location::UNKNOWN,
                     args_location: Location::UNKNOWN,
+                    retry_location: Location::UNKNOWN,
                     arg_locations: Vec::new(),
                 }],
             ),
@@ -2182,9 +2286,11 @@ mod tests {
                     },
                 ],
                 optional: false,
+                retry: None,
                 save: Vec::new(),
                 location: Location::UNKNOWN,
                 args_location: Location::UNKNOWN,
+                retry_location: Location::UNKNOWN,
                 arg_locations: Vec::new(),
             }],
         );
@@ -2270,5 +2376,459 @@ mod tests {
         };
         assert!(errors[0].message.contains("app_log"), "{:?}", errors[0]);
         assert!(errors[0].message.contains("note"), "{:?}", errors[0]);
+    }
+
+    #[test]
+    fn retry_rejects_steps_whose_check_retry_refuses_in_preflight() {
+        let mut step = echo(json!("hi"), Vec::new());
+        step.retry = Some(crate::core::case::RetryPolicy {
+            until: vec![Expectation {
+                path: "$".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!("hi")),
+            }],
+            timeout_ms: 500,
+            interval_ms: 20,
+        });
+        let outcome = run(
+            &loaded(vec![step]),
+            &registry(),
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert_eq!(outcome.exit_code(), crate::exit::ExitCode::InvalidCase);
+        let RunOutcome::Rejected { errors } = outcome else {
+            panic!("check_retry failure must reject before running");
+        };
+        assert!(errors[0].message.contains("test.echo"), "{:?}", errors[0]);
+        assert!(
+            errors[0].message.contains("cannot use `retry`"),
+            "{:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn retry_retries_execution_and_timeout_errors_then_passes_and_isolates_observations() {
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        static OBSERVER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct AttemptObserver(usize);
+
+        impl Observer for AttemptObserver {
+            fn start(&mut self, _sessions: &mut Sessions) -> Result<(), ObserverError> {
+                self.0 = OBSERVER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(())
+            }
+
+            fn collect(&mut self, _sessions: &mut Sessions) -> Result<Value, ObserverError> {
+                Ok(json!({ "attempt": self.0 }))
+            }
+        }
+
+        let mut reg = registry();
+        reg.register(StepDefinition {
+            name: "test.flaky",
+            description: "Fails execution, then timeout, then returns ready.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::allow_retry,
+            run: |_, _| {
+                let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                match n {
+                    1 => Err(StepError::Execution("not ready yet".to_string())),
+                    2 => Err(StepError::Timeout("timed out once".to_string())),
+                    3 => Ok(json!({ "ready": false, "attempt": n })),
+                    _ => Ok(json!({ "ready": true, "attempt": n })),
+                }
+            },
+        })
+        .expect("flaky step must register");
+        reg.register_observer(crate::core::observer::ObserverDefinition {
+            name: "test.attempt",
+            description: "Records attempt number.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            create: |_| Ok(Box::new(AttemptObserver(0))),
+        })
+        .expect("attempt observer must register");
+
+        ATTEMPTS.store(0, Ordering::SeqCst);
+        OBSERVER_CALLS.store(0, Ordering::SeqCst);
+
+        let mut step = failing("test.flaky");
+        step.retry = Some(crate::core::case::RetryPolicy {
+            until: vec![
+                Expectation {
+                    path: "$.ready".to_string(),
+                    matcher: crate::core::case::Matcher::Equals(json!(true)),
+                },
+                Expectation {
+                    path: "$.observed.snap.attempt".to_string(),
+                    matcher: crate::core::case::Matcher::Equals(json!(4)),
+                },
+            ],
+            timeout_ms: 2000,
+            interval_ms: 10,
+        });
+        step.expect = vec![Expectation {
+            path: "$.attempt".to_string(),
+            matcher: crate::core::case::Matcher::Equals(json!(4)),
+        }];
+        step.save = vec![SavedValue {
+            name: "attempts".to_string(),
+            path: "$.attempt".to_string(),
+        }];
+
+        let mut case = test_case("retry", vec![step, echo(json!("${attempts}"), Vec::new())]);
+        case.observe = vec![observation("snap", "test.attempt", json!({}))];
+
+        let outcome = run(
+            &[LoadedCase {
+                path: "retry.yaml".into(),
+                case,
+            }],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let report = one_case(outcome);
+        assert_eq!(report.steps[0].assertions.len(), 3);
+        assert!(report.steps[0].assertions.iter().all(|a| a.passed));
+        let result = report.steps[0]
+            .result
+            .as_ref()
+            .expect("step result must be recorded");
+        assert_eq!(result["observed"]["snap"]["attempt"], json!(4));
+        assert_eq!(
+            report.steps[1].result.as_ref().map(|v| &v["value"]),
+            Some(&json!("4"))
+        );
+    }
+
+    #[test]
+    fn retry_aborts_immediately_on_invalid_arguments_and_environment_errors() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        let mut reg = registry();
+        for (name, fail_env) in [("test.retry_env", true), ("test.retry_invalid", false)] {
+            let step_def = if fail_env {
+                StepDefinition {
+                    name,
+                    description: "Fails environment.",
+                    args_schema: json!({"type": "object"}),
+                    validate: |_| Ok(()),
+                    check_retry: crate::core::registry::allow_retry,
+                    run: |_, _| {
+                        CALLS.fetch_add(1, Ordering::SeqCst);
+                        Err(StepError::Environment("down".to_string()))
+                    },
+                }
+            } else {
+                StepDefinition {
+                    name,
+                    description: "Fails invalid arguments.",
+                    args_schema: json!({"type": "object"}),
+                    validate: |_| Ok(()),
+                    check_retry: crate::core::registry::allow_retry,
+                    run: |_, _| {
+                        CALLS.fetch_add(1, Ordering::SeqCst);
+                        Err(StepError::InvalidArguments("bad arg".to_string()))
+                    },
+                }
+            };
+            reg.register(step_def).expect("test step must register");
+        }
+
+        for (action, expected_exit) in [
+            ("test.retry_env", crate::exit::ExitCode::Environment),
+            ("test.retry_invalid", crate::exit::ExitCode::InvalidCase),
+        ] {
+            CALLS.store(0, Ordering::SeqCst);
+            let mut step = failing(action);
+            step.retry = Some(crate::core::case::RetryPolicy {
+                until: vec![Expectation {
+                    path: "$".to_string(),
+                    matcher: crate::core::case::Matcher::Exists(true),
+                }],
+                timeout_ms: 2000,
+                interval_ms: 10,
+            });
+
+            let outcome = run(
+                &loaded(vec![step]),
+                &reg,
+                &EventBus::new(),
+                None,
+                &Filters::default(),
+                &mut Secrets::new(),
+                1,
+            );
+
+            assert_eq!(outcome.exit_code(), expected_exit, "{action}");
+            assert_eq!(
+                CALLS.load(Ordering::SeqCst),
+                1,
+                "{action} must stop after the first fatal error"
+            );
+        }
+    }
+
+    /// A session-backed event buffer modeling observers that only drain in `collect`.
+    struct BufferedEvents(Vec<String>);
+
+    impl Session for BufferedEvents {
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct DrainingObserver;
+
+    impl Observer for DrainingObserver {
+        fn start(&mut self, _sessions: &mut Sessions) -> Result<(), ObserverError> {
+            // Deliberately leaves any uncollected entries untouched, matching
+            // observers whose `collect` drains the step's completed events.
+            Ok(())
+        }
+
+        fn collect(&mut self, sessions: &mut Sessions) -> Result<Value, ObserverError> {
+            let events = match sessions
+                .get::<BufferedEvents>("test.buffered")
+                .map_err(ObserverError::Environment)?
+            {
+                Some(buffer) => std::mem::take(&mut buffer.0),
+                None => Vec::new(),
+            };
+            Ok(json!({ "events": events }))
+        }
+    }
+
+    #[test]
+    fn retry_discards_stateful_observer_state_from_failed_execution_and_timeout_attempts() {
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+        let mut reg = registry();
+        reg.register(StepDefinition {
+            name: "test.buffered_flaky",
+            description: "Records buffered events across execution, timeout, and ready attempts.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::allow_retry,
+            run: |_, sessions| {
+                let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                let buffer = sessions
+                    .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
+                    .map_err(StepError::Environment)?;
+                match n {
+                    1 => {
+                        buffer.0.push("attempt-1-exec".to_string());
+                        Err(StepError::Execution("not ready yet".to_string()))
+                    }
+                    2 => {
+                        buffer.0.push("attempt-2-timeout".to_string());
+                        Err(StepError::Timeout("timed out once".to_string()))
+                    }
+                    3 => {
+                        buffer.0.push("attempt-3-ok".to_string());
+                        Ok(json!({ "ready": true, "attempt": n }))
+                    }
+                    _ => panic!("unexpected extra attempt {n}"),
+                }
+            },
+        })
+        .expect("buffered flaky step must register");
+        reg.register_observer(crate::core::observer::ObserverDefinition {
+            name: "test.draining",
+            description: "Drains buffered events on collect.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            create: |_| Ok(Box::new(DrainingObserver)),
+        })
+        .expect("draining observer must register");
+
+        ATTEMPTS.store(0, Ordering::SeqCst);
+
+        let mut step = failing("test.buffered_flaky");
+        step.retry = Some(crate::core::case::RetryPolicy {
+            until: vec![Expectation {
+                path: "$.ready".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!(true)),
+            }],
+            timeout_ms: 2000,
+            interval_ms: 10,
+        });
+        step.expect = vec![Expectation {
+            path: "$.observed.buf.events".to_string(),
+            matcher: crate::core::case::Matcher::Equals(json!(["attempt-3-ok"])),
+        }];
+
+        let mut case = test_case("retry-drains-observer", vec![step]);
+        case.observe = vec![observation("buf", "test.draining", json!({}))];
+
+        let outcome = run(
+            &[LoadedCase {
+                path: "retry-drain.yaml".into(),
+                case,
+            }],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 3);
+        let report = one_case(outcome);
+        let result = report.steps[0]
+            .result
+            .as_ref()
+            .expect("step result must be recorded");
+        assert_eq!(
+            result["observed"]["buf"]["events"],
+            json!(["attempt-3-ok"]),
+            "failed attempt events must never leak into the final observation: {result}"
+        );
+    }
+
+    #[test]
+    fn optional_skipped_step_discards_observer_state_before_next_step() {
+        let mut reg = registry();
+        reg.register(StepDefinition {
+            name: "test.emit_and_fail",
+            description: "Emits a buffered event then fails execution.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::disallow_retry,
+            run: |_, sessions| {
+                let buffer = sessions
+                    .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
+                    .map_err(StepError::Environment)?;
+                buffer.0.push("stale-optional".to_string());
+                Err(StepError::Execution("optional failure".to_string()))
+            },
+        })
+        .expect("emit-and-fail step must register");
+        reg.register(StepDefinition {
+            name: "test.emit_and_ok",
+            description: "Emits a buffered event then succeeds.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::disallow_retry,
+            run: |_, sessions| {
+                let buffer = sessions
+                    .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
+                    .map_err(StepError::Environment)?;
+                buffer.0.push("second-step-ok".to_string());
+                Ok(json!({ "ok": true }))
+            },
+        })
+        .expect("emit-and-ok step must register");
+        reg.register_observer(crate::core::observer::ObserverDefinition {
+            name: "test.draining",
+            description: "Drains buffered events on collect.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            create: |_| Ok(Box::new(DrainingObserver)),
+        })
+        .expect("draining observer must register");
+
+        let mut first = failing("test.emit_and_fail");
+        first.optional = true;
+        let mut second = failing("test.emit_and_ok");
+        second.expect = vec![Expectation {
+            path: "$.observed.buf.events".to_string(),
+            matcher: crate::core::case::Matcher::Equals(json!(["second-step-ok"])),
+        }];
+
+        let mut case = test_case("optional-drains-observer", vec![first, second]);
+        case.observe = vec![observation("buf", "test.draining", json!({}))];
+
+        let outcome = run(
+            &[LoadedCase {
+                path: "optional-drain.yaml".into(),
+                case,
+            }],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let report = one_case(outcome);
+        assert_eq!(report.steps[0].status, StepStatus::Skipped);
+        let result = report.steps[1]
+            .result
+            .as_ref()
+            .expect("second step result must be recorded");
+        assert_eq!(
+            result["observed"]["buf"]["events"],
+            json!(["second-step-ok"])
+        );
+    }
+
+    #[test]
+    fn retry_aborts_immediately_if_observer_collect_fails_after_retryable_step_error() {
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+        let mut reg = registry();
+        reg.register(StepDefinition {
+            name: "test.retry_exec",
+            description: "Fails execution.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::allow_retry,
+            run: |_, _| {
+                ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+                Err(StepError::Execution("not ready".to_string()))
+            },
+        })
+        .expect("test step must register");
+
+        ATTEMPTS.store(0, Ordering::SeqCst);
+        let mut step = failing("test.retry_exec");
+        step.retry = Some(crate::core::case::RetryPolicy {
+            until: vec![Expectation {
+                path: "$".to_string(),
+                matcher: crate::core::case::Matcher::Exists(true),
+            }],
+            timeout_ms: 2000,
+            interval_ms: 10,
+        });
+        let mut case = test_case("broken-collect-aborts-retry", vec![step]);
+        case.observe = vec![observation("app_log", "test.broken", json!({}))];
+
+        let outcome = run(
+            &[LoadedCase {
+                path: "broken-retry.yaml".into(),
+                case,
+            }],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+
+        assert_eq!(outcome.exit_code(), crate::exit::ExitCode::Environment);
+        assert_eq!(
+            ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "observer environment failure must stop retry after attempt 1"
+        );
     }
 }

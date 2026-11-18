@@ -22,6 +22,7 @@ The complete reference for `da`: installation options, building from source, the
   - [Variables](#variables)
   - [Assertions](#assertions)
   - [Optional steps](#optional-steps)
+  - [Retrying read-only steps](#retrying-read-only-steps)
   - [`http.request`](#httprequest)
   - [`cli.run`](#clirun)
   - [`db.query`](#dbquery)
@@ -731,7 +732,7 @@ Redaction has limits that matter when you choose a value:
 `da schema` prints a [JSON Schema](https://json-schema.org/) (draft 2020-12) for
 one case file. The schema follows the parser: only `name`, `project`, `suite`,
 `layer`, `tags`, `vars`, `observe` and `steps` at the top level; one registered
-step name per step, plus optional `optional`, `expect` and `save`, where a step
+step name per step, plus optional `optional`, `retry`, `expect` and `save`, where a step
 that saves may not be optional; one registered observer
 and its arguments per entry of `observe`; the four comparisons with their value
 types; and each step's and observer's argument schema under `$defs`, together
@@ -775,7 +776,7 @@ but no step is registered, so the step item accepts nothing.
 
 A case is a YAML file with a name, optional variables, optional observations and
 a list of steps. Each step is a mapping with exactly one step name, optionally
-followed by `optional`, `expect` and `save`:
+followed by `optional`, `retry`, `expect` and `save`:
 
 ```yaml
 name: Login returns a token
@@ -922,6 +923,72 @@ always runs. `optional: false` is allowed and changes nothing.
 `optional` takes a literal `true` or `false`; a quoted string such as
 `optional: "true"` is a case error. The field name is reserved, so no step can be
 registered as `optional`.
+
+### Retrying read-only steps
+
+`retry` polls a read-only step until every assertion in `until` passes or the
+time budget expires. Use it for asynchronous work that becomes observable
+later — a background job finishing, a row appearing in the database, or text
+updating on a page — without repeating side effects.
+
+```yaml
+name: Wait for a background job to finish
+steps:
+  - http.request:
+      method: POST
+      url: ${base}/jobs
+      json: { task: export }
+    save:
+      job_id: $.body.id
+  - http.request:
+      url: ${base}/jobs/${job_id}
+    retry:
+      until:
+        - path: $.status
+          equals: 200
+        - path: $.body.state
+          equals: ready
+      timeout_ms: 5000
+      interval_ms: 200
+    expect:
+      - path: $.body.count
+        equals: 10
+    save:
+      result_url: $.body.url
+```
+
+| Field | Meaning |
+| --- | --- |
+| `until` | Non-empty list of assertions using the same syntax as `expect`. Required. |
+| `timeout_ms` | Total polling budget in milliseconds (at least `1`). Required. |
+| `interval_ms` | Wait between failed attempts in milliseconds (at least `1`). Defaults to `250`. |
+
+Only read-only steps may declare `retry`:
+
+- `http.request` with exact uppercase `method` `GET` or `HEAD` (including when `method` is omitted, which defaults to `GET`)
+- `db.query`
+- `browser.read`
+- `browser.wait`
+
+State-changing steps — `http.request` with `POST`, `PUT`, `PATCH` or `DELETE`
+(or an unresolved variable method), `cli.run`, `browser.open`,
+`browser.click`, `browser.type`, `browser.press` and `browser.screenshot` —
+are refused statically by `da lint` and before any step runs in `da run`
+(exit 3). `retry` is a reserved step field name, so no step may register under
+that name.
+
+Each polling iteration runs the step and any declared `observe` observers for
+that attempt, keeping only the last attempt's result and observations:
+
+- When every assertion in `until` passes, polling stops immediately; `expect`
+  and `save` run against that result, and both `until` and `expect` assertions
+  appear in the step report.
+- When `until` fails, or the step returns an execution error or timeout, `da`
+  sleeps up to `interval_ms` (capped at the remaining budget) and retries until
+  `timeout_ms` is reached, then reports the last attempt's failure (or `skipped`
+  when combined with `optional: true`).
+- An environment error (exit 4) or invalid-arguments error (exit 3) aborts
+  polling immediately instead of waiting for `timeout_ms`.
 
 ### `http.request`
 
@@ -1307,6 +1374,13 @@ When a step with `dialog` configured handles a dialog, it succeeds and includes
 `dialog` in its JSON result (`{ "type": ..., "message": ..., "accepted": ... }`),
 so `expect` can assert the dialog kind, text and decision. Dismissing a
 `beforeunload` dialog on `browser.open` keeps the browser on the current page.
+
+A dialog that opens late is why `browser.wait` may combine `dialog` with
+`retry`: every polling attempt handles the dialogs of its own attempt, so
+`until` can assert `$.dialog.type` on the attempt that finally sees the dialog.
+`browser.read` takes no `dialog` argument, so an unexpected dialog ends that
+attempt at once as an execution error; because an execution error is retryable,
+a later attempt still succeeds once the dialog is gone.
 
 ```yaml
 name: Confirm deletion and enter a prompt value

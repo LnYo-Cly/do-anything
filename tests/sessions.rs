@@ -269,6 +269,7 @@ fn registry() -> Registry {
                 description,
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
+                check_retry: do_anything::core::registry::disallow_retry,
                 run,
             })
             .unwrap_or_else(|error| panic!("`{name}` must register: {error}"));
@@ -311,10 +312,12 @@ fn step_with(action: &str, args: Value) -> Step {
         action: action.to_string(),
         args,
         optional: false,
+        retry: None,
         expect: Vec::new(),
         save: Vec::new(),
         location: Location::UNKNOWN,
         args_location: Location::UNKNOWN,
+        retry_location: Location::UNKNOWN,
         arg_locations: Vec::new(),
     }
 }

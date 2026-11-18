@@ -4224,3 +4224,81 @@ steps:
         "handled dialog result leaked or missed redaction: {handled_stdout}"
     );
 }
+
+#[test]
+fn retry_on_browser_read_and_wait_interacts_cleanly_with_dialogs() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-retry-dialogs");
+    let case = dir.write(
+        "retry-dialogs.yaml",
+        &format!(
+            r##"name: retry on browser.wait and browser.read with and without dialog
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#arm-confirm"
+  - browser.wait:
+      css: "#status"
+      dialog: accept
+      timeout_ms: 300
+    retry:
+      until:
+        - path: $.dialog.type
+          equals: confirm
+      timeout_ms: 8000
+      interval_ms: 50
+    expect:
+      - path: $.dialog.message
+        equals: "Ready now?"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+    retry:
+      until:
+        - path: $.text
+          equals: "confirmed"
+      timeout_ms: 5000
+      interval_ms: 50
+  - browser.click:
+      css: "#arm-unexpected"
+  - browser.read:
+      css: "#status"
+      timeout_ms: 5000
+    retry:
+      until:
+        - path: $.text
+          equals: "after-alert"
+      timeout_ms: 8000
+      interval_ms: 50
+"##,
+            server.url("/browser/dialogs/retry")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["status"], "passed", "{report}");
+    assert_eq!(
+        report["cases"][0]["steps"][2]["result"]["dialog"]["type"], "confirm",
+        "{report}"
+    );
+    assert_eq!(
+        report["cases"][0]["steps"][5]["result"]["text"], "after-alert",
+        "{report}"
+    );
+}

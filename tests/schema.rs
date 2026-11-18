@@ -59,7 +59,7 @@ fn schema() -> &'static Value {
     &SCHEMA
 }
 
-#[cfg(any(feature = "browser", feature = "cli"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "http"))]
 fn validator(schema: &'static Value) -> jsonschema::Validator {
     jsonschema::validator_for(schema).expect("the emitted schema must compile")
 }
@@ -491,6 +491,62 @@ fn an_optional_step_takes_a_boolean_and_cannot_save() {
         assert!(
             !validator.is_valid(&instance),
             "`optional: {wrong}` is not a boolean, so it must not validate"
+        );
+    }
+}
+
+#[cfg(feature = "http")]
+#[test]
+fn a_retry_block_requires_until_and_positive_durations() {
+    let validator = validator(schema());
+    let valid = json!({
+        "name": "Retry polling",
+        "steps": [{
+            "http.request": {"url": "http://127.0.0.1:8080/jobs/1"},
+            "retry": {
+                "until": [{"path": "$.body.status", "equals": "done"}],
+                "timeout_ms": 2000
+            }
+        }]
+    });
+    assert!(
+        validator.is_valid(&valid),
+        "the parser accepts retry without interval_ms, so the schema must too: {valid}"
+    );
+
+    let mut with_interval = valid.clone();
+    with_interval["steps"][0]["retry"]["interval_ms"] = json!(50);
+    assert!(
+        validator.is_valid(&with_interval),
+        "the parser accepts explicit interval_ms, so the schema must too: {with_interval}"
+    );
+
+    for (label, bad_retry) in [
+        ("missing until", json!({"timeout_ms": 100})),
+        ("empty until", json!({"until": [], "timeout_ms": 100})),
+        (
+            "missing timeout_ms",
+            json!({"until": [{"path": "$.status", "equals": 200}]}),
+        ),
+        (
+            "zero timeout_ms",
+            json!({"until": [{"path": "$.status", "equals": 200}], "timeout_ms": 0}),
+        ),
+        (
+            "zero interval_ms",
+            json!({"until": [{"path": "$.status", "equals": 200}], "timeout_ms": 100, "interval_ms": 0}),
+        ),
+        (
+            "unknown field",
+            json!({"until": [{"path": "$.status", "equals": 200}], "timeout_ms": 100, "extra": 1}),
+        ),
+        ("non-object", json!(true)),
+    ] {
+        let mut instance = valid.clone();
+        instance["steps"][0]["retry"] = bad_retry;
+        assert!(
+            !validator.is_valid(&instance),
+            "`retry` ({label}) must not validate: {instance}"
         );
     }
 }

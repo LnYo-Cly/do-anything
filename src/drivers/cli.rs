@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use wait_timeout::ChildExt;
 
-use crate::core::registry::{Registry, StepDefinition, StepError};
+use crate::core::registry::{Registry, StepDefinition, StepError, disallow_retry};
 use crate::core::session::Sessions;
 
 /// Name of the step this module registers.
@@ -38,6 +38,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         description: "Runs a program without a shell and returns `exit_code`, `stdout`, `stderr` and `json`.",
         args_schema,
         validate,
+        check_retry: disallow_retry,
         run,
     })
 }

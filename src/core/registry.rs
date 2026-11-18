@@ -39,12 +39,30 @@ pub struct StepDefinition {
     /// Checks arguments against the same contract as [`Self::args_schema`],
     /// returning a message the user can act on.
     pub validate: fn(&Value) -> Result<(), String>,
+    /// Checks whether a step may be retried with `retry` given its expanded
+    /// arguments.
+    ///
+    /// Only read-only steps may use `retry`; state-changing steps must return
+    /// an error so `da lint` and preflight refuse them before execution.
+    pub check_retry: fn(&Value) -> Result<(), String>,
     /// Runs the step and returns its JSON result.
     ///
     /// The [`Sessions`] value belongs to the running case. A step that needs a
     /// long-lived resource asks it for the resource on first use and receives
     /// the same one on every later step of that case.
     pub run: fn(&Value, &mut Sessions) -> Result<Value, StepError>,
+}
+
+/// Default `check_retry` implementation that refuses `retry` for steps that
+/// change state.
+pub fn disallow_retry(_args: &Value) -> Result<(), String> {
+    Err("changes state and cannot use `retry`; only read-only steps may be retried".to_string())
+}
+
+/// `check_retry` implementation for read-only steps that are always safe to
+/// poll.
+pub fn allow_retry(_args: &Value) -> Result<(), String> {
+    Ok(())
 }
 
 /// The steps and observers available to the runner, keyed by name.
@@ -116,14 +134,14 @@ impl Registry {
 }
 
 /// Field names every step already gives a meaning to.
-const RESERVED_NAMES: [&str; 3] = ["expect", "optional", "save"];
+const RESERVED_NAMES: [&str; 4] = ["expect", "optional", "retry", "save"];
 
 /// Checks the name a step registers under.
 ///
 /// A name is written in every case that uses the step and becomes a key of the
 /// schema's `$defs`, so it is limited to characters that need no escaping and
 /// that read the same on every platform. The fields a step already carries,
-/// `expect`, `optional` and `save`, cannot also name a step.
+/// `expect`, `optional`, `retry` and `save`, cannot also name a step.
 fn validate_name(name: &str) -> Result<(), String> {
     if RESERVED_NAMES.contains(&name) {
         return Err(format!(
@@ -167,6 +185,7 @@ mod tests {
             description: "Test step.",
             args_schema: serde_json::json!({"type": "object"}),
             validate: |_| Ok(()),
+            check_retry: disallow_retry,
             run: |_, _| Ok(Value::Null),
         }
     }
@@ -266,7 +285,7 @@ mod tests {
 
     #[test]
     fn refuses_the_names_the_case_format_already_uses() {
-        for name in ["expect", "optional", "save"] {
+        for name in ["expect", "optional", "retry", "save"] {
             let mut registry = Registry::new();
             let error = registry
                 .register(definition(name))
