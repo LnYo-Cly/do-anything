@@ -602,6 +602,14 @@ $ da session stop s-1794974416388-44376-0
   `# fragile:` in the YAML and listed in the export JSON's `fragile` array.
   Generated hashes/utility tokens and digit-heavy IDs/classes are penalized or
   skipped.
+- **Dialogs**: `da session` steps use the same JavaScript-dialog handling as
+  `da run`. A `ref`-targeted `browser.click`, `browser.type`, `browser.wait` or
+  `browser.read` has no `dialog` argument, so an unexpected `alert`, `confirm`,
+  `prompt` or `beforeunload` is dismissed immediately and fails that step with
+  the dialog type and its redacted message. Take a fresh snapshot and retry
+  after the page settles. Locator-targeted `browser.open`, `browser.click`,
+  `browser.type`, `browser.press` and `browser.wait` steps accept `dialog` in a
+  session exactly as they do in a case file.
 - **Secrets & cleanup**: resolved `${env:...}` secret strings are redacted from
   JSON outputs and never written into session logs or handles. `da session stop`
   and idle reaping close detached Chrome instances and delete both
