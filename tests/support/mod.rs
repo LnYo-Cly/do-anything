@@ -726,7 +726,7 @@ fn browser_network(query: &str) -> String {
     let closed = closed.parse::<u16>().unwrap_or(9);
     format!(
         r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>Network page</title></head>
+<html><head><meta charset="utf-8"><title>Network page</title><link rel="icon" href="data:,"></head>
 <body>
 <h1>Network page</h1>
 <p id="case">{label}</p>
