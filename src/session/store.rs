@@ -404,10 +404,15 @@ pub fn list_and_reap(
             }
         };
 
-        let Ok(state) = load_state(&dir) else {
-            // Incomplete or already-stopped directory without state.json.
-            lock.release();
-            continue;
+        let state = match load_state(&dir) {
+            Ok(state) => state,
+            Err(err) => {
+                if dir.join(STATE_FILE).exists() {
+                    errors.push(err);
+                }
+                lock.release();
+                continue;
+            }
         };
 
         let threshold = idle_override_ms.unwrap_or(state.idle_timeout_ms);

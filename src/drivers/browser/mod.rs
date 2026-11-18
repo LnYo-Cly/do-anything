@@ -1574,46 +1574,50 @@ impl BrowserSession {
     fn reattach(handle: &Value) -> Result<Self, String> {
         let parsed: DetachedBrowserHandle = serde_json::from_value(handle.clone())
             .map_err(|error| format!("invalid browser session handle: {error}"))?;
-        let deadline = Deadline::after(connect::CONNECT_TIMEOUT);
-        let mut connection =
-            Connection::connect(&parsed.websocket_url, deadline).map_err(|error| {
-                format!(
-                    "browser session is no longer reachable at `{}`: {error}",
-                    parsed.websocket_url
-                )
-            })?;
-        let page = attach_existing_target(
-            &mut connection,
-            &parsed.target_id,
-            deadline,
-            ATTACH_ENABLE_TIMEOUT,
-        )
-        .map_err(|failure| failure.message)?;
-        let network = network::NetworkState::new(&page);
-        let origin = match parsed.mode.as_str() {
-            "launched" => {
-                let pid = parsed
-                    .pid
-                    .ok_or_else(|| "detached browser handle is missing `pid`".to_string())?;
-                let profile = parsed
-                    .profile
-                    .ok_or_else(|| "detached browser handle is missing `profile`".to_string())?;
-                Origin::Detached {
+        let (origin, port, websocket_url, target_id) =
+            match validate_detached_handle(&parsed, &std::env::temp_dir())? {
+                ValidatedHandle::Launched {
                     pid,
-                    profile: PathBuf::from(profile),
-                }
-            }
-            "connected" => Origin::Connected,
-            other => return Err(format!("unknown browser session mode `{other}`")),
-        };
+                    profile,
+                    port,
+                    websocket_url,
+                    target_id,
+                } => (
+                    Origin::Detached {
+                        pid,
+                        profile: profile.to_path_buf(),
+                    },
+                    port,
+                    websocket_url.to_string(),
+                    target_id.to_string(),
+                ),
+                ValidatedHandle::Connected {
+                    port,
+                    websocket_url,
+                    target_id,
+                } => (
+                    Origin::Connected,
+                    port,
+                    websocket_url.to_string(),
+                    target_id.to_string(),
+                ),
+            };
+        let deadline = Deadline::after(connect::CONNECT_TIMEOUT);
+        let mut connection = Connection::connect(&websocket_url, deadline).map_err(|error| {
+            format!("browser session is no longer reachable at `{websocket_url}`: {error}")
+        })?;
+        let page =
+            attach_existing_target(&mut connection, &target_id, deadline, ATTACH_ENABLE_TIMEOUT)
+                .map_err(|failure| failure.message)?;
+        let network = network::NetworkState::new(&page);
         Ok(Self {
             connection: Some(connection),
             origin: Some(origin),
-            target_id: parsed.target_id,
+            target_id,
             page,
             network,
-            port: parsed.port,
-            websocket_url: parsed.websocket_url,
+            port,
+            websocket_url,
             headless: parsed.headless,
             width: parsed.width,
             height: parsed.height,
@@ -1626,33 +1630,26 @@ impl BrowserSession {
     }
 
     fn dispose_handle(handle: &Value) -> Result<(), String> {
-        let parsed: DetachedBrowserHandle = serde_json::from_value(handle.clone())
-            .map_err(|error| format!("invalid browser session handle: {error}"))?;
-        record_close(parsed.port);
-        let mut errors = Vec::new();
-        let deadline = Deadline::after(Duration::from_secs(2));
-        if let Ok(mut connection) = Connection::connect(&parsed.websocket_url, deadline) {
-            match parsed.mode.as_str() {
-                "launched" => send_browser_close(&mut connection, &mut errors),
-                "connected" => send_target_close(&mut connection, &parsed.target_id, &mut errors),
-                other => errors.push(format!("unknown browser session mode `{other}`")),
-            }
-            drop(connection);
-        }
-        if parsed.mode == "launched"
-            && let Err(error) = launch::dispose_detached(
-                parsed.pid,
-                Some(parsed.port),
-                parsed.profile.as_deref().map(Path::new),
-            )
-        {
-            errors.push(error);
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        dispose_handle_with(
+            handle,
+            &std::env::temp_dir(),
+            record_close,
+            launch::is_port_listening,
+            launch::verify_launched_process_before_close,
+            |websocket_url, errors| {
+                let deadline = Deadline::after(Duration::from_secs(2));
+                if let Ok(mut connection) = Connection::connect(websocket_url, deadline) {
+                    send_browser_close(&mut connection, errors);
+                }
+            },
+            |websocket_url, target_id, errors| {
+                let deadline = Deadline::after(Duration::from_secs(2));
+                if let Ok(mut connection) = Connection::connect(websocket_url, deadline) {
+                    send_target_close(&mut connection, target_id, errors);
+                }
+            },
+            launch::dispose_detached,
+        )
     }
 
     /// Refuses an option that only applies when the session is created.
@@ -3482,6 +3479,245 @@ struct DetachedBrowserHandle {
     refs: snapshot::RefStore,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ValidatedHandle<'a> {
+    Launched {
+        pid: u32,
+        profile: &'a Path,
+        port: u16,
+        websocket_url: &'a str,
+        target_id: &'a str,
+    },
+    Connected {
+        port: u16,
+        websocket_url: &'a str,
+        target_id: &'a str,
+    },
+}
+
+fn validate_detached_handle<'a>(
+    parsed: &'a DetachedBrowserHandle,
+    temp_root: &Path,
+) -> Result<ValidatedHandle<'a>, String> {
+    if parsed.port == 0 {
+        return Err("browser session handle has invalid port 0".to_string());
+    }
+    if parsed.target_id.trim().is_empty() {
+        return Err("browser session handle has empty `target_id`".to_string());
+    }
+    match parsed.mode.as_str() {
+        "launched" => {
+            if parsed.connect.is_some() {
+                return Err(
+                    "launched browser session handle must not specify `connect`".to_string()
+                );
+            }
+            let pid = parsed
+                .pid
+                .ok_or_else(|| "launched browser session handle is missing `pid`".to_string())?;
+            if pid == 0 {
+                return Err("launched browser session handle has invalid pid 0".to_string());
+            }
+            let profile_raw = parsed.profile.as_deref().ok_or_else(|| {
+                "launched browser session handle is missing `profile`".to_string()
+            })?;
+            let profile = Path::new(profile_raw);
+            launch::validate_owned_profile_in(profile, temp_root)?;
+            validate_launched_ws_url(&parsed.websocket_url, parsed.port)?;
+            Ok(ValidatedHandle::Launched {
+                pid,
+                profile,
+                port: parsed.port,
+                websocket_url: &parsed.websocket_url,
+                target_id: &parsed.target_id,
+            })
+        }
+        "connected" => {
+            if parsed.pid.is_some() || parsed.profile.is_some() {
+                return Err(
+                    "connected browser session handle must not specify `pid` or `profile`"
+                        .to_string(),
+                );
+            }
+            let connect = parsed.connect.as_deref().ok_or_else(|| {
+                "connected browser session handle is missing `connect`".to_string()
+            })?;
+            let endpoint = Endpoint::parse(connect)?;
+            if endpoint.port() != parsed.port {
+                return Err(format!(
+                    "connected browser session handle `port` ({}) does not match `connect` port ({})",
+                    parsed.port,
+                    endpoint.port()
+                ));
+            }
+            validate_connected_ws_url(&parsed.websocket_url)?;
+            Ok(ValidatedHandle::Connected {
+                port: parsed.port,
+                websocket_url: &parsed.websocket_url,
+                target_id: &parsed.target_id,
+            })
+        }
+        other => Err(format!("unknown browser session mode `{other}`")),
+    }
+}
+
+fn validate_launched_ws_url(url: &str, port: u16) -> Result<(), String> {
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "launched browser session handle has invalid `websocket_url` `{url}`"
+        ));
+    }
+    let expected_prefix = format!("ws://127.0.0.1:{port}/");
+    if !url.starts_with(&expected_prefix) || url.len() == expected_prefix.len() {
+        return Err(format!(
+            "launched browser session handle `websocket_url` `{url}` does not match loopback port {port}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_connected_ws_url(url: &str) -> Result<(), String> {
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "connected browser session handle has invalid `websocket_url` `{url}`"
+        ));
+    }
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` must use `ws://`"
+        ));
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` is missing a path"
+        ));
+    };
+    if path.is_empty() {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` is missing a path"
+        ));
+    }
+    let Some((host, port_str)) = authority.rsplit_once(':') else {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` is missing a port"
+        ));
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` must use a loopback host"
+        ));
+    }
+    if !port_str.parse::<u16>().is_ok_and(|port| port > 0) {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` has an invalid port"
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal callback seam for verifying handle disposal without real sockets or disk"
+)]
+fn dispose_handle_with<R, P, V, CB, CT, D>(
+    handle: &Value,
+    temp_root: &Path,
+    mut on_record_close: R,
+    port_listening: P,
+    verify_before_close: V,
+    mut close_browser: CB,
+    mut close_target: CT,
+    dispose_detached_fn: D,
+) -> Result<(), String>
+where
+    R: FnMut(u16),
+    P: FnMut(u16) -> bool,
+    V: FnMut(u32, u16, &Path) -> Result<bool, String>,
+    CB: FnMut(&str, &mut Vec<String>),
+    CT: FnMut(&str, &str, &mut Vec<String>),
+    D: FnMut(Option<u32>, Option<u16>, Option<&Path>) -> Result<(), String>,
+{
+    let parsed: DetachedBrowserHandle = serde_json::from_value(handle.clone())
+        .map_err(|error| format!("invalid browser session handle: {error}"))?;
+    let validated = validate_detached_handle(&parsed, temp_root)?;
+
+    match validated {
+        ValidatedHandle::Connected {
+            port,
+            websocket_url,
+            target_id,
+        } => {
+            on_record_close(port);
+            let mut errors = Vec::new();
+            close_target(websocket_url, target_id, &mut errors);
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+        ValidatedHandle::Launched {
+            pid,
+            profile,
+            port,
+            websocket_url,
+            ..
+        } => {
+            on_record_close(port);
+            let mut errors = Vec::new();
+            close_and_dispose_detached_with(
+                pid,
+                port,
+                profile,
+                &mut errors,
+                port_listening,
+                verify_before_close,
+                |errs| close_browser(websocket_url, errs),
+                dispose_detached_fn,
+            );
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared teardown helper used by both dispose_handle_with and BrowserSession::close"
+)]
+fn close_and_dispose_detached_with<P, V, CB, D>(
+    pid: u32,
+    port: u16,
+    profile: &Path,
+    errors: &mut Vec<String>,
+    mut port_listening: P,
+    mut verify_before_close: V,
+    mut close_browser: CB,
+    mut dispose_detached_fn: D,
+) where
+    P: FnMut(u16) -> bool,
+    V: FnMut(u32, u16, &Path) -> Result<bool, String>,
+    CB: FnMut(&mut Vec<String>),
+    D: FnMut(Option<u32>, Option<u16>, Option<&Path>) -> Result<(), String>,
+{
+    if port_listening(port) {
+        match verify_before_close(pid, port, profile) {
+            Ok(true) => close_browser(errors),
+            Ok(false) => {}
+            Err(error) => {
+                errors.push(error);
+                return;
+            }
+        }
+    }
+    if let Err(error) = dispose_detached_fn(Some(pid), Some(port), Some(profile)) {
+        errors.push(error);
+    }
+}
+
 impl Session for BrowserSession {
     fn detach(&mut self) -> Result<Option<Value>, String> {
         let _ = self.connection.take();
@@ -3659,13 +3895,21 @@ impl Session for BrowserSession {
                 }
             }
             Some(Origin::Detached { pid, profile }) => {
-                send_browser_close(&mut connection, &mut errors);
-                drop(connection);
-                if let Err(error) =
-                    launch::dispose_detached(Some(pid), Some(self.port), Some(&profile))
-                {
-                    errors.push(error);
-                }
+                let mut connection = Some(connection);
+                close_and_dispose_detached_with(
+                    pid,
+                    self.port,
+                    &profile,
+                    &mut errors,
+                    launch::is_port_listening,
+                    launch::verify_launched_process_before_close,
+                    |errs| {
+                        if let Some(mut conn) = connection.take() {
+                            send_browser_close(&mut conn, errs);
+                        }
+                    },
+                    launch::dispose_detached,
+                );
             }
             Some(Origin::Connected) => {
                 // Only this case's tab is ours. `Browser.close` is never sent:
@@ -6609,6 +6853,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     type MockSocket = tungstenite::WebSocket<std::net::TcpStream>;
 
     fn send_mock_reply(socket: &mut MockSocket, id: &Value, result: Value) {
@@ -7298,5 +7543,353 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[test]
+    fn validate_detached_handle_rejects_incomplete_and_inconsistent_launched_handles() {
+        let temp_root = std::env::temp_dir();
+        let owned_profile = temp_root
+            .join(format!("{}-9999-0", launch::PROFILE_PREFIX))
+            .to_string_lossy()
+            .into_owned();
+        let base = || DetachedBrowserHandle {
+            mode: "launched".to_string(),
+            websocket_url: "ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
+            target_id: "target-1".to_string(),
+            port: 9222,
+            pid: Some(4242),
+            profile: Some(owned_profile.clone()),
+            headless: true,
+            width: 1280,
+            height: 800,
+            connect: None,
+            testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
+            refs: snapshot::RefStore::default(),
+        };
+
+        assert!(matches!(
+            validate_detached_handle(&base(), &temp_root),
+            Ok(ValidatedHandle::Launched {
+                pid: 4242,
+                port: 9222,
+                ..
+            })
+        ));
+
+        let mut missing_pid = base();
+        missing_pid.pid = None;
+        assert!(validate_detached_handle(&missing_pid, &temp_root).is_err());
+
+        let mut zero_pid = base();
+        zero_pid.pid = Some(0);
+        assert!(validate_detached_handle(&zero_pid, &temp_root).is_err());
+
+        let mut missing_profile = base();
+        missing_profile.profile = None;
+        assert!(validate_detached_handle(&missing_profile, &temp_root).is_err());
+
+        let mut unowned_profile = base();
+        unowned_profile.profile = Some(temp_root.join("unrelated").to_string_lossy().into_owned());
+        assert!(validate_detached_handle(&unowned_profile, &temp_root).is_err());
+
+        let mut zero_port = base();
+        zero_port.port = 0;
+        assert!(validate_detached_handle(&zero_port, &temp_root).is_err());
+
+        let mut empty_target = base();
+        empty_target.target_id = "  ".to_string();
+        assert!(validate_detached_handle(&empty_target, &temp_root).is_err());
+
+        let mut hybrid_connect = base();
+        hybrid_connect.connect = Some("http://127.0.0.1:9222".to_string());
+        assert!(validate_detached_handle(&hybrid_connect, &temp_root).is_err());
+
+        let mut mismatched_port = base();
+        mismatched_port.websocket_url = "ws://127.0.0.1:9333/devtools/browser/abc".to_string();
+        assert!(validate_detached_handle(&mismatched_port, &temp_root).is_err());
+
+        let mut remote_ws = base();
+        remote_ws.websocket_url = "ws://192.0.2.10:9222/devtools/browser/abc".to_string();
+        assert!(validate_detached_handle(&remote_ws, &temp_root).is_err());
+    }
+
+    #[test]
+    fn validate_detached_handle_preserves_connected_semantics_and_rejects_hybrid_fields() {
+        let temp_root = std::env::temp_dir();
+        let owned_profile = temp_root
+            .join(format!("{}-9999-1", launch::PROFILE_PREFIX))
+            .to_string_lossy()
+            .into_owned();
+        let base = || DetachedBrowserHandle {
+            mode: "connected".to_string(),
+            websocket_url: "ws://127.0.0.1:9333/devtools/browser/mock".to_string(),
+            target_id: "target-1".to_string(),
+            port: 9222,
+            pid: None,
+            profile: None,
+            headless: true,
+            width: 1280,
+            height: 800,
+            connect: Some("http://127.0.0.1:9222".to_string()),
+            testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
+            refs: snapshot::RefStore::default(),
+        };
+
+        assert!(matches!(
+            validate_detached_handle(&base(), &temp_root),
+            Ok(ValidatedHandle::Connected { port: 9222, .. })
+        ));
+
+        let mut with_pid = base();
+        with_pid.pid = Some(4242);
+        assert!(validate_detached_handle(&with_pid, &temp_root).is_err());
+
+        let mut with_profile = base();
+        with_profile.profile = Some(owned_profile);
+        assert!(validate_detached_handle(&with_profile, &temp_root).is_err());
+
+        let mut no_connect = base();
+        no_connect.connect = None;
+        assert!(validate_detached_handle(&no_connect, &temp_root).is_err());
+
+        let mut remote_ws = base();
+        remote_ws.websocket_url = "ws://192.0.2.10:9333/devtools/browser/mock".to_string();
+        assert!(validate_detached_handle(&remote_ws, &temp_root).is_err());
+    }
+
+    #[test]
+    fn dispose_handle_with_rejects_bad_handles_and_preserves_connected_ownership() {
+        let temp_root = std::env::temp_dir();
+        let owned_profile = temp_root
+            .join(format!("{}-8888-0", launch::PROFILE_PREFIX))
+            .to_string_lossy()
+            .into_owned();
+
+        let mut record_calls = 0usize;
+        let mut close_browser_calls = 0usize;
+        let mut close_target_calls = 0usize;
+        let mut dispose_detached_calls = 0usize;
+
+        // 1. Incomplete launched handle must fail before any callback runs.
+        let incomplete = json!({
+            "mode": "launched",
+            "websocket_url": "ws://127.0.0.1:9222/devtools/browser/abc",
+            "target_id": "target-1",
+            "port": 9222,
+            "pid": null,
+            "profile": owned_profile,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        });
+        assert!(
+            dispose_handle_with(
+                &incomplete,
+                &temp_root,
+                |_| record_calls += 1,
+                |_| true,
+                |_, _, _| Ok(true),
+                |_, _| close_browser_calls += 1,
+                |_, _, _| close_target_calls += 1,
+                |_, _, _| {
+                    dispose_detached_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(record_calls, 0);
+        assert_eq!(close_browser_calls, 0);
+        assert_eq!(close_target_calls, 0);
+        assert_eq!(dispose_detached_calls, 0);
+
+        // 2. Open port with unverified pid must refuse Browser.close and dispose_detached.
+        let unverified = json!({
+            "mode": "launched",
+            "websocket_url": "ws://127.0.0.1:9222/devtools/browser/abc",
+            "target_id": "target-1",
+            "port": 9222,
+            "pid": 4242,
+            "profile": owned_profile,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        });
+        assert!(
+            dispose_handle_with(
+                &unverified,
+                &temp_root,
+                |_| record_calls += 1,
+                |_| true,
+                |_, _, _| Err("pid 4242 does not match temporary profile".to_string()),
+                |_, _| close_browser_calls += 1,
+                |_, _, _| close_target_calls += 1,
+                |_, _, _| {
+                    dispose_detached_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(close_browser_calls, 0);
+        assert_eq!(close_target_calls, 0);
+        assert_eq!(dispose_detached_calls, 0);
+
+        // 3. Connected handle closes only its target tab and never sends Browser.close or disposes.
+        let connected = json!({
+            "mode": "connected",
+            "websocket_url": "ws://127.0.0.1:9222/devtools/browser/abc",
+            "target_id": "target-tab-1",
+            "port": 9222,
+            "pid": null,
+            "profile": null,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": "http://127.0.0.1:9222",
+            "testid_attribute": "data-testid",
+            "refs": {}
+        });
+        assert!(
+            dispose_handle_with(
+                &connected,
+                &temp_root,
+                |_| record_calls += 1,
+                |_| true,
+                |_, _, _| Ok(true),
+                |_, _| close_browser_calls += 1,
+                |_, target_id, _| {
+                    assert_eq!(target_id, "target-tab-1");
+                    close_target_calls += 1;
+                },
+                |_, _, _| {
+                    dispose_detached_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(close_target_calls, 1);
+        assert_eq!(close_browser_calls, 0);
+        assert_eq!(dispose_detached_calls, 0);
+    }
+
+    #[test]
+    fn reattach_rejects_invalid_handle_before_connecting() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let port = listener.local_addr().expect("port").port();
+        listener.set_nonblocking(true).expect("nonblocking");
+
+        let bad_handle = json!({
+            "mode": "launched",
+            "websocket_url": format!("ws://127.0.0.1:{port}/devtools/browser/mock"),
+            "target_id": "tab-1",
+            "port": port,
+            "pid": 4242,
+            "profile": std::env::temp_dir().join("not-da-profile").to_string_lossy(),
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": DEFAULT_TESTID_ATTRIBUTE,
+            "refs": {}
+        });
+        let err = match BrowserSession::reattach(&bad_handle) {
+            Ok(_) => panic!("unowned profile handle must fail reattach before connecting"),
+            Err(err) => err,
+        };
+        assert!(err.contains("refusing"), "{err}");
+        assert!(
+            matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "reattach must not open a TCP/WS connection on an invalid handle"
+        );
+    }
+
+    #[test]
+    fn connected_session_detach_reattach_and_dispose_closes_only_target_tab() {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock CDP listener");
+        let port = listener.local_addr().expect("port").port();
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/mock");
+        let server = std::thread::spawn(move || {
+            // Connection 1: BrowserSession::reattach
+            let (stream1, _) = listener.accept().expect("accept reattach connection");
+            let _ = stream1.set_nodelay(true);
+            let mut socket1 = tungstenite::accept(stream1).expect("handshake 1");
+            let attach_cmd = read_cdp_request(&mut socket1);
+            assert_eq!(attach_cmd["method"], "Target.attachToTarget");
+            assert_eq!(attach_cmd["params"]["targetId"], "tab-connected");
+            socket1
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": attach_cmd["id"],
+                        "result": { "sessionId": "session-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send attach reply");
+
+            for method in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let req = read_cdp_request(&mut socket1);
+                assert_eq!(req["method"], method);
+                socket1
+                    .send(tungstenite::Message::text(
+                        json!({ "id": req["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("send domain reply");
+            }
+            while socket1.read().is_ok() {}
+
+            // Connection 2: BrowserSession::dispose_handle
+            let (stream2, _) = listener.accept().expect("accept dispose connection");
+            let _ = stream2.set_nodelay(true);
+            let mut socket2 = tungstenite::accept(stream2).expect("handshake 2");
+            let close_target = read_cdp_request(&mut socket2);
+            assert_eq!(
+                close_target["method"], "Target.closeTarget",
+                "connected dispose_handle must only close its tab, never Browser.close"
+            );
+            assert_eq!(close_target["params"]["targetId"], "tab-connected");
+            socket2
+                .send(tungstenite::Message::text(
+                    json!({ "id": close_target["id"], "result": { "success": true } }).to_string(),
+                ))
+                .expect("send closeTarget reply");
+            while socket2.read().is_ok() {}
+        });
+
+        let handle = json!({
+            "mode": "connected",
+            "websocket_url": ws_url,
+            "target_id": "tab-connected",
+            "port": port,
+            "pid": null,
+            "profile": null,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": format!("http://127.0.0.1:{port}"),
+            "testid_attribute": DEFAULT_TESTID_ATTRIBUTE,
+            "refs": {}
+        });
+
+        let mut reattached =
+            BrowserSession::reattach(&handle).expect("connected handle must reattach");
+        let re_detached = reattached
+            .detach()
+            .expect("detach succeeds")
+            .expect("detach returns handle");
+        assert!(re_detached["pid"].is_null());
+        assert!(re_detached["profile"].is_null());
+        assert_eq!(re_detached["mode"], "connected");
+
+        BrowserSession::dispose_handle(&re_detached).expect("dispose connected handle succeeds");
+        server.join().expect("mock CDP server finishes");
     }
 }

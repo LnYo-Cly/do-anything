@@ -534,8 +534,18 @@ fn handle_stop(sessions_dir: &Path, id: &str, registry: &Registry) -> SessionRes
             return error_response(ExitCode::Environment, "environment", message);
         }
     };
-    let state = store::load_state(&session_dir).ok();
-    let errors = store::close_and_remove_session(&session_dir, state.as_ref(), lock, registry);
+    let (state, load_error) = if session_dir.join(store::STATE_FILE).exists() {
+        match store::load_state(&session_dir) {
+            Ok(state) => (Some(state), None),
+            Err(err) => (None, Some(err)),
+        }
+    } else {
+        (None, None)
+    };
+    let mut errors = store::close_and_remove_session(&session_dir, state.as_ref(), lock, registry);
+    if let Some(err) = load_error {
+        errors.insert(0, err);
+    }
 
     let ok = errors.is_empty();
     SessionResponse {

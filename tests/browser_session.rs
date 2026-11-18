@@ -1418,21 +1418,29 @@ fn stop_reports_error_when_browser_port_remains_listening_after_cleanup() {
         active: true,
     };
 
-    // Break CDP control connection and drop `pid` while keeping `real_port` so
-    // `stop` cannot close or kill Chrome and must detect the surviving listener.
-    let closed_listener = support::bind_browser_safe_listener();
-    let closed_port = closed_listener.local_addr().unwrap().port();
-    drop(closed_listener);
+    // Keep a complete, consistent handle whose CDP endpoint cannot be reached
+    // and whose pid belongs to an already-exited dummy process, so `stop` cannot
+    // close or verify Chrome, must report the surviving listener, and must not
+    // delete Chrome's temporary profile while Chrome is still alive.
+    let mut dead_child = Command::new(da())
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn short-lived dummy process");
+    let dead_pid = dead_child.id();
+    let _ = dead_child.wait();
 
     let mut state: Value = serde_json::from_str(&original_state).expect("parse state.json");
     let browser_handle = state["handles"]["browser"]
         .as_object_mut()
         .expect("browser handle object");
-    browser_handle.remove("pid");
+    browser_handle.insert("pid".to_string(), json!(dead_pid));
     browser_handle.insert(
         "websocket_url".to_string(),
         json!(format!(
-            "ws://127.0.0.1:{closed_port}/devtools/browser/unreachable"
+            "ws://127.0.0.1:{real_port}/devtools/browser/unreachable"
         )),
     );
     fs::write(
@@ -1463,6 +1471,10 @@ fn stop_reports_error_when_browser_port_remains_listening_after_cleanup() {
         is_port_open(real_port),
         "Chrome debug port {real_port} should still be open before cleanup"
     );
+    assert!(
+        profile_dir.exists(),
+        "temp profile must not be deleted while Chrome is still alive"
+    );
 
     // Restore original handle and confirm real cleanup succeeds cleanly.
     fs::create_dir_all(&session_dir).expect("recreate session dir for cleanup");
@@ -1473,4 +1485,242 @@ fn stop_reports_error_when_browser_port_remains_listening_after_cleanup() {
     assert!(!is_port_open(real_port));
     assert!(!profile_dir.exists());
     assert!(!session_dir.exists());
+}
+
+fn spawn_dead_pid() -> u32 {
+    let mut child = Command::new(da())
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn short-lived dummy process");
+    let pid = child.id();
+    let _ = child.wait();
+    pid
+}
+
+fn write_persisted_browser_handle(dir: &Path, id: &str, handle: Value) {
+    let state_path = dir.join(".da/sessions").join(id).join("state.json");
+    let mut state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state.json"))
+            .expect("parse state.json");
+    state["handles"]["browser"] = handle;
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize state.json"),
+    )
+    .expect("write state.json");
+}
+
+#[test]
+fn stop_reap_and_reattach_refuse_tampered_unowned_profile_without_deleting_it() {
+    let dir = TempDir::new("browser-unowned-profile");
+    let unrelated_dir = dir.path().join("unrelated-user-dir");
+    fs::create_dir_all(&unrelated_dir).expect("create unrelated dir");
+    let sentinel = unrelated_dir.join("keep.txt");
+    fs::write(&sentinel, "do not delete").expect("write sentinel");
+
+    let closed_listener = support::bind_browser_safe_listener();
+    let closed_port = closed_listener.local_addr().unwrap().port();
+    drop(closed_listener);
+    let dead_pid = spawn_dead_pid();
+
+    let tampered_handle = json!({
+        "mode": "launched",
+        "websocket_url": format!("ws://127.0.0.1:{closed_port}/devtools/browser/fake"),
+        "target_id": "target-1",
+        "port": closed_port,
+        "pid": dead_pid,
+        "profile": unrelated_dir.to_string_lossy(),
+        "headless": true,
+        "width": 1280,
+        "height": 800,
+        "connect": null,
+        "testid_attribute": "data-testid",
+        "refs": {}
+    });
+
+    // 1. Reattach via `session snapshot` must reject the unowned profile.
+    let s1 = json_stdout(&run_da_in(dir.path(), &["session", "start"]))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_persisted_browser_handle(dir.path(), &s1, tampered_handle.clone());
+    let snap = run_da_in(dir.path(), &["session", "snapshot", &s1]);
+    assert_eq!(snap.status.code(), Some(4), "{:?}", snap);
+    assert!(
+        sentinel.exists(),
+        "reattach path must leave unrelated directory intact"
+    );
+
+    // 2. `session stop` must reject the unowned profile and leave the directory intact.
+    let stop = run_da_in(dir.path(), &["session", "stop", &s1]);
+    assert_eq!(
+        stop.status.code(),
+        Some(4),
+        "stop must reject unowned profile: {}",
+        String::from_utf8_lossy(&stop.stdout)
+    );
+    let stop_json = json_stdout(&stop);
+    assert_eq!(stop_json["ok"], false, "{stop_json}");
+    assert!(
+        sentinel.exists(),
+        "stop must never recursively delete an unowned profile directory"
+    );
+
+    // 3. Idle reap via `session list --idle-timeout-ms 0` must also refuse and preserve it.
+    let s2 = json_stdout(&run_da_in(dir.path(), &["session", "start"]))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_persisted_browser_handle(dir.path(), &s2, tampered_handle);
+    let list = run_da_in(dir.path(), &["session", "list", "--idle-timeout-ms", "0"]);
+    assert_eq!(
+        list.status.code(),
+        Some(4),
+        "idle reap must report unowned profile refusal: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+    let list_json = json_stdout(&list);
+    assert_eq!(list_json["ok"], false, "{list_json}");
+    assert!(
+        sentinel.exists(),
+        "idle reap must never recursively delete an unowned profile directory"
+    );
+}
+
+#[test]
+fn stop_refuses_incomplete_and_inconsistent_launched_handles_before_connecting() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let dir = TempDir::new("browser-bad-handles");
+    let incomplete_listener = TcpListener::bind("127.0.0.1:0").expect("bind incomplete listener");
+    let incomplete_port = incomplete_listener.local_addr().unwrap().port();
+    incomplete_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking");
+
+    let open_probe_listener = TcpListener::bind("127.0.0.1:0").expect("bind open probe listener");
+    let open_probe_port = open_probe_listener.local_addr().unwrap().port();
+    open_probe_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking");
+
+    let accepted_incomplete = Arc::new(AtomicBool::new(false));
+    let accepted_incomplete_flag = Arc::clone(&accepted_incomplete);
+    let received_cdp_bytes = Arc::new(AtomicBool::new(false));
+    let received_cdp_flag = Arc::clone(&received_cdp_bytes);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop_flag);
+    let server = thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            if let Ok((_stream, _)) = incomplete_listener.accept() {
+                accepted_incomplete_flag.store(true, Ordering::SeqCst);
+            }
+            if let Ok((mut stream, _)) = open_probe_listener.accept() {
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                let mut buf = [0u8; 64];
+                if let Ok(n) = stream.read(&mut buf)
+                    && n > 0
+                {
+                    received_cdp_flag.store(true, Ordering::SeqCst);
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let dead_pid = spawn_dead_pid();
+    let owned_profile = std::env::temp_dir().join(format!("da-chrome-profile-{dead_pid}-999"));
+    let other_listener = support::bind_browser_safe_listener();
+    let other_port = other_listener.local_addr().unwrap().port();
+    drop(other_listener);
+
+    let bad_handles = [
+        // Missing pid and profile while pointing at a live listening port.
+        json!({
+            "mode": "launched",
+            "websocket_url": format!("ws://127.0.0.1:{incomplete_port}/devtools/browser/fake"),
+            "target_id": "target-1",
+            "port": incomplete_port,
+            "pid": null,
+            "profile": null,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        }),
+        // Present profile, missing pid, listening port.
+        json!({
+            "mode": "launched",
+            "websocket_url": format!("ws://127.0.0.1:{incomplete_port}/devtools/browser/fake"),
+            "target_id": "target-1",
+            "port": incomplete_port,
+            "pid": null,
+            "profile": owned_profile.to_string_lossy(),
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        }),
+        // Inconsistent websocket_url port vs handle port.
+        json!({
+            "mode": "launched",
+            "websocket_url": format!("ws://127.0.0.1:{incomplete_port}/devtools/browser/fake"),
+            "target_id": "target-1",
+            "port": other_port,
+            "pid": dead_pid,
+            "profile": owned_profile.to_string_lossy(),
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        }),
+        // Valid-looking handle whose pid does NOT own the listening port (listening port alone is insufficient proof).
+        json!({
+            "mode": "launched",
+            "websocket_url": format!("ws://127.0.0.1:{open_probe_port}/devtools/browser/fake"),
+            "target_id": "target-1",
+            "port": open_probe_port,
+            "pid": dead_pid,
+            "profile": owned_profile.to_string_lossy(),
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        }),
+    ];
+
+    for bad_handle in bad_handles {
+        let id = json_stdout(&run_da_in(dir.path(), &["session", "start"]))["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_persisted_browser_handle(dir.path(), &id, bad_handle);
+        let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+        assert_eq!(stop.status.code(), Some(4), "{:?}", stop);
+        assert_eq!(json_stdout(&stop)["ok"], false);
+    }
+
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = server.join();
+    assert!(
+        !accepted_incomplete.load(Ordering::SeqCst),
+        "dispose_handle must never even connect to incomplete or inconsistent launched handles"
+    );
+    assert!(
+        !received_cdp_bytes.load(Ordering::SeqCst),
+        "dispose_handle must never send WebSocket handshake or Browser.close without confirmed pid ownership"
+    );
 }

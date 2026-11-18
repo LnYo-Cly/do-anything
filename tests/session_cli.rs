@@ -431,3 +431,30 @@ fn optional_step_skips_and_exports_with_optional_modifier() {
         Some(0)
     );
 }
+
+#[test]
+fn corrupt_persisted_state_is_reported_by_list_and_stop() {
+    let dir = TempDir::new("session-corrupt-state");
+    let start = json_stdout(&run_da_in(dir.path(), &["session", "start"]));
+    let id = start["session_id"].as_str().unwrap().to_string();
+    let state_path = dir.path().join(".da/sessions").join(&id).join("state.json");
+    std::fs::write(&state_path, "{corrupt json").expect("write corrupt state.json");
+
+    let list = run_da_in(dir.path(), &["session", "list"]);
+    assert_eq!(list.status.code(), Some(4), "{:?}", list);
+    let list_json = json_stdout(&list);
+    assert_eq!(list_json["ok"], false, "{list_json}");
+    assert!(
+        !list_json["errors"].as_array().unwrap().is_empty(),
+        "list must report corrupt state.json: {list_json}"
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(4), "{:?}", stop);
+    let stop_json = json_stdout(&stop);
+    assert_eq!(stop_json["ok"], false, "{stop_json}");
+    assert!(
+        !stop_json["errors"].as_array().unwrap().is_empty(),
+        "stop must report corrupt state.json: {stop_json}"
+    );
+}

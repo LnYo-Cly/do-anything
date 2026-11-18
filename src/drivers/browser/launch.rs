@@ -12,7 +12,7 @@
 
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -334,11 +334,176 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<(), String> {
     }
 }
 
-/// Removes the temporary profile, retrying while Windows releases its handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileEntry {
+    Missing,
+    Directory,
+    Unsafe,
+}
+
+/// Pure validator checking that `profile` is a direct `da-chrome-profile-<pid>-<seq>`
+/// child directory of `temp_root`, with no traversal or non-canonical segments.
+pub(crate) fn validate_owned_profile_in(profile: &Path, temp_root: &Path) -> Result<(), String> {
+    let raw = profile
+        .to_str()
+        .ok_or_else(|| "browser profile path must be valid UTF-8".to_string())?;
+    if raw.is_empty() {
+        return Err("browser profile path must not be empty".to_string());
+    }
+    if !profile.is_absolute() || !temp_root.is_absolute() {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: path must be absolute"
+        ));
+    }
+    if raw.ends_with('/')
+        || raw.ends_with('\\')
+        || raw.ends_with("/.")
+        || raw.ends_with("\\.")
+        || raw.contains("/./")
+        || raw.contains("\\.\\")
+        || raw.contains("/.\\")
+        || raw.contains("\\./")
+    {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: path must be canonical"
+        ));
+    }
+    if profile
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: path must not contain `.` or `..`"
+        ));
+    }
+
+    let temp_components: Vec<Component<'_>> = temp_root.components().collect();
+    let profile_components: Vec<Component<'_>> = profile.components().collect();
+    if profile_components.len() != temp_components.len() + 1 {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: expected a direct child of `{}`",
+            temp_root.display()
+        ));
+    }
+    if !profile_components[..temp_components.len()]
+        .iter()
+        .zip(temp_components.iter())
+        .all(|(left, right)| same_path_component(*left, *right))
+    {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: outside temporary root `{}`",
+            temp_root.display()
+        ));
+    }
+
+    let Some(Component::Normal(dir_name)) = profile_components.last() else {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: invalid directory name"
+        ));
+    };
+    let Some(dir_name) = dir_name.to_str() else {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: non-UTF-8 directory name"
+        ));
+    };
+    if !is_owned_profile_dir_name(dir_name) {
+        return Err(format!(
+            "refusing unowned browser profile `{raw}`: directory name `{dir_name}` is not owned by `da`"
+        ));
+    }
+    Ok(())
+}
+
+fn same_path_component(left: Component<'_>, right: Component<'_>) -> bool {
+    #[cfg(windows)]
+    match (left, right) {
+        (Component::RootDir, Component::RootDir) => true,
+        (Component::Prefix(a), Component::Prefix(b)) => a
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()),
+        (Component::Normal(a), Component::Normal(b)) => a
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy()),
+        _ => false,
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn is_owned_profile_dir_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(PROFILE_PREFIX) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some((pid_part, seq_part)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid_part.is_empty()
+        && pid_part.bytes().all(|byte| byte.is_ascii_digit())
+        && pid_part.parse::<u32>().is_ok_and(|pid| pid > 0)
+        && !seq_part.is_empty()
+        && seq_part.bytes().all(|byte| byte.is_ascii_digit())
+        && seq_part.parse::<u64>().is_ok()
+}
+
+fn inspect_profile_entry(path: &Path) -> Result<ProfileEntry, String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                Ok(ProfileEntry::Unsafe)
+            } else {
+                Ok(ProfileEntry::Directory)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProfileEntry::Missing),
+        Err(error) => Err(format!(
+            "could not inspect temporary browser profile `{}`: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Removes the temporary profile after validating ownership and rejecting symlinks,
+/// retrying while Windows releases its handles.
 fn remove_profile(profile: &Path) -> Result<(), String> {
+    remove_profile_with(
+        profile,
+        &std::env::temp_dir(),
+        inspect_profile_entry,
+        |path| fs::remove_dir_all(path),
+    )
+}
+
+fn remove_profile_with<I, R>(
+    profile: &Path,
+    temp_root: &Path,
+    mut inspect_entry: I,
+    mut remove_dir_all: R,
+) -> Result<(), String>
+where
+    I: FnMut(&Path) -> Result<ProfileEntry, String>,
+    R: FnMut(&Path) -> std::io::Result<()>,
+{
+    validate_owned_profile_in(profile, temp_root)?;
+    match inspect_entry(profile)? {
+        ProfileEntry::Missing => return Ok(()),
+        ProfileEntry::Unsafe => {
+            return Err(format!(
+                "refusing to remove unowned or non-directory browser profile `{}`",
+                profile.display()
+            ));
+        }
+        ProfileEntry::Directory => {}
+    }
+
     let mut last = None;
     for _ in 0..40 {
-        match fs::remove_dir_all(profile) {
+        match remove_dir_all(profile) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
@@ -413,53 +578,163 @@ fn dispose_detached_with(
     profile: Option<&Path>,
     exit_timeout: Duration,
 ) -> Result<(), String> {
-    dispose_detached_with_kill(pid, port, profile, exit_timeout, kill_process)
+    dispose_detached_with_ops(
+        pid,
+        port,
+        profile,
+        &std::env::temp_dir(),
+        exit_timeout,
+        default_grace_window(),
+        is_port_listening,
+        default_pid_exists,
+        pid_matches_profile,
+        force_kill_pid,
+        remove_profile,
+    )
 }
 
 /// [`dispose_detached_with`] with termination injected so a test can prove that
 /// a failing or non-zero kill reaches the caller instead of being swallowed.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "test seam for termination error propagation")
+)]
 fn dispose_detached_with_kill<K>(
     pid: Option<u32>,
     port: Option<u16>,
     profile: Option<&Path>,
     exit_timeout: Duration,
-    mut kill: K,
+    kill: K,
 ) -> Result<(), String>
 where
     K: FnMut(u32, Option<&Path>) -> Result<(), String>,
 {
+    dispose_detached_with_ops(
+        pid,
+        port,
+        profile,
+        &std::env::temp_dir(),
+        exit_timeout,
+        default_grace_window(),
+        is_port_listening,
+        default_pid_exists,
+        pid_matches_profile,
+        kill,
+        remove_profile,
+    )
+}
+
+fn default_grace_window() -> Duration {
+    #[cfg(windows)]
+    {
+        Duration::from_millis(250)
+    }
+    #[cfg(unix)]
+    {
+        Duration::from_millis(500)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        Duration::ZERO
+    }
+}
+
+fn default_pid_exists(pid: u32) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        windows_pid_exists(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal callback seam for pure unit tests without touching real processes or disk"
+)]
+fn dispose_detached_with_ops<P, E, V, K, R>(
+    pid: Option<u32>,
+    port: Option<u16>,
+    profile: Option<&Path>,
+    temp_root: &Path,
+    exit_timeout: Duration,
+    grace_window: Duration,
+    mut port_listening: P,
+    mut pid_exists: E,
+    mut verify: V,
+    mut kill: K,
+    mut remove_dir: R,
+) -> Result<(), String>
+where
+    P: FnMut(u16) -> bool,
+    E: FnMut(u32) -> Option<bool>,
+    V: FnMut(u32, &Path) -> PidProfileMatch,
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+    R: FnMut(&Path) -> Result<(), String>,
+{
+    let Some(profile) = profile else {
+        return Err(match pid {
+            Some(pid) => format!(
+                "could not verify or terminate browser pid {pid}: the session handle has no profile path"
+            ),
+            None => "could not verify detached browser: the session handle has no profile path"
+                .to_string(),
+        });
+    };
+    validate_owned_profile_in(profile, temp_root)?;
+    if pid == Some(0) {
+        return Err("could not verify or terminate browser pid 0: invalid pid".to_string());
+    }
+
     let mut errors = Vec::new();
     let deadline = Instant::now() + exit_timeout;
 
-    let mut port_open = port.is_some_and(is_port_listening);
+    let mut port_open = port.is_some_and(&mut port_listening);
     if let Some(port) = port
         && port_open
     {
-        while is_port_listening(port) && Instant::now() < deadline {
+        while port_listening(port) && Instant::now() < deadline {
             thread::sleep(POLL_INTERVAL);
         }
-        port_open = is_port_listening(port);
+        port_open = port_listening(port);
     }
 
     let mut kill_attempted = false;
-    if let Some(pid) = pid {
-        if port_open {
-            kill_attempted = true;
-            if let Err(err) = kill(pid, profile) {
-                errors.push(err);
+    match pid {
+        Some(pid) if port_open => match verify(pid, profile) {
+            PidProfileMatch::Matches => {
+                kill_attempted = true;
+                if let Err(err) = kill(pid, Some(profile)) {
+                    errors.push(err);
+                }
             }
-        } else if let Some(profile) = profile {
-            ensure_profile_process_stopped(pid, profile, &mut errors, &mut kill);
-        } else {
-            // The debug port is closed, so there is no live socket that ties
-            // this pid to the browser, and without the profile path there is
-            // no command line to check either. The number may belong to a
-            // recycled, unrelated process by now, and killing it would be
-            // worse than leaving it. Report that the handle could not be
-            // verified instead of claiming a clean teardown.
-            errors.push(format!(
-                "could not verify or terminate browser pid {pid}: the session handle has no profile path"
-            ));
+            PidProfileMatch::Unknown => {
+                errors.push(format!(
+                    "could not verify command line for browser pid {pid} before termination"
+                ));
+            }
+            PidProfileMatch::DoesNotMatch => {
+                errors.push(format!(
+                    "could not confirm ownership of browser pid {pid} for listening debug port"
+                ));
+            }
+        },
+        Some(pid) => {
+            ensure_profile_process_stopped_with(
+                pid,
+                profile,
+                grace_window,
+                &mut errors,
+                &mut pid_exists,
+                &mut verify,
+                &mut kill,
+            );
+        }
+        None => {
+            errors.push("could not confirm browser process ownership: missing pid".to_string());
         }
     }
 
@@ -468,31 +743,41 @@ where
     {
         if kill_attempted {
             let socket_deadline = Instant::now() + Duration::from_secs(1);
-            while is_port_listening(port) && Instant::now() < socket_deadline {
+            while port_listening(port) && Instant::now() < socket_deadline {
                 thread::sleep(POLL_INTERVAL);
             }
         }
-        if is_port_listening(port) {
+        if port_listening(port) {
             errors.push(format!(
                 "browser debug port {port} is still listening after cleanup"
             ));
         }
     }
 
-    if let Some(profile) = profile
-        && let Err(err) = remove_profile(profile)
+    if errors.is_empty()
+        && let Some(pid) = pid
+        && let Err(err) = remove_dir(profile)
     {
-        if let Some(pid) = pid
-            && errors.is_empty()
-        {
-            if let Err(kill_err) = kill(pid, Some(profile)) {
-                errors.push(kill_err);
+        match verify(pid, profile) {
+            PidProfileMatch::Matches => {
+                if let Err(kill_err) = kill(pid, Some(profile)) {
+                    errors.push(kill_err);
+                }
+                if errors.is_empty()
+                    && let Err(retry_err) = remove_dir(profile)
+                {
+                    errors.push(retry_err);
+                }
             }
-            if let Err(retry_err) = remove_profile(profile) {
-                errors.push(retry_err);
+            PidProfileMatch::Unknown => {
+                errors.push(format!(
+                    "could not verify command line for browser pid {pid} before cleanup retry"
+                ));
+                errors.push(err);
             }
-        } else {
-            errors.push(err);
+            PidProfileMatch::DoesNotMatch => {
+                errors.push(err);
+            }
         }
     }
 
@@ -500,6 +785,55 @@ where
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+pub(crate) fn verify_launched_process_before_close(
+    pid: u32,
+    port: u16,
+    profile: &Path,
+) -> Result<bool, String> {
+    verify_launched_process_before_close_with(
+        pid,
+        port,
+        profile,
+        &std::env::temp_dir(),
+        pid_matches_profile,
+        is_port_listening,
+    )
+}
+
+fn verify_launched_process_before_close_with<V, P>(
+    pid: u32,
+    port: u16,
+    profile: &Path,
+    temp_root: &Path,
+    mut verify: V,
+    mut port_open: P,
+) -> Result<bool, String>
+where
+    V: FnMut(u32, &Path) -> PidProfileMatch,
+    P: FnMut(u16) -> bool,
+{
+    if pid == 0 {
+        return Err("could not verify browser pid 0 before closing".to_string());
+    }
+    validate_owned_profile_in(profile, temp_root)?;
+    match verify(pid, profile) {
+        PidProfileMatch::Matches => Ok(true),
+        PidProfileMatch::Unknown => Err(format!(
+            "could not verify command line for browser pid {pid} before closing port {port}"
+        )),
+        PidProfileMatch::DoesNotMatch => {
+            if port_open(port) {
+                Err(format!(
+                    "refusing to close browser on port {port}: pid {pid} does not match temporary profile `{}`",
+                    profile.display()
+                ))
+            } else {
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -518,7 +852,7 @@ fn configure_detached(command: &mut Command) {
     }
 }
 
-fn is_port_listening(port: u16) -> bool {
+pub(crate) fn is_port_listening(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
 }
@@ -533,29 +867,34 @@ enum PidProfileMatch {
 /// Checks whether a process `pid` is still alive and owns `--user-data-dir=<profile>`
 /// after its debug port stopped listening, allowing a short grace window for a
 /// clean post-`Browser.close` exit before force-killing.
-fn ensure_profile_process_stopped<K>(
+fn ensure_profile_process_stopped_with<E, V, K>(
     pid: u32,
     profile: &Path,
+    grace_window: Duration,
     errors: &mut Vec<String>,
+    pid_exists: &mut E,
+    verify: &mut V,
     kill: &mut K,
 ) where
+    E: FnMut(u32) -> Option<bool>,
+    V: FnMut(u32, &Path) -> PidProfileMatch,
     K: FnMut(u32, Option<&Path>) -> Result<(), String>,
 {
     #[cfg(windows)]
     {
-        match windows_pid_exists(pid) {
+        match pid_exists(pid) {
             Some(false) => return,
-            Some(true) => {
-                // Give a closing browser a brief window to exit cleanly after closing
-                // its debug port so the fast `tasklist` check avoids spawning PowerShell.
-                thread::sleep(Duration::from_millis(250));
-                if windows_pid_exists(pid) == Some(false) {
+            // Give a closing browser a brief window to exit cleanly after closing
+            // its debug port so the fast `tasklist` check avoids spawning PowerShell.
+            Some(true) if !grace_window.is_zero() => {
+                thread::sleep(grace_window);
+                if pid_exists(pid) == Some(false) {
                     return;
                 }
             }
-            None => {}
+            Some(true) | None => {}
         }
-        match windows_pid_matches_profile(pid, profile) {
+        match verify(pid, profile) {
             PidProfileMatch::DoesNotMatch => {}
             PidProfileMatch::Matches => {
                 if let Err(err) = kill(pid, Some(profile)) {
@@ -571,7 +910,8 @@ fn ensure_profile_process_stopped<K>(
     }
     #[cfg(unix)]
     {
-        match unix_pid_matches_profile(pid, profile) {
+        let _ = pid_exists;
+        match verify(pid, profile) {
             PidProfileMatch::DoesNotMatch => return,
             PidProfileMatch::Unknown => {
                 errors.push(format!(
@@ -581,10 +921,10 @@ fn ensure_profile_process_stopped<K>(
             }
             PidProfileMatch::Matches => {}
         }
-        let grace_deadline = Instant::now() + Duration::from_millis(500);
+        let grace_deadline = Instant::now() + grace_window;
         while Instant::now() < grace_deadline {
             thread::sleep(Duration::from_millis(50));
-            match unix_pid_matches_profile(pid, profile) {
+            match verify(pid, profile) {
                 PidProfileMatch::DoesNotMatch => return,
                 PidProfileMatch::Matches => {}
                 PidProfileMatch::Unknown => {
@@ -601,12 +941,18 @@ fn ensure_profile_process_stopped<K>(
     }
     #[cfg(not(any(windows, unix)))]
     {
-        let _ = (pid, profile, errors, kill);
+        let _ = (pid, profile, grace_window, errors, pid_exists, verify, kill);
     }
 }
 
 fn kill_process(pid: u32, profile: Option<&Path>) -> Result<(), String> {
-    kill_process_with(pid, profile, pid_matches_profile, force_kill_pid)
+    kill_process_in(
+        pid,
+        profile,
+        &std::env::temp_dir(),
+        pid_matches_profile,
+        force_kill_pid,
+    )
 }
 
 /// [`kill_process`] with ownership verification and termination injected.
@@ -615,9 +961,27 @@ fn kill_process(pid: u32, profile: Option<&Path>) -> Result<(), String> {
 /// does not name `profile`; that is what keeps a recycled pid safe. This seam
 /// exists so a test can prove both halves of that contract without depending on
 /// the host having a kill utility that fails on demand.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "test seam for ownership verification")
+)]
 fn kill_process_with<V, K>(
     pid: u32,
     profile: Option<&Path>,
+    verify: V,
+    kill: K,
+) -> Result<(), String>
+where
+    V: FnMut(u32, &Path) -> PidProfileMatch,
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+{
+    kill_process_in(pid, profile, &std::env::temp_dir(), verify, kill)
+}
+
+fn kill_process_in<V, K>(
+    pid: u32,
+    profile: Option<&Path>,
+    temp_root: &Path,
     mut verify: V,
     mut kill: K,
 ) -> Result<(), String>
@@ -625,18 +989,25 @@ where
     V: FnMut(u32, &Path) -> PidProfileMatch,
     K: FnMut(u32, Option<&Path>) -> Result<(), String>,
 {
-    if let Some(profile) = profile {
-        match verify(pid, profile) {
-            PidProfileMatch::Matches => {}
-            PidProfileMatch::DoesNotMatch => return Ok(()),
-            PidProfileMatch::Unknown => {
-                return Err(format!(
-                    "could not verify command line for browser pid {pid} before termination"
-                ));
-            }
+    if pid == 0 {
+        return Err("could not terminate browser pid 0: invalid pid".to_string());
+    }
+    let Some(profile) = profile else {
+        return Err(format!(
+            "could not verify or terminate browser pid {pid}: the session handle has no profile path"
+        ));
+    };
+    validate_owned_profile_in(profile, temp_root)?;
+    match verify(pid, profile) {
+        PidProfileMatch::Matches => {}
+        PidProfileMatch::DoesNotMatch => return Ok(()),
+        PidProfileMatch::Unknown => {
+            return Err(format!(
+                "could not verify command line for browser pid {pid} before termination"
+            ));
         }
     }
-    kill(pid, profile)
+    kill(pid, Some(profile))
 }
 
 fn force_kill_pid(pid: u32, profile: Option<&Path>) -> Result<(), String> {
@@ -857,11 +1228,17 @@ fn cmdline_matches_profile(cmdline: &str, profile: &Path) -> bool {
     while let Some(offset) = haystack[start..].find(target) {
         let match_start = start + offset;
         let end = match_start + target.len();
+        let prev_is_boundary = haystack[..match_start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| {
+                ch == '=' || ch == '\0' || ch == '"' || ch == '\'' || ch.is_whitespace()
+            });
         let next_is_boundary = haystack[end..]
             .chars()
             .next()
             .is_none_or(|ch| ch == '\0' || ch == '"' || ch == '\'' || ch.is_whitespace());
-        if next_is_boundary {
+        if prev_is_boundary && next_is_boundary {
             return true;
         }
         let step = haystack[match_start..]
@@ -1023,12 +1400,19 @@ fn unix_pid_matches_profile(pid: u32, profile: &Path) -> PidProfileMatch {
 /// Creates an empty profile directory with a unique name.
 fn create_profile() -> Result<PathBuf, String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
+    let temp = std::env::temp_dir();
+    fs::create_dir_all(&temp).map_err(|error| {
+        format!(
+            "could not prepare temporary directory `{}`: {error}",
+            temp.display()
+        )
+    })?;
+    let path = temp.join(format!(
         "{PROFILE_PREFIX}-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir_all(&path).map_err(|error| {
+    fs::create_dir(&path).map_err(|error| {
         format!(
             "could not create the temporary browser profile `{}`: {error}",
             path.display()
@@ -1772,5 +2156,403 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_owned_profile_accepts_only_direct_owned_temp_children() {
+        let temp_root = std::env::temp_dir();
+        let valid = temp_root.join(format!("{PROFILE_PREFIX}-1234-0"));
+        assert!(
+            validate_owned_profile_in(&valid, &temp_root).is_ok(),
+            "direct da profile child must pass: {valid:?}"
+        );
+
+        let relative = PathBuf::from(format!("{PROFILE_PREFIX}-1234-0"));
+        let nested = valid.join("sub");
+        let traversal = temp_root
+            .join(format!("{PROFILE_PREFIX}-1234-0"))
+            .join("..")
+            .join("victim");
+        let dot_suffix = PathBuf::from(format!("{}/.", valid.display()));
+        let slash_suffix = PathBuf::from(format!("{}/", valid.display()));
+        let wrong_prefix = temp_root.join("other-dir-1234-0");
+        let zero_pid = temp_root.join(format!("{PROFILE_PREFIX}-0-0"));
+        let missing_seq = temp_root.join(format!("{PROFILE_PREFIX}-1234"));
+        let extra_suffix = temp_root.join(format!("{PROFILE_PREFIX}-1234-0-extra"));
+        let non_numeric = temp_root.join(format!("{PROFILE_PREFIX}-abc-0"));
+        let outside = temp_root
+            .parent()
+            .unwrap_or(&temp_root)
+            .join(format!("{PROFILE_PREFIX}-1234-0"));
+
+        for invalid in [
+            Path::new(""),
+            relative.as_path(),
+            temp_root.as_path(),
+            nested.as_path(),
+            traversal.as_path(),
+            dot_suffix.as_path(),
+            slash_suffix.as_path(),
+            wrong_prefix.as_path(),
+            zero_pid.as_path(),
+            missing_seq.as_path(),
+            extra_suffix.as_path(),
+            non_numeric.as_path(),
+            outside.as_path(),
+        ] {
+            assert!(
+                validate_owned_profile_in(invalid, &temp_root).is_err(),
+                "unowned or non-canonical profile `{}` must be rejected",
+                invalid.display()
+            );
+        }
+    }
+
+    #[test]
+    fn remove_profile_refuses_invalid_paths_and_symlinks_without_removing() {
+        let temp_root = std::env::temp_dir();
+        let valid = temp_root.join(format!("{PROFILE_PREFIX}-4321-7"));
+
+        let mut inspect_calls = 0usize;
+        let mut remove_calls = 0usize;
+        for invalid in [
+            temp_root.as_path(),
+            Path::new("relative-dir"),
+            &temp_root.join("unrelated-dir"),
+            &valid.join("..").join("unrelated"),
+        ] {
+            let err = remove_profile_with(
+                invalid,
+                &temp_root,
+                |_| {
+                    inspect_calls += 1;
+                    Ok(ProfileEntry::Directory)
+                },
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("unowned profile must be rejected before inspection or deletion");
+            assert!(
+                err.contains("refusing") || err.contains("empty"),
+                "unexpected error: {err}"
+            );
+        }
+        assert_eq!(inspect_calls, 0, "invalid paths must not be inspected");
+        assert_eq!(
+            remove_calls, 0,
+            "invalid paths must never reach remove_dir_all"
+        );
+
+        let symlink_err = remove_profile_with(
+            &valid,
+            &temp_root,
+            |_| Ok(ProfileEntry::Unsafe),
+            |_| {
+                remove_calls += 1;
+                Ok(())
+            },
+        )
+        .expect_err("symlinked or non-directory profile must be refused");
+        assert!(symlink_err.contains("refusing"), "{symlink_err}");
+        assert_eq!(remove_calls, 0, "symlinks must never reach remove_dir_all");
+
+        assert!(
+            remove_profile_with(
+                &valid,
+                &temp_root,
+                |_| Ok(ProfileEntry::Missing),
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(remove_calls, 0);
+
+        assert!(
+            remove_profile_with(
+                &valid,
+                &temp_root,
+                |_| Ok(ProfileEntry::Directory),
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(remove_calls, 1);
+    }
+
+    #[test]
+    fn kill_process_refuses_missing_or_unowned_profile_and_zero_pid_without_signaling() {
+        let temp_root = std::env::temp_dir();
+        let owned = temp_root.join(format!("{PROFILE_PREFIX}-4242-0"));
+        let unowned = temp_root.join("not-da-profile");
+
+        let mut verify_calls = 0usize;
+        let mut kill_calls = 0usize;
+
+        for (pid, profile) in [
+            (0, Some(owned.as_path())),
+            (4242, None),
+            (4242, Some(unowned.as_path())),
+        ] {
+            let result = kill_process_in(
+                pid,
+                profile,
+                &temp_root,
+                |_, _| {
+                    verify_calls += 1;
+                    PidProfileMatch::Matches
+                },
+                |_, _| {
+                    kill_calls += 1;
+                    Ok(())
+                },
+            );
+            assert!(
+                result.is_err(),
+                "expected refusal for pid={pid}, profile={profile:?}"
+            );
+        }
+        assert_eq!(verify_calls, 0, "invalid inputs must not reach verify");
+        assert_eq!(
+            kill_calls, 0,
+            "invalid inputs must never signal any process"
+        );
+    }
+
+    #[test]
+    fn dispose_detached_refuses_open_port_without_profile_and_skips_kill_and_remove() {
+        let temp_root = std::env::temp_dir();
+        let mut kill_calls = 0usize;
+        let mut remove_calls = 0usize;
+        let mut verify_calls = 0usize;
+
+        let err = dispose_detached_with_ops(
+            Some(4242),
+            Some(9222),
+            None,
+            &temp_root,
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| true,
+            |_| Some(true),
+            |_, _| {
+                verify_calls += 1;
+                PidProfileMatch::Matches
+            },
+            |_, _| {
+                kill_calls += 1;
+                Ok(())
+            },
+            |_| {
+                remove_calls += 1;
+                Ok(())
+            },
+        )
+        .expect_err("open port without profile must be rejected");
+        assert!(err.contains("4242"), "{err}");
+        assert_eq!(verify_calls, 0);
+        assert_eq!(
+            kill_calls, 0,
+            "listening port alone must never authorize kill"
+        );
+        assert_eq!(remove_calls, 0);
+    }
+
+    #[test]
+    fn dispose_detached_skips_profile_removal_when_ownership_unconfirmed_or_cleanup_fails() {
+        let temp_root = std::env::temp_dir();
+        let owned = temp_root.join(format!("{PROFILE_PREFIX}-5555-1"));
+
+        // 1. Missing pid (even with closed port and valid profile): no removal.
+        let mut remove_calls = 0usize;
+        let mut kill_calls = 0usize;
+        assert!(
+            dispose_detached_with_ops(
+                None,
+                Some(9222),
+                Some(&owned),
+                &temp_root,
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| false,
+                |_| Some(false),
+                |_, _| PidProfileMatch::DoesNotMatch,
+                |_, _| {
+                    kill_calls += 1;
+                    Ok(())
+                },
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(kill_calls, 0);
+        assert_eq!(remove_calls, 0);
+
+        // 2. Open port + mismatched pid: no kill and no removal.
+        assert!(
+            dispose_detached_with_ops(
+                Some(4242),
+                Some(9222),
+                Some(&owned),
+                &temp_root,
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| true,
+                |_| Some(true),
+                |_, _| PidProfileMatch::DoesNotMatch,
+                |_, _| {
+                    kill_calls += 1;
+                    Ok(())
+                },
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(kill_calls, 0);
+        assert_eq!(remove_calls, 0);
+
+        // 3. Closed port + Unknown ownership: no kill and no removal.
+        assert!(
+            dispose_detached_with_ops(
+                Some(4242),
+                Some(9222),
+                Some(&owned),
+                &temp_root,
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| false,
+                |_| Some(true),
+                |_, _| PidProfileMatch::Unknown,
+                |_, _| {
+                    kill_calls += 1;
+                    Ok(())
+                },
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(kill_calls, 0);
+        assert_eq!(remove_calls, 0);
+
+        // 4. Open port + Matches + kill fails: no removal.
+        assert!(
+            dispose_detached_with_ops(
+                Some(4242),
+                Some(9222),
+                Some(&owned),
+                &temp_root,
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| true,
+                |_| Some(true),
+                |_, _| PidProfileMatch::Matches,
+                |_, _| {
+                    kill_calls += 1;
+                    Err("kill failed".to_string())
+                },
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(kill_calls, 1);
+        assert_eq!(remove_calls, 0);
+
+        // 5. Closed port + live unrelated (recycled) pid (DoesNotMatch): no kill, removes owned profile.
+        kill_calls = 0;
+        remove_calls = 0;
+        assert!(
+            dispose_detached_with_ops(
+                Some(4242),
+                Some(9222),
+                Some(&owned),
+                &temp_root,
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| false,
+                |_| Some(true),
+                |_, _| PidProfileMatch::DoesNotMatch,
+                |_, _| {
+                    kill_calls += 1;
+                    Ok(())
+                },
+                |_| {
+                    remove_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(kill_calls, 0);
+        assert_eq!(remove_calls, 1);
+    }
+
+    #[test]
+    fn verify_launched_process_before_close_requires_matching_ownership_on_open_port() {
+        let temp_root = std::env::temp_dir();
+        let owned = temp_root.join(format!("{PROFILE_PREFIX}-5555-2"));
+
+        assert_eq!(
+            verify_launched_process_before_close_with(
+                4242,
+                9222,
+                &owned,
+                &temp_root,
+                |_, _| PidProfileMatch::Matches,
+                |_| true,
+            ),
+            Ok(true)
+        );
+        assert!(
+            verify_launched_process_before_close_with(
+                4242,
+                9222,
+                &owned,
+                &temp_root,
+                |_, _| PidProfileMatch::Unknown,
+                |_| true,
+            )
+            .is_err()
+        );
+        let mismatch_open = verify_launched_process_before_close_with(
+            4242,
+            9222,
+            &owned,
+            &temp_root,
+            |_, _| PidProfileMatch::DoesNotMatch,
+            |_| true,
+        )
+        .expect_err("listening port with mismatched pid must refuse Browser.close");
+        assert!(mismatch_open.contains("9222") && mismatch_open.contains("4242"));
+
+        assert_eq!(
+            verify_launched_process_before_close_with(
+                4242,
+                9222,
+                &owned,
+                &temp_root,
+                |_, _| PidProfileMatch::DoesNotMatch,
+                |_| false,
+            ),
+            Ok(false)
+        );
     }
 }
