@@ -1397,28 +1397,65 @@ fn unix_pid_matches_profile(pid: u32, profile: &Path) -> PidProfileMatch {
     }
 }
 
+/// Maximum number of counter values tried when creating an exclusive temporary
+/// browser profile directory after `AlreadyExists` collisions.
+const PROFILE_CREATE_ATTEMPTS: usize = 256;
+
 /// Creates an empty profile directory with a unique name.
 fn create_profile() -> Result<PathBuf, String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let temp = std::env::temp_dir();
-    fs::create_dir_all(&temp).map_err(|error| {
+    create_profile_in(&std::env::temp_dir(), std::process::id(), &COUNTER)
+}
+
+fn create_profile_in(temp_root: &Path, pid: u32, counter: &AtomicU64) -> Result<PathBuf, String> {
+    create_profile_in_with(temp_root, pid, counter, PROFILE_CREATE_ATTEMPTS, |path| {
+        fs::create_dir(path)
+    })
+}
+
+fn create_profile_in_with<C>(
+    temp_root: &Path,
+    pid: u32,
+    counter: &AtomicU64,
+    max_attempts: usize,
+    mut create_dir: C,
+) -> Result<PathBuf, String>
+where
+    C: FnMut(&Path) -> std::io::Result<()>,
+{
+    if pid == 0 {
+        return Err("could not create temporary browser profile: invalid pid 0".to_string());
+    }
+    if max_attempts == 0 {
+        return Err(format!(
+            "could not create a unique temporary browser profile under `{}`: zero attempts allowed",
+            temp_root.display()
+        ));
+    }
+    fs::create_dir_all(temp_root).map_err(|error| {
         format!(
             "could not prepare temporary directory `{}`: {error}",
-            temp.display()
+            temp_root.display()
         )
     })?;
-    let path = temp.join(format!(
-        "{PROFILE_PREFIX}-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir(&path).map_err(|error| {
-        format!(
-            "could not create the temporary browser profile `{}`: {error}",
-            path.display()
-        )
-    })?;
-    Ok(path)
+    for _ in 0..max_attempts {
+        let seq = counter.fetch_add(1, Ordering::Relaxed);
+        let path = temp_root.join(format!("{PROFILE_PREFIX}-{pid}-{seq}"));
+        match create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create the temporary browser profile `{}`: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "could not create a unique temporary browser profile under `{}` after {max_attempts} attempts",
+        temp_root.display()
+    ))
 }
 
 /// Reads the port and browser path Chrome writes to `DevToolsActivePort`.
@@ -2554,5 +2591,244 @@ mod tests {
             ),
             Ok(false)
         );
+    }
+
+    struct IsolatedProfileFixture {
+        path: PathBuf,
+    }
+
+    impl IsolatedProfileFixture {
+        fn new(label: &str) -> Self {
+            static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+            let base = std::env::temp_dir();
+            fs::create_dir_all(&base).expect("create base temp directory");
+            let pid = std::process::id();
+            for _ in 0..PROFILE_CREATE_ATTEMPTS {
+                let seq = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let candidate = base.join(format!("da-launch-fixture-{label}-{pid}-{seq}"));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => return Self { path: candidate },
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        panic!(
+                            "could not create isolated fixture `{}`: {error}",
+                            candidate.display()
+                        );
+                    }
+                }
+            }
+            panic!("could not allocate isolated fixture `{label}`");
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for IsolatedProfileFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn create_profile_retries_after_already_exists_and_protects_existing_entries() {
+        let fixture = IsolatedProfileFixture::new("collision");
+        let pid = 42420;
+        let counter = AtomicU64::new(0);
+
+        let dir_collision = fixture.path().join(format!("{PROFILE_PREFIX}-{pid}-0"));
+        let nested_dir = dir_collision.join("nested");
+        fs::create_dir_all(&nested_dir).expect("create colliding directory");
+        let dir_sentinel = nested_dir.join("sentinel.txt");
+        fs::write(&dir_sentinel, "keep-existing-dir").expect("write dir sentinel");
+
+        let file_collision = fixture.path().join(format!("{PROFILE_PREFIX}-{pid}-1"));
+        fs::write(&file_collision, "keep-existing-file").expect("write colliding file");
+
+        let empty_dir_collision = fixture.path().join(format!("{PROFILE_PREFIX}-{pid}-2"));
+        fs::create_dir(&empty_dir_collision).expect("create colliding empty directory");
+
+        let created = create_profile_in(fixture.path(), pid, &counter)
+            .expect("collision on -0..-2 must advance to -3");
+        assert_eq!(
+            created,
+            fixture.path().join(format!("{PROFILE_PREFIX}-{pid}-3"))
+        );
+        assert!(created.is_dir(), "created profile must be a directory");
+        assert_eq!(
+            fs::read_dir(&created)
+                .expect("read created profile")
+                .count(),
+            0,
+            "created profile must be empty"
+        );
+        assert!(
+            validate_owned_profile_in(&created, fixture.path()).is_ok(),
+            "created profile must satisfy ownership validation"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+
+        let next = create_profile_in(fixture.path(), pid, &counter)
+            .expect("subsequent creation must advance to -4");
+        assert_eq!(
+            next,
+            fixture.path().join(format!("{PROFILE_PREFIX}-{pid}-4"))
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
+
+        // Removing the newly created profile must leave colliding entries untouched.
+        remove_profile_with(&created, fixture.path(), inspect_profile_entry, |path| {
+            fs::remove_dir_all(path)
+        })
+        .expect("remove newly created profile");
+        assert!(!created.exists());
+        assert_eq!(
+            fs::read_to_string(&dir_sentinel).expect("dir sentinel must remain intact"),
+            "keep-existing-dir"
+        );
+        assert!(file_collision.is_file());
+        assert_eq!(
+            fs::read_to_string(&file_collision).expect("file sentinel must remain intact"),
+            "keep-existing-file"
+        );
+        assert!(empty_dir_collision.is_dir());
+    }
+
+    #[test]
+    fn create_profile_fails_after_finite_limit_on_repeated_already_exists() {
+        let fixture = IsolatedProfileFixture::new("finite-limit");
+        let pid = 7777;
+        let counter = AtomicU64::new(0);
+
+        for seq in 0..PROFILE_CREATE_ATTEMPTS {
+            let entry = fixture.path().join(format!("{PROFILE_PREFIX}-{pid}-{seq}"));
+            fs::create_dir(&entry).expect("create colliding dir");
+        }
+        let sentinel = fixture
+            .path()
+            .join(format!("{PROFILE_PREFIX}-{pid}-0"))
+            .join("keep.txt");
+        fs::write(&sentinel, "do-not-delete").expect("write sentinel");
+
+        let err = create_profile_in(fixture.path(), pid, &counter)
+            .expect_err("exhausting finite retry limit must fail");
+        assert!(
+            err.contains(&PROFILE_CREATE_ATTEMPTS.to_string()),
+            "error must report finite attempt limit {PROFILE_CREATE_ATTEMPTS}: {err}"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            PROFILE_CREATE_ATTEMPTS as u64,
+            "counter must stop after exact attempt limit"
+        );
+        assert!(
+            !fixture
+                .path()
+                .join(format!("{PROFILE_PREFIX}-{pid}-{PROFILE_CREATE_ATTEMPTS}"))
+                .exists(),
+            "must not probe past finite limit"
+        );
+        assert_eq!(
+            fs::read_to_string(&sentinel).expect("existing sentinel must remain intact"),
+            "do-not-delete"
+        );
+    }
+
+    #[test]
+    fn create_profile_propagates_non_already_exists_errors_without_retrying() {
+        let fixture = IsolatedProfileFixture::new("other-errors");
+        let pid = 8888;
+        let counter = AtomicU64::new(0);
+
+        let colliding_file = fixture.path().join(format!("{PROFILE_PREFIX}-{pid}-0"));
+        fs::write(&colliding_file, "keep-file").expect("write colliding file");
+
+        let mut immediate_calls = 0usize;
+        let immediate_counter = AtomicU64::new(0);
+        let immediate_err = create_profile_in_with(
+            fixture.path(),
+            pid,
+            &immediate_counter,
+            PROFILE_CREATE_ATTEMPTS,
+            |_| {
+                immediate_calls += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "immediate denial",
+                ))
+            },
+        )
+        .expect_err("non-AlreadyExists error on first attempt must propagate immediately");
+        assert_eq!(immediate_calls, 1);
+        assert_eq!(immediate_counter.load(Ordering::Relaxed), 1);
+        assert!(
+            immediate_err.contains("immediate denial"),
+            "{immediate_err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&colliding_file).expect("colliding file must remain intact"),
+            "keep-file"
+        );
+
+        let mut calls = 0usize;
+        let err = create_profile_in_with(
+            fixture.path(),
+            pid,
+            &counter,
+            PROFILE_CREATE_ATTEMPTS,
+            |path| {
+                calls += 1;
+                if calls == 1 {
+                    fs::create_dir(path)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected permission denied",
+                    ))
+                }
+            },
+        )
+        .expect_err("non-AlreadyExists error must propagate immediately");
+        assert_eq!(calls, 2, "must stop immediately on non-AlreadyExists error");
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert!(
+            err.contains(&format!("{PROFILE_PREFIX}-{pid}-1"))
+                && err.contains("injected permission denied"),
+            "error must name path and root cause: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&colliding_file).expect("colliding file must remain intact"),
+            "keep-file"
+        );
+        assert!(
+            !fixture
+                .path()
+                .join(format!("{PROFILE_PREFIX}-{pid}-1"))
+                .exists()
+        );
+
+        let blocking_root = fixture.path().join("not-a-directory");
+        fs::write(&blocking_root, "root-file").expect("write blocking root file");
+        let root_counter = AtomicU64::new(0);
+        let root_err = create_profile_in(&blocking_root, pid, &root_counter)
+            .expect_err("non-directory temp_root must fail before creating profiles");
+        assert_eq!(root_counter.load(Ordering::Relaxed), 0);
+        assert!(root_err.contains("not-a-directory"), "{root_err}");
+        assert_eq!(
+            fs::read_to_string(&blocking_root).expect("blocking file must remain intact"),
+            "root-file"
+        );
+
+        let zero_pid_counter = AtomicU64::new(0);
+        assert!(create_profile_in(fixture.path(), 0, &zero_pid_counter).is_err());
+        assert_eq!(zero_pid_counter.load(Ordering::Relaxed), 0);
+
+        let zero_limit_counter = AtomicU64::new(0);
+        assert!(
+            create_profile_in_with(fixture.path(), pid, &zero_limit_counter, 0, |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(zero_limit_counter.load(Ordering::Relaxed), 0);
     }
 }
