@@ -251,7 +251,7 @@ fn retry_schema() -> Value {
             "timeout_ms": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Maximum total time budget for polling, in milliseconds."
+                "description": "Total polling budget in milliseconds for starting new attempts; an already in-flight attempt is allowed to finish."
             },
             "interval_ms": {
                 "type": "integer",

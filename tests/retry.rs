@@ -707,3 +707,219 @@ steps:
         serde_json::json!(["attempt-2"])
     );
 }
+
+#[cfg(feature = "http")]
+#[test]
+fn retry_succeeds_within_budget_and_fails_when_interval_exceeds_remaining_budget() {
+    let within_budget = TestServer::start();
+    let dir = TempDir::new("retry-budget-boundary");
+    let pass_case = dir.write(
+        "within-budget.yaml",
+        &format!(
+            r#"
+name: Poll succeeds within budget
+steps:
+  - http.request:
+      url: {base}/poll?ready_at=2
+    retry:
+      until:
+        - path: $.body.ready
+          equals: true
+      timeout_ms: 2000
+      interval_ms: 20
+"#,
+            base = within_budget.url("")
+        ),
+    );
+    let pass_output = run_da(&[
+        "--output",
+        "json",
+        "run",
+        path_str(&pass_case),
+        "--no-bundle",
+    ]);
+    assert_eq!(
+        exit_code(&pass_output),
+        Some(0),
+        "stderr: {:?}",
+        stderr(&pass_output)
+    );
+    let pass_json = json_stdout(&pass_output);
+    assert_eq!(pass_json["ok"], true);
+    assert_eq!(pass_json["cases"][0]["steps"][0]["status"], "passed");
+    assert_eq!(
+        pass_json["cases"][0]["steps"][0]["result"]["body"]["attempt"],
+        2
+    );
+    assert_eq!(within_budget.request_count(), 2);
+
+    let over_interval = TestServer::start();
+    let fail_case = dir.write(
+        "interval-exceeds-budget.yaml",
+        &format!(
+            r#"
+name: Poll stops when interval exceeds remaining budget
+steps:
+  - http.request:
+      url: {base}/poll?ready_at=2
+    retry:
+      until:
+        - path: $.body.ready
+          equals: true
+      timeout_ms: 150
+      interval_ms: 1000
+"#,
+            base = over_interval.url("")
+        ),
+    );
+    let fail_output = run_da(&[
+        "--output",
+        "json",
+        "run",
+        path_str(&fail_case),
+        "--no-bundle",
+    ]);
+    assert_eq!(
+        exit_code(&fail_output),
+        Some(1),
+        "must fail when interval_ms exceeds remaining budget: stdout={:?} stderr={:?}",
+        stdout(&fail_output),
+        stderr(&fail_output)
+    );
+    assert_eq!(
+        over_interval.request_count(),
+        1,
+        "must not start a second attempt when interval_ms exceeds remaining budget"
+    );
+    let fail_json = json_stdout(&fail_output);
+    assert_eq!(fail_json["ok"], false);
+    let step = &fail_json["cases"][0]["steps"][0];
+    assert_eq!(step["status"], "failed");
+    assert_eq!(step["error"]["kind"], "assertion");
+    assert_eq!(step["assertions"][0]["passed"], false);
+    assert_eq!(step["result"]["body"]["ready"], false);
+    assert_eq!(step["result"]["body"]["attempt"], 1);
+}
+
+#[cfg(all(feature = "http", feature = "log"))]
+#[test]
+fn retry_interval_longer_than_budget_preserves_observer_isolation() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::TcpListener;
+
+    let dir = TempDir::new("retry-interval-observer");
+    let log_path = dir.path().join("app.log");
+    std::fs::write(&log_path, "startup\n").expect("seed log file must succeed");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+    let port = listener.local_addr().expect("listener addr").port();
+    let server_log = log_path.clone();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_requests = std::sync::Arc::clone(&requests);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_stop = std::sync::Arc::clone(&stop);
+    listener
+        .set_nonblocking(true)
+        .expect("listener must be non-blocking");
+
+    let server = std::thread::spawn(move || {
+        while !server_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut req_line = String::new();
+                    {
+                        let mut reader = BufReader::new(&stream);
+                        let _ = reader.read_line(&mut req_line);
+                    }
+                    let (status, body) = if req_line.starts_with("GET /poll ") {
+                        let attempt =
+                            server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let mut file = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&server_log)
+                            .expect("open log file");
+                        writeln!(file, "poll-{attempt}").expect("append log line");
+                        (
+                            "202 Accepted",
+                            format!(r#"{{"ready":{},"attempt":{attempt}}}"#, attempt >= 2),
+                        )
+                    } else {
+                        let mut file = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&server_log)
+                            .expect("open log file");
+                        writeln!(file, "after-step").expect("append log line");
+                        ("200 OK", r#"{"ok":true}"#.to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let case = dir.write(
+        "retry-interval-log.yaml",
+        &format!(
+            r#"
+name: Interval exceeding budget isolates observer
+observe:
+  app_log:
+    log.file:
+      path: '{log}'
+steps:
+  - http.request:
+      url: http://127.0.0.1:{port}/poll
+    optional: true
+    retry:
+      until:
+        - path: $.status
+          equals: 200
+      timeout_ms: 150
+      interval_ms: 1000
+    expect:
+      - path: $.observed.app_log.lines
+        equals: ["poll-1"]
+  - http.request:
+      url: http://127.0.0.1:{port}/after
+    expect:
+      - path: $.observed.app_log.lines
+        equals: ["after-step"]
+"#,
+            log = path_str(&log_path).replace('\\', "/")
+        ),
+    );
+
+    let output = run_da(&["--output", "json", "run", path_str(&case), "--no-bundle"]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().expect("server thread must finish");
+
+    assert_eq!(exit_code(&output), Some(0), "stderr: {:?}", stderr(&output));
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "poll step must make only 1 attempt when interval exceeds remaining budget"
+    );
+    let value = json_stdout(&output);
+    assert_eq!(value["cases"][0]["steps"][0]["status"], "skipped");
+    assert_eq!(value["cases"][0]["steps"][0]["result"]["status"], 202);
+    assert_eq!(
+        value["cases"][0]["steps"][0]["result"]["observed"]["app_log"]["lines"],
+        serde_json::json!(["poll-1"])
+    );
+    assert_eq!(value["cases"][0]["steps"][1]["status"], "passed");
+    assert_eq!(
+        value["cases"][0]["steps"][1]["result"]["observed"]["app_log"]["lines"],
+        serde_json::json!(["after-step"])
+    );
+}

@@ -980,13 +980,20 @@ that name.
 Each polling iteration runs the step and any declared `observe` observers for
 that attempt, keeping only the last attempt's result and observations:
 
+- `timeout_ms` is the polling budget for **starting** a new attempt; it never
+  cancels or interrupts an attempt that is already in flight (each individual
+  call keeps the step's own `timeout_ms`). If an already in-flight attempt
+  finishes after `retry.timeout_ms`, its completed result or error is still
+  evaluated normally, and no further attempt is started.
 - When every assertion in `until` passes, polling stops immediately; `expect`
   and `save` run against that result, and both `until` and `expect` assertions
   appear in the step report.
 - When `until` fails, or the step returns an execution error or timeout, `da`
-  sleeps up to `interval_ms` (capped at the remaining budget) and retries until
-  `timeout_ms` is reached, then reports the last attempt's failure (or `skipped`
-  when combined with `optional: true`).
+  waits `interval_ms` before starting another attempt only while enough time
+  remains strictly within `timeout_ms`. If `interval_ms` is longer than or equal
+  to the remaining budget, or if the wait exhausts the remaining budget, `da`
+  does not start a new attempt and reports the last completed failed result or
+  last error (or `skipped` when combined with `optional: true`).
 - An environment error (exit 4) or invalid-arguments error (exit 3) aborts
   polling immediately instead of waiting for `timeout_ms`.
 

@@ -708,7 +708,7 @@ fn execute_step(
         });
     }
 
-    let deadline = Instant::now() + Duration::from_millis(policy.timeout_ms);
+    let deadline = Instant::now().checked_add(Duration::from_millis(policy.timeout_ms));
     let interval = Duration::from_millis(policy.interval_ms);
     loop {
         match run_attempt(definition, &args, observations, sessions) {
@@ -722,25 +722,44 @@ fn execute_step(
                     }
                     return Ok((result, assertions));
                 }
-                let now = Instant::now();
-                if now >= deadline {
+                if !wait_before_next_attempt(deadline, interval) {
                     return Ok((result, until_assertions));
                 }
-                std::thread::sleep(interval.min(deadline.saturating_duration_since(now)));
             }
             Err(problem) => {
-                if matches!(problem.kind, ProblemKind::Execution | ProblemKind::Timeout) {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(problem);
-                    }
-                    std::thread::sleep(interval.min(deadline.saturating_duration_since(now)));
-                } else {
-                    return Err(problem);
+                if matches!(problem.kind, ProblemKind::Execution | ProblemKind::Timeout)
+                    && wait_before_next_attempt(deadline, interval)
+                {
+                    continue;
                 }
+                return Err(problem);
             }
         }
     }
+}
+
+/// Sleeps `interval` before starting another attempt only when time remains
+/// strictly before `deadline` afterwards.
+///
+/// An already in-flight attempt is never canceled when `deadline` passes; if
+/// no further attempt can start within budget, its completed failed result or
+/// error is kept.
+fn wait_before_next_attempt(deadline: Option<Instant>, interval: Duration) -> bool {
+    wait_before_next_attempt_with(deadline, interval, std::thread::sleep)
+}
+
+fn wait_before_next_attempt_with(
+    deadline: Option<Instant>,
+    interval: Duration,
+    sleep: impl FnOnce(Duration),
+) -> bool {
+    if let Some(deadline) = deadline
+        && deadline.saturating_duration_since(Instant::now()) <= interval
+    {
+        return false;
+    }
+    sleep(interval);
+    deadline.is_none_or(|deadline| Instant::now() < deadline)
 }
 
 fn run_attempt(
@@ -2830,5 +2849,388 @@ mod tests {
             1,
             "observer environment failure must stop retry after attempt 1"
         );
+    }
+
+    #[test]
+    fn retry_stops_without_starting_new_attempt_when_interval_exceeds_remaining_budget() {
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        static OBSERVER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct AttemptObserver(usize);
+
+        impl Observer for AttemptObserver {
+            fn start(&mut self, _sessions: &mut Sessions) -> Result<(), ObserverError> {
+                self.0 = OBSERVER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(())
+            }
+
+            fn collect(&mut self, _sessions: &mut Sessions) -> Result<Value, ObserverError> {
+                Ok(json!({ "attempt": self.0 }))
+            }
+        }
+
+        let mut reg = registry();
+        reg.register(StepDefinition {
+            name: "test.count_until",
+            description: "Fails until on attempt 1 and succeeds on attempt 2.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::allow_retry,
+            run: |_, _| {
+                let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(json!({ "ready": n >= 2, "attempt": n }))
+            },
+        })
+        .expect("count_until step must register");
+        reg.register(StepDefinition {
+            name: "test.count_error",
+            description: "Emits buffered event and fails with Execution/Timeout.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::allow_retry,
+            run: |args, sessions| {
+                let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                let buffer = sessions
+                    .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
+                    .map_err(StepError::Environment)?;
+                buffer.0.push(format!("failed-attempt-{n}"));
+                if args.get("timeout").and_then(Value::as_bool) == Some(true) {
+                    Err(StepError::Timeout(format!("timed out on attempt {n}")))
+                } else {
+                    Err(StepError::Execution(format!("exec error on attempt {n}")))
+                }
+            },
+        })
+        .expect("count_error step must register");
+        reg.register(StepDefinition {
+            name: "test.emit_and_ok",
+            description: "Emits a buffered event then succeeds.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::disallow_retry,
+            run: |_, sessions| {
+                let buffer = sessions
+                    .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
+                    .map_err(StepError::Environment)?;
+                buffer.0.push("second-step-ok".to_string());
+                Ok(json!({ "ok": true }))
+            },
+        })
+        .expect("emit_and_ok step must register");
+        reg.register_observer(crate::core::observer::ObserverDefinition {
+            name: "test.attempt",
+            description: "Records attempt number.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            create: |_| Ok(Box::new(AttemptObserver(0))),
+        })
+        .expect("attempt observer must register");
+        reg.register_observer(crate::core::observer::ObserverDefinition {
+            name: "test.draining",
+            description: "Drains buffered events on collect.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            create: |_| Ok(Box::new(DrainingObserver)),
+        })
+        .expect("draining observer must register");
+
+        // 1. Failed `until`: keeps attempt 1's failed result and does not start attempt 2.
+        ATTEMPTS.store(0, Ordering::SeqCst);
+        OBSERVER_CALLS.store(0, Ordering::SeqCst);
+        let mut step = failing("test.count_until");
+        step.retry = Some(crate::core::case::RetryPolicy {
+            until: vec![Expectation {
+                path: "$.ready".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!(true)),
+            }],
+            timeout_ms: 150,
+            interval_ms: 1000,
+        });
+        let mut case = test_case("interval-exceeds-budget-until", vec![step]);
+        case.observe = vec![observation("snap", "test.attempt", json!({}))];
+
+        let outcome = run(
+            &[LoadedCase {
+                path: "until-over.yaml".into(),
+                case,
+            }],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert_eq!(outcome.exit_code(), crate::exit::ExitCode::TestFailure);
+        assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
+        let report = one_case(outcome);
+        assert_eq!(report.steps[0].status, StepStatus::Failed);
+        assert_eq!(
+            report.steps[0].result.as_ref().map(|v| &v["attempt"]),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            report.steps[0]
+                .result
+                .as_ref()
+                .map(|v| &v["observed"]["snap"]["attempt"]),
+            Some(&json!(1))
+        );
+
+        // 2. Non-optional Execution and Timeout errors: keeps the last error and stops at 1 attempt.
+        for (is_timeout, expected_exit, expected_kind, expected_msg) in [
+            (
+                false,
+                crate::exit::ExitCode::TestFailure,
+                ProblemKind::Execution,
+                "exec error on attempt 1",
+            ),
+            (
+                true,
+                crate::exit::ExitCode::Timeout,
+                ProblemKind::Timeout,
+                "timed out on attempt 1",
+            ),
+        ] {
+            ATTEMPTS.store(0, Ordering::SeqCst);
+            let mut err_step = failing("test.count_error");
+            err_step.args = json!({ "timeout": is_timeout });
+            err_step.retry = Some(crate::core::case::RetryPolicy {
+                until: vec![Expectation {
+                    path: "$".to_string(),
+                    matcher: crate::core::case::Matcher::Exists(true),
+                }],
+                timeout_ms: 150,
+                interval_ms: 1000,
+            });
+            let mut case = test_case("interval-exceeds-budget-non-optional-error", vec![err_step]);
+            case.observe = vec![observation("buf", "test.draining", json!({}))];
+
+            let outcome = run(
+                &[LoadedCase {
+                    path: "err-over-non-opt.yaml".into(),
+                    case,
+                }],
+                &reg,
+                &EventBus::new(),
+                None,
+                &Filters::default(),
+                &mut Secrets::new(),
+                1,
+            );
+            assert_eq!(outcome.exit_code(), expected_exit);
+            assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
+            let report = one_case(outcome);
+            assert_eq!(report.steps[0].status, StepStatus::Error);
+            let error = report.steps[0].error.as_ref().expect("last error kept");
+            assert_eq!(error.kind, expected_kind);
+            assert_eq!(error.message, expected_msg);
+        }
+
+        // 3. Optional Execution and Timeout errors: keeps last error, skips step, drains observer.
+        for is_timeout in [false, true] {
+            ATTEMPTS.store(0, Ordering::SeqCst);
+            let mut err_step = failing("test.count_error");
+            err_step.args = json!({ "timeout": is_timeout });
+            err_step.optional = true;
+            err_step.retry = Some(crate::core::case::RetryPolicy {
+                until: vec![Expectation {
+                    path: "$".to_string(),
+                    matcher: crate::core::case::Matcher::Exists(true),
+                }],
+                timeout_ms: 150,
+                interval_ms: 1000,
+            });
+            let mut next = failing("test.emit_and_ok");
+            next.expect = vec![Expectation {
+                path: "$.observed.buf.events".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!(["second-step-ok"])),
+            }];
+            let mut case = test_case("interval-exceeds-budget-error", vec![err_step, next]);
+            case.observe = vec![observation("buf", "test.draining", json!({}))];
+
+            let outcome = run(
+                &[LoadedCase {
+                    path: "err-over.yaml".into(),
+                    case,
+                }],
+                &reg,
+                &EventBus::new(),
+                None,
+                &Filters::default(),
+                &mut Secrets::new(),
+                1,
+            );
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
+            let report = one_case(outcome);
+            assert_eq!(report.steps[0].status, StepStatus::Skipped);
+            let expected_kind = if is_timeout {
+                ProblemKind::Timeout
+            } else {
+                ProblemKind::Execution
+            };
+            assert_eq!(
+                report.steps[0].error.as_ref().map(|e| e.kind),
+                Some(expected_kind)
+            );
+            assert_eq!(
+                report.steps[1]
+                    .result
+                    .as_ref()
+                    .map(|v| &v["observed"]["buf"]["events"]),
+                Some(&json!(["second-step-ok"]))
+            );
+        }
+    }
+
+    #[test]
+    fn retry_allows_already_in_flight_attempt_to_finish_after_deadline() {
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+        let mut reg = registry();
+        reg.register(StepDefinition {
+            name: "test.slow_once",
+            description: "Sleeps longer than retry.timeout_ms and returns `ready`.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            check_retry: crate::core::registry::allow_retry,
+            run: |args, sessions| {
+                let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                std::thread::sleep(Duration::from_millis(60));
+                let buffer = sessions
+                    .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
+                    .map_err(StepError::Environment)?;
+                buffer.0.push(format!("in-flight-{n}"));
+                let ready = args.get("ready").and_then(Value::as_bool).unwrap_or(false);
+                Ok(json!({ "ready": ready || n >= 2, "attempt": n }))
+            },
+        })
+        .expect("slow_once step must register");
+        reg.register_observer(crate::core::observer::ObserverDefinition {
+            name: "test.draining",
+            description: "Drains buffered events on collect.",
+            args_schema: json!({"type": "object"}),
+            validate: |_| Ok(()),
+            create: |_| Ok(Box::new(DrainingObserver)),
+        })
+        .expect("draining observer must register");
+
+        // In-flight attempt started within budget passes `until` after deadline -> passes.
+        ATTEMPTS.store(0, Ordering::SeqCst);
+        let mut passing = failing("test.slow_once");
+        passing.args = json!({ "ready": true });
+        passing.retry = Some(crate::core::case::RetryPolicy {
+            until: vec![Expectation {
+                path: "$.ready".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!(true)),
+            }],
+            timeout_ms: 25,
+            interval_ms: 10,
+        });
+        passing.expect = vec![Expectation {
+            path: "$.observed.buf.events".to_string(),
+            matcher: crate::core::case::Matcher::Equals(json!(["in-flight-1"])),
+        }];
+        passing.save = vec![SavedValue {
+            name: "attempt".to_string(),
+            path: "$.attempt".to_string(),
+        }];
+        let mut pass_case = test_case(
+            "in-flight-pass",
+            vec![passing, echo(json!("${attempt}"), Vec::new())],
+        );
+        pass_case.observe = vec![observation("buf", "test.draining", json!({}))];
+
+        let pass_outcome = run(
+            &[LoadedCase {
+                path: "in-flight-pass.yaml".into(),
+                case: pass_case,
+            }],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert!(pass_outcome.is_ok(), "{pass_outcome:?}");
+        assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
+        let pass_report = one_case(pass_outcome);
+        assert_eq!(
+            pass_report.steps[1].result.as_ref().map(|v| &v["value"]),
+            Some(&json!("1"))
+        );
+
+        // In-flight attempt started within budget fails `until` after deadline -> fails with attempt 1.
+        ATTEMPTS.store(0, Ordering::SeqCst);
+        let mut failing_step = failing("test.slow_once");
+        failing_step.args = json!({ "ready": false });
+        failing_step.retry = Some(crate::core::case::RetryPolicy {
+            until: vec![Expectation {
+                path: "$.ready".to_string(),
+                matcher: crate::core::case::Matcher::Equals(json!(true)),
+            }],
+            timeout_ms: 25,
+            interval_ms: 10,
+        });
+        let fail_outcome = run(
+            &loaded(vec![failing_step]),
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert_eq!(fail_outcome.exit_code(), crate::exit::ExitCode::TestFailure);
+        assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
+        let fail_report = one_case(fail_outcome);
+        assert_eq!(
+            fail_report.steps[0].result.as_ref().map(|v| &v["attempt"]),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            fail_report.steps[0].result.as_ref().map(|v| &v["ready"]),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn retry_wait_stops_when_sleep_exhausts_remaining_budget() {
+        let now = Instant::now();
+
+        let mut slept = false;
+        assert!(
+            !wait_before_next_attempt_with(
+                Some(now + Duration::from_millis(50)),
+                Duration::from_millis(100),
+                |_| slept = true,
+            ),
+            "interval >= remaining must stop without sleeping"
+        );
+        assert!(!slept);
+
+        let mut slept = false;
+        assert!(
+            wait_before_next_attempt_with(
+                Some(now + Duration::from_millis(500)),
+                Duration::from_millis(20),
+                |_| slept = true,
+            ),
+            "remaining > interval with time left after sleep must allow another attempt"
+        );
+        assert!(slept);
+
+        let mut slept = false;
+        let tight_deadline = Instant::now() + Duration::from_millis(40);
+        assert!(
+            !wait_before_next_attempt_with(Some(tight_deadline), Duration::from_millis(10), |_| {
+                slept = true;
+                std::thread::sleep(Duration::from_millis(60));
+            },),
+            "sleep exhausting the remaining budget must prevent starting a new attempt"
+        );
+        assert!(slept);
     }
 }
