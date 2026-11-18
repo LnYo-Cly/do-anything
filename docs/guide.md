@@ -1520,10 +1520,15 @@ a same-origin `<iframe>` or `<frame>`, point `within` at the frame element;
 
 When `within` resolves to a same-origin frame, `da` enters its `contentDocument`
 (waiting until it finishes loading within `timeout_ms`), converts element
-coordinates across every enclosing frame's viewport offset, border, and padding,
-and checks `elementFromPoint` in each enclosing document as well as the inner
-frame — so clicks land at the true viewport coordinates and a top-level overlay
-covering an iframe element still fails as occluded.
+coordinates across every enclosing frame's viewport offset, border, padding, and
+axis-aligned CSS scaling (`transform: scale(...)` / `translate(...)`, individual
+`scale`/`translate`, `zoom`, and scaled ancestor wrappers), and checks
+`elementFromPoint` in each enclosing document as well as the inner frame — so
+clicks land at the true viewport coordinates and a top-level overlay covering an
+iframe element still fails as occluded. If an enclosing frame has a CSS transform
+that cannot be mapped to axis-aligned viewport coordinates (such as rotation,
+skew, reflection, or a 3D transform), actionability checks fail immediately as
+an execution error (exit 1) instead of clicking the wrong coordinates.
 
 Cross-origin frames (including `<iframe sandbox>` without `allow-same-origin`)
 fail immediately as an execution error (exit 1) without waiting out
@@ -1578,9 +1583,12 @@ enters text output, `--output json` or a future shareable report.
 The cover hides editable fields, not ordinary text. A page that writes a secret
 into a heading, a paragraph or an attribute still shows it in the screenshot
 pixels; `dom.html` is redacted, but the PNG is not. The cover also descends into
-accessible same-origin and nested frames (`<iframe>` and `<frame>`), whereas
-cross-origin frames cannot be reached from the main page. Treat both kinds of
-page as unsuitable for screenshots that leave the machine.
+accessible same-origin and nested frames (`<iframe>` and `<frame>`), scaling
+masks across axis-aligned frame transforms (`scale(...)`, `translate(...)`,
+`zoom`), and refuses to emit a screenshot when a visible field lies inside an
+unmappable transform (such as rotation, skew, reflection, or 3D transforms),
+whereas cross-origin frames cannot be reached from the main page. Treat both
+kinds of page as unsuitable for screenshots that leave the machine.
 
 `headless`, `width` and `height` only apply when the first `browser.open` creates
 the page. A later `browser.open` that gives a different effective value is a step

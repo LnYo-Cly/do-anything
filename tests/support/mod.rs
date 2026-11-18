@@ -423,6 +423,15 @@ fn route(
             )
         }
         (_, "/browser/iframes/frameset") => html_response("200 OK", browser_iframes_frameset()),
+        (_, "/browser/iframes/scaled-host") => {
+            html_response("200 OK", &browser_iframes_scaled_host(query))
+        }
+        (_, "/browser/iframes/scaled-inner") => {
+            html_response("200 OK", browser_iframes_scaled_inner())
+        }
+        (_, "/browser/iframes/unmappable-transform") => {
+            html_response("200 OK", &browser_iframes_unmappable_transform(query))
+        }
         (_, "/browser/mask-iframe") => html_response("200 OK", browser_mask_iframe()),
         (_, "/browser/mask-iframe-inner") => html_response("200 OK", browser_mask_iframe_inner()),
         (_, "/browser/mask-iframe-nested") => html_response("200 OK", browser_mask_iframe_nested()),
@@ -1117,6 +1126,98 @@ fn browser_iframes_frameset() -> &'static str {
   <frame id="frame-right" name="right" src="/browser/iframes/nested">
 </frameset>
 </html>"#
+}
+
+fn browser_iframes_scaled_host(query: &str) -> String {
+    let overlay = match query_value(query, "overlay").as_str() {
+        "unscaled" => {
+            r#"<div id="unscaled-modal" style="position:fixed;left:170px;top:105px;width:50px;height:30px;background:rgba(0,0,0,0.2);z-index:10;">Unscaled Modal</div>"#
+        }
+        "scaled" => {
+            r#"<div id="scaled-modal" style="position:fixed;left:240px;top:140px;width:70px;height:40px;background:rgba(0,0,0,0.2);z-index:10;">Scaled Modal</div>"#
+        }
+        _ => "",
+    };
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Scaled Iframe Host</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="scaled-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:40px;top:40px;width:320px;height:320px;border:6px solid #333;padding:8px;margin:0;background:#fff;transform-origin:top left;transform:scale(1.5);"></iframe>
+<div id="scale-wrapper" style="position:fixed;left:580px;top:40px;transform-origin:top left;transform:scale(1.5);">
+  <iframe id="ancestor-scaled-frame" src="/browser/iframes/scaled-inner"
+    style="width:260px;height:180px;border:4px solid #333;padding:6px;margin:0;background:#fff;"></iframe>
+</div>
+{overlay}
+</body></html>"#
+    )
+}
+
+fn browser_iframes_scaled_inner() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Scaled Inner Frame</title></head>
+<body style="margin:0;background:#fff;">
+<button id="unscaled-decoy" type="button"
+  style="position:fixed;left:50px;top:20px;width:55px;height:26px;"
+  onclick="document.getElementById('decoy-hit').textContent='decoy-clicked';">Decoy</button>
+<p id="decoy-hit" style="position:fixed;left:10px;top:5px;margin:0;">idle</p>
+<button id="scaled-btn" type="button"
+  style="position:fixed;left:100px;top:50px;width:80px;height:30px;"
+  onclick="this.textContent='done';document.getElementById('scaled-result').textContent='done';">Click</button>
+<p id="scaled-result" style="position:fixed;left:10px;top:60px;margin:0;">idle</p>
+<input id="scaled-pw" type="password" value="scaled-secret" autocomplete="off"
+  style="position:fixed;left:100px;top:95px;width:120px;height:28px;background:#ff0000;color:#ff0000;border:2px solid #ff0000;padding:0;margin:0;outline:none;">
+<iframe id="nested-scaled" src="/browser/iframes/nested"
+  style="position:fixed;left:10px;top:140px;width:240px;height:120px;border:3px solid #555;padding:4px;margin:0;background:#fff;transform-origin:top left;transform:scale(1.2);"></iframe>
+</body></html>"#
+}
+
+fn browser_iframes_unmappable_transform(query: &str) -> String {
+    match query_value(query, "kind").as_str() {
+        "skew" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Skewed Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform-origin:top left;transform:skewX(20deg);"></iframe>
+</body></html>"#
+            .to_string(),
+        "flip" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Flipped Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform-origin:center;transform:scale(-1, 1);"></iframe>
+</body></html>"#
+            .to_string(),
+        "3d" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>3D Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform:perspective(400px) rotateY(35deg);"></iframe>
+</body></html>"#
+            .to_string(),
+        "ancestor_rotate" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Ancestor Rotated Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<div style="position:fixed;left:80px;top:80px;transform-origin:top left;transform:rotate(15deg);">
+  <iframe id="bad-frame" src="/browser/iframes/scaled-inner" style="width:300px;height:220px;"></iframe>
+</div>
+</body></html>"#
+            .to_string(),
+        "rotate_no_inputs" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Rotated Frame Without Inputs</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/probe/iframe-inner"
+  style="position:fixed;left:80px;top:80px;width:240px;height:100px;transform-origin:top left;transform:rotate(25deg);"></iframe>
+</body></html>"#
+            .to_string(),
+        _ => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Rotated Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform-origin:top left;transform:rotate(25deg);"></iframe>
+</body></html>"#
+            .to_string(),
+    }
 }
 
 fn browser_mask_iframe() -> &'static str {

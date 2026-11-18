@@ -785,7 +785,7 @@ const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long removing the masks may take after the screenshot itself.
 const MASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Shared JavaScript helpers for frame traversal, coordinate offsets, and visibility.
+/// Shared JavaScript helpers for frame traversal, coordinate transforms, and visibility.
 const FRAME_HELPERS_JS: &str = r#"
 var isBoxVisible = function (node, win) {
   if (!node || node.nodeType !== 1) return false;
@@ -828,24 +828,130 @@ var areEnclosingFramesVisible = function (frames) {
   }
   return true;
 };
-var frameContentOffset = function (frame) {
+var checkAxisAlignedTransform = function (node, win) {
+  if (win.SVGElement && node instanceof win.SVGElement) {
+    return { ok: false, reason: 'SVG ancestor transforms cannot be mapped to viewport coordinates' };
+  }
+  var cs = win.getComputedStyle(node);
+  var sx = 1;
+  var sy = 1;
+  if (cs.transform && cs.transform !== 'none') {
+    var m = null;
+    try {
+      m = new (win.DOMMatrix || DOMMatrix)(cs.transform);
+    } catch (e) {
+      return { ok: false, reason: 'CSS transform `' + cs.transform + '` could not be parsed' };
+    }
+    if (!m.is2D || !isFinite(m.a) || !isFinite(m.b) || !isFinite(m.c) || !isFinite(m.d) || !isFinite(m.e) || !isFinite(m.f)) {
+      return { ok: false, reason: '3D CSS transform `' + cs.transform + '` cannot be mapped as a 2D viewport coordinate' };
+    }
+    if (Math.abs(m.b) > 1e-6 || Math.abs(m.c) > 1e-6) {
+      return { ok: false, reason: 'rotated or skewed CSS transform `' + cs.transform + '` cannot be mapped to axis-aligned viewport coordinates' };
+    }
+    if (m.a <= 0 || m.d <= 0) {
+      return { ok: false, reason: 'non-positive or reflected CSS transform `' + cs.transform + '` cannot be mapped' };
+    }
+    sx *= m.a;
+    sy *= m.d;
+  }
+  if (cs.rotate && cs.rotate !== 'none') {
+    var rm = String(cs.rotate).trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(deg|rad|grad|turn)$/i);
+    if (!rm || !isFinite(parseFloat(rm[1])) || Math.abs(parseFloat(rm[1])) > 1e-6) {
+      return { ok: false, reason: 'CSS `rotate: ' + cs.rotate + '` cannot be mapped to axis-aligned viewport coordinates' };
+    }
+  }
+  if (cs.scale && cs.scale !== 'none') {
+    var sp = String(cs.scale).trim().split(/\s+/);
+    var s0 = Number(sp[0]);
+    var s1 = sp.length > 1 ? Number(sp[1]) : s0;
+    var s2 = sp.length > 2 ? Number(sp[2]) : 1;
+    if (sp.length > 3 || !isFinite(s0) || !isFinite(s1) || !isFinite(s2) || s0 <= 0 || s1 <= 0 || Math.abs(s2 - 1) > 1e-6) {
+      return { ok: false, reason: 'CSS `scale: ' + cs.scale + '` cannot be mapped to 2D viewport coordinates' };
+    }
+    sx *= s0;
+    sy *= s1;
+  }
+  if (cs.translate && cs.translate !== 'none') {
+    var tp = String(cs.translate).trim().split(/\s+/);
+    if (tp.length > 2) {
+      var tz = parseFloat(tp[2]);
+      if (!isFinite(tz) || Math.abs(tz) > 1e-6) {
+        return { ok: false, reason: '3D CSS `translate: ' + cs.translate + '` cannot be mapped' };
+      }
+    }
+  }
+  if (cs.offsetPath && cs.offsetPath !== 'none') {
+    return { ok: false, reason: 'CSS `offset-path` transform cannot be mapped' };
+  }
+  if (cs.zoom && cs.zoom !== 'normal') {
+    var zm = parseFloat(cs.zoom);
+    if (String(cs.zoom).indexOf('%') !== -1) zm /= 100;
+    if (!isFinite(zm) || zm <= 0) {
+      return { ok: false, reason: 'non-positive CSS `zoom: ' + cs.zoom + '` cannot be mapped' };
+    }
+    sx *= zm;
+    sy *= zm;
+  }
+  return { ok: true, sx: sx, sy: sy };
+};
+var checkTransformChain = function (startNode, doc) {
+  var win = (doc && doc.defaultView) || window;
+  var sx = 1;
+  var sy = 1;
+  var cur = startNode;
+  while (cur && cur.nodeType === 1) {
+    var step = checkAxisAlignedTransform(cur, win);
+    if (!step.ok) return step;
+    sx *= step.sx;
+    sy *= step.sy;
+    cur = cur.parentElement || (cur.parentNode && cur.parentNode.host) || null;
+  }
+  return { ok: true, sx: sx, sy: sy };
+};
+var frameTransform = function (frame) {
+  var doc = frame.ownerDocument || document;
+  var fv = doc.defaultView || window;
+  var chain = checkTransformChain(frame, doc);
+  if (!chain.ok) return chain;
   var fr = frame.getBoundingClientRect();
-  var fv = (frame.ownerDocument && frame.ownerDocument.defaultView) || window;
   var fs = fv.getComputedStyle(frame);
-  var borderLeft = frame.clientLeft || parseFloat(fs.borderLeftWidth) || 0;
-  var borderTop = frame.clientTop || parseFloat(fs.borderTopWidth) || 0;
+  var cssBl = parseFloat(fs.borderLeftWidth) || 0;
+  var cssBt = parseFloat(fs.borderTopWidth) || 0;
+  var borderLeft = frame.clientLeft > cssBl + 0.5 ? frame.clientLeft : (cssBl || frame.clientLeft || 0);
+  var borderTop = frame.clientTop > cssBt + 0.5 ? frame.clientTop : (cssBt || frame.clientTop || 0);
   var padLeft = parseFloat(fs.paddingLeft) || 0;
   var padTop = parseFloat(fs.paddingTop) || 0;
   var borderRight = parseFloat(fs.borderRightWidth) || 0;
   var borderBottom = parseFloat(fs.borderBottomWidth) || 0;
   var padRight = parseFloat(fs.paddingRight) || 0;
   var padBottom = parseFloat(fs.paddingBottom) || 0;
+  var cssW = parseFloat(fs.width);
+  var cssH = parseFloat(fs.height);
+  var isBorderBox = fs.boxSizing === 'border-box';
+  var localW = isFinite(cssW) && cssW > 0
+    ? (isBorderBox ? cssW : cssW + borderLeft + borderRight + padLeft + padRight)
+    : frame.offsetWidth;
+  var localH = isFinite(cssH) && cssH > 0
+    ? (isBorderBox ? cssH : cssH + borderTop + borderBottom + padTop + padBottom)
+    : frame.offsetHeight;
+  if (!isFinite(localW) || localW <= 0 || !isFinite(localH) || localH <= 0 || !isFinite(fr.width) || fr.width <= 0 || !isFinite(fr.height) || fr.height <= 0) {
+    return { ok: false, reason: 'enclosing frame has non-positive layout dimensions' };
+  }
+  if (Math.abs(fr.width - localW * chain.sx) > Math.max(2, localW * chain.sx * 0.02) ||
+      Math.abs(fr.height - localH * chain.sy) > Math.max(2, localH * chain.sy * 0.02)) {
+    return { ok: false, reason: 'enclosing frame bounding box does not match axis-aligned transform geometry' };
+  }
+  var sx = fr.width / localW;
+  var sy = fr.height / localH;
   return {
+    ok: true,
     rect: fr,
-    ox: fr.left + borderLeft + padLeft,
-    oy: fr.top + borderTop + padTop,
-    rightInset: borderRight + padRight,
-    bottomInset: borderBottom + padBottom
+    sx: sx,
+    sy: sy,
+    ox: fr.left + sx * (borderLeft + padLeft),
+    oy: fr.top + sy * (borderTop + padTop),
+    contentRight: fr.right - sx * (borderRight + padRight),
+    contentBottom: fr.bottom - sy * (borderBottom + padBottom)
   };
 };
 "#;
@@ -853,11 +959,11 @@ var frameContentOffset = function (frame) {
 /// JavaScript that covers every visible editable field with an opaque box,
 /// including fields inside accessible same-origin and nested iframes.
 ///
-/// `position: fixed` uses top-level viewport coordinates (`ox + rect.left`,
-/// `oy + rect.top`) so a single overlay at the highest `z-index` covers fields
-/// across nested frames, except in `<frameset>` documents where masks live on
-/// each frame document itself. Cleanup runs separately so it executes even on
-/// capture errors.
+/// `position: fixed` uses top-level viewport coordinates (`ox + sx * rect.left`,
+/// `oy + sy * rect.top`) so a single overlay at the highest `z-index` covers fields
+/// across nested scaled frames, except in `<frameset>` documents where masks live on
+/// each frame document itself. Fails clearly instead of leaving uncovered pixels if
+/// a frame or root element has a CSS transform that cannot be mapped accurately.
 static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"(function () {{
@@ -865,15 +971,58 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
   var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
   var masks = [];
   var isFrameset = Boolean(document.body && document.body.tagName === 'FRAMESET');
-  var appendMask = function (hostDoc, left, top, width, height) {{
-    if (!hostDoc || !hostDoc.documentElement || width <= 0 || height <= 0) return;
+  var fail = function (reason) {{
+    for (var m = 0; m < masks.length; m++) {{
+      masks[m].remove();
+    }}
+    return {{ ok: false, reason: reason }};
+  }};
+  var measureHostMap = function (hostDoc) {{
+    var root = hostDoc && hostDoc.documentElement;
+    if (!root) return {{ ok: false, reason: 'document root element is missing' }};
+    var win = hostDoc.defaultView || window;
+    var chain = checkTransformChain(root, hostDoc);
+    if (!chain.ok) return chain;
+    var rcs = win.getComputedStyle(root);
+    var rootMoved = (rcs.transform && rcs.transform !== 'none') ||
+      (rcs.scale && rcs.scale !== 'none') ||
+      (rcs.translate && rcs.translate !== 'none') ||
+      Math.abs(chain.sx - 1) > 1e-6 ||
+      Math.abs(chain.sy - 1) > 1e-6;
+    if (!rootMoved) {{
+      return {{ ok: true, ox: 0, oy: 0, sx: 1, sy: 1 }};
+    }}
+    var probe = hostDoc.createElement('div');
+    probe.style.cssText = 'position:fixed;box-sizing:border-box;left:0px;top:0px;width:100px;height:100px;border:0;padding:0;margin:0;visibility:hidden;pointer-events:none;';
+    root.appendChild(probe);
+    var pr = probe.getBoundingClientRect();
+    probe.remove();
+    if (!isFinite(pr.width) || !isFinite(pr.height) || pr.width <= 0 || pr.height <= 0) {{
+      return {{ ok: false, reason: 'document root has collapsed transform geometry' }};
+    }}
+    return {{ ok: true, ox: pr.left, oy: pr.top, sx: pr.width / 100, sy: pr.height / 100 }};
+  }};
+  var topHost = isFrameset ? {{ ok: true, ox: 0, oy: 0, sx: 1, sy: 1 }} : measureHostMap(document);
+  var appendMask = function (hostDoc, hostMap, left, top, width, height) {{
+    if (!hostDoc || !hostDoc.documentElement || width <= 0 || height <= 0) return true;
+    var cssLeft = (left - hostMap.ox) / hostMap.sx;
+    var cssTop = (top - hostMap.oy) / hostMap.sy;
+    var cssW = width / hostMap.sx;
+    var cssH = height / hostMap.sy;
     var mask = hostDoc.createElement('div');
     mask.setAttribute('data-da-screenshot-mask', '');
-    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + height + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
+    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + cssLeft + 'px;top:' + cssTop + 'px;width:' + cssW + 'px;height:' + cssH + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
     hostDoc.documentElement.appendChild(mask);
     masks.push(mask);
+    var mr = mask.getBoundingClientRect();
+    if (!isFinite(mr.width) || mr.width <= 0 || !isFinite(mr.height) || mr.height <= 0 ||
+        mr.left > left + 1 || mr.top > top + 1 ||
+        mr.right < left + width - 1 || mr.bottom < top + height - 1) {{
+      return false;
+    }}
+    return true;
   }};
-  var collectDoc = function (doc, ox, oy, clip) {{
+  var collectDoc = function (doc, ox, oy, sx, sy, clip, blockedReason) {{
     var win = doc.defaultView || window;
     var fields = doc.querySelectorAll('input, textarea, select, [contenteditable]');
     for (var i = 0; i < fields.length; i++) {{
@@ -884,22 +1033,30 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
       if (!field && !el.isContentEditable) continue;
       if (tag === 'INPUT' && skipped.indexOf((el.type || 'text').toLowerCase()) !== -1) continue;
       if (!isBoxVisible(el, win)) continue;
+      if (blockedReason) return fail(blockedReason);
       var rect = el.getBoundingClientRect();
       if (isFrameset && doc !== document) {{
-        appendMask(doc, rect.left, rect.top, rect.width, rect.height);
+        var frameHost = measureHostMap(doc);
+        if (!frameHost.ok) return fail(frameHost.reason);
+        if (!appendMask(doc, frameHost, rect.left, rect.top, rect.width, rect.height)) {{
+          return fail('screenshot mask could not cover transformed field');
+        }}
         continue;
       }}
-      var left = ox + rect.left;
-      var top = oy + rect.top;
-      var right = left + rect.width;
-      var bottom = top + rect.height;
+      var left = ox + sx * rect.left;
+      var top = oy + sy * rect.top;
+      var right = ox + sx * rect.right;
+      var bottom = oy + sy * rect.bottom;
       if (clip) {{
         left = Math.max(left, clip.left);
         top = Math.max(top, clip.top);
         right = Math.min(right, clip.right);
         bottom = Math.min(bottom, clip.bottom);
       }}
-      appendMask(document, left, top, right - left, bottom - top);
+      if (right <= left || bottom <= top) continue;
+      if (!appendMask(document, topHost, left, top, right - left, bottom - top)) {{
+        return fail('screenshot mask could not cover transformed field');
+      }}
     }}
     var frames = doc.querySelectorAll('iframe, frame');
     for (var j = 0; j < frames.length; j++) {{
@@ -912,14 +1069,26 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
         childDoc = null;
       }}
       if (!childDoc) continue;
-      var fOff = frameContentOffset(frame);
-      var childOx = ox + fOff.ox;
-      var childOy = oy + fOff.oy;
+      if (blockedReason) {{
+        var blockedErr = collectDoc(childDoc, 0, 0, 1, 1, null, blockedReason);
+        if (blockedErr) return blockedErr;
+        continue;
+      }}
+      var fTr = frameTransform(frame);
+      if (!fTr.ok) {{
+        var trErr = collectDoc(childDoc, 0, 0, 1, 1, null, fTr.reason);
+        if (trErr) return trErr;
+        continue;
+      }}
+      var childOx = ox + sx * fTr.ox;
+      var childOy = oy + sy * fTr.oy;
+      var childSx = sx * fTr.sx;
+      var childSy = sy * fTr.sy;
       var nextClip = {{
         left: childOx,
         top: childOy,
-        right: ox + fOff.rect.right - fOff.rightInset,
-        bottom: oy + fOff.rect.bottom - fOff.bottomInset
+        right: ox + sx * fTr.contentRight,
+        bottom: oy + sy * fTr.contentBottom
       }};
       if (clip) {{
         nextClip.left = Math.max(nextClip.left, clip.left);
@@ -928,11 +1097,15 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
         nextClip.bottom = Math.min(nextClip.bottom, clip.bottom);
       }}
       if (nextClip.right <= nextClip.left || nextClip.bottom <= nextClip.top) continue;
-      collectDoc(childDoc, childOx, childOy, nextClip);
+      var childErr = collectDoc(childDoc, childOx, childOy, childSx, childSy, nextClip, null);
+      if (childErr) return childErr;
     }}
+    return null;
   }};
-  collectDoc(document, 0, 0, null);
-  return masks.length;
+  var rootBlocked = topHost.ok ? null : topHost.reason;
+  var err = collectDoc(document, 0, 0, 1, 1, null, rootBlocked);
+  if (err) return err;
+  return {{ ok: true, count: masks.length }};
 }})()"#
     )
 });
@@ -1401,21 +1574,30 @@ for (var i = frames.length - 1; i >= 0; i--) {{
   var f = frames[i];
   var fDoc = f.ownerDocument || document;
   var fWin = fDoc.defaultView || window;
-  var fb = frameContentOffset(f);
-  var px = fb.ox + curX;
-  var py = fb.oy + curY;
+  var fb = frameTransform(f);
+  if (!fb.ok) {{
+    return {{ status: 'unmappable_transform', reason: fb.reason }};
+  }}
+  var px = fb.ox + fb.sx * curX;
+  var py = fb.oy + fb.sy * curY;
   var fVw = fWin.innerWidth || (fDoc.documentElement && fDoc.documentElement.clientWidth) || 0;
   var fVh = fWin.innerHeight || (fDoc.documentElement && fDoc.documentElement.clientHeight) || 0;
   if (px < 0 || px >= fVw || py < 0 || py >= fVh) {{
     f.scrollIntoView({{ block: 'center', inline: 'center' }});
-    fb = frameContentOffset(f);
-    px = fb.ox + curX;
-    py = fb.oy + curY;
+    fb = frameTransform(f);
+    if (!fb.ok) {{
+      return {{ status: 'unmappable_transform', reason: fb.reason }};
+    }}
+    px = fb.ox + fb.sx * curX;
+    py = fb.oy + fb.sy * curY;
     if (px < 0 || px >= fVw || py < 0 || py >= fVh) {{
       fWin.scrollBy(px - fVw / 2, py - fVh / 2);
-      fb = frameContentOffset(f);
-      px = fb.ox + curX;
-      py = fb.oy + curY;
+      fb = frameTransform(f);
+      if (!fb.ok) {{
+        return {{ status: 'unmappable_transform', reason: fb.reason }};
+      }}
+      px = fb.ox + fb.sx * curX;
+      py = fb.oy + fb.sy * curY;
     }}
   }}
   curX = px;
@@ -1424,18 +1606,25 @@ for (var i = frames.length - 1; i >= 0; i--) {{
 rect = el.getBoundingClientRect();
 var lx = rect.left + rect.width / 2;
 var ly = rect.top + rect.height / 2;
-var totalOx = 0;
-var totalOy = 0;
-var levelChecks = [];
 var accX = lx;
 var accY = ly;
+var accLeft = rect.left;
+var accTop = rect.top;
+var accW = rect.width;
+var accH = rect.height;
+var levelChecks = [];
 for (var j = frames.length - 1; j >= 0; j--) {{
   var frame = frames[j];
-  var fOff = frameContentOffset(frame);
-  totalOx += fOff.ox;
-  totalOy += fOff.oy;
-  accX += fOff.ox;
-  accY += fOff.oy;
+  var fTr = frameTransform(frame);
+  if (!fTr.ok) {{
+    return {{ status: 'unmappable_transform', reason: fTr.reason }};
+  }}
+  accX = fTr.ox + fTr.sx * accX;
+  accY = fTr.oy + fTr.sy * accY;
+  accLeft = fTr.ox + fTr.sx * accLeft;
+  accTop = fTr.oy + fTr.sy * accTop;
+  accW = fTr.sx * accW;
+  accH = fTr.sy * accH;
   levelChecks.unshift({{
     doc: frame.ownerDocument || document,
     x: accX,
@@ -1443,9 +1632,9 @@ for (var j = frames.length - 1; j >= 0; j--) {{
     target: frame
   }});
 }}
-var topX = totalOx + lx;
-var topY = totalOy + ly;
-var topRect = {{ x: totalOx + rect.left, y: totalOy + rect.top, width: rect.width, height: rect.height }};
+var topX = accX;
+var topY = accY;
+var topRect = {{ x: accLeft, y: accTop, width: accW, height: accH }};
 for (var k = 0; k < levelChecks.length; k++) {{
   var check = levelChecks[k];
   var fHit = check.doc.elementFromPoint(check.x, check.y);
@@ -1499,6 +1688,9 @@ impl ElementRect {
 enum ActionableInspect {
     NotVisible,
     Disabled,
+    UnmappableTransform {
+        reason: String,
+    },
     ReadyCandidate {
         rect: ElementRect,
         x: f64,
@@ -2178,12 +2370,17 @@ impl BrowserSession {
             )))
         })?;
         match evaluate_actionable_inspect(previous_rect, inspect) {
-            Ok((x, y)) => Ok(Ok(ActionableTarget {
+            ActionablePoll::Ready(x, y) => Ok(Ok(ActionableTarget {
                 located: Located(object_id),
                 x,
                 y,
             })),
-            Err(reason) => Ok(Err(reason)),
+            ActionablePoll::Pending(reason) => Ok(Err(reason)),
+            ActionablePoll::UnmappableTransform(reason) => {
+                Err(LocateError::Step(StepError::Execution(format!(
+                    "could not map {target_desc} into viewport coordinates: {reason}"
+                ))))
+            }
         }
     }
 
@@ -2906,7 +3103,7 @@ impl BrowserSession {
     fn capture_masked_png(&mut self, deadline: Deadline) -> Result<Vec<u8>, StepError> {
         let scope = self.scope();
         let mut dialog = DialogContext::fail_fast();
-        page_evaluate(
+        let mask_result = page_evaluate(
             self.connection_mut()?,
             &scope,
             MASK_INPUTS_SCRIPT.as_str(),
@@ -2916,6 +3113,15 @@ impl BrowserSession {
         .map_err(|failure| {
             failure.environment("could not cover the editable fields before the screenshot")
         })?;
+        if mask_result.get("ok").and_then(Value::as_bool) != Some(true) {
+            let reason = mask_result
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("enclosing frame geometry could not be mapped");
+            return Err(StepError::Execution(format!(
+                "could not cover editable fields before the screenshot: {reason}"
+            )));
+        }
 
         let captured = page_call(
             self.connection_mut()?,
@@ -3774,19 +3980,31 @@ enum PendingReason {
     Occluded(Option<CandidateInfo>),
 }
 
+/// Outcome of evaluating one actionability snapshot against the prior poll's geometry.
+#[derive(Debug, PartialEq)]
+enum ActionablePoll {
+    Ready(f64, f64),
+    Pending(PendingReason),
+    UnmappableTransform(String),
+}
+
 /// Evaluates one actionability snapshot against the prior poll's geometry.
 fn evaluate_actionable_inspect(
     previous_rect: &mut Option<ElementRect>,
     inspect: ActionableInspect,
-) -> Result<(f64, f64), PendingReason> {
+) -> ActionablePoll {
     match inspect {
         ActionableInspect::NotVisible => {
             *previous_rect = None;
-            Err(PendingReason::Hidden)
+            ActionablePoll::Pending(PendingReason::Hidden)
         }
         ActionableInspect::Disabled => {
             *previous_rect = None;
-            Err(PendingReason::Disabled)
+            ActionablePoll::Pending(PendingReason::Disabled)
+        }
+        ActionableInspect::UnmappableTransform { reason } => {
+            *previous_rect = None;
+            ActionablePoll::UnmappableTransform(reason)
         }
         ActionableInspect::ReadyCandidate {
             rect,
@@ -3798,12 +4016,12 @@ fn evaluate_actionable_inspect(
             let stable = previous_rect.is_some_and(|prev| prev.same_geometry(rect));
             *previous_rect = Some(rect);
             if !hit_ok {
-                return Err(PendingReason::Occluded(blocker));
+                return ActionablePoll::Pending(PendingReason::Occluded(blocker));
             }
             if !stable {
-                return Err(PendingReason::Unstable);
+                return ActionablePoll::Pending(PendingReason::Unstable);
             }
-            Ok((x, y))
+            ActionablePoll::Ready(x, y)
         }
     }
 }
@@ -6021,7 +6239,10 @@ mod tests {
                 blocker: Some(host.clone()),
             },
         );
-        assert_eq!(first, Err(PendingReason::Occluded(Some(host.clone()))));
+        assert_eq!(
+            first,
+            ActionablePoll::Pending(PendingReason::Occluded(Some(host.clone())))
+        );
         assert!(previous.is_some());
 
         // Second poll with unchanged geometry still reports Occluded.
@@ -6035,7 +6256,10 @@ mod tests {
                 blocker: Some(host.clone()),
             },
         );
-        assert_eq!(second, Err(PendingReason::Occluded(Some(host))));
+        assert_eq!(
+            second,
+            ActionablePoll::Pending(PendingReason::Occluded(Some(host)))
+        );
 
         // Second poll with changed geometry reports Unstable even if poll 1 was occluded.
         let moved_second = evaluate_actionable_inspect(
@@ -6048,7 +6272,10 @@ mod tests {
                 blocker: None,
             },
         );
-        assert_eq!(moved_second, Err(PendingReason::Unstable));
+        assert_eq!(
+            moved_second,
+            ActionablePoll::Pending(PendingReason::Unstable)
+        );
 
         // Unoccluded element still requires two matching polls, and Hidden resets history.
         let mut fresh = None;
@@ -6063,11 +6290,11 @@ mod tests {
                     blocker: None,
                 },
             ),
-            Err(PendingReason::Unstable)
+            ActionablePoll::Pending(PendingReason::Unstable)
         );
         assert_eq!(
             evaluate_actionable_inspect(&mut fresh, ActionableInspect::NotVisible),
-            Err(PendingReason::Hidden)
+            ActionablePoll::Pending(PendingReason::Hidden)
         );
         assert!(fresh.is_none());
         assert_eq!(
@@ -6081,7 +6308,7 @@ mod tests {
                     blocker: None,
                 },
             ),
-            Err(PendingReason::Unstable)
+            ActionablePoll::Pending(PendingReason::Unstable)
         );
         assert_eq!(
             evaluate_actionable_inspect(
@@ -6094,8 +6321,18 @@ mod tests {
                     blocker: None,
                 },
             ),
-            Ok((88.0, 26.0))
+            ActionablePoll::Ready(88.0, 26.0)
         );
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::UnmappableTransform {
+                    reason: "rotated CSS transform".to_string()
+                }
+            ),
+            ActionablePoll::UnmappableTransform("rotated CSS transform".to_string())
+        );
+        assert!(fresh.is_none());
     }
 
     fn spawn_mock_cdp<F>(handler: F) -> (String, thread::JoinHandle<()>)
@@ -8418,5 +8655,14 @@ mod tests {
                 && xpath.contains("doc.evaluate("),
             "xpath expression must evaluate against root's ownerDocument: {xpath}"
         );
+
+        let unmappable: ActionableInspect = serde_json::from_str(
+            r#"{"status":"unmappable_transform","reason":"rotated CSS transform"}"#,
+        )
+        .expect("unmappable_transform status must deserialize");
+        assert!(matches!(
+            unmappable,
+            ActionableInspect::UnmappableTransform { ref reason } if reason == "rotated CSS transform"
+        ));
     }
 }

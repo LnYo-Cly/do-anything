@@ -4996,3 +4996,380 @@ steps:
         "secret leaked in failure report.json: {report_json}"
     );
 }
+
+#[test]
+fn within_scaled_iframe_clicks_exact_target_and_masks_screenshot_pixels() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-scaled");
+    let host_url = server.url("/browser/iframes/scaled-host");
+    let unscaled_overlay_url = server.url("/browser/iframes/scaled-host?overlay=unscaled");
+    let scaled_overlay_url = server.url("/browser/iframes/scaled-host?overlay=scaled");
+
+    // 1. Click, type, nested scaled iframe click, screenshot masking at scale(1.5),
+    //    and unscaled vs. scaled occlusion checks.
+    let case = dir.write(
+        "scaled-iframe.yaml",
+        &format!(
+            r##"name: scaled iframe click hits button and screenshot masks scaled field
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.type:
+      css: "#scaled-pw"
+      text: scaled-secret-value
+      within:
+        css: "#scaled-frame"
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#scaled-frame"
+  - browser.read:
+      css: "#scaled-result"
+      within:
+        css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: done
+  - browser.read:
+      css: "#decoy-hit"
+      within:
+        css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: idle
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#ancestor-scaled-frame"
+  - browser.read:
+      css: "#scaled-result"
+      within:
+        css: "#ancestor-scaled-frame"
+    expect:
+      - path: $.text
+        equals: done
+  - browser.click:
+      css: "#nested-btn"
+      within:
+        css: "#nested-scaled"
+        within:
+          css: "#scaled-frame"
+  - browser.read:
+      css: "#nested-result"
+      within:
+        css: "#nested-scaled"
+        within:
+          css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: nested-clicked
+  - browser.screenshot:
+      path: shots/scaled-masked.png
+  - browser.open:
+      url: "{unscaled_overlay_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#scaled-frame"
+  - browser.read:
+      css: "#scaled-result"
+      within:
+        css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: done
+  - browser.open:
+      url: "{scaled_overlay_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 400
+      within:
+        css: "#scaled-frame"
+    optional: true
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let main_json = json_stdout(&output);
+    let steps = main_json["cases"][0]["steps"]
+        .as_array()
+        .expect("steps array");
+    for (idx, step) in steps.iter().enumerate() {
+        if idx == 14 {
+            assert_eq!(
+                step["status"], "skipped",
+                "optional step 14 must be skipped when occluded: {step}"
+            );
+            let err = step["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("scaled-modal"),
+                "expected scaled-modal occlusion blocker, got: {err}"
+            );
+        } else {
+            assert_eq!(step["status"], "passed", "step {idx} must pass: {step}");
+        }
+    }
+
+    // 2. Inspect actual rendered pixels of shots/scaled-masked.png via headless Chrome <canvas>.
+    let shot_bytes =
+        fs::read(dir.path().join("shots/scaled-masked.png")).expect("screenshot PNG must exist");
+    assert!(is_png(&shot_bytes), "must be a valid PNG");
+    let png_b64 = support::base64_encode(&shot_bytes);
+    let inspect_html = format!(
+        r##"<!doctype html><html><body>
+<p id="px-report">pending</p>
+<script>
+var img = new Image();
+img.onload = function () {{
+  var c = document.createElement('canvas');
+  c.width = img.width;
+  c.height = img.height;
+  var ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  var data = ctx.getImageData(0, 0, c.width, c.height).data;
+  var redCount = 0;
+  for (var i = 0; i < data.length; i += 4) {{
+    if (data[i] > 180 && data[i + 1] < 60 && data[i + 2] < 60) redCount++;
+  }}
+  var allBlack = function (x0, y0, x1, y1) {{
+    for (var y = y0; y <= y1; y++) {{
+      for (var x = x0; x <= x1; x++) {{
+        var idx = (y * c.width + x) * 4;
+        if (data[idx] !== 0 || data[idx + 1] !== 0 || data[idx + 2] !== 0) return false;
+      }}
+    }}
+    return true;
+  }};
+  var directBlack = allBlack(215, 208, 390, 248);
+  var ancestorBlack = allBlack(750, 202, 926, 241);
+  document.getElementById('px-report').textContent =
+    'red=' + redCount + ',direct=' + directBlack + ',ancestor=' + ancestorBlack;
+}};
+img.src = 'data:image/png;base64,{png_b64}';
+</script></body></html>"##
+    );
+    let inspect_url = format!(
+        "data:text/html;base64,{}",
+        support::base64_encode(inspect_html.as_bytes())
+    );
+    let inspect_case = dir.write(
+        "inspect-pixels.yaml",
+        &format!(
+            r##"name: verify scaled screenshot pixels
+steps:
+  - browser.open:
+      url: "{inspect_url}"
+  - browser.wait:
+      css: "#px-report"
+  - browser.read:
+      css: "#px-report"
+    expect:
+      - path: $.text
+        equals: "red=0,direct=true,ancestor=true"
+"##
+        ),
+    );
+    let inspect_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&inspect_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&inspect_out),
+        Some(0),
+        "pixel inspection failed: stdout={}\nstderr={}",
+        stdout(&inspect_out),
+        stderr(&inspect_out)
+    );
+}
+
+#[test]
+fn within_unmappable_frame_transform_fails_clearly_for_click_and_screenshots() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-unmappable-transform");
+
+    let rotate_url = server.url("/browser/iframes/unmappable-transform?kind=rotate");
+    let skew_url = server.url("/browser/iframes/unmappable-transform?kind=skew");
+    let flip_url = server.url("/browser/iframes/unmappable-transform?kind=flip");
+    let d3_url = server.url("/browser/iframes/unmappable-transform?kind=3d");
+    let ancestor_url = server.url("/browser/iframes/unmappable-transform?kind=ancestor_rotate");
+    let no_inputs_url = server.url("/browser/iframes/unmappable-transform?kind=rotate_no_inputs");
+
+    // 1. Check all 5 unmappable transforms fail fast on click, screenshot with fields refuses,
+    //    and decorative rotated iframe without fields allows screenshot in one session.
+    let checks_case = dir.write(
+        "unmappable-checks.yaml",
+        &format!(
+            r##"name: unmappable frame transforms fail fast and refuse uncovered screenshots
+steps:
+  - browser.open:
+      url: "{rotate_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.screenshot:
+      path: shots/should-not-exist.png
+    optional: true
+  - browser.open:
+      url: "{skew_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{flip_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{d3_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{ancestor_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{no_inputs_url}"
+  - browser.screenshot:
+      path: shots/no-inputs-ok.png
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&checks_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout={}\nstderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let steps = value["cases"][0]["steps"].as_array().expect("steps array");
+    for (idx, label) in [
+        (1, "rotate"),
+        (4, "skew"),
+        (6, "flip"),
+        (8, "3d"),
+        (10, "ancestor_rotate"),
+    ] {
+        let step = &steps[idx];
+        assert_eq!(step["status"], "skipped", "{label}: {step}");
+        let duration_ms = step["duration_ms"].as_u64().unwrap_or(u64::MAX);
+        assert!(
+            duration_ms < 4000,
+            "{label}: unmappable transform must fail immediately instead of waiting 8000 ms (took {duration_ms} ms)"
+        );
+        let err = step["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("transform") && err.contains("cannot be mapped"),
+            "{label}: expected clear transform mapping error, got: {err}"
+        );
+    }
+    let shot_step = &steps[2];
+    assert_eq!(shot_step["status"], "skipped", "{shot_step}");
+    let shot_err = shot_step["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        shot_err.contains("transform") && shot_err.contains("cover"),
+        "expected screenshot refusal naming transform, got: {shot_err}"
+    );
+    assert!(
+        !dir.path().join("shots/should-not-exist.png").exists(),
+        "screenshot must not write an uncovered PNG file on failure"
+    );
+    assert_eq!(steps[12]["status"], "passed", "{}", steps[12]);
+    assert!(
+        is_png(&fs::read(dir.path().join("shots/no-inputs-ok.png")).expect("PNG must exist")),
+        "screenshot must succeed when rotated frame has no editable fields"
+    );
+
+    // 2. Failure bundle on a page with an unmappable field inside a rotated iframe must not write uncovered screenshot.png.
+    let bundle_root = dir.path().join("failures");
+    let bundle_case = dir.write(
+        "bundle-rotate.yaml",
+        &format!(
+            r##"name: failure bundle refuses uncovered screenshot in rotated iframe
+steps:
+  - browser.open:
+      url: "{rotate_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#bad-frame"
+"##
+        ),
+    );
+    let bundle_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&bundle_case),
+            "--bundle-dir",
+            path_str(&bundle_root),
+        ],
+    );
+    assert_eq!(exit_code(&bundle_out), Some(1));
+    let bundle_json = json_stdout(&bundle_out);
+    let bundle_rel = bundle_json["cases"][0]["bundle"]
+        .as_str()
+        .expect("failed case must write failure bundle");
+    let bundle_dir = PathBuf::from(bundle_rel);
+    assert!(
+        !bundle_dir.join("browser/screenshot.png").exists(),
+        "failure bundle must not emit an uncovered screenshot.png"
+    );
+    let evidence_err = fs::read_to_string(bundle_dir.join("browser/evidence-error.txt"))
+        .expect("evidence-error.txt must record why screenshot was withheld");
+    assert!(
+        evidence_err.contains("transform"),
+        "evidence-error.txt must explain the transform failure: {evidence_err}"
+    );
+}
