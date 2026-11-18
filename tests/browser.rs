@@ -5373,3 +5373,137 @@ steps:
         "evidence-error.txt must explain the transform failure: {evidence_err}"
     );
 }
+
+#[test]
+fn within_iframe_retry_enforces_allowlist_and_handles_dialogs() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-retry-dialogs");
+    let url = server.url("/browser/iframes/retry");
+
+    for (name, action, body) in [
+        (
+            "click-within-retry.yaml",
+            "browser.click",
+            format!(
+                "name: click within retry rejected\nsteps:\n  - browser.open:\n      url: \"{url}\"\n  - browser.click:\n      css: \"#arm-confirm\"\n      within:\n        css: \"#retry-frame\"\n    retry:\n      until:\n        - path: $.text\n          equals: ok\n      timeout_ms: 500\n"
+            ),
+        ),
+        (
+            "type-within-retry.yaml",
+            "browser.type",
+            format!(
+                "name: type within retry rejected\nsteps:\n  - browser.open:\n      url: \"{url}\"\n  - browser.type:\n      css: \"#arm-confirm\"\n      text: hi\n      within:\n        css: \"#retry-frame\"\n    retry:\n      until:\n        - path: $.text\n          equals: ok\n      timeout_ms: 500\n"
+            ),
+        ),
+    ] {
+        let bad_case = dir.write(name, &body);
+        let lint_out = run_da_in(
+            dir.path(),
+            &["--output", "json", "lint", path_str(&bad_case)],
+        );
+        assert_eq!(
+            exit_code(&lint_out),
+            Some(3),
+            "{name} must fail lint with exit 3: stdout={}\nstderr={}",
+            stdout(&lint_out),
+            stderr(&lint_out)
+        );
+        let lint_err = stderr(&lint_out);
+        let lint_stdout = stdout(&lint_out);
+        assert!(
+            (lint_stdout.contains(action) && lint_stdout.contains("cannot use `retry`"))
+                || (lint_err.contains(action) && lint_err.contains("cannot use `retry`")),
+            "{name}: expected retry disallow error, stdout={lint_stdout} stderr={lint_err}"
+        );
+    }
+
+    let case = dir.write(
+        "iframe-retry-dialogs.yaml",
+        &format!(
+            r##"name: retry on browser.wait and browser.read inside within iframe handles dialogs
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#arm-confirm"
+      within:
+        css: "#retry-frame"
+  - browser.wait:
+      css: "#status"
+      dialog: accept
+      timeout_ms: 300
+      within:
+        css: "#retry-frame"
+    retry:
+      until:
+        - path: $.dialog.type
+          equals: confirm
+      timeout_ms: 8000
+      interval_ms: 50
+    expect:
+      - path: $.dialog.message
+        equals: "Ready now?"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+      within:
+        css: "#retry-frame"
+    retry:
+      until:
+        - path: $.text
+          equals: "confirmed"
+      timeout_ms: 5000
+      interval_ms: 50
+  - browser.click:
+      css: "#arm-unexpected"
+      within:
+        css: "#retry-frame"
+  - browser.read:
+      css: "#status"
+      timeout_ms: 5000
+      within:
+        css: "#retry-frame"
+    retry:
+      until:
+        - path: $.text
+          equals: "after-alert"
+      timeout_ms: 8000
+      interval_ms: 50
+"##
+        ),
+    );
+    let lint_ok = run_da_in(dir.path(), &["--output", "json", "lint", path_str(&case)]);
+    assert_eq!(
+        exit_code(&lint_ok),
+        Some(0),
+        "iframe retry read/wait must pass lint: stdout={}\nstderr={}",
+        stdout(&lint_ok),
+        stderr(&lint_ok)
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["status"], "passed", "{report}");
+    assert_eq!(
+        report["cases"][0]["steps"][2]["result"]["dialog"]["type"], "confirm",
+        "{report}"
+    );
+    assert_eq!(
+        report["cases"][0]["steps"][5]["result"]["text"], "after-alert",
+        "{report}"
+    );
+}

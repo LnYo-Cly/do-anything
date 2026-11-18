@@ -432,6 +432,7 @@ fn route(
         (_, "/browser/iframes/unmappable-transform") => {
             html_response("200 OK", &browser_iframes_unmappable_transform(query))
         }
+        (_, "/browser/iframes/retry") => html_response("200 OK", browser_iframes_retry()),
         (_, "/browser/mask-iframe") => html_response("200 OK", browser_mask_iframe()),
         (_, "/browser/mask-iframe-inner") => html_response("200 OK", browser_mask_iframe_inner()),
         (_, "/browser/mask-iframe-nested") => html_response("200 OK", browser_mask_iframe_nested()),
@@ -1126,6 +1127,15 @@ fn browser_iframes_frameset() -> &'static str {
   <frame id="frame-right" name="right" src="/browser/iframes/nested">
 </frameset>
 </html>"#
+}
+
+fn browser_iframes_retry() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Retry Iframe Host</title></head>
+<body style="margin:0;">
+<iframe id="retry-frame" src="/browser/dialogs/retry"
+  style="position:fixed;left:80px;top:60px;width:360px;height:180px;border:4px solid #333;padding:6px;background:#fff;"></iframe>
+</body></html>"#
 }
 
 fn browser_iframes_scaled_host(query: &str) -> String {

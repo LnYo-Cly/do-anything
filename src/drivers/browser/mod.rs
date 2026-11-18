@@ -5569,12 +5569,15 @@ mod tests {
 
     #[test]
     fn only_read_and_wait_allow_retry() {
+        let within_args = json!({ "css": "#status", "within": { "css": "#embed" } });
         for name in ["browser.read", "browser.wait"] {
             let def = definition(name);
-            assert!(
-                (def.check_retry)(&json!({})).is_ok(),
-                "`{name}` must allow retry"
-            );
+            for args in [json!({}), within_args.clone()] {
+                assert!(
+                    (def.check_retry)(&args).is_ok(),
+                    "`{name}` must allow retry for {args}"
+                );
+            }
         }
         for name in [
             "browser.open",
@@ -5584,10 +5587,12 @@ mod tests {
             "browser.screenshot",
         ] {
             let def = definition(name);
-            let error = (def.check_retry)(&json!({}))
-                .err()
-                .unwrap_or_else(|| panic!("`{name}` must reject retry"));
-            assert!(error.contains("cannot use `retry`"), "{name}: {error}");
+            for args in [json!({}), within_args.clone()] {
+                let error = (def.check_retry)(&args)
+                    .err()
+                    .unwrap_or_else(|| panic!("`{name}` must reject retry for {args}"));
+                assert!(error.contains("cannot use `retry`"), "{name}: {error}");
+            }
         }
     }
 
@@ -7802,43 +7807,48 @@ mod tests {
         }
     }
 
+    fn send_mock_network_request(
+        socket: &mut MockSocket,
+        request_id: &str,
+        url: &str,
+        status: i64,
+    ) {
+        for payload in [
+            json!({
+                "sessionId": "session-1",
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": request_id,
+                    "type": "Fetch",
+                    "request": { "method": "GET", "url": url }
+                }
+            }),
+            json!({
+                "sessionId": "session-1",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": request_id,
+                    "type": "Fetch",
+                    "response": { "url": url, "status": status }
+                }
+            }),
+            json!({
+                "sessionId": "session-1",
+                "method": "Network.loadingFinished",
+                "params": { "requestId": request_id }
+            }),
+        ] {
+            socket
+                .send(tungstenite::Message::text(payload.to_string()))
+                .expect("send mock network event");
+        }
+    }
+
     #[test]
     fn retry_with_browser_network_discards_failed_attempt_requests() {
         use crate::core::case::{Expectation, Matcher, Observation, RetryPolicy};
         use crate::core::report::CaseStatus;
         use serde_saphyr::Location;
-
-        let send_request = |socket: &mut MockSocket, request_id: &str, url: &str, status: i64| {
-            for payload in [
-                json!({
-                    "sessionId": "session-1",
-                    "method": "Network.requestWillBeSent",
-                    "params": {
-                        "requestId": request_id,
-                        "type": "Fetch",
-                        "request": { "method": "GET", "url": url }
-                    }
-                }),
-                json!({
-                    "sessionId": "session-1",
-                    "method": "Network.responseReceived",
-                    "params": {
-                        "requestId": request_id,
-                        "type": "Fetch",
-                        "response": { "url": url, "status": status }
-                    }
-                }),
-                json!({
-                    "sessionId": "session-1",
-                    "method": "Network.loadingFinished",
-                    "params": { "requestId": request_id }
-                }),
-            ] {
-                socket
-                    .send(tungstenite::Message::text(payload.to_string()))
-                    .expect("send mock network event");
-            }
-        };
 
         let mut step = mock_read_step(
             20,
@@ -7874,13 +7884,13 @@ mod tests {
             step,
             move |mut socket| {
                 mock_open_handshake(&mut socket, |sock| {
-                    send_request(sock, "req-doc", "http://127.0.0.1/app", 200);
+                    send_mock_network_request(sock, "req-doc", "http://127.0.0.1/app", 200);
                 });
 
                 // attempt 1: Execution (ambiguous)
                 let attempt1 = read_cdp_request(&mut socket);
                 assert_eq!(attempt1["method"], "Runtime.evaluate");
-                send_request(
+                send_mock_network_request(
                     &mut socket,
                     "req-exec",
                     "http://127.0.0.1/attempt1-exec",
@@ -7904,7 +7914,7 @@ mod tests {
                 // attempt 2: Timeout
                 let attempt2_loc = read_cdp_request(&mut socket);
                 assert_eq!(attempt2_loc["method"], "Runtime.evaluate");
-                send_request(
+                send_mock_network_request(
                     &mut socket,
                     "req-timeout",
                     "http://127.0.0.1/attempt2-timeout",
@@ -7942,7 +7952,12 @@ mod tests {
                 );
                 let attempt3_text = read_cdp_request(&mut socket);
                 assert_eq!(attempt3_text["method"], "Runtime.callFunctionOn");
-                send_request(&mut socket, "req-ok", "http://127.0.0.1/attempt3-ok", 200);
+                send_mock_network_request(
+                    &mut socket,
+                    "req-ok",
+                    "http://127.0.0.1/attempt3-ok",
+                    200,
+                );
                 send_mock_reply(
                     &mut socket,
                     &attempt3_text["id"],
@@ -8664,5 +8679,188 @@ mod tests {
             unmappable,
             ActionableInspect::UnmappableTransform { ref reason } if reason == "rotated CSS transform"
         ));
+    }
+
+    #[test]
+    fn retry_within_iframe_isolates_network_and_recovers_from_unexpected_dialog() {
+        use crate::core::case::{Expectation, Matcher, Observation, RetryPolicy};
+        use crate::core::report::CaseStatus;
+        use serde_saphyr::Location;
+
+        let mut step = mock_read_step(
+            5000,
+            RetryPolicy {
+                until: vec![Expectation {
+                    path: "$.text".to_string(),
+                    matcher: Matcher::Equals(json!("ready")),
+                }],
+                timeout_ms: 3000,
+                interval_ms: 10,
+            },
+        );
+        step.args = json!({
+            "css": "#status",
+            "within": { "css": "#embed" },
+            "timeout_ms": 5000
+        });
+        step.expect = vec![Expectation {
+            path: "$.observed.net.requests".to_string(),
+            matcher: Matcher::Equals(json!([{
+                "method": "GET",
+                "url": "http://127.0.0.1/attempt3-iframe-ok",
+                "status": 200,
+                "type": "Fetch",
+                "failed": null
+            }])),
+        }];
+
+        let report = run_mock_browser_retry_case(
+            "iframe retry network and dialog isolation",
+            vec![Observation {
+                name: "net".to_string(),
+                kind: network::OBSERVER_NAME.to_string(),
+                args: json!({}),
+                location: Location::UNKNOWN,
+                args_location: Location::UNKNOWN,
+            }],
+            step,
+            |mut socket| {
+                mock_open_handshake(&mut socket, |sock| {
+                    send_mock_network_request(sock, "req-doc", "http://127.0.0.1/app", 200);
+                });
+
+                // Attempt 1: resolves #embed, then enter_within_container meets an unexpected alert
+                let a1_frame = read_cdp_request(&mut socket);
+                assert_eq!(a1_frame["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &a1_frame["id"],
+                    json!({ "result": { "objectId": "frame-1" } }),
+                );
+                let a1_enter = read_cdp_request(&mut socket);
+                assert_eq!(a1_enter["method"], "Runtime.callFunctionOn");
+                send_mock_network_request(
+                    &mut socket,
+                    "req-a1",
+                    "http://127.0.0.1/attempt1-iframe-dialog",
+                    500,
+                );
+                send_mock_dialog(&mut socket, "alert", "iframe-transient");
+                let handle = read_cdp_request(&mut socket);
+                assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+                assert_eq!(handle["params"]["accept"], false);
+                send_mock_reply(&mut socket, &handle["id"], json!({}));
+                send_mock_reply(
+                    &mut socket,
+                    &a1_enter["id"],
+                    json!({ "result": { "value": null } }),
+                );
+
+                // Attempt 2: enters #embed, reads "pending" -> `until` fails and drains req-a2
+                let a2_frame = read_cdp_request(&mut socket);
+                assert_eq!(a2_frame["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_frame["id"],
+                    json!({ "result": { "objectId": "frame-2" } }),
+                );
+                let a2_enter = read_cdp_request(&mut socket);
+                assert_eq!(a2_enter["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_enter["id"],
+                    json!({ "result": { "objectId": "frame-doc-2" } }),
+                );
+                let a2_inner = read_cdp_request(&mut socket);
+                assert_eq!(a2_inner["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_inner["id"],
+                    json!({ "result": { "objectId": "elem-2" } }),
+                );
+                let a2_vis = read_cdp_request(&mut socket);
+                assert_eq!(a2_vis["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let a2_text = read_cdp_request(&mut socket);
+                assert_eq!(a2_text["method"], "Runtime.callFunctionOn");
+                send_mock_network_request(
+                    &mut socket,
+                    "req-a2",
+                    "http://127.0.0.1/attempt2-iframe-pending",
+                    200,
+                );
+                send_mock_reply(
+                    &mut socket,
+                    &a2_text["id"],
+                    json!({ "result": { "value": "pending" } }),
+                );
+
+                // Attempt 3: enters #embed, reads "ready" -> succeeds with only req-a3 observed
+                let a3_frame = read_cdp_request(&mut socket);
+                assert_eq!(a3_frame["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_frame["id"],
+                    json!({ "result": { "objectId": "frame-3" } }),
+                );
+                let a3_enter = read_cdp_request(&mut socket);
+                assert_eq!(a3_enter["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_enter["id"],
+                    json!({ "result": { "objectId": "frame-doc-3" } }),
+                );
+                let a3_inner = read_cdp_request(&mut socket);
+                assert_eq!(a3_inner["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_inner["id"],
+                    json!({ "result": { "objectId": "elem-3" } }),
+                );
+                let a3_vis = read_cdp_request(&mut socket);
+                assert_eq!(a3_vis["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let a3_text = read_cdp_request(&mut socket);
+                assert_eq!(a3_text["method"], "Runtime.callFunctionOn");
+                send_mock_network_request(
+                    &mut socket,
+                    "req-a3",
+                    "http://127.0.0.1/attempt3-iframe-ok",
+                    200,
+                );
+                send_mock_reply(
+                    &mut socket,
+                    &a3_text["id"],
+                    json!({ "result": { "value": "ready" } }),
+                );
+
+                mock_close_loop(&mut socket);
+            },
+        );
+        assert_eq!(report.cases[0].status, CaseStatus::Passed, "{report:?}");
+        let result = report.cases[0].steps[1]
+            .result
+            .as_ref()
+            .expect("browser.read result must exist");
+        assert_eq!(result["text"], "ready");
+        assert_eq!(
+            result["observed"]["net"]["requests"],
+            json!([{
+                "method": "GET",
+                "url": "http://127.0.0.1/attempt3-iframe-ok",
+                "status": 200,
+                "type": "Fetch",
+                "failed": null
+            }]),
+            "stale iframe retry requests leaked into final observation: {result}"
+        );
     }
 }
