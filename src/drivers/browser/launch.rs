@@ -105,15 +105,26 @@ impl Launched {
             }
 
             if deadline.passed() {
+                let mut cleanup_errors = Vec::new();
                 if let Some(mut c) = child.take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                } else if let Some(pid) = detached_pid {
-                    let _ = kill_process(pid, Some(&profile));
+                    if let Err(error) = c.kill().and_then(|()| c.wait().map(drop)) {
+                        cleanup_errors.push(format!("could not kill the browser process: {error}"));
+                    }
+                } else if let Some(pid) = detached_pid
+                    && let Err(error) = kill_process(pid, Some(&profile))
+                {
+                    cleanup_errors.push(error);
                 }
-                let _ = remove_profile(&profile);
+                if let Err(error) = remove_profile(&profile) {
+                    cleanup_errors.push(error);
+                }
+                let cleanup = if cleanup_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; cleanup also failed: {}", cleanup_errors.join("; "))
+                };
                 return Err(format!(
-                    "the browser did not report a debugging port within {} ms; set `DA_CHROME` to the Chrome or Chromium executable",
+                    "the browser did not report a debugging port within {} ms; set `DA_CHROME` to the Chrome or Chromium executable{cleanup}",
                     deadline.timeout_ms()
                 ));
             }
@@ -402,6 +413,21 @@ fn dispose_detached_with(
     profile: Option<&Path>,
     exit_timeout: Duration,
 ) -> Result<(), String> {
+    dispose_detached_with_kill(pid, port, profile, exit_timeout, kill_process)
+}
+
+/// [`dispose_detached_with`] with termination injected so a test can prove that
+/// a failing or non-zero kill reaches the caller instead of being swallowed.
+fn dispose_detached_with_kill<K>(
+    pid: Option<u32>,
+    port: Option<u16>,
+    profile: Option<&Path>,
+    exit_timeout: Duration,
+    mut kill: K,
+) -> Result<(), String>
+where
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+{
     let mut errors = Vec::new();
     let deadline = Instant::now() + exit_timeout;
 
@@ -419,11 +445,21 @@ fn dispose_detached_with(
     if let Some(pid) = pid {
         if port_open {
             kill_attempted = true;
-            if let Err(err) = kill_process(pid, profile) {
+            if let Err(err) = kill(pid, profile) {
                 errors.push(err);
             }
         } else if let Some(profile) = profile {
-            ensure_profile_process_stopped(pid, profile, &mut errors);
+            ensure_profile_process_stopped(pid, profile, &mut errors, &mut kill);
+        } else {
+            // The debug port is closed, so there is no live socket that ties
+            // this pid to the browser, and without the profile path there is
+            // no command line to check either. The number may belong to a
+            // recycled, unrelated process by now, and killing it would be
+            // worse than leaving it. Report that the handle could not be
+            // verified instead of claiming a clean teardown.
+            errors.push(format!(
+                "could not verify or terminate browser pid {pid}: the session handle has no profile path"
+            ));
         }
     }
 
@@ -449,7 +485,7 @@ fn dispose_detached_with(
         if let Some(pid) = pid
             && errors.is_empty()
         {
-            if let Err(kill_err) = kill_process(pid, Some(profile)) {
+            if let Err(kill_err) = kill(pid, Some(profile)) {
                 errors.push(kill_err);
             }
             if let Err(retry_err) = remove_profile(profile) {
@@ -497,7 +533,14 @@ enum PidProfileMatch {
 /// Checks whether a process `pid` is still alive and owns `--user-data-dir=<profile>`
 /// after its debug port stopped listening, allowing a short grace window for a
 /// clean post-`Browser.close` exit before force-killing.
-fn ensure_profile_process_stopped(pid: u32, profile: &Path, errors: &mut Vec<String>) {
+fn ensure_profile_process_stopped<K>(
+    pid: u32,
+    profile: &Path,
+    errors: &mut Vec<String>,
+    kill: &mut K,
+) where
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+{
     #[cfg(windows)]
     {
         match windows_pid_exists(pid) {
@@ -515,7 +558,7 @@ fn ensure_profile_process_stopped(pid: u32, profile: &Path, errors: &mut Vec<Str
         match windows_pid_matches_profile(pid, profile) {
             PidProfileMatch::DoesNotMatch => {}
             PidProfileMatch::Matches => {
-                if let Err(err) = force_kill_pid(pid, Some(profile)) {
+                if let Err(err) = kill(pid, Some(profile)) {
                     errors.push(err);
                 }
             }
@@ -552,19 +595,38 @@ fn ensure_profile_process_stopped(pid: u32, profile: &Path, errors: &mut Vec<Str
                 }
             }
         }
-        if let Err(err) = force_kill_pid(pid, Some(profile)) {
+        if let Err(err) = kill(pid, Some(profile)) {
             errors.push(err);
         }
     }
     #[cfg(not(any(windows, unix)))]
     {
-        let _ = (pid, profile, errors);
+        let _ = (pid, profile, errors, kill);
     }
 }
 
 fn kill_process(pid: u32, profile: Option<&Path>) -> Result<(), String> {
+    kill_process_with(pid, profile, pid_matches_profile, force_kill_pid)
+}
+
+/// [`kill_process`] with ownership verification and termination injected.
+///
+/// The real [`pid_matches_profile`] refuses to signal a pid whose command line
+/// does not name `profile`; that is what keeps a recycled pid safe. This seam
+/// exists so a test can prove both halves of that contract without depending on
+/// the host having a kill utility that fails on demand.
+fn kill_process_with<V, K>(
+    pid: u32,
+    profile: Option<&Path>,
+    mut verify: V,
+    mut kill: K,
+) -> Result<(), String>
+where
+    V: FnMut(u32, &Path) -> PidProfileMatch,
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+{
     if let Some(profile) = profile {
-        match pid_matches_profile(pid, profile) {
+        match verify(pid, profile) {
             PidProfileMatch::Matches => {}
             PidProfileMatch::DoesNotMatch => return Ok(()),
             PidProfileMatch::Unknown => {
@@ -574,7 +636,7 @@ fn kill_process(pid: u32, profile: Option<&Path>) -> Result<(), String> {
             }
         }
     }
-    force_kill_pid(pid, profile)
+    kill(pid, profile)
 }
 
 fn force_kill_pid(pid: u32, profile: Option<&Path>) -> Result<(), String> {
@@ -704,9 +766,16 @@ where
     R: FnMut(&[&str]) -> std::io::Result<std::process::ExitStatus>,
     A: FnMut(u32, Option<&Path>) -> Option<bool>,
 {
-    let pid_str = format!("-{}", pid);
+    // Signals target the browser pid itself, never `-pid`. A detached Chrome is
+    // a group leader, but a handle can also point at a browser that was started
+    // before that (or at a helper that never got its own group), and `kill -TERM
+    // -<pid>` then either fails with ESRCH or reaches an unrelated group. The
+    // per-pid form (`kill -TERM <pid>`, `kill -KILL <pid>`, `kill -0 <pid>`) is
+    // the form that passed the Linux and macOS CI runs and the repeated browser
+    // suite; Chrome tears down its own helper processes when the browser exits.
+    let pid_str = pid.to_string();
     let term_status = run_kill(&["-TERM", &pid_str])
-        .map_err(|error| format!("could not terminate browser process group {pid}: {error}"))?;
+        .map_err(|error| format!("could not terminate browser pid {pid}: {error}"))?;
     if !term_status.success() && is_alive(pid, profile) == Some(false) {
         return Ok(());
     }
@@ -720,13 +789,13 @@ where
     }
 
     let kill_status = run_kill(&["-KILL", &pid_str])
-        .map_err(|error| format!("could not terminate browser process group {pid}: {error}"))?;
+        .map_err(|error| format!("could not terminate browser pid {pid}: {error}"))?;
     if !kill_status.success() {
         if is_alive(pid, profile) == Some(false) {
             return Ok(());
         }
         return Err(format!(
-            "could not terminate browser process group {pid} (kill -KILL exited with {kill_status})"
+            "could not terminate browser pid {pid} (kill -KILL exited with {kill_status})"
         ));
     }
 
@@ -888,9 +957,8 @@ fn windows_pid_matches_profile(pid: u32, profile: &Path) -> PidProfileMatch {
 
 #[cfg(unix)]
 fn is_unix_pid_alive(pid: u32) -> bool {
-    // Check if the process group exists by sending signal 0 to the group
     Command::new("kill")
-        .args(["-0", &format!("-{}", pid)])
+        .args(["-0", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1533,6 +1601,135 @@ mod tests {
             err.contains(&open_port.to_string()),
             "error must name open debug port {open_port}: {err}"
         );
+    }
+
+    #[test]
+    fn dispose_detached_propagates_termination_error_and_reports_surviving_port() {
+        let profile = create_profile().expect("create temp profile");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind live port");
+        let open_port = listener.local_addr().expect("addr").port();
+
+        let mut child = spawn_sleeping_process_for_profile(Some(&profile));
+        let pid = child.id();
+        thread::sleep(Duration::from_millis(300));
+
+        let kill_error = format!("could not terminate browser pid {pid}: kill -KILL exited with 1");
+        let result = dispose_detached_with_kill(
+            Some(pid),
+            Some(open_port),
+            Some(&profile),
+            Duration::from_millis(100),
+            |_, _| Err(kill_error.clone()),
+        );
+        let still_running = matches!(child.try_wait(), Ok(None));
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(listener);
+        let _ = fs::remove_dir_all(&profile);
+
+        let err = result.expect_err("a failing kill must never be reported as success");
+        assert!(
+            err.contains(&kill_error),
+            "termination error must reach the caller: {err}"
+        );
+        assert!(
+            err.contains(&open_port.to_string()),
+            "surviving debug port must be reported too: {err}"
+        );
+        assert!(
+            still_running,
+            "the injected kill did not run, so the helper must still be alive"
+        );
+    }
+
+    #[test]
+    fn dispose_detached_refuses_unverified_pid_without_profile() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind dummy port");
+        let closed_port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let mut child = spawn_sleeping_process_for_profile(None);
+        let pid = child.id();
+        thread::sleep(Duration::from_millis(300));
+
+        let result = dispose_detached_with(
+            Some(pid),
+            Some(closed_port),
+            None,
+            Duration::from_millis(100),
+        );
+        let still_running = matches!(child.try_wait(), Ok(None));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let err = result.expect_err("an unverifiable pid must not be reported as cleaned up");
+        assert!(
+            err.contains(&pid.to_string()),
+            "error must name the unverified pid {pid}: {err}"
+        );
+        assert!(
+            still_running,
+            "an unverified pid must not be killed because it may have been recycled"
+        );
+    }
+
+    #[test]
+    fn kill_process_propagates_non_zero_termination_errors() {
+        let profile = create_profile().expect("create temp profile");
+        let mut calls = 0;
+        let result = kill_process_with(
+            4242,
+            Some(&profile),
+            |_, _| PidProfileMatch::Matches,
+            |_, _| {
+                calls += 1;
+                Err("could not terminate browser pid 4242 (taskkill exited with 1)".to_string())
+            },
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        let err = result.expect_err("termination failure must propagate through kill_process");
+        assert!(
+            err.contains("taskkill exited with 1"),
+            "termination error must be preserved: {err}"
+        );
+        assert_eq!(calls, 1, "the kill must be attempted exactly once");
+    }
+
+    #[test]
+    fn kill_process_refuses_unknown_ownership_and_skips_the_kill() {
+        let profile = create_profile().expect("create temp profile");
+        let mut calls = 0;
+        let unknown = kill_process_with(
+            4242,
+            Some(&profile),
+            |_, _| PidProfileMatch::Unknown,
+            |_, _| {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(
+            unknown.is_err(),
+            "an unverifiable command line must be an error"
+        );
+        assert_eq!(calls, 0, "an unverified pid must not be signalled");
+
+        let recycled = kill_process_with(
+            4242,
+            Some(&profile),
+            |_, _| PidProfileMatch::DoesNotMatch,
+            |_, _| {
+                calls += 1;
+                Ok(())
+            },
+        );
+        let _ = fs::remove_dir_all(&profile);
+        assert!(
+            recycled.is_ok(),
+            "a recycled pid that does not own the profile is a no-op"
+        );
+        assert_eq!(calls, 0, "a mismatched pid must not be signalled");
     }
 
     #[test]
