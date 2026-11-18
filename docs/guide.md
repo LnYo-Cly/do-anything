@@ -1437,7 +1437,7 @@ A **locator** takes **exactly one** of the five ways below, plus any modifiers:
 
 | Modifier | Meaning |
 | --- | --- |
-| `within: <locator>` | Narrows the search to elements inside the unique element matched by this container locator; may be nested. |
+| `within: <locator>` | Narrows the search to elements inside the unique element matched by this container locator; may be nested. When `within` matches a same-origin `<iframe>` or `<frame>`, the inner locator searches that frame's document (and may nest further). |
 | `nth: <integer>` | Selects the zero-based match (`0`, `1`, …) in document order. Explicit `nth` permits multiple matches and waits until that index exists (failing on timeout if still out of range). |
 | `timeout_ms: <ms>` | How long the step polls before timing out (defaults to 5000). |
 
@@ -1502,6 +1502,33 @@ If `timeout_ms` expires, the error names the check that failed — and when
 occluded, identifies the blocking element (tag, `id`, and snippet). `browser.read`
 and `browser.wait` only wait for existence and visibility.
 
+#### Frames (`iframe` and `frame`)
+
+Unscoped locators search only the main document. To interact with elements inside
+a same-origin `<iframe>` or `<frame>`, point `within` at the frame element;
+`within` can be nested across any combination of containers and inner frames:
+
+```yaml
+- browser.click:
+    role: button
+    name: Save card
+    within:
+      css: "#nested-frame"
+      within:
+        css: "#embed"
+```
+
+When `within` resolves to a same-origin frame, `da` enters its `contentDocument`
+(waiting until it finishes loading within `timeout_ms`), converts element
+coordinates across every enclosing frame's viewport offset, border, and padding,
+and checks `elementFromPoint` in each enclosing document as well as the inner
+frame — so clicks land at the true viewport coordinates and a top-level overlay
+covering an iframe element still fails as occluded.
+
+Cross-origin frames (including `<iframe sandbox>` without `allow-same-origin`)
+fail immediately as an execution error (exit 1) without waiting out
+`timeout_ms`, because the browser blocks access to their `contentDocument`.
+
 `browser.type` keeps its original `text` argument as the text to type. Because
 `text` is also a locator, the two meanings are separated by `value`: when `value`
 is given, `text` names the element and `value` is typed. These two steps are
@@ -1550,9 +1577,10 @@ enters text output, `--output json` or a future shareable report.
 
 The cover hides editable fields, not ordinary text. A page that writes a secret
 into a heading, a paragraph or an attribute still shows it in the screenshot
-pixels; `dom.html` is redacted, but the PNG is not. The cover applies to the
-page's main document, so an editable field inside an iframe is not reached. Treat
-both kinds of page as unsuitable for screenshots that leave the machine.
+pixels; `dom.html` is redacted, but the PNG is not. The cover also descends into
+accessible same-origin and nested frames (`<iframe>` and `<frame>`), whereas
+cross-origin frames cannot be reached from the main page. Treat both kinds of
+page as unsuitable for screenshots that leave the machine.
 
 `headless`, `width` and `height` only apply when the first `browser.open` creates
 the page. A later `browser.open` that gives a different effective value is a step

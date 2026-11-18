@@ -3050,7 +3050,7 @@ fn unsupported_capabilities_probe_current_behavior() {
     };
     let dir = TempDir::new("browser-probes");
 
-    // 1. iframe
+    // 1. iframe (unscoped locator stays in the main document; `within` enters same-origin iframes)
     let iframe_case = dir.write(
         "probe-iframe.yaml",
         &format!(
@@ -3080,6 +3080,31 @@ fn unsupported_capabilities_probe_current_behavior() {
     assert!(
         iframe_err.contains("could not find CSS selector `#inside-frame`"),
         "unexpected iframe probe error: {iframe_err}"
+    );
+
+    let scoped_iframe_case = dir.write(
+        "probe-iframe-within.yaml",
+        &format!(
+            "name: probe iframe within\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-frame\"\n      within:\n        css: \"#probe-frame\"\n  - browser.read:\n      css: \"#probe-status\"\n      within:\n        css: \"#probe-frame\"\n    expect:\n      - path: $.text\n        equals: clicked\n",
+            server.url("/browser/probe/iframe")
+        ),
+    );
+    let scoped_iframe_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&scoped_iframe_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&scoped_iframe_out),
+        Some(0),
+        "scoped iframe probe must succeed: stdout={}\nstderr={}",
+        stdout(&scoped_iframe_out),
+        stderr(&scoped_iframe_out)
     );
 
     // 2. shadow DOM (css misses; role finds AX node but light-DOM elementFromPoint sees shadow host)
@@ -4311,5 +4336,663 @@ steps:
     assert_eq!(
         report["cases"][0]["steps"][5]["result"]["text"], "after-alert",
         "{report}"
+    );
+}
+
+#[test]
+fn within_same_origin_and_nested_iframes_support_all_locators_and_actions() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-nested");
+    let host_url = server.url("/browser/iframes/host");
+    let slow_url = server.url("/browser/iframes/slow-host");
+    let frameset_url = server.url("/browser/iframes/frameset");
+
+    let main_case = dir.write(
+        "iframes-all-locators.yaml",
+        &format!(
+            r##"name: same-origin and nested iframes support all locators and actions
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.wait:
+      role: button
+      name: Frame Action
+      within:
+        css: "#embed"
+  - browser.click:
+      css: "#frame-btn"
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: frame-clicked
+  - browser.click:
+      xpath: "//button[@id='panel-btn']"
+      within:
+        role: region
+        name: Inner Panel
+        within:
+          testid: embed-frame
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: inner-panel-clicked
+  - browser.click:
+      text: Other Save
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: other-panel-clicked
+  - browser.type:
+      testid: frame-input
+      text: hello-iframe
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: "typed:hello-iframe"
+  - browser.click:
+      css: "#frame-confirm-btn"
+      dialog: accept
+      within:
+        css: "#embed"
+    expect:
+      - path: $.dialog.type
+        equals: confirm
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: confirmed
+  - browser.click:
+      testid: nested-btn
+      within:
+        css: ".nested-box"
+        within:
+          testid: nested-frame
+          within:
+            css: "#embed"
+  - browser.read:
+      css: "#nested-result"
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+    expect:
+      - path: $.text
+        equals: nested-clicked
+  - browser.type:
+      role: textbox
+      name: Nested Field
+      text: deep-value
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+  - browser.read:
+      css: "#nested-result"
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+    expect:
+      - path: $.text
+        equals: "nested-typed:deep-value"
+  - browser.click:
+      css: "#spawn-nested-badge"
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+  - browser.wait:
+      text: nested-ready
+      timeout_ms: 2000
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+"##
+        ),
+    );
+    let main_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&main_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&main_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&main_out),
+        stderr(&main_out)
+    );
+
+    // Unscoped `role` locator must stay in the main document and not pierce into `#embed`.
+    let unscoped_role_case = dir.write(
+        "iframe-unscoped-role.yaml",
+        &format!(
+            r##"name: unscoped role stays in main document
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.click:
+      role: button
+      name: Frame Action
+      timeout_ms: 400
+"##
+        ),
+    );
+    let unscoped_role_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&unscoped_role_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&unscoped_role_out), Some(1));
+    let unscoped_role_json = json_stdout(&unscoped_role_out);
+    let unscoped_role_err = case_error(&unscoped_role_json);
+    assert!(
+        unscoped_role_err.contains("could not find role `button` named `Frame Action`"),
+        "expected unscoped role miss, got: {unscoped_role_err}"
+    );
+
+    // Unhandled JS dialog inside an iframe still fails fast via DialogWatch.
+    let dialog_case = dir.write(
+        "iframe-unhandled-dialog.yaml",
+        &format!(
+            r##"name: unhandled dialog inside iframe fails fast
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.click:
+      css: "#frame-alert-btn"
+      timeout_ms: 5000
+      within:
+        css: "#embed"
+"##
+        ),
+    );
+    let dialog_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&dialog_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&dialog_out), Some(1));
+    let dialog_json = json_stdout(&dialog_out);
+    let dialog_ms = dialog_json["cases"][0]["steps"][1]["duration_ms"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    assert!(
+        dialog_ms < 3000,
+        "unhandled iframe dialog must fail fast, took {dialog_ms} ms"
+    );
+    let dialog_err = case_error(&dialog_json);
+    assert!(
+        dialog_err.contains("alert") && dialog_err.contains("inner alert"),
+        "expected inner alert message, got: {dialog_err}"
+    );
+
+    // Slow-loading dynamically inserted same-origin iframe waits within timeout_ms.
+    let slow_case = dir.write(
+        "iframe-slow-ready.yaml",
+        &format!(
+            r##"name: waits for same-origin iframe document to become ready
+steps:
+  - browser.open:
+      url: "{slow_url}"
+  - browser.click:
+      css: "#spawn-lazy-frame"
+  - browser.wait:
+      css: "#slow-ready"
+      timeout_ms: 3000
+      within:
+        css: "#lazy-frame"
+  - browser.click:
+      css: "#slow-btn"
+      timeout_ms: 3000
+      within:
+        css: "#lazy-frame"
+  - browser.read:
+      css: "#slow-ready"
+      within:
+        css: "#lazy-frame"
+    expect:
+      - path: $.text
+        equals: slow-clicked
+"##
+        ),
+    );
+    let slow_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&slow_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&slow_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&slow_out),
+        stderr(&slow_out)
+    );
+
+    // <frameset> / <frame> works identically to <iframe>.
+    let frameset_case = dir.write(
+        "frameset-frame.yaml",
+        &format!(
+            r##"name: within supports frame elements in a frameset
+steps:
+  - browser.open:
+      url: "{frameset_url}"
+  - browser.click:
+      css: "#inside-frame"
+      within:
+        css: "#frame-left"
+  - browser.read:
+      css: "#probe-status"
+      within:
+        css: "#frame-left"
+    expect:
+      - path: $.text
+        equals: clicked
+"##
+        ),
+    );
+    let frameset_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&frameset_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&frameset_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&frameset_out),
+        stderr(&frameset_out)
+    );
+}
+
+#[test]
+fn within_iframe_click_accumulates_frame_offsets_instead_of_clicking_decoy() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-offset");
+    let host_url = server.url("/browser/iframes/host");
+
+    let case = dir.write(
+        "offset-click.yaml",
+        &format!(
+            r##"name: iframe click accumulates outer frame viewport offset
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.click:
+      css: "#frame-btn"
+      timeout_ms: 2000
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: frame-clicked
+  - browser.read:
+      css: "#decoy-result"
+    expect:
+      - path: $.text
+        equals: decoy-idle
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn within_iframe_checks_top_level_and_inner_occlusion_and_scrolls_offscreen_frames() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-occlusion");
+    let url = server.url("/browser/iframes/occlusion");
+
+    // 1. Top-level modal backdrop over an iframe button blocks the click and names the backdrop.
+    let top_blocked = dir.write(
+        "top-blocked.yaml",
+        &format!(
+            r##"name: top-level backdrop over iframe button fails naming backdrop
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#top-blocked-btn"
+      timeout_ms: 400
+      within:
+        css: "#occ-frame"
+"##
+        ),
+    );
+    let top_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&top_blocked),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&top_out), Some(1));
+    let top_json = json_stdout(&top_out);
+    let top_err = case_error(&top_json);
+    assert!(
+        top_err.contains("top-modal-backdrop"),
+        "expected top-modal-backdrop blocker, got: {top_err}"
+    );
+
+    // 2. Inner overlay inside the iframe blocks the click and names the inner overlay.
+    let inner_blocked = dir.write(
+        "inner-blocked.yaml",
+        &format!(
+            r##"name: inner overlay inside iframe fails naming inner overlay
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#inner-blocked-btn"
+      timeout_ms: 400
+      within:
+        css: "#occ-frame"
+"##
+        ),
+    );
+    let inner_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&inner_blocked),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&inner_out), Some(1));
+    let inner_json = json_stdout(&inner_out);
+    let inner_err = case_error(&inner_json);
+    assert!(
+        inner_err.contains("inner-overlay"),
+        "expected inner-overlay blocker, got: {inner_err}"
+    );
+
+    // 3. Transient top-level overlay clears -> click succeeds; offscreen iframe scrolls in -> click succeeds.
+    let recover_and_scroll = dir.write(
+        "uncover-and-scroll.yaml",
+        &format!(
+            r##"name: waits for top-level overlay to hide and scrolls offscreen iframe
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#uncover-iframe-modal"
+  - browser.click:
+      css: "#temp-blocked-btn"
+      timeout_ms: 2000
+      within:
+        css: "#occ-frame"
+  - browser.read:
+      css: "#occ-result"
+      within:
+        css: "#occ-frame"
+    expect:
+      - path: $.text
+        equals: temp-blocked-clicked
+  - browser.click:
+      css: "#inside-frame"
+      within:
+        css: "#offscreen-frame"
+  - browser.read:
+      css: "#probe-status"
+      within:
+        css: "#offscreen-frame"
+    expect:
+      - path: $.text
+        equals: clicked
+"##
+        ),
+    );
+    let recover_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&recover_and_scroll),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&recover_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&recover_out),
+        stderr(&recover_out)
+    );
+}
+
+#[test]
+fn within_cross_origin_iframe_fails_immediately_with_clear_error() {
+    let server1 = TestServer::start();
+    let Some(_guard) = chrome_test(&server1) else {
+        return;
+    };
+    let server2 = TestServer::start();
+    let dir = TempDir::new("browser-iframe-cross-origin");
+    let url = format!(
+        "{}?cross_port={}",
+        server1.url("/browser/iframes/host"),
+        server2.port()
+    );
+
+    for (name, frame_selector) in [
+        ("cross-origin-port.yaml", "#cross-origin-frame"),
+        ("cross-origin-sandbox.yaml", "#sandboxed-frame"),
+    ] {
+        let case = dir.write(
+            name,
+            &format!(
+                r##"name: cross-origin iframe fails immediately
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#inside-frame"
+      timeout_ms: 10000
+      within:
+        css: "{frame_selector}"
+"##
+            ),
+        );
+        let output = run_da_in(
+            dir.path(),
+            &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        );
+        assert_eq!(
+            exit_code(&output),
+            Some(1),
+            "{name}: stdout={}\nstderr={}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let value = json_stdout(&output);
+        let duration_ms = value["cases"][0]["steps"][1]["duration_ms"]
+            .as_u64()
+            .unwrap_or(u64::MAX);
+        assert!(
+            duration_ms < 4000,
+            "{name}: cross-origin iframe must fail immediately instead of waiting 10000 ms (took {duration_ms} ms)"
+        );
+        let message = case_error(&value);
+        assert!(
+            message.contains("cross-origin") && message.contains("same-origin"),
+            "{name}: expected clear cross-origin iframe message, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn screenshot_and_failure_evidence_cover_editable_fields_inside_same_origin_iframes() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-mask-iframe");
+    let url = server.url("/browser/mask-iframe");
+    let secret = "iframe-pw-s3cr3t-42";
+
+    let case = dir.write(
+        "mask-iframe.yaml",
+        &format!(
+            r##"name: screenshot masks editable fields inside same-origin and nested iframes
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      css: "#iframe-pw"
+      text: "${{env:DA_IFRAME_PW_SECRET}}"
+      within:
+        css: "#mask-frame"
+  - browser.screenshot:
+      path: shots/iframe-masked.png
+  - browser.read:
+      css: "#mask-report"
+    expect:
+      - path: $.text
+        equals: "top_pw=true,iframe_pw=true,iframe_note=true,nested_pw=true"
+  - browser.click:
+      css: "#iframe-pw"
+      within:
+        css: "#mask-frame"
+  - browser.read:
+      css: "#mask-report"
+    expect:
+      - path: $.text
+        equals: "force-failure-bundle"
+"##
+        ),
+    );
+    let bundles = dir.path().join("failures");
+    let output = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_IFRAME_PW_SECRET", secret.to_string())],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let raw_stdout = stdout(&output);
+    assert!(
+        !raw_stdout.contains(secret),
+        "secret leaked in JSON output: {raw_stdout}"
+    );
+    let value = json_stdout(&output);
+    // Step 3 (0-based index 3) is the mask-report expectation; it must pass before step 4 fails!
+    assert_eq!(
+        value["cases"][0]["steps"][3]["status"], "passed",
+        "mask report check inside step 3 must pass: {value}"
+    );
+    let explicit_shot = dir.path().join("shots/iframe-masked.png");
+    assert!(
+        is_png(&fs::read(&explicit_shot).expect("explicit screenshot must exist")),
+        "explicit screenshot must be a valid PNG"
+    );
+
+    let bundle_rel = value["cases"][0]["bundle"]
+        .as_str()
+        .expect("failed case must emit failure bundle");
+    let bundle_dir = PathBuf::from(bundle_rel);
+    assert!(
+        is_png(
+            &fs::read(bundle_dir.join("browser/screenshot.png"))
+                .expect("failure bundle browser/screenshot.png must exist")
+        ),
+        "failure bundle screenshot must be a valid PNG"
+    );
+    let report_json =
+        fs::read_to_string(bundle_dir.join("report.json")).expect("report.json must exist");
+    assert!(
+        !report_json.contains(secret),
+        "secret leaked in failure report.json: {report_json}"
     );
 }

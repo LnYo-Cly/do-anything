@@ -28,6 +28,7 @@ mod synthesis;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use schemars::{JsonSchema, schema_for};
@@ -784,41 +785,181 @@ const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long removing the masks may take after the screenshot itself.
 const MASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// JavaScript that covers every visible editable field with an opaque box.
-///
-/// `position: fixed` uses the viewport rectangle `getBoundingClientRect`
-/// returns, and `z-index` is the largest value a browser accepts. The element
-/// stays in the page only until the screenshot is captured; cleanup is a
-/// separate call so it can run after a failed capture too. The page is not
-/// notified when the masks appear or disappear.
-const MASK_INPUTS_SCRIPT: &str = r#"(function () {
-  var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
-  var fields = document.querySelectorAll('input, textarea, select, [contenteditable]');
-  var masks = [];
-  for (var i = 0; i < fields.length; i++) {
-    var el = fields[i];
-    if (el.nodeType !== 1) continue;
-    var tag = el.tagName;
-    var field = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
-    if (!field && !el.isContentEditable) continue;
-    if (tag === 'INPUT' && skipped.indexOf((el.type || 'text').toLowerCase()) !== -1) continue;
-    var style = window.getComputedStyle(el);
-    var rect = el.getBoundingClientRect();
-    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || rect.width <= 0 || rect.height <= 0) continue;
-    var mask = document.createElement('div');
-    mask.setAttribute('data-da-screenshot-mask', '');
-    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + rect.left + 'px;top:' + rect.top + 'px;width:' + rect.width + 'px;height:' + rect.height + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
-    document.documentElement.appendChild(mask);
-    masks.push(mask);
+/// Shared JavaScript helpers for frame traversal, coordinate offsets, and visibility.
+const FRAME_HELPERS_JS: &str = r#"
+var isBoxVisible = function (node, win) {
+  if (!node || node.nodeType !== 1) return false;
+  var view = win || (node.ownerDocument && node.ownerDocument.defaultView) || window;
+  var style = view.getComputedStyle(node);
+  var rect = node.getBoundingClientRect();
+  return style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    style.visibility !== 'collapse' &&
+    rect.width > 0 &&
+    rect.height > 0;
+};
+var collectEnclosingFrames = function (node) {
+  var frames = [];
+  var doc = node.nodeType === 9 ? node : node.ownerDocument;
+  var win = doc && doc.defaultView;
+  var topWin = window;
+  try {
+    topWin = window.top || window;
+  } catch (e) {
+    return null;
   }
-  return masks.length;
-})()"#;
+  while (win && win !== topWin) {
+    var frame = null;
+    try {
+      frame = win.frameElement;
+    } catch (e) {
+      return null;
+    }
+    if (!frame || !frame.isConnected) return null;
+    frames.unshift(frame);
+    doc = frame.ownerDocument;
+    win = doc && doc.defaultView;
+  }
+  return frames;
+};
+var areEnclosingFramesVisible = function (frames) {
+  for (var i = 0; i < frames.length; i++) {
+    if (!isBoxVisible(frames[i], null)) return false;
+  }
+  return true;
+};
+var frameContentOffset = function (frame) {
+  var fr = frame.getBoundingClientRect();
+  var fv = (frame.ownerDocument && frame.ownerDocument.defaultView) || window;
+  var fs = fv.getComputedStyle(frame);
+  var borderLeft = frame.clientLeft || parseFloat(fs.borderLeftWidth) || 0;
+  var borderTop = frame.clientTop || parseFloat(fs.borderTopWidth) || 0;
+  var padLeft = parseFloat(fs.paddingLeft) || 0;
+  var padTop = parseFloat(fs.paddingTop) || 0;
+  var borderRight = parseFloat(fs.borderRightWidth) || 0;
+  var borderBottom = parseFloat(fs.borderBottomWidth) || 0;
+  var padRight = parseFloat(fs.paddingRight) || 0;
+  var padBottom = parseFloat(fs.paddingBottom) || 0;
+  return {
+    rect: fr,
+    ox: fr.left + borderLeft + padLeft,
+    oy: fr.top + borderTop + padTop,
+    rightInset: borderRight + padRight,
+    bottomInset: borderBottom + padBottom
+  };
+};
+"#;
 
-/// JavaScript that removes every mask this module added.
-const REMOVE_MASKS_SCRIPT: &str = r#"(function () {
-  var masks = document.querySelectorAll('[data-da-screenshot-mask]');
-  for (var i = 0; i < masks.length; i++) masks[i].remove();
+/// JavaScript that covers every visible editable field with an opaque box,
+/// including fields inside accessible same-origin and nested iframes.
+///
+/// `position: fixed` uses top-level viewport coordinates (`ox + rect.left`,
+/// `oy + rect.top`) so a single overlay at the highest `z-index` covers fields
+/// across nested frames, except in `<frameset>` documents where masks live on
+/// each frame document itself. Cleanup runs separately so it executes even on
+/// capture errors.
+static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"(function () {{
+{FRAME_HELPERS_JS}
+  var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
+  var masks = [];
+  var isFrameset = Boolean(document.body && document.body.tagName === 'FRAMESET');
+  var appendMask = function (hostDoc, left, top, width, height) {{
+    if (!hostDoc || !hostDoc.documentElement || width <= 0 || height <= 0) return;
+    var mask = hostDoc.createElement('div');
+    mask.setAttribute('data-da-screenshot-mask', '');
+    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + left + 'px;top:' + top + 'px;width:' + width + 'px;height:' + height + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
+    hostDoc.documentElement.appendChild(mask);
+    masks.push(mask);
+  }};
+  var collectDoc = function (doc, ox, oy, clip) {{
+    var win = doc.defaultView || window;
+    var fields = doc.querySelectorAll('input, textarea, select, [contenteditable]');
+    for (var i = 0; i < fields.length; i++) {{
+      var el = fields[i];
+      if (el.nodeType !== 1) continue;
+      var tag = el.tagName;
+      var field = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+      if (!field && !el.isContentEditable) continue;
+      if (tag === 'INPUT' && skipped.indexOf((el.type || 'text').toLowerCase()) !== -1) continue;
+      if (!isBoxVisible(el, win)) continue;
+      var rect = el.getBoundingClientRect();
+      if (isFrameset && doc !== document) {{
+        appendMask(doc, rect.left, rect.top, rect.width, rect.height);
+        continue;
+      }}
+      var left = ox + rect.left;
+      var top = oy + rect.top;
+      var right = left + rect.width;
+      var bottom = top + rect.height;
+      if (clip) {{
+        left = Math.max(left, clip.left);
+        top = Math.max(top, clip.top);
+        right = Math.min(right, clip.right);
+        bottom = Math.min(bottom, clip.bottom);
+      }}
+      appendMask(document, left, top, right - left, bottom - top);
+    }}
+    var frames = doc.querySelectorAll('iframe, frame');
+    for (var j = 0; j < frames.length; j++) {{
+      var frame = frames[j];
+      if (!isBoxVisible(frame, win)) continue;
+      var childDoc = null;
+      try {{
+        childDoc = frame.contentDocument;
+      }} catch (e) {{
+        childDoc = null;
+      }}
+      if (!childDoc) continue;
+      var fOff = frameContentOffset(frame);
+      var childOx = ox + fOff.ox;
+      var childOy = oy + fOff.oy;
+      var nextClip = {{
+        left: childOx,
+        top: childOy,
+        right: ox + fOff.rect.right - fOff.rightInset,
+        bottom: oy + fOff.rect.bottom - fOff.bottomInset
+      }};
+      if (clip) {{
+        nextClip.left = Math.max(nextClip.left, clip.left);
+        nextClip.top = Math.max(nextClip.top, clip.top);
+        nextClip.right = Math.min(nextClip.right, clip.right);
+        nextClip.bottom = Math.min(nextClip.bottom, clip.bottom);
+      }}
+      if (nextClip.right <= nextClip.left || nextClip.bottom <= nextClip.top) continue;
+      collectDoc(childDoc, childOx, childOy, nextClip);
+    }}
+  }};
+  collectDoc(document, 0, 0, null);
   return masks.length;
+}})()"#
+    )
+});
+
+/// JavaScript that removes every mask this module added across the top document
+/// and any accessible same-origin frames.
+const REMOVE_MASKS_SCRIPT: &str = r#"(function () {
+  var removed = 0;
+  var cleanDoc = function (doc) {
+    var masks = doc.querySelectorAll('[data-da-screenshot-mask]');
+    for (var i = 0; i < masks.length; i++) {
+      masks[i].remove();
+      removed++;
+    }
+    var frames = doc.querySelectorAll('iframe, frame');
+    for (var j = 0; j < frames.length; j++) {
+      var childDoc = null;
+      try {
+        childDoc = frames[j].contentDocument;
+      } catch (e) {
+        childDoc = null;
+      }
+      if (childDoc) cleanDoc(childDoc);
+    }
+  };
+  cleanDoc(document);
+  return removed;
 })()"#;
 
 /// A deterministic way to name one element.
@@ -1008,7 +1149,7 @@ impl Locator {
                 json_string(selector)
             ),
             Self::Xpath(expression) => format!(
-                "var snap = document.evaluate({}, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\nvar matches = [];\nfor (var i = 0; i < snap.snapshotLength; i++) {{\n  var node = snap.snapshotItem(i);\n  if (node && node.nodeType === 1 && (root === document || (node !== root && root.contains(node)))) matches.push(node);\n}}\nvar hiddenFound = false;",
+                "var doc = root.nodeType === 9 ? root : (root.ownerDocument || document);\nvar snap = doc.evaluate({}, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\nvar matches = [];\nfor (var i = 0; i < snap.snapshotLength; i++) {{\n  var node = snap.snapshotItem(i);\n  if (node && node.nodeType === 1 && (root === doc || (node !== root && root.contains(node)))) matches.push(node);\n}}\nvar hiddenFound = false;",
                 json_string(expression)
             ),
             Self::TestId(id) => format!(
@@ -1032,14 +1173,84 @@ impl Locator {
 }
 
 /// The body of a focus lookup, run with the located element as `el`.
-const FOCUS_BODY: &str = "if (!el) return false; el.focus(); return document.activeElement === el;";
+const FOCUS_BODY: &str = "if (!el || !el.isConnected) return false; el.focus(); return (el.ownerDocument || document).activeElement === el;";
 
 /// The body of a text read, run with the located element as `el`.
 const TEXT_BODY: &str =
     "if (!el) return ''; return String(el.textContent === null ? '' : el.textContent).trim();";
 
 /// The body of a visibility read, run with the located element as `el`.
-const VISIBLE_BODY: &str = "if (!el || el.nodeType !== 1) return false; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;";
+static VISIBLE_BODY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{FRAME_HELPERS_JS}
+if (!el || el.nodeType !== 1 || !el.isConnected) return false;
+var frames = collectEnclosingFrames(el);
+if (!frames || !areEnclosingFramesVisible(frames)) return false;
+return isBoxVisible(el, null);"#
+    )
+});
+
+/// Inspects a matched `within` container (`this`) and returns either the
+/// container element itself, the `contentDocument` of a ready same-origin frame,
+/// or a JSON status string (`missing`, `loading`, `cross_origin`).
+const ENTER_CONTAINER_SCRIPT: &str = r#"function () {
+  var el = this;
+  if (!el || el.nodeType !== 1) {
+    return JSON.stringify({ status: 'missing' });
+  }
+  var tag = el.tagName ? el.tagName.toUpperCase() : '';
+  if (tag !== 'IFRAME' && tag !== 'FRAME') {
+    return el;
+  }
+  if (!el.isConnected) {
+    return JSON.stringify({ status: 'missing' });
+  }
+  var doc = null;
+  try {
+    doc = el.contentDocument;
+  } catch (e) {
+    return JSON.stringify({ status: 'cross_origin' });
+  }
+  if (!doc) {
+    var hasWindow = false;
+    try {
+      hasWindow = el.contentWindow !== null;
+    } catch (e) {
+      hasWindow = true;
+    }
+    if (hasWindow || el.hasAttribute('sandbox')) {
+      return JSON.stringify({ status: 'cross_origin' });
+    }
+    return JSON.stringify({ status: 'missing' });
+  }
+  if (!el.hasAttribute('srcdoc')) {
+    var rawSrc = el.getAttribute('src');
+    if (rawSrc !== null) {
+      var trimmed = String(rawSrc).trim();
+      if (trimmed !== '' && trimmed.toLowerCase().indexOf('javascript:') !== 0) {
+        try {
+          var base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
+          var targetUrl = new URL(trimmed, base);
+          var docUrl = String(doc.URL || '');
+          if (targetUrl.href !== 'about:blank' && docUrl === 'about:blank') {
+            var hostOrigin = (el.ownerDocument && el.ownerDocument.defaultView && el.ownerDocument.defaultView.location)
+              ? el.ownerDocument.defaultView.location.origin
+              : location.origin;
+            if (targetUrl.origin !== hostOrigin) {
+              return JSON.stringify({ status: 'cross_origin' });
+            }
+            return JSON.stringify({ status: 'loading' });
+          }
+        } catch (e) {
+        }
+      }
+    }
+  }
+  if (doc.readyState === 'loading') {
+    return JSON.stringify({ status: 'loading' });
+  }
+  return doc;
+}"#;
 
 /// Summarizes one DOM element (`el`) as `{ tag, id, text }` for multi-match diagnostics.
 const SUMMARIZE_ELEMENT_BODY: &str = r#"
@@ -1089,18 +1300,15 @@ const TEXT_COLLECT_TEMPLATE: &str = r#"var wanted = __DA_WANTED__;
 var normalize = function (value) {
   return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
 };
-var visible = function (el) {
-  var style = window.getComputedStyle(el);
-  var rect = el.getBoundingClientRect();
-  return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
-};
+var rootFrames = collectEnclosingFrames(root);
+var framesVisible = rootFrames !== null && areEnclosingFramesVisible(rootFrames);
 var all = root.querySelectorAll('*');
 var hiddenFound = false;
 var visibleMatches = [];
 for (var i = 0; i < all.length; i++) {
   var el = all[i];
   if (normalize(el.innerText) === wanted) {
-    if (visible(el)) visibleMatches.push(el);
+    if (framesVisible && isBoxVisible(el, null)) visibleMatches.push(el);
     else hiddenFound = true;
   }
 }
@@ -1116,7 +1324,10 @@ for (var j = 0; j < visibleMatches.length; j++) {
 
 /// Builds the text candidate collection snippet for one value.
 fn text_collect_script(text: &str) -> String {
-    TEXT_COLLECT_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
+    format!(
+        "{FRAME_HELPERS_JS}\n{}",
+        TEXT_COLLECT_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
+    )
 }
 
 /// One matched element summary returned for ambiguous-locator and occlusion errors.
@@ -1144,61 +1355,125 @@ impl CandidateInfo {
     }
 }
 
-/// Inspects an element (`el`) for visibility, disabled state, geometry, and hit-test.
-const ACTIONABLE_INSPECT_BODY: &str = r#"
-var summarizeNode = function (node) {
+/// Inspects an element (`el`) for visibility, disabled state, geometry, and hit-test,
+/// accumulating viewport offsets and checking `elementFromPoint` across enclosing frames.
+static ACTIONABLE_INSPECT_BODY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{FRAME_HELPERS_JS}
+var summarizeNode = function (node) {{
   var tag = node.tagName ? node.tagName.toLowerCase() : 'element';
   var id = node.id ? String(node.id) : '';
   var raw = (node.innerText && node.innerText.trim()) ? node.innerText : node.textContent;
   var text = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ').trim();
   if (text.length > 240) text = text.slice(0, 240);
-  return { tag: tag, id: id, text: text };
-};
-if (!el || el.nodeType !== 1) return { status: 'not_visible' };
-var style = window.getComputedStyle(el);
-var rect = el.getBoundingClientRect();
-if (
-  style.display === 'none' ||
-  style.visibility === 'hidden' ||
-  style.visibility === 'collapse' ||
-  rect.width <= 0 ||
-  rect.height <= 0
-) {
-  return { status: 'not_visible' };
-}
+  return {{ tag: tag, id: id, text: text }};
+}};
+if (!el || el.nodeType !== 1 || !el.isConnected) return {{ status: 'not_visible' }};
+var frames = collectEnclosingFrames(el);
+if (!frames || !areEnclosingFramesVisible(frames) || !isBoxVisible(el, null)) {{
+  return {{ status: 'not_visible' }};
+}}
 var fs = typeof el.closest === 'function' ? el.closest('fieldset[disabled]') : null;
 var inDisabledFieldset = false;
-if (fs) {
+if (fs) {{
   var legend = fs.querySelector('legend');
   if (!legend || !legend.contains(el)) inDisabledFieldset = true;
-}
+}}
 var ariaNode = typeof el.closest === 'function' ? el.closest('[aria-disabled]') : null;
 var ariaDisabled = ariaNode !== null && String(ariaNode.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
-if (el.disabled === true || el.hasAttribute('disabled') || inDisabledFieldset || ariaDisabled) {
-  return { status: 'disabled' };
-}
-var vw = window.innerWidth || document.documentElement.clientWidth || 0;
-var vh = window.innerHeight || document.documentElement.clientHeight || 0;
-var cx0 = rect.left + rect.width / 2;
-var cy0 = rect.top + rect.height / 2;
-if (cx0 < 0 || cx0 >= vw || cy0 < 0 || cy0 >= vh) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
+if (el.disabled === true || el.hasAttribute('disabled') || inDisabledFieldset || ariaDisabled) {{
+  return {{ status: 'disabled' }};
+}}
+var elDoc = el.ownerDocument || document;
+var elWin = elDoc.defaultView || window;
+var rect = el.getBoundingClientRect();
+var elVw = elWin.innerWidth || (elDoc.documentElement && elDoc.documentElement.clientWidth) || 0;
+var elVh = elWin.innerHeight || (elDoc.documentElement && elDoc.documentElement.clientHeight) || 0;
+var lx0 = rect.left + rect.width / 2;
+var ly0 = rect.top + rect.height / 2;
+if (lx0 < 0 || lx0 >= elVw || ly0 < 0 || ly0 >= elVh) {{
+  el.scrollIntoView({{ block: 'center', inline: 'center' }});
   rect = el.getBoundingClientRect();
-}
-var cx = rect.left + rect.width / 2;
-var cy = rect.top + rect.height / 2;
-var hit = document.elementFromPoint(cx, cy);
+}}
+var curX = rect.left + rect.width / 2;
+var curY = rect.top + rect.height / 2;
+for (var i = frames.length - 1; i >= 0; i--) {{
+  var f = frames[i];
+  var fDoc = f.ownerDocument || document;
+  var fWin = fDoc.defaultView || window;
+  var fb = frameContentOffset(f);
+  var px = fb.ox + curX;
+  var py = fb.oy + curY;
+  var fVw = fWin.innerWidth || (fDoc.documentElement && fDoc.documentElement.clientWidth) || 0;
+  var fVh = fWin.innerHeight || (fDoc.documentElement && fDoc.documentElement.clientHeight) || 0;
+  if (px < 0 || px >= fVw || py < 0 || py >= fVh) {{
+    f.scrollIntoView({{ block: 'center', inline: 'center' }});
+    fb = frameContentOffset(f);
+    px = fb.ox + curX;
+    py = fb.oy + curY;
+    if (px < 0 || px >= fVw || py < 0 || py >= fVh) {{
+      fWin.scrollBy(px - fVw / 2, py - fVh / 2);
+      fb = frameContentOffset(f);
+      px = fb.ox + curX;
+      py = fb.oy + curY;
+    }}
+  }}
+  curX = px;
+  curY = py;
+}}
+rect = el.getBoundingClientRect();
+var lx = rect.left + rect.width / 2;
+var ly = rect.top + rect.height / 2;
+var totalOx = 0;
+var totalOy = 0;
+var levelChecks = [];
+var accX = lx;
+var accY = ly;
+for (var j = frames.length - 1; j >= 0; j--) {{
+  var frame = frames[j];
+  var fOff = frameContentOffset(frame);
+  totalOx += fOff.ox;
+  totalOy += fOff.oy;
+  accX += fOff.ox;
+  accY += fOff.oy;
+  levelChecks.unshift({{
+    doc: frame.ownerDocument || document,
+    x: accX,
+    y: accY,
+    target: frame
+  }});
+}}
+var topX = totalOx + lx;
+var topY = totalOy + ly;
+var topRect = {{ x: totalOx + rect.left, y: totalOy + rect.top, width: rect.width, height: rect.height }};
+for (var k = 0; k < levelChecks.length; k++) {{
+  var check = levelChecks[k];
+  var fHit = check.doc.elementFromPoint(check.x, check.y);
+  if (fHit !== check.target) {{
+    return {{
+      status: 'ready_candidate',
+      rect: topRect,
+      x: topX,
+      y: topY,
+      hit_ok: false,
+      blocker: fHit ? summarizeNode(fHit) : null
+    }};
+  }}
+}}
+var hit = elDoc.elementFromPoint(lx, ly);
 var hitOk = hit !== null && (hit === el || el.contains(hit));
 var blocker = !hitOk && hit ? summarizeNode(hit) : null;
-return {
+return {{
   status: 'ready_candidate',
-  rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
-  x: cx,
-  y: cy,
+  rect: topRect,
+  x: topX,
+  y: topY,
   hit_ok: hitOk,
   blocker: blocker
-};
-"#;
+}};
+"#
+    )
+});
 
 /// Viewport rectangle used to check stability across consecutive polls.
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1231,6 +1506,43 @@ enum ActionableInspect {
         hit_ok: bool,
         blocker: Option<CandidateInfo>,
     },
+}
+
+/// JavaScript returning the frame-index path from `window.top` to the document
+/// holding `this`, or `null` if detached / cross-origin.
+const FRAME_PATH_BODY: &str = r#"function () {
+  var doc = this && this.nodeType === 9 ? this : (this && this.ownerDocument);
+  var win = doc && doc.defaultView;
+  if (!win) return null;
+  var path = [];
+  try {
+    var topWin = window.top;
+    while (win !== topWin) {
+      var parent = win.parent;
+      var idx = -1;
+      for (var i = 0; i < parent.frames.length; i++) {
+        if (parent.frames[i] === win) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) return null;
+      path.unshift(idx);
+      win = parent;
+    }
+  } catch (e) {
+    return null;
+  }
+  return path;
+}"#;
+
+/// Status returned by `ENTER_CONTAINER_SCRIPT` when a `within` frame is missing, loading, or cross-origin.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum WithinContainerStatus {
+    Missing,
+    Loading,
+    CrossOrigin,
 }
 
 /// Status returned by the page candidate-resolution script when no single element was picked.
@@ -1803,7 +2115,7 @@ impl BrowserSession {
                     session.call_function_poll(
                         target_desc,
                         &object_id,
-                        VISIBLE_BODY,
+                        VISIBLE_BODY.as_str(),
                         "check the visibility of",
                         deadline,
                         dialog,
@@ -1855,7 +2167,7 @@ impl BrowserSession {
         let raw = self.call_function_poll(
             target_desc,
             &object_id,
-            ACTIONABLE_INSPECT_BODY,
+            ACTIONABLE_INSPECT_BODY.as_str(),
             "inspect the actionability of",
             deadline,
             dialog,
@@ -1889,7 +2201,7 @@ impl BrowserSession {
             match self.call_function_poll(
                 &target_desc,
                 &object_id,
-                VISIBLE_BODY,
+                VISIBLE_BODY.as_str(),
                 "check the visibility of",
                 deadline,
                 dialog,
@@ -2059,14 +2371,25 @@ impl BrowserSession {
         deadline: Deadline,
         dialog: &mut DialogContext,
     ) -> Result<ResolvePoll, LocateError> {
+        let testid_attribute = self.testid_attribute.clone();
         let root = match &target.within {
             Some(container) => match self.resolve_target_once(container, deadline, dialog)? {
-                ResolvePoll::Found(container_id) => Some(container_id),
+                ResolvePoll::Found(container_id) => {
+                    let container_desc = container.describe_with(&testid_attribute);
+                    match self.enter_within_container(
+                        &container_desc,
+                        container_id,
+                        deadline,
+                        dialog,
+                    )? {
+                        ResolvePoll::Found(entered_id) => Some(entered_id),
+                        pending @ ResolvePoll::Pending { .. } => return Ok(pending),
+                    }
+                }
                 pending @ ResolvePoll::Pending { .. } => return Ok(pending),
             },
             None => None,
         };
-        let testid_attribute = self.testid_attribute.clone();
         let target_desc = target.describe_with(&testid_attribute);
         if let Locator::Role { role, name } = &target.locator {
             return self.resolve_role_once(
@@ -2147,6 +2470,58 @@ impl BrowserSession {
         }
     }
 
+    /// Resolves a matched `within` container into the DOM node whose subtree the
+    /// inner locator searches: the element itself, or `contentDocument` when the
+    /// element is an `<iframe>` or `<frame>`.
+    fn enter_within_container(
+        &mut self,
+        container_desc: &str,
+        object_id: String,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<ResolvePoll, LocateError> {
+        let scope = self.scope();
+        let connection = self.connection_mut().map_err(LocateError::Step)?;
+        let remote = page_call_function_remote(
+            connection,
+            &scope,
+            &object_id,
+            ENTER_CONTAINER_SCRIPT,
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(container_desc, failure))?;
+
+        match remote {
+            RemoteResult::Object(root_id) => Ok(ResolvePoll::Found(root_id)),
+            RemoteResult::Value(Value::String(raw_json)) => {
+                let status: WithinContainerStatus = serde_json::from_str(&raw_json).map_err(|error| {
+                    LocateError::Step(StepError::Environment(format!(
+                        "the browser returned an invalid container status for {container_desc}: {error}"
+                    )))
+                })?;
+                match status {
+                    WithinContainerStatus::Missing => Ok(ResolvePoll::Pending {
+                        target_desc: container_desc.to_string(),
+                        reason: PendingReason::Missing,
+                    }),
+                    WithinContainerStatus::Loading => Ok(ResolvePoll::Pending {
+                        target_desc: container_desc.to_string(),
+                        reason: PendingReason::FrameLoading,
+                    }),
+                    WithinContainerStatus::CrossOrigin => {
+                        Err(LocateError::Step(StepError::Execution(format!(
+                            "cannot enter {container_desc}: cross-origin iframes are not supported; `within` only supports same-origin iframes"
+                        ))))
+                    }
+                }
+            }
+            RemoteResult::Value(other) => Err(LocateError::Step(StepError::Environment(format!(
+                "the browser returned an unexpected value while entering {container_desc}: {other}"
+            )))),
+        }
+    }
+
     /// Runs one non-blocking resolution pass for a `role` locator inside `root`.
     #[allow(clippy::too_many_arguments)]
     // Splitting role, name, nth, root, deadline, and dialog across a single-use struct would obscure the direct poll arguments.
@@ -2167,7 +2542,7 @@ impl BrowserSession {
             let visible = self.call_function_poll(
                 target_desc,
                 &object_id,
-                VISIBLE_BODY,
+                VISIBLE_BODY.as_str(),
                 "check the visibility of",
                 deadline,
                 dialog,
@@ -2291,6 +2666,16 @@ impl BrowserSession {
             .cloned()
             .unwrap_or_default();
 
+        let root_context = match root {
+            Some(root_id) => {
+                match self.resolve_role_root_context(target_desc, root_id, deadline, dialog)? {
+                    Some(context) => Some(context),
+                    None => return Ok((false, Vec::new())),
+                }
+            }
+            None => None,
+        };
+
         let mut matched = false;
         let mut objects = Vec::new();
         for node in nodes {
@@ -2318,28 +2703,131 @@ impl BrowserSession {
                 dialog,
             )
             .map_err(|failure| locate_error(target_desc, failure))?;
-            if let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str) {
-                if let Some(root_id) = root {
-                    let connection = self.connection_mut().map_err(LocateError::Step)?;
-                    let inside = page_call_function_with_object(
-                        connection,
-                        &scope,
-                        root_id,
-                        object_id,
-                        "function (el) { return Boolean(el) && this !== el && this.contains(el); }",
-                        deadline,
-                        dialog,
-                    )
-                    .map_err(|failure| locate_error(target_desc, failure))?;
-                    if inside != Value::Bool(true) {
-                        continue;
-                    }
-                }
+            if let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str)
+                && self.node_matches_role_root(
+                    target_desc,
+                    object_id,
+                    root_context.as_ref(),
+                    deadline,
+                    dialog,
+                )?
+            {
                 matched = true;
                 objects.push(object_id.to_string());
             }
         }
         Ok((matched, objects))
+    }
+
+    /// Resolves a `role` query's `within` root into its frame-index path and an
+    /// `objectId` in that frame's own JavaScript world so `this.contains(el)` runs
+    /// in the same context as nodes returned by `DOM.resolveNode`.
+    fn resolve_role_root_context(
+        &mut self,
+        target_desc: &str,
+        root_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<Option<(Vec<Value>, String)>, LocateError> {
+        let scope = self.scope();
+        let connection = self.connection_mut().map_err(LocateError::Step)?;
+        let path = page_call_function(
+            connection,
+            &scope,
+            root_id,
+            FRAME_PATH_BODY,
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(target_desc, failure))?;
+        let Some(path_array) = path.as_array().cloned() else {
+            return Ok(None);
+        };
+        if path_array.is_empty() {
+            return Ok(Some((path_array, root_id.to_string())));
+        }
+        let described = page_call(
+            connection,
+            &scope,
+            "DOM.describeNode",
+            json!({ "objectId": root_id, "depth": 0 }),
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(target_desc, failure))?;
+        let Some(root_backend_id) = described
+            .pointer("/node/backendNodeId")
+            .and_then(Value::as_i64)
+        else {
+            return Ok(None);
+        };
+        let resolved_root = page_call(
+            connection,
+            &scope,
+            "DOM.resolveNode",
+            json!({ "backendNodeId": root_backend_id }),
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(target_desc, failure))?;
+        Ok(resolved_root
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .map(|own_id| (path_array, own_id.to_string())))
+    }
+
+    /// Checks that an AX node belongs to the top-level document (when unscoped)
+    /// or to the exact frame and DOM subtree of `root_context` (when `within` is set).
+    fn node_matches_role_root(
+        &mut self,
+        target_desc: &str,
+        object_id: &str,
+        root_context: Option<&(Vec<Value>, String)>,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<bool, LocateError> {
+        let scope = self.scope();
+        let inside = match root_context {
+            Some((expected_path, root_id)) => {
+                let connection = self.connection_mut().map_err(LocateError::Step)?;
+                let el_path = page_call_function(
+                    connection,
+                    &scope,
+                    object_id,
+                    FRAME_PATH_BODY,
+                    deadline,
+                    dialog,
+                )
+                .map_err(|failure| locate_error(target_desc, failure))?;
+                if el_path.as_array() != Some(expected_path) {
+                    return Ok(false);
+                }
+                let connection = self.connection_mut().map_err(LocateError::Step)?;
+                page_call_function_with_object(
+                    connection,
+                    &scope,
+                    root_id,
+                    object_id,
+                    "function (el) { return Boolean(el) && this !== el && this.contains(el); }",
+                    deadline,
+                    dialog,
+                )
+                .map_err(|failure| locate_error(target_desc, failure))?
+            }
+            None => {
+                let connection = self.connection_mut().map_err(LocateError::Step)?;
+                page_call_function(
+                    connection,
+                    &scope,
+                    object_id,
+                    "function () { return window === window.top && this.ownerDocument === document; }",
+                    deadline,
+                    dialog,
+                )
+                .map_err(|failure| locate_error(target_desc, failure))?
+            }
+        };
+        Ok(inside == Value::Bool(true))
     }
 
     /// Runs one action body on a located element and maps its errors.
@@ -2421,7 +2909,7 @@ impl BrowserSession {
         page_evaluate(
             self.connection_mut()?,
             &scope,
-            MASK_INPUTS_SCRIPT,
+            MASK_INPUTS_SCRIPT.as_str(),
             deadline,
             &mut dialog,
         )
@@ -3279,6 +3767,7 @@ enum ResolvePoll {
 enum PendingReason {
     Missing,
     Hidden,
+    FrameLoading,
     OutOfRange { index: usize, count: usize },
     Disabled,
     Unstable,
@@ -3338,6 +3827,9 @@ fn pending_timeout_error(
         )),
         PendingReason::Hidden => StepError::Execution(format!(
             "{target_desc} was found but not visible within {ms} ms; check the page and the locator"
+        )),
+        PendingReason::FrameLoading => StepError::Execution(format!(
+            "frame {target_desc} did not finish loading within {ms} ms"
         )),
         PendingReason::OutOfRange { index, count } => {
             let noun = if count == 1 { "element" } else { "elements" };
@@ -7891,5 +8383,40 @@ mod tests {
 
         BrowserSession::dispose_handle(&re_detached).expect("dispose connected handle succeeds");
         server.join().expect("mock CDP server finishes");
+    }
+
+    #[test]
+    fn iframe_container_status_and_frame_loading_timeout_messages_parse_and_format() {
+        assert!(matches!(
+            serde_json::from_str::<WithinContainerStatus>(r#"{"status":"missing"}"#).ok(),
+            Some(WithinContainerStatus::Missing)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<WithinContainerStatus>(r#"{"status":"loading"}"#).ok(),
+            Some(WithinContainerStatus::Loading)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<WithinContainerStatus>(r#"{"status":"cross_origin"}"#).ok(),
+            Some(WithinContainerStatus::CrossOrigin)
+        ));
+
+        let err = pending_timeout_error(
+            "CSS selector `#lazy-frame`",
+            PendingReason::FrameLoading,
+            Deadline::after(Duration::from_millis(1200)),
+        );
+        assert_eq!(
+            step_error_text(err),
+            "frame CSS selector `#lazy-frame` did not finish loading within 1200 ms"
+        );
+
+        let xpath = Locator::Xpath("//button".to_string())
+            .resolve_body_with(DEFAULT_TESTID_ATTRIBUTE, None)
+            .expect("xpath locator has a page expression");
+        assert!(
+            xpath.contains("root.nodeType === 9 ? root : (root.ownerDocument || document)")
+                && xpath.contains("doc.evaluate("),
+            "xpath expression must evaluate against root's ownerDocument: {xpath}"
+        );
     }
 }
