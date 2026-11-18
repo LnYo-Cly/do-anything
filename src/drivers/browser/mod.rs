@@ -6853,7 +6853,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     type MockSocket = tungstenite::WebSocket<std::net::TcpStream>;
 
     fn send_mock_reply(socket: &mut MockSocket, id: &Value, result: Value) {
