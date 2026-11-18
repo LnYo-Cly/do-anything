@@ -33,7 +33,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use self::cdp::{CdpError, Connection, Deadline, RemoteResult};
+use self::cdp::{
+    CdpError, Connection, Deadline, DialogPolicy, DialogWatch, OpenedDialog, RemoteResult,
+};
 use self::connect::Endpoint;
 use self::launch::Launched;
 use crate::core::paths;
@@ -67,19 +69,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub fn register(registry: &mut Registry) -> Result<(), String> {
     for definition in [
         open_step()?,
-        locator_step::<ClickArgs>(
-            STEP_NAMES[1],
-            "Clicks the element the locator names and returns its `text` when it has one.",
-            validate_click,
-            run_click,
-        )?,
+        click_step()?,
         type_step()?,
-        step::<PressArgs>(
-            STEP_NAMES[3],
-            "Presses `key`, such as `Enter` or `Tab`, on the focused element.",
-            validate_press,
-            run_press,
-        )?,
+        press_step()?,
         wait_step(
             STEP_NAMES[4],
             "Waits for the element the locator names, or for the URL to contain `url_contains`, and returns the `url`.",
@@ -113,6 +105,19 @@ fn open_step() -> Result<StepDefinition, String> {
     )?;
     string_property(&mut definition.args_schema, "connect");
     string_property(&mut definition.args_schema, "testid_attribute");
+    apply_dialog_schema(&mut definition.args_schema);
+    Ok(definition)
+}
+
+/// Builds `browser.click`, with optional `dialog` handling.
+fn click_step() -> Result<StepDefinition, String> {
+    let mut definition = locator_step::<ClickArgs>(
+        STEP_NAMES[1],
+        "Clicks the element the locator names and returns its `text` when it has one.",
+        validate_click,
+        run_click,
+    )?;
+    apply_dialog_schema(&mut definition.args_schema);
     Ok(definition)
 }
 
@@ -129,6 +134,7 @@ fn type_step() -> Result<StepDefinition, String> {
         run_type,
     )?;
     string_property(&mut definition.args_schema, "value");
+    apply_dialog_schema(&mut definition.args_schema);
     definition.args_schema["oneOf"] = json!([
         { "required": ["css"] },
         { "required": ["xpath"] },
@@ -136,6 +142,18 @@ fn type_step() -> Result<StepDefinition, String> {
         { "required": ["role"] },
         { "required": ["testid"] }
     ]);
+    Ok(definition)
+}
+
+/// Builds `browser.press`, with optional `dialog` handling.
+fn press_step() -> Result<StepDefinition, String> {
+    let mut definition = step::<PressArgs>(
+        STEP_NAMES[3],
+        "Presses `key`, such as `Enter` or `Tab`, on the focused element.",
+        validate_press,
+        run_press,
+    )?;
+    apply_dialog_schema(&mut definition.args_schema);
     Ok(definition)
 }
 
@@ -193,6 +211,7 @@ fn wait_step(
     let mut definition = step::<WaitArgs>(name, description, validate, run)?;
     apply_locator_schema(&mut definition.args_schema, name);
     string_property(&mut definition.args_schema, "url_contains");
+    apply_dialog_schema(&mut definition.args_schema);
     definition.args_schema["oneOf"] = json!([
         { "required": ["css"] },
         { "required": ["xpath"] },
@@ -263,6 +282,161 @@ fn within_schema(step_name: &str) -> Value {
             "name": ["role"]
         }
     })
+}
+
+/// Replaces `dialog` with a self-contained schema that rejects `null`.
+fn apply_dialog_schema(schema: &mut Value) {
+    if let Value::Object(entries) = schema {
+        entries.remove("$defs");
+    }
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("dialog".to_string(), dialog_schema_value());
+    }
+}
+
+/// Self-contained JSON Schema for the optional `dialog` step option.
+fn dialog_schema_value() -> Value {
+    json!({
+        "description": "How to respond if this step opens a JavaScript dialog (`alert`, `confirm`, `prompt`, or `beforeunload`).",
+        "oneOf": [
+            {
+                "type": "string",
+                "enum": ["accept", "dismiss"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action"],
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["accept", "dismiss"]
+                    },
+                    "prompt_text": {
+                        "type": "string"
+                    }
+                }
+            }
+        ]
+    })
+}
+
+/// Action taken when a step encounters a JavaScript dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DialogAction {
+    Accept,
+    Dismiss,
+}
+
+impl DialogAction {
+    fn is_accept(self) -> bool {
+        matches!(self, Self::Accept)
+    }
+}
+
+/// Detailed dialog handling configuration for a browser step.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DialogOptions {
+    action: DialogAction,
+    #[serde(default)]
+    prompt_text: Option<String>,
+}
+
+/// Optional `dialog` argument accepted by interactive browser steps.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum DialogArg {
+    Action(DialogAction),
+    Options(DialogOptions),
+}
+
+impl DialogArg {
+    fn to_policy(&self) -> DialogPolicy {
+        match self {
+            Self::Action(action) => DialogPolicy::Handle {
+                accept: action.is_accept(),
+                prompt_text: None,
+            },
+            Self::Options(options) => DialogPolicy::Handle {
+                accept: options.action.is_accept(),
+                prompt_text: options.prompt_text.clone(),
+            },
+        }
+    }
+}
+
+impl JsonSchema for DialogArg {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("DialogArg")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Replaced by `apply_dialog_schema` so `Option<DialogArg>` never emits `null`.
+        schemars::Schema::from(serde_json::Map::new())
+    }
+}
+
+/// Per-step dialog watch state passed through page-session CDP waits.
+struct DialogContext {
+    policy: DialogPolicy,
+    opened: Option<OpenedDialog>,
+}
+
+impl DialogContext {
+    fn fail_fast() -> Self {
+        Self {
+            policy: DialogPolicy::FailFast,
+            opened: None,
+        }
+    }
+
+    fn from_arg(arg: Option<&DialogArg>) -> Self {
+        match arg {
+            None => Self::fail_fast(),
+            Some(arg) => Self {
+                policy: arg.to_policy(),
+                opened: None,
+            },
+        }
+    }
+
+    fn watch<'a>(&'a mut self, session_id: &'a str) -> DialogWatch<'a> {
+        DialogWatch {
+            session_id,
+            policy: &self.policy,
+            opened: &mut self.opened,
+        }
+    }
+
+    fn is_fail_fast_triggered(&self) -> bool {
+        matches!(self.policy, DialogPolicy::FailFast) && self.opened.is_some()
+    }
+
+    fn take_result(&mut self) -> Option<Value> {
+        self.opened.take().map(|dialog| {
+            json!({
+                "type": dialog.dialog_type,
+                "message": dialog.message,
+                "accepted": dialog.accepted,
+            })
+        })
+    }
+}
+
+/// Attaches the handled `dialog` summary to `result` when a dialog opened.
+fn attach_dialog(mut result: Value, dialog: &mut DialogContext) -> Value {
+    if let Some(info) = dialog.take_result()
+        && let Some(entries) = result.as_object_mut()
+    {
+        entries.insert("dialog".to_string(), info);
+    }
+    result
 }
 
 /// Makes one optional property a string in the emitted schema.
@@ -342,6 +516,9 @@ struct OpenArgs {
     #[schemars(extend("minLength" = 1, "pattern" = "^\\S+$"))]
     #[serde(default)]
     testid_attribute: Option<String>,
+    /// How to respond if navigating opens a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
 }
 
 /// Container locator used by `within` to narrow a search to a subtree.
@@ -409,6 +586,9 @@ struct ClickArgs {
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+    /// How to respond if clicking opens a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
 }
 
 /// Arguments of `browser.type`.
@@ -448,6 +628,9 @@ struct TypeArgs {
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+    /// How to respond if typing opens a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
 }
 
 /// Arguments of `browser.press`.
@@ -457,6 +640,9 @@ struct PressArgs {
     /// Key name, for example `Enter` or `Tab`.
     #[schemars(extend("minLength" = 1))]
     key: String,
+    /// How to respond if pressing the key opens a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
 }
 
 /// Arguments of `browser.wait`.
@@ -495,6 +681,9 @@ struct WaitArgs {
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+    /// How to respond if waiting encounters a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
 }
 
 /// Arguments of `browser.screenshot`.
@@ -1406,7 +1595,12 @@ impl BrowserSession {
     }
 
     /// Navigates the session's page and returns its current URL and title.
-    fn navigate(&mut self, url: &str, timeout: Duration) -> Result<(String, String), StepError> {
+    fn navigate(
+        &mut self,
+        url: &str,
+        timeout: Duration,
+        dialog: &mut DialogContext,
+    ) -> Result<(String, String), StepError> {
         let scope = self.scope();
         let deadline = Deadline::after(timeout);
         // Network events that arrive before a navigation still belong to a
@@ -1414,12 +1608,14 @@ impl BrowserSession {
         self.absorb_network();
         let connection = self.connection_mut()?;
         // Events from the about:blank page must not be mistaken for this
-        // navigation's load event, while any terminal target/session event that
-        // already arrived stays queued so the navigation aborts immediately.
+        // navigation's load event, while any terminal target/session event or
+        // pending dialog opening stays queued so navigation handles it at once.
         let terminal_events: Vec<Value> = connection
             .take_messages()
             .into_iter()
-            .filter(|event| scope.is_terminal(event))
+            .filter(|event| {
+                scope.is_terminal(event) || cdp::is_dialog_opening_for(event, &scope.session_id)
+            })
             .collect();
         connection.restore_messages(terminal_events);
         let reply = page_call(
@@ -1428,6 +1624,7 @@ impl BrowserSession {
             "Page.navigate",
             json!({ "url": url }),
             deadline,
+            dialog,
         )
         .map_err(|failure| {
             let action = if failure.is_timeout() {
@@ -1437,21 +1634,27 @@ impl BrowserSession {
             };
             failure.step(&action, timeout_or_environment)
         })?;
-        if let Some(error_text) = reply.get("errorText").and_then(Value::as_str) {
+        let beforeunload_dismissed = dialog
+            .opened
+            .as_ref()
+            .is_some_and(|opened| opened.dialog_type == "beforeunload" && !opened.accepted);
+        if let Some(error_text) = reply.get("errorText").and_then(Value::as_str)
+            && !(beforeunload_dismissed && error_text == "net::ERR_ABORTED")
+        {
             return Err(StepError::Environment(format!(
                 "could not open `{url}`: {error_text}"
             )));
         }
         // Chrome omits `loaderId` for a same-document navigation (a fragment
         // or history change): no new document loads, so no load event fires.
-        if reply.get("loaderId").is_some() {
-            wait_for_load(connection, &scope, url, deadline)?;
+        if reply.get("loaderId").is_some() && !beforeunload_dismissed {
+            wait_for_load(connection, &scope, url, deadline, dialog)?;
         }
 
-        let current = page_evaluate(connection, &scope, "location.href", deadline)
+        let current = page_evaluate(connection, &scope, "location.href", deadline, dialog)
             .map(|value| value.as_str().unwrap_or(url).to_string())
             .map_err(|failure| load_error(failure, url, "read the URL of", deadline))?;
-        let title = page_evaluate(connection, &scope, "document.title", deadline)
+        let title = page_evaluate(connection, &scope, "document.title", deadline, dialog)
             .map(|value| value.as_str().unwrap_or_default().to_string())
             .map_err(|failure| load_error(failure, url, "read the title of", deadline))?;
         Ok((current, title))
@@ -1462,27 +1665,34 @@ impl BrowserSession {
         &mut self,
         target: &ElementTarget,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<Located, StepError> {
         let is_locator_visible_only =
             matches!(target.locator, Locator::Text(_) | Locator::Role { .. });
-        self.poll_target(target, deadline, |session, target_desc, object_id| {
-            let visible = if is_locator_visible_only {
-                true
-            } else {
-                session.call_function_poll(
-                    target_desc,
-                    &object_id,
-                    VISIBLE_BODY,
-                    "check the visibility of",
-                    deadline,
-                )? == Value::Bool(true)
-            };
-            if visible {
-                Ok(Ok(Located(object_id)))
-            } else {
-                Ok(Err(PendingReason::Hidden))
-            }
-        })
+        self.poll_target(
+            target,
+            deadline,
+            dialog,
+            |session, target_desc, object_id, dialog| {
+                let visible = if is_locator_visible_only {
+                    true
+                } else {
+                    session.call_function_poll(
+                        target_desc,
+                        &object_id,
+                        VISIBLE_BODY,
+                        "check the visibility of",
+                        deadline,
+                        dialog,
+                    )? == Value::Bool(true)
+                };
+                if visible {
+                    Ok(Ok(Located(object_id)))
+                } else {
+                    Ok(Err(PendingReason::Hidden))
+                }
+            },
+        )
     }
 
     /// Waits for the target element to exist, be visible, enabled, stable across
@@ -1491,30 +1701,37 @@ impl BrowserSession {
         &mut self,
         target: &ElementTarget,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<ActionableTarget, StepError> {
         let mut previous_rect: Option<ElementRect> = None;
-        self.poll_target(target, deadline, |session, target_desc, object_id| {
-            let raw = session.call_function_poll(
-                target_desc,
-                &object_id,
-                ACTIONABLE_INSPECT_BODY,
-                "inspect the actionability of",
-                deadline,
-            )?;
-            let inspect: ActionableInspect = serde_json::from_value(raw).map_err(|error| {
-                LocateError::Step(StepError::Environment(format!(
-                    "the browser returned an invalid actionability state for {target_desc}: {error}"
-                )))
-            })?;
-            match evaluate_actionable_inspect(&mut previous_rect, inspect) {
-                Ok((x, y)) => Ok(Ok(ActionableTarget {
-                    located: Located(object_id),
-                    x,
-                    y,
-                })),
-                Err(reason) => Ok(Err(reason)),
-            }
-        })
+        self.poll_target(
+            target,
+            deadline,
+            dialog,
+            |session, target_desc, object_id, dialog| {
+                let raw = session.call_function_poll(
+                    target_desc,
+                    &object_id,
+                    ACTIONABLE_INSPECT_BODY,
+                    "inspect the actionability of",
+                    deadline,
+                    dialog,
+                )?;
+                let inspect: ActionableInspect = serde_json::from_value(raw).map_err(|error| {
+                    LocateError::Step(StepError::Environment(format!(
+                        "the browser returned an invalid actionability state for {target_desc}: {error}"
+                    )))
+                })?;
+                match evaluate_actionable_inspect(&mut previous_rect, inspect) {
+                    Ok((x, y)) => Ok(Ok(ActionableTarget {
+                        located: Located(object_id),
+                        x,
+                        y,
+                    })),
+                    Err(reason) => Ok(Err(reason)),
+                }
+            },
+        )
     }
 
     /// Shared polling loop for `locate_target` and `locate_actionable_target`.
@@ -1522,12 +1739,18 @@ impl BrowserSession {
         &mut self,
         target: &ElementTarget,
         deadline: Deadline,
-        mut check: impl FnMut(&mut Self, &str, String) -> Result<Result<T, PendingReason>, LocateError>,
+        dialog: &mut DialogContext,
+        mut check: impl FnMut(
+            &mut Self,
+            &str,
+            String,
+            &mut DialogContext,
+        ) -> Result<Result<T, PendingReason>, LocateError>,
     ) -> Result<T, StepError> {
         let target_desc = target.describe_with(&self.testid_attribute);
         let mut last_pending = (target_desc.clone(), PendingReason::Missing);
         loop {
-            let poll = match self.resolve_target_once(target, deadline) {
+            let poll = match self.resolve_target_once(target, deadline, dialog) {
                 Ok(poll) => poll,
                 Err(LocateError::Timeout) => {
                     return Err(pending_timeout_error(
@@ -1539,7 +1762,8 @@ impl BrowserSession {
                 Err(LocateError::Step(error)) => return Err(error),
             };
             match poll {
-                ResolvePoll::Found(object_id) => match check(self, &target_desc, object_id) {
+                ResolvePoll::Found(object_id) => match check(self, &target_desc, object_id, dialog)
+                {
                     Ok(Ok(ready)) => return Ok(ready),
                     Ok(Err(reason)) => {
                         last_pending = (target_desc.clone(), reason);
@@ -1579,11 +1803,12 @@ impl BrowserSession {
         body: &str,
         action: &str,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<Value, LocateError> {
         let scope = self.scope();
         let function = format!("function () {{ var el = this; {body} }}");
         let connection = self.connection_mut().map_err(LocateError::Step)?;
-        page_call_function(connection, &scope, object_id, &function, deadline)
+        page_call_function(connection, &scope, object_id, &function, deadline, dialog)
             .map_err(|failure| action_poll_error(target_desc, action, failure))
     }
 
@@ -1592,9 +1817,10 @@ impl BrowserSession {
         &mut self,
         target: &ElementTarget,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<ResolvePoll, LocateError> {
         let root = match &target.within {
-            Some(container) => match self.resolve_target_once(container, deadline)? {
+            Some(container) => match self.resolve_target_once(container, deadline, dialog)? {
                 ResolvePoll::Found(container_id) => Some(container_id),
                 pending @ ResolvePoll::Pending { .. } => return Ok(pending),
             },
@@ -1610,6 +1836,7 @@ impl BrowserSession {
                 target.nth,
                 root.as_deref(),
                 deadline,
+                dialog,
             );
         }
         let body = target
@@ -1625,12 +1852,12 @@ impl BrowserSession {
             Some(root_id) => {
                 let fn_decl = format!("function () {{ var root = this; {body} }}");
                 let connection = self.connection_mut().map_err(LocateError::Step)?;
-                page_call_function_remote(connection, &scope, root_id, &fn_decl, deadline)
+                page_call_function_remote(connection, &scope, root_id, &fn_decl, deadline, dialog)
             }
             None => {
                 let expr = format!("(function () {{ var root = document; {body} }})()");
                 let connection = self.connection_mut().map_err(LocateError::Step)?;
-                page_evaluate_remote(connection, &scope, &expr, deadline)
+                page_evaluate_remote(connection, &scope, &expr, deadline, dialog)
             }
         }
         .map_err(|failure| locate_error(&target_desc, failure))?;
@@ -1681,6 +1908,8 @@ impl BrowserSession {
     }
 
     /// Runs one non-blocking resolution pass for a `role` locator inside `root`.
+    #[allow(clippy::too_many_arguments)]
+    // Splitting role, name, nth, root, deadline, and dialog across a single-use struct would obscure the direct poll arguments.
     fn resolve_role_once(
         &mut self,
         target_desc: &str,
@@ -1689,8 +1918,10 @@ impl BrowserSession {
         nth: Option<usize>,
         root: Option<&str>,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<ResolvePoll, LocateError> {
-        let (matched, objects) = self.role_objects(target_desc, role, name, root, deadline)?;
+        let (matched, objects) =
+            self.role_objects(target_desc, role, name, root, deadline, dialog)?;
         let mut visible_objects = Vec::new();
         for object_id in objects {
             let visible = self.call_function_poll(
@@ -1699,6 +1930,7 @@ impl BrowserSession {
                 VISIBLE_BODY,
                 "check the visibility of",
                 deadline,
+                dialog,
             )?;
             if visible == Value::Bool(true) {
                 visible_objects.push(object_id);
@@ -1725,6 +1957,7 @@ impl BrowserSession {
                             SUMMARIZE_ELEMENT_BODY,
                             "summarize",
                             deadline,
+                            dialog,
                         )?;
                         let candidate: CandidateInfo = serde_json::from_value(summary_val)
                             .unwrap_or(CandidateInfo {
@@ -1772,6 +2005,7 @@ impl BrowserSession {
         name: Option<&str>,
         root: Option<&str>,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<(bool, Vec<String>), LocateError> {
         let scope = self.scope();
         let mut params = if let Some(root_id) = root {
@@ -1784,6 +2018,7 @@ impl BrowserSession {
                 "DOM.getDocument",
                 json!({ "depth": 0 }),
                 deadline,
+                dialog,
             )
             .map_err(|failure| locate_error(target_desc, failure))?;
             let node_id = document
@@ -1807,6 +2042,7 @@ impl BrowserSession {
             "Accessibility.queryAXTree",
             params,
             deadline,
+            dialog,
         )
         .map_err(|failure| locate_error(target_desc, failure))?;
         let nodes = reply
@@ -1839,6 +2075,7 @@ impl BrowserSession {
                 "DOM.resolveNode",
                 json!({ "backendNodeId": backend_node_id }),
                 deadline,
+                dialog,
             )
             .map_err(|failure| locate_error(target_desc, failure))?;
             if let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str) {
@@ -1851,6 +2088,7 @@ impl BrowserSession {
                         object_id,
                         "function (el) { return Boolean(el) && this !== el && this.contains(el); }",
                         deadline,
+                        dialog,
                     )
                     .map_err(|failure| locate_error(target_desc, failure))?;
                     if inside != Value::Bool(true) {
@@ -1872,8 +2110,9 @@ impl BrowserSession {
         body: &str,
         action: &str,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<Value, StepError> {
-        self.call_function_on(target_desc, &located.0, body, action, deadline)
+        self.call_function_on(target_desc, &located.0, body, action, deadline, dialog)
     }
 
     /// Runs one action body with a resolved DOM node as `this`.
@@ -1884,11 +2123,12 @@ impl BrowserSession {
         body: &str,
         action: &str,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<Value, StepError> {
         let scope = self.scope();
         let function = format!("function () {{ var el = this; {body} }}");
         let connection = self.connection_mut()?;
-        page_call_function(connection, &scope, object_id, &function, deadline)
+        page_call_function(connection, &scope, object_id, &function, deadline, dialog)
             .map_err(|failure| evaluate_error(target_desc, failure, action, deadline))
     }
 
@@ -1900,10 +2140,11 @@ impl BrowserSession {
         params: Value,
         action: &str,
         deadline: Deadline,
+        dialog: &mut DialogContext,
     ) -> Result<(), StepError> {
         let scope = self.scope();
         let connection = self.connection_mut()?;
-        page_call(connection, &scope, method, params, deadline)
+        page_call(connection, &scope, method, params, deadline, dialog)
             .map(|_| ())
             .map_err(|failure| {
                 failure.step(
@@ -1936,11 +2177,17 @@ impl BrowserSession {
     /// gone cannot be cleaned, and then the capture error is the one reported.
     fn capture_masked_png(&mut self, deadline: Deadline) -> Result<Vec<u8>, StepError> {
         let scope = self.scope();
-        page_evaluate(self.connection_mut()?, &scope, MASK_INPUTS_SCRIPT, deadline).map_err(
-            |failure| {
-                failure.environment("could not cover the editable fields before the screenshot")
-            },
-        )?;
+        let mut dialog = DialogContext::fail_fast();
+        page_evaluate(
+            self.connection_mut()?,
+            &scope,
+            MASK_INPUTS_SCRIPT,
+            deadline,
+            &mut dialog,
+        )
+        .map_err(|failure| {
+            failure.environment("could not cover the editable fields before the screenshot")
+        })?;
 
         let captured = page_call(
             self.connection_mut()?,
@@ -1948,12 +2195,14 @@ impl BrowserSession {
             "Page.captureScreenshot",
             json!({ "format": "png" }),
             deadline,
+            &mut dialog,
         );
         let cleaned = page_evaluate(
             self.connection_mut()?,
             &scope,
             REMOVE_MASKS_SCRIPT,
             Deadline::after(MASK_CLEANUP_TIMEOUT),
+            &mut dialog,
         );
         if let Err(failure) = cleaned {
             let mut message =
@@ -2245,16 +2494,16 @@ impl PageScope {
         } else {
             Vec::new()
         };
-        PageFailure {
+        PageFailure(Box::new(PageFailureDetail {
             error,
             events,
             scope: self.clone(),
-        }
+        }))
     }
 }
 
-/// One failed CDP wait on the page session.
-struct PageFailure {
+/// Boxed payload for [`PageFailure`] so `Result<_, PageFailure>` stays pointer-sized.
+struct PageFailureDetail {
     /// The CDP failure that ended the wait.
     error: CdpError,
     /// The events received while waiting, when the failure can name them.
@@ -2263,43 +2512,76 @@ struct PageFailure {
     scope: PageScope,
 }
 
+/// One failed CDP wait on the page session.
+struct PageFailure(Box<PageFailureDetail>);
+
 impl PageFailure {
+    /// The underlying CDP error that ended the wait.
+    fn error(&self) -> &CdpError {
+        &self.0.error
+    }
+
     /// Whether a terminal target/session event ended the wait.
     fn is_death(&self) -> bool {
-        matches!(self.error, CdpError::Aborted { .. })
+        matches!(self.0.error, CdpError::Aborted { .. })
     }
 
     /// Whether the deadline passed before an answer arrived.
     fn is_timeout(&self) -> bool {
-        matches!(self.error, CdpError::Timeout { .. })
+        matches!(self.0.error, CdpError::Timeout { .. })
     }
 
     /// The failure text: `prefix`, the CDP error, and what the watch saw.
     fn describe(&self, prefix: &str) -> String {
         format_target_error(
             prefix,
-            &self.error,
-            Some(&self.scope.target_id),
-            Some(&self.scope.session_id),
-            &self.events,
+            &self.0.error,
+            Some(&self.0.scope.target_id),
+            Some(&self.0.scope.session_id),
+            &self.0.events,
         )
     }
 
-    /// The step error for this failure, keeping `kind` unless the page died.
+    /// The step error for this failure, keeping `kind` unless the page died
+    /// or an unhandled JavaScript dialog opened.
     ///
     /// A page death is always an environment error, so the step exits with 4.
+    /// An unhandled dialog is always an execution error, so the step exits with 1.
     fn step(self, prefix: &str, kind: fn(&CdpError) -> StepErrorKind) -> StepError {
+        if let CdpError::Dialog(opened) = &self.0.error {
+            return StepError::Execution(format_dialog_error(prefix, opened));
+        }
         let message = self.describe(prefix);
         if self.is_death() {
             return StepError::Environment(message);
         }
-        kind(&self.error).into_step(message)
+        kind(&self.0.error).into_step(message)
     }
 
-    /// The step error for a failure the page caused: always an environment error.
+    /// The step error for a failure the page caused: always an environment error,
+    /// except an unhandled JavaScript dialog which is an execution error.
     fn environment(self, prefix: &str) -> StepError {
+        if let CdpError::Dialog(opened) = &self.0.error {
+            return StepError::Execution(format_dialog_error(prefix, opened));
+        }
         StepError::Environment(self.describe(prefix))
     }
+}
+
+/// Formats an unhandled JavaScript dialog failure with type, message, and guidance.
+fn format_dialog_error(prefix: &str, dialog: &OpenedDialog) -> String {
+    let detail = if dialog.message.is_empty() {
+        format!(
+            "unexpected JavaScript `{}` dialog opened (empty message)",
+            dialog.dialog_type
+        )
+    } else {
+        format!(
+            "unexpected JavaScript `{}` dialog opened: {}",
+            dialog.dialog_type, dialog.message
+        )
+    };
+    format!("{prefix}: {detail}; add `dialog: \"accept\"` or `dialog: \"dismiss\"` to handle it")
 }
 
 /// The step error a page-wait failure reports unless the page died.
@@ -2347,7 +2629,7 @@ fn execution_error(_: &CdpError) -> StepErrorKind {
     StepErrorKind::Execution
 }
 
-/// Runs one CDP command on the page session, watching for terminal events.
+/// Runs one CDP command on the page session, watching for terminal events and dialogs.
 ///
 /// This is the only path a step uses to reach the page. `Target.*` and
 /// `Browser.*` run on the browser itself, and `close` deliberately bypasses the
@@ -2358,11 +2640,18 @@ fn page_call(
     method: &str,
     params: Value,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<Value, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
     connection
-        .call_until(method, params, Some(&scope.session_id), deadline, |event| {
-            scope.is_terminal(event)
-        })
+        .call_until_with_dialog(
+            method,
+            params,
+            Some(&scope.session_id),
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
         .map_err(|error| scope.failure(connection, error))
 }
 
@@ -2372,11 +2661,17 @@ fn page_evaluate(
     scope: &PageScope,
     expression: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<Value, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
     connection
-        .evaluate(&scope.session_id, expression, deadline, |event| {
-            scope.is_terminal(event)
-        })
+        .evaluate(
+            &scope.session_id,
+            expression,
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
         .map_err(|error| scope.failure(connection, error))
 }
 
@@ -2386,11 +2681,17 @@ fn page_evaluate_remote(
     scope: &PageScope,
     expression: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<RemoteResult, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
     connection
-        .evaluate_remote(&scope.session_id, expression, deadline, |event| {
-            scope.is_terminal(event)
-        })
+        .evaluate_remote(
+            &scope.session_id,
+            expression,
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
         .map_err(|error| scope.failure(connection, error))
 }
 
@@ -2401,11 +2702,18 @@ fn page_call_function(
     object_id: &str,
     function: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<Value, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
     connection
-        .call_function(&scope.session_id, object_id, function, deadline, |event| {
-            scope.is_terminal(event)
-        })
+        .call_function(
+            &scope.session_id,
+            object_id,
+            function,
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
         .map_err(|error| scope.failure(connection, error))
 }
 
@@ -2416,11 +2724,18 @@ fn page_call_function_remote(
     object_id: &str,
     function: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<RemoteResult, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
     connection
-        .call_function_remote(&scope.session_id, object_id, function, deadline, |event| {
-            scope.is_terminal(event)
-        })
+        .call_function_remote(
+            &scope.session_id,
+            object_id,
+            function,
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
         .map_err(|error| scope.failure(connection, error))
 }
 
@@ -2432,28 +2747,37 @@ fn page_call_function_with_object(
     arg_object_id: &str,
     function: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<Value, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
     connection
         .call_function_with_object(
             &scope.session_id,
-            object_id,
-            arg_object_id,
+            (object_id, arg_object_id),
             function,
             deadline,
             |event| scope.is_terminal(event),
+            Some(watch),
         )
         .map_err(|error| scope.failure(connection, error))
 }
 
-/// Waits for one page event, watching for terminal target/session events.
+/// Waits for one page event, watching for terminal target/session events and dialogs.
 fn page_wait_for_event(
     connection: &mut Connection,
     scope: &PageScope,
     method: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<Value, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
     connection
-        .wait_for_event_until(method, deadline, |event| scope.is_terminal(event))
+        .wait_for_event_with_dialog(
+            method,
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
         .map_err(|error| scope.failure(connection, error))
 }
 
@@ -2506,7 +2830,9 @@ fn classify_attach_failure(step: AttachStep, error: &CdpError) -> AttachFailureK
     match step {
         AttachStep::CreateTarget => AttachFailureKind::BrowserFailed,
         AttachStep::AttachToTarget => match error {
-            CdpError::Timeout { .. } | CdpError::Aborted { .. } => AttachFailureKind::TargetFailed,
+            CdpError::Timeout { .. } | CdpError::Aborted { .. } | CdpError::Dialog(_) => {
+                AttachFailureKind::TargetFailed
+            }
             CdpError::Method { message, .. } if message.contains("No target") => {
                 AttachFailureKind::TargetFailed
             }
@@ -2515,9 +2841,10 @@ fn classify_attach_failure(step: AttachStep, error: &CdpError) -> AttachFailureK
             }
         },
         AttachStep::EnableDomain => match error {
-            CdpError::Timeout { .. } | CdpError::Aborted { .. } | CdpError::Method { .. } => {
-                AttachFailureKind::TargetFailed
-            }
+            CdpError::Timeout { .. }
+            | CdpError::Aborted { .. }
+            | CdpError::Dialog(_)
+            | CdpError::Method { .. } => AttachFailureKind::TargetFailed,
             CdpError::Script(_) | CdpError::Transport(_) => AttachFailureKind::BrowserFailed,
         },
     }
@@ -2794,7 +3121,7 @@ fn locate_error(target_desc: &str, failure: PageFailure) -> LocateError {
     if failure.is_timeout() {
         return LocateError::Timeout;
     }
-    if let CdpError::Script(message) = &failure.error {
+    if let CdpError::Script(message) = failure.error() {
         return LocateError::Step(StepError::Execution(format!(
             "could not use {target_desc}: {message}"
         )));
@@ -2843,10 +3170,11 @@ fn wait_for_load(
     scope: &PageScope,
     url: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<(), StepError> {
     loop {
         if let Err(failure) =
-            page_wait_for_event(connection, scope, "Page.loadEventFired", deadline)
+            page_wait_for_event(connection, scope, "Page.loadEventFired", deadline, dialog)
         {
             let prefix = if failure.is_timeout() {
                 format!(
@@ -2858,9 +3186,9 @@ fn wait_for_load(
             };
             return Err(failure.step(&prefix, timeout_or_environment));
         }
-        let current = page_evaluate(connection, scope, "location.href", deadline)
+        let current = page_evaluate(connection, scope, "location.href", deadline, dialog)
             .map_err(|failure| load_error(failure, url, "read the URL of", deadline))?;
-        let ready = page_evaluate(connection, scope, "document.readyState", deadline)
+        let ready = page_evaluate(connection, scope, "document.readyState", deadline, dialog)
             .map_err(|failure| load_error(failure, url, "read the state of", deadline))?;
         if current.as_str() != Some("about:blank") && ready.as_str() == Some("complete") {
             return Ok(());
@@ -2913,12 +3241,14 @@ impl Session for BrowserSession {
             ));
         } else {
             let scope = self.scope();
+            let mut dialog = DialogContext::fail_fast();
             match self.connection_mut().and_then(|connection| {
                 page_evaluate(
                     connection,
                     &scope,
                     "document.documentElement.outerHTML",
                     deadline,
+                    &mut dialog,
                 )
                 .map_err(|failure| failure.environment("could not read the DOM snapshot"))
             }) {
@@ -3125,7 +3455,7 @@ fn reject_null_fields(value: &Value) -> Result<(), String> {
         if field.is_null() {
             return Err(format!("invalid arguments: `{key}` must not be null"));
         }
-        if key == "within" {
+        if key == "within" || key == "dialog" {
             reject_null_fields(field)?;
         }
     }
@@ -3329,8 +3659,16 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
             session.testid_attribute = attribute.clone();
         }
     }
-    let (url, title) = session.navigate(&args.url, Duration::from_millis(args.timeout_ms))?;
-    Ok(json!({ "url": url, "title": title }))
+    let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
+    let (url, title) = session.navigate(
+        &args.url,
+        Duration::from_millis(args.timeout_ms),
+        &mut dialog,
+    )?;
+    Ok(attach_dialog(
+        json!({ "url": url, "title": title }),
+        &mut dialog,
+    ))
 }
 
 fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -3348,9 +3686,10 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     let target = ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
         .map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
-    let actionable = session.locate_actionable_target(&target, deadline)?;
+    let actionable = session.locate_actionable_target(&target, deadline, &mut dialog)?;
     let located = actionable.located;
     let (x, y) = (actionable.x, actionable.y);
     for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
@@ -3367,24 +3706,29 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             }),
             "click",
             deadline,
+            &mut dialog,
         )?;
     }
     // A click may navigate, which detaches the element. The click itself
-    // succeeded, so a text that can no longer be read is not a failure.
-    let text = session
-        .run_on(
-            &target_desc,
-            &located,
-            TEXT_BODY,
-            "read the text of",
-            deadline,
-        )
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string));
-    match text {
-        Some(text) if !text.trim().is_empty() => Ok(json!({ "text": text.trim() })),
-        _ => Ok(json!({})),
-    }
+    // succeeded, so a text that can no longer be read is not a failure unless
+    // an unhandled JavaScript dialog opened.
+    let text = match session.run_on(
+        &target_desc,
+        &located,
+        TEXT_BODY,
+        "read the text of",
+        deadline,
+        &mut dialog,
+    ) {
+        Ok(value) => value.as_str().map(str::to_string),
+        Err(error) if dialog.is_fail_fast_triggered() => return Err(error),
+        Err(_) => None,
+    };
+    let result = match text {
+        Some(text) if !text.trim().is_empty() => json!({ "text": text.trim() }),
+        _ => json!({}),
+    };
+    Ok(attach_dialog(result, &mut dialog))
 }
 
 fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -3395,15 +3739,17 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         .to_string();
     let target = type_target(&args).map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
-    let actionable = session.locate_actionable_target(&target, deadline)?;
+    let actionable = session.locate_actionable_target(&target, deadline, &mut dialog)?;
     let focused = session.run_on(
         &target_desc,
         &actionable.located,
         FOCUS_BODY,
         "focus",
         deadline,
+        &mut dialog,
     )?;
     if focused != Value::Bool(true) {
         return Err(action_error(
@@ -3418,14 +3764,16 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         json!({ "text": text }),
         "type into",
         deadline,
+        &mut dialog,
     )?;
-    Ok(json!({}))
+    Ok(attach_dialog(json!({}), &mut dialog))
 }
 
 fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: PressArgs = parse(args)?;
     let key = Key::parse(&args.key).map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_secs(5));
+    let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
     let session = session(sessions)?;
     let scope = session.scope();
     for params in [key.down_params(), key.up_params()] {
@@ -3436,6 +3784,7 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             "Input.dispatchKeyEvent",
             params,
             deadline,
+            &mut dialog,
         )
         .map_err(|failure| {
             let prefix = if failure.is_timeout() {
@@ -3450,7 +3799,7 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             failure.step(&prefix, timeout_or_execution)
         })?;
     }
-    Ok(json!({}))
+    Ok(attach_dialog(json!({}), &mut dialog))
 }
 
 fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -3458,18 +3807,22 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let target = WaitTarget::from_args(&args).map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
     let session = session(sessions)?;
     let url = match target {
         WaitTarget::Element(target) => {
-            session.locate_target(&target, deadline)?;
+            session.locate_target(&target, deadline, &mut dialog)?;
             let scope = session.scope();
             let connection = session.connection_mut()?;
-            page_evaluate(connection, &scope, "location.href", deadline)
+            page_evaluate(connection, &scope, "location.href", deadline, &mut dialog)
                 .map_err(|failure| failure.environment("could not read the current URL"))?
         }
-        WaitTarget::Url(wanted) => wait_for_url(session, &wanted, deadline)?,
+        WaitTarget::Url(wanted) => wait_for_url(session, &wanted, deadline, &mut dialog)?,
     };
-    Ok(json!({ "url": url.as_str().unwrap_or_default() }))
+    Ok(attach_dialog(
+        json!({ "url": url.as_str().unwrap_or_default() }),
+        &mut dialog,
+    ))
 }
 
 /// Waits until the page's URL contains `wanted`.
@@ -3477,11 +3830,12 @@ fn wait_for_url(
     session: &mut BrowserSession,
     wanted: &str,
     deadline: Deadline,
+    dialog: &mut DialogContext,
 ) -> Result<Value, StepError> {
     let scope = session.scope();
     loop {
         let connection = session.connection_mut()?;
-        match page_evaluate(connection, &scope, "location.href", deadline) {
+        match page_evaluate(connection, &scope, "location.href", deadline, dialog) {
             Ok(value) => {
                 if value.as_str().is_some_and(|url| url.contains(wanted)) {
                     return Ok(value);
@@ -3572,15 +3926,17 @@ fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let target = ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
         .map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::fail_fast();
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
-    let located = session.locate_target(&target, deadline)?;
+    let located = session.locate_target(&target, deadline, &mut dialog)?;
     let text = session.run_on(
         &target_desc,
         &located,
         TEXT_BODY,
         "read the text of",
         deadline,
+        &mut dialog,
     )?;
     let mut result = json!({ "text": text.as_str().unwrap_or_default() });
     if let Some(attribute) = &args.attribute {
@@ -3594,6 +3950,7 @@ fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
             &body,
             "read the attribute of",
             deadline,
+            &mut dialog,
         )?;
         result["value"] = value;
     }
@@ -3987,6 +4344,7 @@ mod tests {
             within: None,
             nth: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            dialog: None,
         };
         assert_eq!(type_text(&typed).ok(), Some("Ada"));
         assert_eq!(
@@ -4005,6 +4363,7 @@ mod tests {
             within: None,
             nth: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            dialog: None,
         };
         assert_eq!(type_text(&located).ok(), Some(" typed"));
         assert_eq!(
@@ -4023,6 +4382,7 @@ mod tests {
             within: None,
             nth: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            dialog: None,
         };
         assert!(type_text(&missing).is_err());
     }
@@ -5002,7 +5362,11 @@ mod tests {
         let mut session = mock_session(conn, "target-1", "session-1");
         let started = std::time::Instant::now();
         let err = session
-            .navigate("http://127.0.0.1/page", Duration::from_secs(5))
+            .navigate(
+                "http://127.0.0.1/page",
+                Duration::from_secs(5),
+                &mut DialogContext::fail_fast(),
+            )
             .expect_err("navigate must abort when session detaches");
         drop(session);
         server.join().expect("mock CDP thread must finish");
@@ -5060,7 +5424,11 @@ mod tests {
         let mut session = mock_session(conn, "target-1", "session-1");
         let started = std::time::Instant::now();
         let err = session
-            .navigate("http://127.0.0.1/page", Duration::from_secs(5))
+            .navigate(
+                "http://127.0.0.1/page",
+                Duration::from_secs(5),
+                &mut DialogContext::fail_fast(),
+            )
             .expect_err("navigate must abort immediately on queued crash event");
         drop(session);
         server.join().expect("mock CDP thread must finish");
@@ -5119,7 +5487,11 @@ mod tests {
         let mut session = mock_session(conn, "target-1", "session-1");
         let started = std::time::Instant::now();
         let err = session
-            .navigate("http://127.0.0.1/page", Duration::from_secs(5))
+            .navigate(
+                "http://127.0.0.1/page",
+                Duration::from_secs(5),
+                &mut DialogContext::fail_fast(),
+            )
             .expect_err("the load wait must abort when the page crashes");
         drop(session);
         server.join().expect("mock CDP thread must finish");
@@ -5155,7 +5527,11 @@ mod tests {
             .expect("must connect to mock CDP");
         let mut session = mock_session(conn, "target-1", "session-1");
         let err = session
-            .navigate("http://127.0.0.1/page", Duration::from_millis(250))
+            .navigate(
+                "http://127.0.0.1/page",
+                Duration::from_millis(250),
+                &mut DialogContext::fail_fast(),
+            )
             .expect_err("a silent load wait must time out");
         drop(session);
         server.join().expect("mock CDP thread must finish");
@@ -5380,7 +5756,11 @@ mod tests {
         let mut session = mock_session(conn, "target-1", "session-1");
         let target = ElementTarget::from_parts(Locator::Css("#go".to_string()), None, None)
             .expect("a css locator needs no modifiers");
-        let err = match session.locate_target(&target, Deadline::after(Duration::from_secs(5))) {
+        let err = match session.locate_target(
+            &target,
+            Deadline::after(Duration::from_secs(5)),
+            &mut DialogContext::fail_fast(),
+        ) {
             Ok(_) => panic!("locating must abort when the page detaches"),
             Err(error) => error,
         };
@@ -5412,7 +5792,11 @@ mod tests {
             .expect("must connect to mock CDP");
         let mut silent_session = mock_session(silent_conn, "target-1", "session-1");
         let silent_err = silent_session
-            .navigate("http://127.0.0.1/silent", Duration::from_millis(250))
+            .navigate(
+                "http://127.0.0.1/silent",
+                Duration::from_millis(250),
+                &mut DialogContext::fail_fast(),
+            )
             .expect_err("silent navigate must time out");
         drop(silent_session);
         silent_server.join().expect("silent server must finish");
@@ -5447,7 +5831,11 @@ mod tests {
             .expect("must connect to mock CDP");
         let mut noisy_session = mock_session(noisy_conn, "target-1", "session-1");
         let noisy_err = noisy_session
-            .navigate("http://127.0.0.1/noisy", Duration::from_millis(250))
+            .navigate(
+                "http://127.0.0.1/noisy",
+                Duration::from_millis(250),
+                &mut DialogContext::fail_fast(),
+            )
             .expect_err("non-terminal event must not abort before timeout");
         drop(noisy_session);
         noisy_server.join().expect("noisy server must finish");
@@ -5461,5 +5849,133 @@ mod tests {
             }
             other => panic!("expected timeout error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dialog_option_schema_and_validate_agree() {
+        let cases: [(&str, Value); 5] = [
+            ("browser.open", json!({"url": "http://127.0.0.1:1/"})),
+            ("browser.click", json!({"css": "#go"})),
+            ("browser.type", json!({"css": "#go", "text": "hello"})),
+            ("browser.press", json!({"key": "Enter"})),
+            ("browser.wait", json!({"css": "#go"})),
+        ];
+        for (step_name, base) in cases {
+            let def = definition(step_name);
+            for valid_dialog in [
+                json!("accept"),
+                json!("dismiss"),
+                json!({"action": "accept"}),
+                json!({"action": "dismiss"}),
+                json!({"action": "accept", "prompt_text": ""}),
+                json!({"action": "accept", "prompt_text": "hello"}),
+            ] {
+                let mut args = base.clone();
+                args["dialog"] = valid_dialog.clone();
+                assert!(
+                    (def.validate)(&args).is_ok(),
+                    "`{step_name}` validate must accept {valid_dialog}: {args}"
+                );
+            }
+            for invalid_dialog in [
+                json!(null),
+                json!("cancel"),
+                json!(123),
+                json!({}),
+                json!({"action": null}),
+                json!({"action": "cancel"}),
+                json!({"action": "accept", "prompt_text": null}),
+                json!({"action": "accept", "prompt_text": 42}),
+                json!({"action": "accept", "extra": true}),
+            ] {
+                let mut args = base.clone();
+                args["dialog"] = invalid_dialog.clone();
+                assert!(
+                    (def.validate)(&args).is_err(),
+                    "`{step_name}` validate must refuse {invalid_dialog}: {args}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn beforeunload_dismiss_stays_on_page_without_environment_error() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let nav = read_cdp_request(&mut socket);
+            assert_eq!(nav["method"], "Page.navigate");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "method": "Page.javascriptDialogOpening",
+                        "sessionId": "session-1",
+                        "params": { "type": "beforeunload", "message": "" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send beforeunload");
+
+            let handle = read_cdp_request(&mut socket);
+            assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+            assert_eq!(handle["params"]["accept"], false);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": handle["id"], "result": {} }).to_string(),
+                ))
+                .expect("reply handleJavaScriptDialog");
+
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": nav["id"],
+                        "result": { "frameId": "frame-1", "errorText": "net::ERR_ABORTED" }
+                    })
+                    .to_string(),
+                ))
+                .expect("reply aborted Page.navigate");
+
+            let href = read_cdp_request(&mut socket);
+            assert_eq!(href["method"], "Runtime.evaluate");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": href["id"], "result": { "result": { "value": "http://127.0.0.1/stay" } } })
+                        .to_string(),
+                ))
+                .expect("reply location.href");
+
+            let title = read_cdp_request(&mut socket);
+            assert_eq!(title["method"], "Runtime.evaluate");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": title["id"], "result": { "result": { "value": "Stay" } } })
+                        .to_string(),
+                ))
+                .expect("reply document.title");
+            while socket.read().is_ok() {}
+        });
+
+        let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("must connect to mock CDP");
+        let mut session = mock_session(conn, "target-1", "session-1");
+        let mut dialog = DialogContext::from_arg(Some(&DialogArg::Action(DialogAction::Dismiss)));
+        let (url, title) = session
+            .navigate(
+                "http://127.0.0.1/leave",
+                Duration::from_secs(5),
+                &mut dialog,
+            )
+            .expect("dismissing beforeunload must keep the current page");
+        drop(session);
+        server.join().expect("mock server finish");
+
+        assert_eq!(url, "http://127.0.0.1/stay");
+        assert_eq!(title, "Stay");
+        assert_eq!(
+            dialog.opened,
+            Some(OpenedDialog {
+                dialog_type: "beforeunload".to_string(),
+                message: String::new(),
+                accepted: false,
+            })
+        );
     }
 }

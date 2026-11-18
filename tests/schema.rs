@@ -729,6 +729,67 @@ fn describes_observations(schema: &Value) -> bool {
     schema["properties"]["observe"]["additionalProperties"] != Value::Bool(false)
 }
 
+#[cfg(feature = "browser")]
+#[test]
+fn browser_dialog_schema_agrees_with_validate() {
+    let validator = validator(schema());
+    let registry = built_in_registry();
+    let bases: [(&str, Value); 5] = [
+        ("browser.open", json!({"url": "http://127.0.0.1:1/"})),
+        ("browser.click", json!({"css": "#go"})),
+        ("browser.type", json!({"css": "#go", "text": "hello"})),
+        ("browser.press", json!({"key": "Enter"})),
+        ("browser.wait", json!({"css": "#go"})),
+    ];
+    for (step_name, base) in bases {
+        let def = registry.get(step_name).expect("browser step must exist");
+        for dialog in [
+            json!("accept"),
+            json!("dismiss"),
+            json!({"action": "accept"}),
+            json!({"action": "dismiss"}),
+            json!({"action": "accept", "prompt_text": "token"}),
+        ] {
+            let mut step_args = base.clone();
+            step_args["dialog"] = dialog.clone();
+            let case = json!({
+                "name": "Dialog schema check",
+                "steps": [{ step_name: step_args.clone() }]
+            });
+            assert!(
+                validator.is_valid(&case),
+                "`{step_name}` schema must accept {dialog}: {case}"
+            );
+            assert!(
+                (def.validate)(&step_args).is_ok(),
+                "`{step_name}` validate must accept {dialog}: {step_args}"
+            );
+        }
+        for bad in [
+            json!(null),
+            json!("cancel"),
+            json!({}),
+            json!({"action": "accept", "prompt_text": null}),
+            json!({"action": "accept", "extra": true}),
+        ] {
+            let mut step_args = base.clone();
+            step_args["dialog"] = bad.clone();
+            let case = json!({
+                "name": "Invalid dialog schema check",
+                "steps": [{ step_name: step_args.clone() }]
+            });
+            assert!(
+                !validator.is_valid(&case),
+                "`{step_name}` schema must reject {bad}: {case}"
+            );
+            assert!(
+                (def.validate)(&step_args).is_err(),
+                "`{step_name}` validate must reject {bad}: {step_args}"
+            );
+        }
+    }
+}
+
 /// Whether this build registers every step a documented case uses.
 ///
 /// A build with `http` and `cli` but no `browser` cannot describe the browser
