@@ -856,6 +856,15 @@ pub fn run_single_step(
             kind: ProblemKind::InvalidInput,
             message: format!("`{}` is not a registered step", step.action),
         })?;
+        if step.retry.is_some() {
+            return Err(Problem {
+                kind: ProblemKind::InvalidInput,
+                message: format!(
+                    "`{}` cannot use `retry` in `da session step`: polling runs only in case files, so send one attempt or move the step into a case",
+                    step.action
+                ),
+            });
+        }
         let args = case::interpolate(&step.args, vars, secrets).map_err(|error| Problem {
             kind: ProblemKind::InvalidInput,
             message: error.message,
@@ -3354,6 +3363,40 @@ mod tests {
             vars.get("greeting").map(String::as_str),
             Some("hello"),
             "failed assertion must not overwrite saved variable"
+        );
+    }
+
+    #[test]
+    fn run_single_step_rejects_a_retry_policy_instead_of_ignoring_it() {
+        let reg = registry();
+        let mut vars = BTreeMap::new();
+        let mut secrets = Secrets::new();
+        let mut sessions = Sessions::new();
+        sessions.set_interactive(true);
+
+        let step = crate::core::case::parse_single_step(
+            r#"{"use":"test.echo","with":{"value":"hello"},"retry":{"until":[{"path":"$","equals":"hello"}],"timeout_ms":50}}"#,
+        )
+        .expect("step must parse");
+        assert!(
+            step.retry.is_some(),
+            "the shared parser must keep the policy for case mode"
+        );
+
+        let report = run_single_step(&step, &reg, &mut vars, &mut secrets, &mut sessions);
+        assert_eq!(report.status, StepStatus::Error);
+        let error = report.error.expect("rejection must carry its message");
+        assert_eq!(error.kind, ProblemKind::InvalidInput);
+        assert!(
+            error
+                .message
+                .contains("cannot use `retry` in `da session step`"),
+            "the limitation must be named: {}",
+            error.message
+        );
+        assert!(
+            vars.is_empty(),
+            "a rejected step must not save variables or run an attempt"
         );
     }
 }

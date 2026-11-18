@@ -610,6 +610,12 @@ $ da session stop s-1794974416388-44376-0
   after the page settles. Locator-targeted `browser.open`, `browser.click`,
   `browser.type`, `browser.press` and `browser.wait` steps accept `dialog` in a
   session exactly as they do in a case file.
+- **No `retry` in a session step**: `retry` polling belongs to the case runner
+  (`da run` / `da lint`). A `da session step` with a `retry` block is rejected
+  as an invalid-input error (exit 3) instead of silently ignoring the policy;
+  send one attempt from the session, or move the polling step into a case file.
+  Session steps still share the same YAML/JSON step schema, `use`, `with`,
+  `expect` and `save` behavior as case steps.
 - **Secrets & cleanup**: resolved `${env:...}` secret strings are redacted from
   JSON outputs and never written into session logs or handles. `da session stop`
   and idle reaping close detached Chrome instances and delete both
@@ -1133,6 +1139,9 @@ that attempt, keeping only the last attempt's result and observations:
   last error (or `skipped` when combined with `optional: true`).
 - An environment error (exit 4) or invalid-arguments error (exit 3) aborts
   polling immediately instead of waiting for `timeout_ms`.
+- `retry` is a case-file feature. `da session step` rejects a step that carries
+  `retry` with an invalid-input error instead of running or ignoring the policy;
+  an interactive caller sends each attempt explicitly.
 
 ### `http.request`
 
