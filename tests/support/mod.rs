@@ -1162,7 +1162,7 @@ pub fn closed_port() -> u16 {
 /// Binds a loopback listener whose port is not on Chrome's restricted-port list
 /// (`ERR_UNSAFE_PORT`). Holds any rejected listener open until a safe port is
 /// acquired so the OS does not hand back the same restricted port.
-fn bind_browser_safe_listener() -> TcpListener {
+pub fn bind_browser_safe_listener() -> TcpListener {
     let mut rejected = Vec::new();
     for _ in 0..32 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind the test server");

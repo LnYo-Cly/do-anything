@@ -15,7 +15,7 @@ use do_anything::core::events::EventBus;
 use do_anything::core::filter::Filters;
 use do_anything::core::observer::{Observer, ObserverDefinition, ObserverError};
 use do_anything::core::output::{self, Format};
-use do_anything::core::registry::{Registry, StepDefinition, StepError};
+use do_anything::core::registry::{Registry, SessionDefinition, StepDefinition, StepError};
 use do_anything::core::report::{CaseStatus, ProblemKind, RunOutcome, StepStatus};
 use do_anything::core::runner;
 use do_anything::core::secrets::Secrets;
@@ -64,12 +64,24 @@ fn closed() -> usize {
 struct FakeSession {
     id: usize,
     label: String,
+    detached: bool,
 }
 
 impl Session for FakeSession {
     fn close(&mut self) -> Result<(), String> {
+        if self.detached {
+            return Ok(());
+        }
         CLOSED.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn detach(&mut self) -> Result<Option<Value>, String> {
+        self.detached = true;
+        Ok(Some(json!({
+            "id": self.id,
+            "label": self.label,
+        })))
     }
 }
 
@@ -97,7 +109,11 @@ fn open_session(args: &Value, sessions: &mut Sessions) -> Result<usize, StepErro
     let session = sessions
         .get_or_create(KIND, || {
             let id = CREATED.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(FakeSession { id, label })
+            Ok(FakeSession {
+                id,
+                label,
+                detached: false,
+            })
         })
         .map_err(StepError::Execution)?;
     Ok(session.id)
@@ -699,4 +715,71 @@ fn sessions_are_not_shared_between_cases_under_jobs_4() {
         .filter_map(|case| case.steps[2].result.as_ref()?.get("id")?.as_u64())
         .collect();
     assert_eq!(ids.len(), 4, "the four sessions must be distinct: {ids:?}");
+}
+
+#[test]
+fn a_detachable_session_survives_detach_and_closes_after_reattach() {
+    let _guard = test_guard();
+    reset_counts();
+
+    let mut reg = registry();
+    reg.register_session(SessionDefinition {
+        kind: KIND,
+        reattach: |handle| {
+            let id = handle["id"]
+                .as_u64()
+                .ok_or_else(|| "missing id".to_string())? as usize;
+            let label = handle["label"].as_str().unwrap_or_default().to_string();
+            Ok(Box::new(FakeSession {
+                id,
+                label,
+                detached: false,
+            }))
+        },
+        dispose_handle: |_handle| {
+            CLOSED.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    })
+    .expect("session definition must register");
+
+    let handles = {
+        let mut first = Sessions::new();
+        let opened = open(&json!({ "label": "alpha" }), &mut first).expect("open must succeed");
+        assert_eq!(opened["id"], 1);
+        assert_eq!(created(), 1);
+        assert_eq!(closed(), 0);
+
+        let detached = first.detach_all();
+        assert!(detached.errors.is_empty(), "got: {:?}", detached.errors);
+        assert_eq!(
+            closed(),
+            0,
+            "detaching must not close the underlying resource"
+        );
+        detached.handles
+    };
+    assert_eq!(
+        closed(),
+        0,
+        "dropping Sessions after detach must not close the underlying resource"
+    );
+
+    let mut second = Sessions::new();
+    let handle = handles.get(KIND).expect("handle for KIND must exist");
+    let def = reg.session(KIND).expect("session kind must be registered");
+    let session = (def.reattach)(handle).expect("reattach must succeed");
+    second
+        .insert_reattached(def.kind, session)
+        .expect("insert_reattached must succeed");
+
+    let verified = verify(&json!({ "label": "alpha" }), &mut second)
+        .expect("reattached session must share the same resource");
+    assert_eq!(verified["id"], 1);
+    assert_eq!(created(), 1, "reattach must not create a second resource");
+    assert_eq!(closed(), 0);
+
+    let errors = second.close_all();
+    assert!(errors.is_empty(), "got: {errors:?}");
+    assert_eq!(closed(), 1, "closing after reattach must close once");
 }

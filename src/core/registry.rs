@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::core::observer::ObserverDefinition;
-use crate::core::session::Sessions;
+use crate::core::session::{Session, Sessions, check_kind};
 
 /// Why a step could not produce a result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +65,27 @@ pub fn allow_retry(_args: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// The steps and observers available to the runner, keyed by name.
+/// A detachable session kind a driver registers so later processes can
+/// reattach to or dispose of its detached handle.
+#[derive(Clone)]
+pub struct SessionDefinition {
+    /// Session kind, matching the key passed to [`Sessions`].
+    pub kind: &'static str,
+    /// Reconnects to a detached resource from its opaque JSON handle.
+    pub reattach: fn(&Value) -> Result<Box<dyn Session>, String>,
+    /// Releases resources named by `handle` when reattach fails or is skipped.
+    pub dispose_handle: fn(&Value) -> Result<(), String>,
+}
+
+type ValidateFn = fn(&Value) -> Result<(), String>;
+
+/// The steps, observers and detachable sessions available to the runner.
 #[derive(Default)]
 pub struct Registry {
     steps: BTreeMap<&'static str, StepDefinition>,
     observers: BTreeMap<&'static str, ObserverDefinition>,
+    sessions: BTreeMap<&'static str, SessionDefinition>,
+    session_validators: BTreeMap<&'static str, ValidateFn>,
 }
 
 impl Registry {
@@ -130,6 +146,55 @@ impl Registry {
     /// Every registered observer name, in order.
     pub fn observer_names(&self) -> Vec<&'static str> {
         self.observers.keys().copied().collect()
+    }
+
+    /// Registers a detachable session kind so `da session` can reattach to or
+    /// dispose of its handle across processes.
+    pub fn register_session(&mut self, definition: SessionDefinition) -> Result<(), String> {
+        check_kind(definition.kind)?;
+        if self.sessions.contains_key(definition.kind) {
+            return Err(format!(
+                "session `{}` is already registered; every session kind must be unique",
+                definition.kind
+            ));
+        }
+        self.sessions.insert(definition.kind, definition);
+        Ok(())
+    }
+
+    /// Looks up a registered detachable session kind.
+    pub fn session(&self, kind: &str) -> Option<&SessionDefinition> {
+        self.sessions.get(kind)
+    }
+
+    /// Registers a validator for `step_name` used inside interactive `da session`
+    /// commands (where additional session-only arguments such as `ref` are allowed).
+    pub fn register_session_validator(
+        &mut self,
+        step_name: &'static str,
+        validate: fn(&Value) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !self.steps.contains_key(step_name) {
+            return Err(format!(
+                "cannot register session validator for unregistered step `{step_name}`"
+            ));
+        }
+        self.session_validators.insert(step_name, validate);
+        Ok(())
+    }
+
+    /// Validates `args` for `step_name` inside an interactive session.
+    ///
+    /// Falls back to the step's regular validator when no interactive-specific
+    /// validator is registered.
+    pub fn validate_for_session(&self, step_name: &str, args: &Value) -> Result<(), String> {
+        if let Some(validate) = self.session_validators.get(step_name) {
+            return validate(args);
+        }
+        let Some(definition) = self.steps.get(step_name) else {
+            return Err(format!("`{step_name}` is not a registered step"));
+        };
+        (definition.validate)(args)
     }
 }
 
@@ -346,5 +411,50 @@ mod tests {
                 "the message must state the rule for `{name}`, got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn session_registration_and_session_validators_work() {
+        let mut registry = Registry::new();
+        registry
+            .register(definition("test.step"))
+            .expect("step must register");
+        registry
+            .register_session(SessionDefinition {
+                kind: "test.kind",
+                reattach: |_| Err("gone".to_string()),
+                dispose_handle: |_| Ok(()),
+            })
+            .expect("session kind must register");
+        assert!(registry.session("test.kind").is_some());
+
+        let dup = registry
+            .register_session(SessionDefinition {
+                kind: "test.kind",
+                reattach: |_| Err("gone".to_string()),
+                dispose_handle: |_| Ok(()),
+            })
+            .expect_err("duplicate session kind must fail");
+        assert!(dup.contains("already registered"), "got: {dup}");
+
+        registry
+            .register_session_validator("test.step", |args| {
+                if args.get("ref").is_some() {
+                    Ok(())
+                } else {
+                    Err("missing ref".to_string())
+                }
+            })
+            .expect("session validator must register");
+        assert!(
+            registry
+                .validate_for_session("test.step", &serde_json::json!({ "ref": "e1" }))
+                .is_ok()
+        );
+        assert!(
+            registry
+                .validate_for_session("test.step", &serde_json::json!({}))
+                .is_err()
+        );
     }
 }

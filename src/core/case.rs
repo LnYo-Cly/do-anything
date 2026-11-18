@@ -900,6 +900,72 @@ pub fn parse(text: &str) -> Result<Case, String> {
     build_case(raw).map_err(|problem| problem.render(text))
 }
 
+/// Parses a single step in either case-file format (`<action>: { ... }`) or
+/// envelope format (`use: <action>`, `with: { ... }`), with optional `expect`
+/// and `save`.
+pub fn parse_single_step(text: &str) -> Result<Step, String> {
+    let raw: Spanned<RawStep> =
+        serde_saphyr::from_str(text).map_err(|error| parser_message(&error.to_string()))?;
+    normalize_and_parse_step(raw).map_err(|problem| problem.render(text))
+}
+
+fn normalize_and_parse_step(mut raw: Spanned<RawStep>) -> Result<Step, Problem> {
+    let location = raw.referenced;
+    let has_use = raw.value.fields.iter().any(|(name, _, _)| name == "use");
+    let has_with = raw.value.fields.iter().any(|(name, _, _)| name == "with");
+    if has_use || has_with {
+        let mut action: Option<(String, Location)> = None;
+        let mut with_args: Option<Spanned<RawArgs>> = None;
+        let mut extra = Vec::new();
+        for (key, key_loc, val) in raw.value.fields.drain(..) {
+            match key.as_str() {
+                "use" => {
+                    let RawArgs::Scalar(Value::String(name)) = val.value else {
+                        return Err(Problem {
+                            location: val.referenced,
+                            message: "step `use` must be a step name string".to_string(),
+                        });
+                    };
+                    if name.trim().is_empty() {
+                        return Err(Problem {
+                            location: val.referenced,
+                            message: "step `use` must not be empty".to_string(),
+                        });
+                    }
+                    action = Some((name, val.referenced));
+                }
+                "with" => {
+                    with_args = Some(val);
+                }
+                _ => extra.push((key, key_loc)),
+            }
+        }
+        if !extra.is_empty() {
+            let names: Vec<&str> = extra.iter().map(|(name, _)| name.as_str()).collect();
+            return Err(Problem {
+                location: extra[0].1,
+                message: format!(
+                    "step with `use`/`with` cannot also name step keys: {}",
+                    names.join(", ")
+                ),
+            });
+        }
+        let Some((name, action_loc)) = action else {
+            return Err(Problem {
+                location,
+                message: "step with `with` must also specify `use`".to_string(),
+            });
+        };
+        let args = with_args.unwrap_or(Spanned {
+            value: RawArgs::Map(Vec::new()),
+            referenced: action_loc,
+            defined: action_loc,
+        });
+        raw.value.fields.push((name, action_loc, args));
+    }
+    parse_step(1, raw)
+}
+
 /// Renders a message at the place in a case file it belongs to.
 ///
 /// A check that needs the registry runs after parsing, but its message belongs
@@ -1676,6 +1742,45 @@ fn is_env_name(name: &str) -> bool {
     };
     (first.is_ascii_alphabetic() || first == '_')
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Collects every valid environment variable name referenced as `${env:NAME}`
+/// anywhere inside `value`, without reading or exposing its value.
+pub fn env_references(value: &Value) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_env_references(value, &mut names);
+    names
+}
+
+fn collect_env_references(value: &Value, names: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => {
+            let mut rest = text.as_str();
+            while let Some(start) = rest.find("${") {
+                let after = &rest[start + 2..];
+                let Some(end) = after.find('}') else {
+                    break;
+                };
+                if let Some(name) = after[..end].strip_prefix(ENV_PREFIX)
+                    && is_env_name(name)
+                {
+                    names.insert(name.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_env_references(item, names);
+            }
+        }
+        Value::Object(entries) => {
+            for item in entries.values() {
+                collect_env_references(item, names);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 /// Expands case files and directories into a sorted list of case files.
@@ -2587,5 +2692,45 @@ steps:
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_single_step_supports_case_and_envelope_formats() {
+        let case_fmt = parse_single_step(
+            "browser.click:\n  css: '#go'\nexpect:\n  - path: $.text\n    equals: Go\nsave:\n  btn: $.text\n",
+        )
+        .expect("case format must parse");
+        assert_eq!(case_fmt.action, "browser.click");
+        assert_eq!(case_fmt.args, serde_json::json!({"css": "#go"}));
+        assert_eq!(case_fmt.expect.len(), 1);
+        assert_eq!(case_fmt.save.len(), 1);
+
+        let env_fmt = parse_single_step(
+            r#"{"use":"browser.click","with":{"ref":"e1"},"expect":[{"path":"$.text","equals":"Go"}],"save":{"btn":"$.text"}}"#,
+        )
+        .expect("envelope format must parse");
+        assert_eq!(env_fmt.action, "browser.click");
+        assert_eq!(env_fmt.args, serde_json::json!({"ref": "e1"}));
+        assert_eq!(env_fmt.expect.len(), 1);
+        assert_eq!(env_fmt.save.len(), 1);
+
+        let no_with =
+            parse_single_step(r#"{"use":"sample.ping"}"#).expect("use without with must default");
+        assert_eq!(no_with.action, "sample.ping");
+        assert_eq!(no_with.args, serde_json::json!({}));
+    }
+
+    #[test]
+    fn env_references_extracts_names_without_reading_values() {
+        let value = serde_json::json!({
+            "a": "${env:TOKEN_ONE}",
+            "b": ["prefix-${env:SECOND_VAR}-suffix", "${plain_var}"],
+            "c": { "nested": "${env:TOKEN_ONE}" }
+        });
+        let refs = env_references(&value);
+        assert_eq!(
+            refs,
+            BTreeSet::from(["SECOND_VAR".to_string(), "TOKEN_ONE".to_string()])
+        );
     }
 }

@@ -135,6 +135,7 @@ An `observe:` block watches another layer with a read-only observer: the built-i
 | Evidence for every case | `da run --record evidence/` records passed, failed and errored cases; `da report evidence/` renders one offline HTML file |
 | Inputs from outside | `--var name=value` for URLs, tokens and paths |
 | Check a case without running it | `da lint cases/`: the same validation as `da run`, every problem in every file, no step executed |
+| Exploratory driving & export | `da session start \| step \| snapshot \| export \| stop`: keep one session across commands and export a clean YAML case |
 | The case format, machine-readable | `da schema`: a JSON Schema with every registered step, also usable by editors |
 
 Everything is in the [guide](docs/guide.md): [case format](docs/guide.md#case-files), [output](docs/guide.md#output), [failure bundles](docs/guide.md#failure-bundles), [linting](docs/guide.md#linting), [schema](docs/guide.md#schema), [exit codes](docs/guide.md#exit-codes).
