@@ -48,6 +48,39 @@ const MAX_QUEUED: usize = 10_000;
 /// whatever is still unread stays on the socket for the next collection.
 const POLL_BUDGET: Duration = Duration::from_millis(200);
 
+/// Maximum time spent waiting for Chrome to confirm `Page.handleJavaScriptDialog`.
+const DIALOG_HANDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Information captured from a `Page.javascriptDialogOpening` event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedDialog {
+    /// Dialog kind reported by Chrome (`alert`, `confirm`, `prompt`, or `beforeunload`).
+    pub dialog_type: String,
+    /// Message text shown inside the dialog.
+    pub message: String,
+    /// Whether the dialog was accepted (`true`) or dismissed (`false`).
+    pub accepted: bool,
+}
+
+/// How a page-session CDP wait responds to `Page.javascriptDialogOpening`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DialogPolicy {
+    /// Dismiss immediately (`accept: false`) and end the wait with [`CdpError::Dialog`].
+    FailFast,
+    /// Respond with the configured action and continue waiting.
+    Handle {
+        accept: bool,
+        prompt_text: Option<String>,
+    },
+}
+
+/// Session-scoped dialog handling attached to a page-session CDP wait.
+pub struct DialogWatch<'a> {
+    pub session_id: &'a str,
+    pub policy: &'a DialogPolicy,
+    pub opened: &'a mut Option<OpenedDialog>,
+}
+
 /// The instant one step must finish by.
 #[derive(Clone, Copy, Debug)]
 pub struct Deadline {
@@ -113,6 +146,8 @@ pub enum CdpError {
     },
     /// A browser event showed the target or session ended while waiting.
     Aborted { waiting_for: String },
+    /// A JavaScript dialog opened while no `dialog` handler was configured.
+    Dialog(OpenedDialog),
     /// The connection failed, closed, or carried an unreadable message.
     Transport(String),
 }
@@ -134,6 +169,21 @@ impl fmt::Display for CdpError {
             ),
             Self::Aborted { waiting_for } => {
                 write!(formatter, "`{waiting_for}` was aborted by a browser event")
+            }
+            Self::Dialog(dialog) => {
+                if dialog.message.is_empty() {
+                    write!(
+                        formatter,
+                        "unexpected JavaScript `{}` dialog opened (empty message)",
+                        dialog.dialog_type
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "unexpected JavaScript `{}` dialog opened: {}",
+                        dialog.dialog_type, dialog.message
+                    )
+                }
             }
             Self::Transport(message) => write!(formatter, "{message}"),
         }
@@ -167,10 +217,15 @@ impl MessageQueue {
 
     /// Removes and returns the first message a call named by `method`.
     fn take(&mut self, method: &str) -> Option<Value> {
-        let index = self
-            .messages
-            .iter()
-            .position(|message| message.get("method").and_then(Value::as_str) == Some(method))?;
+        self.take_where(|message| message.get("method").and_then(Value::as_str) == Some(method))
+    }
+
+    /// Removes and returns the first queued message matching `predicate`.
+    fn take_where<F>(&mut self, mut predicate: F) -> Option<Value>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let index = self.messages.iter().position(&mut predicate)?;
         self.messages.remove(index)
     }
 
@@ -199,6 +254,8 @@ pub struct Connection {
     next_id: u64,
     /// Messages received while waiting for a reply, in arrival order.
     queued: MessageQueue,
+    /// Command IDs abandoned after fail-fast dialog dismissal whose late replies are dropped.
+    ignored_reply_ids: Vec<u64>,
 }
 
 /// Result of evaluating a script that returns either a DOM node handle or a JSON value.
@@ -246,6 +303,7 @@ impl Connection {
             socket,
             next_id: 1,
             queued: MessageQueue::new(),
+            ignored_reply_ids: Vec::new(),
         })
     }
 
@@ -274,38 +332,69 @@ impl Connection {
         params: Value,
         session_id: Option<&str>,
         deadline: Deadline,
-        mut should_abort: F,
+        should_abort: F,
     ) -> Result<Value, CdpError>
     where
         F: FnMut(&Value) -> bool,
     {
-        if self.queued.any(&mut should_abort) {
-            return Err(CdpError::Aborted {
-                waiting_for: method.to_string(),
-            });
-        }
+        self.call_until_with_dialog(method, params, session_id, deadline, should_abort, None)
+    }
+
+    /// Sends one command and returns its `result`, watching for terminal events
+    /// and optional `Page.javascriptDialogOpening` events on the page session.
+    pub fn call_until_with_dialog<F>(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        deadline: Deadline,
+        mut should_abort: F,
+        mut dialog: Option<DialogWatch<'_>>,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        self.drain_queued_control(&mut should_abort, dialog.as_mut(), method, None, deadline)?;
         let id = self.next_id;
         self.next_id += 1;
         self.write(method, id, params, session_id)?;
 
         loop {
+            self.drain_queued_control(
+                &mut should_abort,
+                dialog.as_mut(),
+                method,
+                Some(id),
+                deadline,
+            )?;
             let message = self.read(method, deadline)?;
             if message.get("id").and_then(Value::as_u64) == Some(id) {
-                if let Some(error) = message.get("error") {
-                    return Err(CdpError::Method {
-                        method: method.to_string(),
-                        message: describe_error(error),
-                    });
-                }
-                return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+                return command_result(method, &message);
             }
-            let abort = should_abort(&message);
-            self.queued.push(message);
-            if abort {
+            if should_abort(&message) {
+                self.queued.push(message);
+                self.ignored_reply_ids.push(id);
                 return Err(CdpError::Aborted {
                     waiting_for: method.to_string(),
                 });
             }
+            if let Some(watch) = dialog.as_mut()
+                && is_dialog_opening_for(&message, watch.session_id)
+            {
+                let (opened, outer_reply) =
+                    self.respond_to_dialog(&message, watch, Some(id), deadline, &mut should_abort)?;
+                if matches!(watch.policy, DialogPolicy::FailFast) {
+                    if outer_reply.is_none() {
+                        self.ignored_reply_ids.push(id);
+                    }
+                    return Err(CdpError::Dialog(opened));
+                }
+                if let Some(reply) = outer_reply {
+                    return command_result(method, &reply);
+                }
+                continue;
+            }
+            self.queued.push(message);
         }
     }
 
@@ -321,11 +410,12 @@ impl Connection {
         expression: &str,
         deadline: Deadline,
         should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
     ) -> Result<Value, CdpError>
     where
         F: FnMut(&Value) -> bool,
     {
-        let reply = self.call_until(
+        let reply = self.call_until_with_dialog(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
@@ -335,6 +425,7 @@ impl Connection {
             Some(session_id),
             deadline,
             should_abort,
+            dialog,
         )?;
         if let Some(details) = reply.get("exceptionDetails") {
             return Err(CdpError::Script(exception_message(details)));
@@ -359,30 +450,19 @@ impl Connection {
         function: &str,
         deadline: Deadline,
         should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
     ) -> Result<Value, CdpError>
     where
         F: FnMut(&Value) -> bool,
     {
-        let reply = self.call_until(
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": object_id,
-                "functionDeclaration": function,
-                "returnByValue": true,
-                "awaitPromise": false,
-            }),
-            Some(session_id),
+        self.call_function_value(
+            session_id,
+            (object_id, None),
+            function,
             deadline,
             should_abort,
-        )?;
-        if let Some(details) = reply.get("exceptionDetails") {
-            return Err(CdpError::Script(exception_message(details)));
-        }
-        Ok(reply
-            .get("result")
-            .and_then(|result| result.get("value"))
-            .cloned()
-            .unwrap_or(Value::Null))
+            dialog,
+        )
     }
 
     /// Evaluates a JavaScript expression and returns either a remote `objectId`
@@ -393,11 +473,12 @@ impl Connection {
         expression: &str,
         deadline: Deadline,
         should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
     ) -> Result<RemoteResult, CdpError>
     where
         F: FnMut(&Value) -> bool,
     {
-        let reply = self.call_until(
+        let reply = self.call_until_with_dialog(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
@@ -407,6 +488,7 @@ impl Connection {
             Some(session_id),
             deadline,
             should_abort,
+            dialog,
         )?;
         parse_remote_result(&reply)
     }
@@ -420,11 +502,12 @@ impl Connection {
         function: &str,
         deadline: Deadline,
         should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
     ) -> Result<RemoteResult, CdpError>
     where
         F: FnMut(&Value) -> bool,
     {
-        let reply = self.call_until(
+        let reply = self.call_until_with_dialog(
             "Runtime.callFunctionOn",
             json!({
                 "objectId": object_id,
@@ -435,35 +518,62 @@ impl Connection {
             Some(session_id),
             deadline,
             should_abort,
+            dialog,
         )?;
         parse_remote_result(&reply)
     }
 
-    /// Calls a JavaScript function with `this` and one `objectId` argument, returning a value.
+    /// Calls a JavaScript function with `this` and one `objectId` argument (`(this_id, arg_id)`), returning a value.
     pub fn call_function_with_object<F>(
         &mut self,
         session_id: &str,
-        object_id: &str,
-        arg_object_id: &str,
+        targets: (&str, &str),
         function: &str,
         deadline: Deadline,
         should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
     ) -> Result<Value, CdpError>
     where
         F: FnMut(&Value) -> bool,
     {
-        let reply = self.call_until(
+        self.call_function_value(
+            session_id,
+            (targets.0, Some(targets.1)),
+            function,
+            deadline,
+            should_abort,
+            dialog,
+        )
+    }
+
+    fn call_function_value<F>(
+        &mut self,
+        session_id: &str,
+        targets: (&str, Option<&str>),
+        function: &str,
+        deadline: Deadline,
+        should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let mut params = json!({
+            "objectId": targets.0,
+            "functionDeclaration": function,
+            "returnByValue": true,
+            "awaitPromise": false,
+        });
+        if let Some(arg_id) = targets.1 {
+            params["arguments"] = json!([{ "objectId": arg_id }]);
+        }
+        let reply = self.call_until_with_dialog(
             "Runtime.callFunctionOn",
-            json!({
-                "objectId": object_id,
-                "arguments": [{ "objectId": arg_object_id }],
-                "functionDeclaration": function,
-                "returnByValue": true,
-                "awaitPromise": false,
-            }),
+            params,
             Some(session_id),
             deadline,
             should_abort,
+            dialog,
         )?;
         if let Some(details) = reply.get("exceptionDetails") {
             return Err(CdpError::Script(exception_message(details)));
@@ -480,32 +590,53 @@ impl Connection {
     /// `should_abort` receives every event that arrives before `method` does, so
     /// a caller can end the wait as soon as the page dies. A matching event stays
     /// in the queue so callers can inspect it for diagnostics.
+    #[cfg(test)]
     pub fn wait_for_event_until<F>(
         &mut self,
         method: &str,
         deadline: Deadline,
+        should_abort: F,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        self.wait_for_event_with_dialog(method, deadline, should_abort, None)
+    }
+
+    /// Waits for one event, watching for terminal events and page-session dialogs.
+    pub fn wait_for_event_with_dialog<F>(
+        &mut self,
+        method: &str,
+        deadline: Deadline,
         mut should_abort: F,
+        mut dialog: Option<DialogWatch<'_>>,
     ) -> Result<Value, CdpError>
     where
         F: FnMut(&Value) -> bool,
     {
         loop {
+            self.drain_queued_control(&mut should_abort, dialog.as_mut(), method, None, deadline)?;
             if let Some(event) = self.queued.take(method) {
                 return Ok(event);
             }
-            if self.queued.any(&mut should_abort) {
-                return Err(CdpError::Aborted {
-                    waiting_for: method.to_string(),
-                });
-            }
             let message = self.read(method, deadline)?;
-            let abort = should_abort(&message);
-            self.queued.push(message);
-            if abort {
+            if should_abort(&message) {
+                self.queued.push(message);
                 return Err(CdpError::Aborted {
                     waiting_for: method.to_string(),
                 });
             }
+            if let Some(watch) = dialog.as_mut()
+                && is_dialog_opening_for(&message, watch.session_id)
+            {
+                let (opened, _) =
+                    self.respond_to_dialog(&message, watch, None, deadline, &mut should_abort)?;
+                if matches!(watch.policy, DialogPolicy::FailFast) {
+                    return Err(CdpError::Dialog(opened));
+                }
+                continue;
+            }
+            self.queued.push(message);
         }
     }
 
@@ -567,7 +698,9 @@ impl Connection {
             match self.socket.read() {
                 Ok(Message::Text(text)) => {
                     let value = parse_message(text.as_str())?;
-                    self.queued.push(value);
+                    if !self.take_ignored_reply(&value) {
+                        self.queued.push(value);
+                    }
                 }
                 // Pings are answered by tungstenite on the next read or write,
                 // and binary frames are not part of CDP.
@@ -624,7 +757,13 @@ impl Connection {
                 });
             }
             match self.socket.read() {
-                Ok(Message::Text(text)) => return parse_message(text.as_str()),
+                Ok(Message::Text(text)) => {
+                    let value = parse_message(text.as_str())?;
+                    if self.take_ignored_reply(&value) {
+                        continue;
+                    }
+                    return Ok(value);
+                }
                 // Pings are answered by tungstenite on the next read or write,
                 // and binary frames are not part of CDP.
                 Ok(Message::Binary(_)) | Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
@@ -648,6 +787,189 @@ impl Connection {
             }
         }
     }
+
+    /// Consumes a late reply belonging to an abandoned command.
+    fn take_ignored_reply(&mut self, message: &Value) -> bool {
+        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            return false;
+        };
+        if let Some(pos) = self
+            .ignored_reply_ids
+            .iter()
+            .position(|ignored| *ignored == id)
+        {
+            self.ignored_reply_ids.swap_remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Processes already-queued abort or dialog-opening events before continuing a wait.
+    fn drain_queued_control<F>(
+        &mut self,
+        should_abort: &mut F,
+        mut dialog: Option<&mut DialogWatch<'_>>,
+        waiting_for: &str,
+        outer_id: Option<u64>,
+        deadline: Deadline,
+    ) -> Result<(), CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        loop {
+            if self.queued.any(&mut *should_abort) {
+                if let Some(id) = outer_id {
+                    self.ignored_reply_ids.push(id);
+                }
+                return Err(CdpError::Aborted {
+                    waiting_for: waiting_for.to_string(),
+                });
+            }
+            let Some(watch) = dialog.as_deref_mut() else {
+                return Ok(());
+            };
+            let session_id = watch.session_id;
+            let Some(event) = self
+                .queued
+                .take_where(|message| is_dialog_opening_for(message, session_id))
+            else {
+                return Ok(());
+            };
+            let (opened, _) =
+                self.respond_to_dialog(&event, watch, outer_id, deadline, should_abort)?;
+            if matches!(watch.policy, DialogPolicy::FailFast) {
+                if let Some(id) = outer_id {
+                    self.ignored_reply_ids.push(id);
+                }
+                return Err(CdpError::Dialog(opened));
+            }
+        }
+    }
+
+    /// Sends `Page.handleJavaScriptDialog` for `event` and waits for its acknowledgment.
+    fn respond_to_dialog<F>(
+        &mut self,
+        event: &Value,
+        watch: &mut DialogWatch<'_>,
+        outer_id: Option<u64>,
+        deadline: Deadline,
+        should_abort: &mut F,
+    ) -> Result<(OpenedDialog, Option<Value>), CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let params = event.get("params").unwrap_or(&Value::Null);
+        let dialog_type = params
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("alert")
+            .to_string();
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let (accept, prompt_text) = match watch.policy {
+            DialogPolicy::FailFast => (false, None),
+            DialogPolicy::Handle {
+                accept,
+                prompt_text,
+            } => (*accept, prompt_text.as_deref()),
+        };
+
+        let mut handle_params = json!({ "accept": accept });
+        if accept && let Some(text) = prompt_text {
+            handle_params["promptText"] = json!(text);
+        }
+        let handle_id = self.next_id;
+        self.next_id += 1;
+        if let Err(error) = self.write(
+            "Page.handleJavaScriptDialog",
+            handle_id,
+            handle_params,
+            Some(watch.session_id),
+        ) {
+            if let Some(id) = outer_id {
+                self.ignored_reply_ids.push(id);
+            }
+            return Err(error);
+        }
+
+        let handle_deadline = match watch.policy {
+            DialogPolicy::FailFast => Deadline::after(DIALOG_HANDLE_TIMEOUT),
+            DialogPolicy::Handle { .. } => deadline.capped(DIALOG_HANDLE_TIMEOUT),
+        };
+        let mut outer_reply = None;
+        loop {
+            let reply = match self.read("Page.handleJavaScriptDialog", handle_deadline) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    if outer_reply.is_none()
+                        && let Some(id) = outer_id
+                    {
+                        self.ignored_reply_ids.push(id);
+                    }
+                    return Err(error);
+                }
+            };
+            if reply.get("id").and_then(Value::as_u64) == Some(handle_id) {
+                if let Some(error) = reply.get("error") {
+                    if outer_reply.is_none()
+                        && let Some(id) = outer_id
+                    {
+                        self.ignored_reply_ids.push(id);
+                    }
+                    return Err(CdpError::Method {
+                        method: "Page.handleJavaScriptDialog".to_string(),
+                        message: describe_error(error),
+                    });
+                }
+                let opened = OpenedDialog {
+                    dialog_type,
+                    message,
+                    accepted: accept,
+                };
+                *watch.opened = Some(opened.clone());
+                return Ok((opened, outer_reply));
+            }
+            if let Some(id) = outer_id
+                && reply.get("id").and_then(Value::as_u64) == Some(id)
+            {
+                outer_reply = Some(reply);
+                continue;
+            }
+            let abort = should_abort(&reply);
+            self.queued.push(reply);
+            if abort {
+                if outer_reply.is_none()
+                    && let Some(id) = outer_id
+                {
+                    self.ignored_reply_ids.push(id);
+                }
+                return Err(CdpError::Aborted {
+                    waiting_for: "Page.handleJavaScriptDialog".to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Reports whether `message` is a `Page.javascriptDialogOpening` event for `session_id`.
+pub fn is_dialog_opening_for(message: &Value, session_id: &str) -> bool {
+    message.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening")
+        && message.get("sessionId").and_then(Value::as_str) == Some(session_id)
+}
+
+/// Extracts the `result` or `error` from one CDP command reply.
+fn command_result(method: &str, message: &Value) -> Result<Value, CdpError> {
+    if let Some(error) = message.get("error") {
+        return Err(CdpError::Method {
+            method: method.to_string(),
+            message: describe_error(error),
+        });
+    }
+    Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
 
 /// Reports whether a socket read error means no data arrived before the poll
@@ -1287,6 +1609,209 @@ mod tests {
             )
             .expect("subsequent call must succeed on the same stream");
         assert_eq!(second["next"], json!(true));
+
+        drop(conn);
+        server.join().expect("server finish");
+    }
+
+    #[test]
+    fn call_until_with_dialog_fail_fast_dismisses_and_drops_late_outer_reply() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock CDP");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut socket = tungstenite::accept(stream).expect("handshake");
+
+            let click = match socket.read().expect("click cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(click["method"], "Input.dispatchMouseEvent");
+            socket
+                .send(Message::text(
+                    json!({
+                        "method": "Page.javascriptDialogOpening",
+                        "sessionId": "session-1",
+                        "params": { "type": "alert", "message": "boom" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send dialog opening");
+
+            let handle = match socket.read().expect("handle dialog cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+            assert_eq!(handle["sessionId"], "session-1");
+            assert_eq!(handle["params"]["accept"], false);
+            socket
+                .send(Message::text(
+                    json!({ "id": handle["id"], "result": {} }).to_string(),
+                ))
+                .expect("reply handleJavaScriptDialog");
+
+            // Simulate the outer command finishing slightly after FailFast already returned.
+            thread::sleep(Duration::from_millis(20));
+            socket
+                .send(Message::text(
+                    json!({ "id": click["id"], "result": {} }).to_string(),
+                ))
+                .expect("send late click reply");
+
+            let next = match socket.read().expect("next cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(next["method"], "Runtime.evaluate");
+            socket
+                .send(Message::text(
+                    json!({ "id": next["id"], "result": { "result": { "value": "ok" } } })
+                        .to_string(),
+                ))
+                .expect("send next reply");
+            while socket.read().is_ok() {}
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/test");
+        let mut conn =
+            Connection::connect(&url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let policy = DialogPolicy::FailFast;
+        let mut opened = None;
+        let started = Instant::now();
+        let err = conn
+            .call_until_with_dialog(
+                "Input.dispatchMouseEvent",
+                json!({}),
+                Some("session-1"),
+                Deadline::after(Duration::from_secs(5)),
+                |_| false,
+                Some(DialogWatch {
+                    session_id: "session-1",
+                    policy: &policy,
+                    opened: &mut opened,
+                }),
+            )
+            .expect_err("unhandled dialog must fail fast");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        match err {
+            CdpError::Dialog(dialog) => {
+                assert_eq!(dialog.dialog_type, "alert");
+                assert_eq!(dialog.message, "boom");
+                assert!(!dialog.accepted);
+            }
+            other => panic!("expected CdpError::Dialog, got {other:?}"),
+        }
+
+        let eval = conn
+            .evaluate(
+                "session-1",
+                "'ok'",
+                Deadline::after(Duration::from_secs(2)),
+                |_| false,
+                None,
+            )
+            .expect("subsequent evaluate must succeed");
+        assert_eq!(eval, json!("ok"));
+        assert!(
+            conn.take_messages().is_empty(),
+            "late abandoned reply must be dropped instead of queued"
+        );
+
+        drop(conn);
+        server.join().expect("server finish");
+    }
+
+    #[test]
+    fn call_until_with_dialog_handle_captures_early_outer_reply_before_dialog_ack() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock CDP");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut socket = tungstenite::accept(stream).expect("handshake");
+
+            let click = match socket.read().expect("click cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            // Unrelated session dialog must be ignored; session-1 dialog must be handled.
+            socket
+                .send(Message::text(
+                    json!({
+                        "method": "Page.javascriptDialogOpening",
+                        "sessionId": "other-session",
+                        "params": { "type": "alert", "message": "ignore me" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send other-session dialog");
+            socket
+                .send(Message::text(
+                    json!({
+                        "method": "Page.javascriptDialogOpening",
+                        "sessionId": "session-1",
+                        "params": { "type": "prompt", "message": "Enter token" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send session-1 dialog");
+
+            let handle = match socket.read().expect("handle dialog cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+            assert_eq!(handle["params"]["accept"], true);
+            assert_eq!(handle["params"]["promptText"], "secret-42");
+
+            // Reply to the outer command BEFORE replying to handleJavaScriptDialog.
+            socket
+                .send(Message::text(
+                    json!({ "id": click["id"], "result": { "done": true } }).to_string(),
+                ))
+                .expect("reply outer cmd first");
+            socket
+                .send(Message::text(
+                    json!({ "id": handle["id"], "result": {} }).to_string(),
+                ))
+                .expect("reply handleJavaScriptDialog second");
+            while socket.read().is_ok() {}
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/test");
+        let mut conn =
+            Connection::connect(&url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let policy = DialogPolicy::Handle {
+            accept: true,
+            prompt_text: Some("secret-42".to_string()),
+        };
+        let mut opened = None;
+        let result = conn
+            .call_until_with_dialog(
+                "Input.dispatchMouseEvent",
+                json!({}),
+                Some("session-1"),
+                Deadline::after(Duration::from_secs(2)),
+                |_| false,
+                Some(DialogWatch {
+                    session_id: "session-1",
+                    policy: &policy,
+                    opened: &mut opened,
+                }),
+            )
+            .expect("handled dialog must return outer command result");
+        assert_eq!(result["done"], json!(true));
+        assert_eq!(
+            opened,
+            Some(OpenedDialog {
+                dialog_type: "prompt".to_string(),
+                message: "Enter token".to_string(),
+                accepted: true,
+            })
+        );
+        let remaining = conn.take_messages();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["sessionId"], "other-session");
 
         drop(conn);
         server.join().expect("server finish");

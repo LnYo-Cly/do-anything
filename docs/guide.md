@@ -1142,11 +1142,11 @@ the user's browser keeps running and the user's other tabs are untouched.
 
 | Step | Arguments | Result |
 | --- | --- | --- |
-| `browser.open` | `url` required; optional `connect`, `testid_attribute` (defaults to `data-testid`); `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title` |
-| `browser.click` | locator | `{}`, or the clicked element's `text` when it has one |
-| `browser.type` | locator; `text` required unless `value` is given | `{}` |
-| `browser.press` | `key` required, for example `Enter` or `Tab` | `{}` |
-| `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000 | `url` |
+| `browser.open` | `url` required; optional `connect`, `testid_attribute` (defaults to `data-testid`), `dialog`; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title`; `dialog` when one opened |
+| `browser.click` | locator; optional `dialog` | `{}`, or the clicked element's `text` when it has one; `dialog` when one opened |
+| `browser.type` | locator; `text` required unless `value` is given; optional `dialog` | `{}`; `dialog` when one opened |
+| `browser.press` | `key` required, for example `Enter` or `Tab`; optional `dialog` | `{}`; `dialog` when one opened |
+| `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000; optional `dialog` | `url`; `dialog` when one opened |
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
 | `browser.screenshot` | `path` required | `path`, `bytes` |
 
@@ -1284,6 +1284,58 @@ the page. A later `browser.open` that gives a different effective value is a ste
 error instead of being silently ignored, so one case cannot change the browser it
 is driving halfway through. `timeout_ms` applies to each navigation, so a later
 `browser.open` may choose a different value.
+
+#### JavaScript dialogs (`alert`, `confirm`, `prompt`, `beforeunload`)
+
+By default, an unexpected browser dialog never waits out `timeout_ms`: as soon as
+Chrome opens an `alert`, `confirm`, `prompt` or `beforeunload` dialog, the step
+immediately dismisses it (`Page.handleJavaScriptDialog` with `accept: false`) to
+keep the page responsive for failure evidence, subsequent steps and session
+close, and fails at once as an execution error (exit 1) whose message names the
+dialog `type` and its `message` (redacted like any other step output when it
+contains a `${env:...}` secret).
+
+To handle an expected dialog instead, set `dialog` on `browser.open`,
+`browser.click`, `browser.type`, `browser.press` or `browser.wait`:
+
+- `dialog: accept` or `dialog: dismiss` — accepts or cancels the dialog.
+- `dialog: { action: accept, prompt_text: "..." }` or
+  `dialog: { action: dismiss }` — specifies the action and, when accepting a
+  `prompt`, the text to submit (`prompt_text`).
+
+When a step with `dialog` configured handles a dialog, it succeeds and includes
+`dialog` in its JSON result (`{ "type": ..., "message": ..., "accepted": ... }`),
+so `expect` can assert the dialog kind, text and decision. Dismissing a
+`beforeunload` dialog on `browser.open` keeps the browser on the current page.
+
+```yaml
+name: Confirm deletion and enter a prompt value
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/items
+  - browser.click:
+      role: button
+      name: Delete item
+      dialog: accept
+    expect:
+      - path: $.dialog.type
+        equals: confirm
+      - path: $.dialog.message
+        contains: Delete
+      - path: $.dialog.accepted
+        equals: true
+  - browser.click:
+      role: button
+      name: Rename item
+      dialog:
+        action: accept
+        prompt_text: updated-name
+    expect:
+      - path: $.dialog.type
+        equals: prompt
+      - path: $.dialog.accepted
+        equals: true
+```
 
 #### Connecting to a browser that is already open
 

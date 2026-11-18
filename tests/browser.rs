@@ -3166,7 +3166,7 @@ fn unsupported_capabilities_probe_current_behavior() {
         "unexpected new-tab probe error: {new_tab_err}"
     );
 
-    // 4. dialog (window.alert blocks Input.dispatchMouseEvent until timeout)
+    // 4. dialog (window.alert fails fast with dialog type and message instead of waiting for timeout)
     let dialog_case = dir.write(
         "probe-dialog.yaml",
         &format!(
@@ -3192,9 +3192,17 @@ fn unsupported_capabilities_probe_current_behavior() {
         stderr(&dialog_out)
     );
     let dialog_json = json_stdout(&dialog_out);
+    let dialog_step_ms = dialog_json["cases"][0]["steps"][1]["duration_ms"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    assert!(
+        dialog_step_ms < 3000,
+        "unhandled dialog must fail fast instead of waiting 5000 ms (step took {dialog_step_ms} ms): {}",
+        stdout(&dialog_out)
+    );
     let dialog_err = case_error(&dialog_json);
     assert!(
-        dialog_err.contains("Input.dispatchMouseEvent") && dialog_err.contains("did not answer"),
+        dialog_err.contains("alert") && dialog_err.contains("probe alert"),
         "unexpected dialog probe error: {dialog_err}"
     );
 
@@ -3742,5 +3750,477 @@ fn connect_click_aborts_on_target_death_and_reports_diagnostics() {
     assert!(
         message.contains("Target.targetCrashed") && message.contains("target crashed"),
         "expected crash diagnostic in the click error, got: {message}"
+    );
+}
+
+#[test]
+fn unhandled_dialog_fails_fast_and_does_not_block_evidence_or_next_steps() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-unhandled-dialog");
+    let bundles = dir.path().join("failures");
+    let case = dir.write(
+        "unhandled-dialog.yaml",
+        &format!(
+            r##"name: unhandled dialog fails fast
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#btn-alert"
+      timeout_ms: 10000
+"##,
+            server.url("/browser/dialogs")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    let step_ms = report["cases"][0]["steps"][1]["duration_ms"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    assert!(
+        step_ms < 3000,
+        "unhandled alert must fail fast instead of waiting for 10000 ms timeout (step={step_ms} ms): {}",
+        stdout(&output)
+    );
+    let err = case_error(&report);
+    assert!(
+        err.contains("alert") && err.contains("unexpected warning"),
+        "error must name dialog type and message: {err}"
+    );
+
+    let bundle = PathBuf::from(
+        report["cases"][0]["bundle"]
+            .as_str()
+            .expect("failed case must write failure bundle without hanging"),
+    );
+    let png = fs::read(bundle.join("browser/screenshot.png"))
+        .expect("screenshot evidence must still be collected after unhandled dialog");
+    assert!(is_png(&png), "screenshot must be a valid PNG");
+    let dom = fs::read_to_string(bundle.join("browser/dom.html"))
+        .expect("DOM snapshot must still be collected after unhandled dialog");
+    assert!(dom.contains("id=\"btn-alert\""), "{dom}");
+
+    // An optional step hitting an unhandled dialog must leave the page responsive for later steps.
+    let continued = dir.write(
+        "unhandled-optional-dialog.yaml",
+        &format!(
+            r##"name: optional unhandled dialog leaves page responsive
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#btn-alert"
+      timeout_ms: 10000
+    optional: true
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "alert-done"
+"##,
+            server.url("/browser/dialogs")
+        ),
+    );
+    let cont_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&continued),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&cont_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&cont_out),
+        stderr(&cont_out)
+    );
+}
+
+#[test]
+fn dialog_option_handles_alert_confirm_and_prompt() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-handled-dialogs");
+    let case = dir.write(
+        "handled-dialogs.yaml",
+        &format!(
+            r##"name: handle alert confirm and prompt
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#btn-alert"
+      dialog: accept
+    expect:
+      - path: $.dialog.type
+        equals: alert
+      - path: $.dialog.message
+        equals: "unexpected warning"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "alert-done"
+  - browser.click:
+      css: "#btn-confirm"
+      dialog: accept
+    expect:
+      - path: $.dialog.type
+        equals: confirm
+      - path: $.dialog.message
+        equals: "Proceed with delete?"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "confirmed"
+  - browser.click:
+      css: "#btn-confirm"
+      dialog: dismiss
+    expect:
+      - path: $.dialog.type
+        equals: confirm
+      - path: $.dialog.message
+        equals: "Proceed with delete?"
+      - path: $.dialog.accepted
+        equals: false
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "cancelled"
+  - browser.click:
+      css: "#btn-prompt"
+      dialog:
+        action: accept
+        prompt_text: "custom-token"
+    expect:
+      - path: $.dialog.type
+        equals: prompt
+      - path: $.dialog.message
+        equals: "Enter token"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "prompt:custom-token"
+  - browser.click:
+      css: "#btn-prompt"
+      dialog:
+        action: dismiss
+    expect:
+      - path: $.dialog.type
+        equals: prompt
+      - path: $.dialog.accepted
+        equals: false
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "prompt-cancelled"
+"##,
+            server.url("/browser/dialogs")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["status"], "passed", "{report}");
+}
+
+#[test]
+fn dialog_option_works_on_open_type_press_and_beforeunload() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-step-dialogs");
+    let case = dir.write(
+        "step-dialogs.yaml",
+        &format!(
+            r##"name: dialogs across open type press and beforeunload
+steps:
+  - browser.open:
+      url: "{}"
+      dialog: accept
+    expect:
+      - path: $.dialog.type
+        equals: alert
+      - path: $.dialog.message
+        equals: "load alert"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#loaded"
+    expect:
+      - path: $.text
+        equals: "ready"
+  - browser.open:
+      url: "{}"
+  - browser.type:
+      css: "#type-dialog"
+      text: "go"
+      dialog: dismiss
+    expect:
+      - path: $.dialog.type
+        equals: confirm
+      - path: $.dialog.message
+        equals: "Type confirm?"
+      - path: $.dialog.accepted
+        equals: false
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "type-cancelled"
+  - browser.type:
+      css: "#press-input"
+      text: "x"
+  - browser.press:
+      key: Enter
+      dialog: accept
+    expect:
+      - path: $.dialog.type
+        equals: alert
+      - path: $.dialog.message
+        equals: "press alert"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "press-done"
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#arm-leave"
+  - browser.open:
+      url: "{}"
+      dialog: dismiss
+    expect:
+      - path: $.url
+        contains: "/browser/dialogs/beforeunload"
+      - path: $.dialog.type
+        equals: beforeunload
+      - path: $.dialog.accepted
+        equals: false
+  - browser.open:
+      url: "{}"
+      dialog: accept
+    expect:
+      - path: $.url
+        contains: "/browser/dialogs/left"
+      - path: $.dialog.type
+        equals: beforeunload
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#left-status"
+    expect:
+      - path: $.text
+        equals: "left"
+"##,
+            server.url("/browser/dialogs/onload"),
+            server.url("/browser/dialogs"),
+            server.url("/browser/dialogs/beforeunload"),
+            server.url("/browser/dialogs/left"),
+            server.url("/browser/dialogs/left"),
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["status"], "passed", "{report}");
+}
+
+#[test]
+fn dialog_messages_and_prompt_text_redact_env_secrets() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let secret = "s3cr3t-dialog-token-987";
+    let dir = TempDir::new("browser-dialog-secrets");
+    let bundles = dir.path().join("failures");
+
+    // 1. Unhandled dialog error message and failure bundle redact the secret.
+    let unhandled_case = dir.write(
+        "unhandled-secret-dialog.yaml",
+        &format!(
+            r##"name: unhandled secret dialog
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.type:
+      css: "#secret-input"
+      text: "${{env:DA_DIALOG_SECRET}}"
+  - browser.click:
+      css: "#btn-secret-alert"
+      timeout_ms: 10000
+"##,
+            server.url("/browser/dialogs")
+        ),
+    );
+    let unhandled_out = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&unhandled_case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_DIALOG_SECRET", secret.to_string())],
+    );
+    assert_eq!(
+        exit_code(&unhandled_out),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&unhandled_out),
+        stderr(&unhandled_out)
+    );
+    let unhandled_stdout = stdout(&unhandled_out);
+    let unhandled_stderr = stderr(&unhandled_out);
+    assert!(
+        !unhandled_stdout.contains(secret) && !unhandled_stderr.contains(secret),
+        "unhandled dialog output leaked secret:\nstdout={unhandled_stdout}\nstderr={unhandled_stderr}"
+    );
+    assert!(
+        unhandled_stdout.contains("secret=***"),
+        "expected redacted dialog message in JSON output: {unhandled_stdout}"
+    );
+    let unhandled_json = json_stdout(&unhandled_out);
+    let bundle = PathBuf::from(
+        unhandled_json["cases"][0]["bundle"]
+            .as_str()
+            .expect("must write bundle"),
+    );
+    let bundle_report =
+        fs::read_to_string(bundle.join("report.json")).expect("bundle report.json must exist");
+    assert!(
+        !bundle_report.contains(secret) && bundle_report.contains("secret=***"),
+        "bundle report leaked or missed redaction: {bundle_report}"
+    );
+
+    // 2. Handled dialog result redacts secret in dialog.message.
+    let handled_case = dir.write(
+        "handled-secret-dialog.yaml",
+        &format!(
+            r##"name: handled secret dialog
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.type:
+      css: "#secret-input"
+      text: "${{env:DA_DIALOG_SECRET}}"
+  - browser.click:
+      css: "#btn-secret-confirm"
+      dialog: accept
+    expect:
+      - path: $.dialog.type
+        equals: confirm
+      - path: $.dialog.message
+        equals: "confirm={secret}"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.click:
+      css: "#btn-prompt"
+      dialog:
+        action: accept
+        prompt_text: "${{env:DA_DIALOG_SECRET}}"
+    expect:
+      - path: $.dialog.type
+        equals: prompt
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "prompt:{secret}"
+"##,
+            server.url("/browser/dialogs")
+        ),
+    );
+    let handled_out = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&handled_case),
+            "--no-bundle",
+        ],
+        &[("DA_DIALOG_SECRET", secret.to_string())],
+    );
+    assert_eq!(
+        exit_code(&handled_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&handled_out),
+        stderr(&handled_out)
+    );
+    let handled_stdout = stdout(&handled_out);
+    assert!(
+        !handled_stdout.contains(secret)
+            && handled_stdout.contains("confirm=***")
+            && handled_stdout.contains("prompt:***"),
+        "handled dialog result leaked or missed redaction: {handled_stdout}"
     );
 }

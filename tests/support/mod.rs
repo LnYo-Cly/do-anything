@@ -390,6 +390,15 @@ fn route(
             "<!doctype html><html><head><title>New Tab Target</title></head><body><p id=\"new-tab-marker\">Opened</p></body></html>",
         ),
         (_, "/browser/probe/dialog") => html_response("200 OK", browser_probe_dialog()),
+        (_, "/browser/dialogs") => html_response("200 OK", browser_dialogs()),
+        (_, "/browser/dialogs/onload") => html_response("200 OK", browser_dialogs_onload()),
+        (_, "/browser/dialogs/beforeunload") => {
+            html_response("200 OK", browser_dialogs_beforeunload())
+        }
+        (_, "/browser/dialogs/left") => html_response(
+            "200 OK",
+            "<!doctype html><html><head><title>Left Page</title></head><body><p id=\"left-status\">left</p></body></html>",
+        ),
         (_, "/browser/probe/upload") => html_response("200 OK", browser_probe_upload()),
         (_, "/browser/probe/coords") => html_response("200 OK", browser_probe_coords()),
         (_, "/browser/record") => html_response("200 OK", &browser_record(query)),
@@ -954,6 +963,56 @@ fn browser_probe_dialog() -> &'static str {
 <button id="trigger-alert" type="button"
   onclick="window.alert('probe alert'); document.getElementById('dialog-status').textContent = 'after-alert';">Alert</button>
 <p id="dialog-status">before-alert</p>
+</body></html>"#
+}
+
+fn browser_dialogs() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Dialogs</title></head>
+<body>
+<button id="btn-alert" type="button"
+  onclick="window.alert('unexpected warning'); document.getElementById('status').textContent = 'alert-done';">Alert</button>
+<button id="btn-confirm" type="button"
+  onclick="document.getElementById('status').textContent = window.confirm('Proceed with delete?') ? 'confirmed' : 'cancelled';">Confirm</button>
+<button id="btn-prompt" type="button"
+  onclick="var v = window.prompt('Enter token', 'default'); document.getElementById('status').textContent = v === null ? 'prompt-cancelled' : 'prompt:' + v;">Prompt</button>
+<input id="type-dialog" type="text"
+  oninput="if (this.value === 'go') { document.getElementById('status').textContent = window.confirm('Type confirm?') ? 'type-confirmed' : 'type-cancelled'; }">
+<input id="press-input" type="text"
+  onkeydown="if (event.key === 'Enter') { window.alert('press alert'); document.getElementById('status').textContent = 'press-done'; }">
+<input id="secret-input" type="text">
+<button id="btn-secret-alert" type="button"
+  onclick="window.alert('secret=' + document.getElementById('secret-input').value);">Secret Alert</button>
+<button id="btn-secret-confirm" type="button"
+  onclick="document.getElementById('status').textContent = window.confirm('confirm=' + document.getElementById('secret-input').value) ? 'secret-confirmed' : 'secret-cancelled';">Secret Confirm</button>
+<p id="status">idle</p>
+</body></html>"#
+}
+
+fn browser_dialogs_onload() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Onload Dialog</title></head>
+<body>
+<script>window.alert('load alert');</script>
+<p id="loaded">ready</p>
+</body></html>"#
+}
+
+fn browser_dialogs_beforeunload() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Beforeunload Dialog</title></head>
+<body>
+<button id="arm-leave" type="button"
+  onclick="document.getElementById('armed').textContent = 'armed';">Arm</button>
+<p id="armed">idle</p>
+<script>
+window.addEventListener('beforeunload', function (e) {
+  if (document.getElementById('armed').textContent === 'armed') {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+</script>
 </body></html>"#
 }
 
