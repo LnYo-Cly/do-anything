@@ -33,6 +33,72 @@ pub struct Rendered {
     pub stderr: String,
 }
 
+/// Counts and size of one rendered HTML report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportSummary {
+    /// Complete case records the report contains.
+    pub cases: usize,
+    /// Cases that passed.
+    pub passed: usize,
+    /// Cases that failed an assertion.
+    pub failed: usize,
+    /// Cases that could not run to completion.
+    pub errored: usize,
+    /// Steps across every case.
+    pub steps: usize,
+    /// Steps that were skipped, including optional steps that did not finish.
+    pub steps_skipped: usize,
+    /// Screenshots embedded as data URIs.
+    pub images_embedded: usize,
+    /// Screenshots left out, with a reason in the report.
+    pub images_omitted: usize,
+    /// Size of the generated HTML in bytes.
+    pub bytes: usize,
+}
+
+/// Renders the result of `da report`.
+pub fn render_report(summary: &ReportSummary, path: &std::path::Path, format: Format) -> Rendered {
+    match format {
+        Format::Json => Rendered {
+            stdout: format!(
+                "{}\n",
+                json!({
+                    "ok": true,
+                    "report": paths::display(path),
+                    "cases": summary.cases,
+                    "passed": summary.passed,
+                    "failed": summary.failed,
+                    "errors": summary.errored,
+                    "steps": summary.steps,
+                    "steps_skipped": summary.steps_skipped,
+                    "images_embedded": summary.images_embedded,
+                    "images_omitted": summary.images_omitted,
+                    "bytes": summary.bytes,
+                })
+            ),
+            stderr: String::new(),
+        },
+        Format::Text => Rendered {
+            stdout: format!(
+                "Report: {}\nCases: {} {} ({} passed, {} failed, {} errors), {} {} ({} skipped); images: {} embedded, {} omitted; {} bytes.\n",
+                paths::display(path),
+                summary.cases,
+                noun(summary.cases, "case", "cases"),
+                summary.passed,
+                summary.failed,
+                summary.errored,
+                summary.steps,
+                noun(summary.steps, "step", "steps"),
+                summary.steps_skipped,
+                summary.images_embedded,
+                summary.images_omitted,
+                summary.bytes,
+            ),
+            stderr: String::new(),
+        },
+    }
+}
+
 /// What `da lint` checked and what it found.
 #[derive(Debug, Clone, Default)]
 pub struct LintReport {

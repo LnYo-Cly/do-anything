@@ -93,6 +93,15 @@ $ echo $?
 
 The failed case says which assertion failed and what the real value was, and its evidence is in `.da/failures/…`. Add `--output json` for a single JSON object instead of text.
 
+To keep evidence for passing cases too and turn the whole run into one file a person can read, record it and render the report:
+
+```sh
+da run cases/ --record evidence/
+da report evidence/                 # writes evidence/report.html
+```
+
+The HTML is self-contained and works offline. `--shareable` leaves every screenshot out, and `-o <file.html>` chooses another output path. See [run records and HTML reports](docs/guide.md#run-records-and-html-reports).
+
 A case talks to a program or service that is already running: `da` never starts, restarts or stops it. [The service under test](docs/guide.md#the-service-under-test) shows the start–run–stop pattern, and [capturing JSON on Windows](docs/guide.md#capturing-json-on-windows) how to save the output without the shell re-encoding it.
 
 ## What you can test today
@@ -123,6 +132,7 @@ An `observe:` block watches another layer with a read-only observer: the built-i
 | A verdict | Exit code `0` passed, `1` failed, `2` usage, `3` invalid case, `4` environment, `5` timeout |
 | Details | `da --output json run …`: one JSON object with every step result and assertion |
 | Evidence after the run | A failure bundle per failed case: `case.yaml`, `report.json`, `meta.json` (written last) |
+| Evidence for every case | `da run --record evidence/` records passed, failed and errored cases; `da report evidence/` renders one offline HTML file |
 | Inputs from outside | `--var name=value` for URLs, tokens and paths |
 | Check a case without running it | `da lint cases/`: the same validation as `da run`, every problem in every file, no step executed |
 | The case format, machine-readable | `da schema`: a JSON Schema with every registered step, also usable by editors |

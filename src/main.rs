@@ -15,6 +15,7 @@ use do_anything::core::schema;
 use do_anything::core::secrets::Secrets;
 use do_anything::drivers;
 use do_anything::exit::ExitCode as DaExitCode;
+use do_anything::report as html_report;
 
 /// An agent-friendly, cross-layer testing tool.
 #[derive(Debug, Parser)]
@@ -81,9 +82,24 @@ enum Command {
         /// Do not write failure bundles.
         #[arg(long)]
         no_bundle: bool,
+        /// Write the evidence of every executed case into this empty directory.
+        #[arg(long, value_name = "DIRECTORY")]
+        record: Option<PathBuf>,
         /// Runs up to N cases at the same time. Defaults to 1.
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_jobs)]
         jobs: usize,
+    },
+    /// Render a recorded evidence directory as one static HTML file.
+    Report {
+        /// Directory written by `da run --record`, or one `.da/failures/<run>`.
+        #[arg(value_name = "DIRECTORY")]
+        directory: PathBuf,
+        /// Write the report here instead of `<directory>/report.html`.
+        #[arg(short = 'o', value_name = "FILE")]
+        output_file: Option<PathBuf>,
+        /// Do not embed screenshots.
+        #[arg(long)]
+        shareable: bool,
     },
     /// Validate case files without running them.
     Lint {
@@ -154,12 +170,18 @@ fn main() -> ExitCode {
             skip_tags,
             bundle_dir,
             no_bundle,
+            record,
             jobs,
         } => {
             let sources = match VarSources::load(&vars_files, &vars) {
                 Ok(sources) => sources,
                 Err(message) => return usage_error(&message),
             };
+            if let Some(directory) = &record
+                && let Err(message) = check_record_directory(directory)
+            {
+                return usage_error(&message);
+            }
             run(
                 cli.output,
                 &registry,
@@ -175,10 +197,16 @@ fn main() -> ExitCode {
                     },
                     bundle_dir,
                     no_bundle,
+                    record,
                     jobs,
                 },
             )
         }
+        Command::Report {
+            directory,
+            output_file,
+            shareable,
+        } => report(cli.output, &directory, output_file, shareable),
         Command::Lint {
             paths,
             vars,
@@ -227,6 +255,39 @@ fn usage_error(message: &str) -> ExitCode {
     DaExitCode::Usage.into()
 }
 
+/// Refuses a record directory that already holds files.
+///
+/// Writing a second run into the same names would leave a mix of two runs, and
+/// deleting the old contents could destroy evidence the user still needs.
+fn check_record_directory(directory: &PathBuf) -> Result<(), String> {
+    match std::fs::metadata(directory) {
+        Ok(metadata) if !metadata.is_dir() => Err(format!(
+            "`{}` is not a directory; choose an empty directory for `--record`",
+            do_anything::core::paths::display(directory)
+        )),
+        Ok(_) => {
+            let mut entries = std::fs::read_dir(directory).map_err(|error| {
+                format!(
+                    "could not read `{}`: {error}",
+                    do_anything::core::paths::display(directory)
+                )
+            })?;
+            if entries.next().is_some() {
+                return Err(format!(
+                    "`{}` is not empty; choose an empty directory for `--record` or remove its contents first",
+                    do_anything::core::paths::display(directory)
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not check `{}`: {error}",
+            do_anything::core::paths::display(directory)
+        )),
+    }
+}
+
 /// Everything one `da run` asked for, as the command line stated it.
 struct RunOptions {
     paths: Vec<PathBuf>,
@@ -234,6 +295,7 @@ struct RunOptions {
     filters: Filters,
     bundle_dir: Option<PathBuf>,
     no_bundle: bool,
+    record: Option<PathBuf>,
     jobs: usize,
 }
 
@@ -247,6 +309,31 @@ fn run(format: OutputFormat, registry: &Registry, options: RunOptions) -> ExitCo
     let _ = write_stdout(&rendered.stdout);
     let _ = write_stderr(&rendered.stderr);
     outcome.exit_code().into()
+}
+
+/// Renders one recorded directory and reports where it was written.
+fn report(
+    format: OutputFormat,
+    directory: &std::path::Path,
+    output_file: Option<PathBuf>,
+    shareable: bool,
+) -> ExitCode {
+    let report = match html_report::build(directory, shareable) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = write_stderr(&format!("error: {}\n", error.message()));
+            return error.exit_code().into();
+        }
+    };
+    let path = output_file.unwrap_or_else(|| directory.join("report.html"));
+    if let Err(error) = report.write(&path) {
+        let _ = write_stderr(&format!("error: {}\n", error.message()));
+        return error.exit_code().into();
+    }
+    let rendered = output::render_report(report.summary(), &path, format.into());
+    let _ = write_stdout(&rendered.stdout);
+    let _ = write_stderr(&rendered.stderr);
+    DaExitCode::Success.into()
 }
 
 fn execute(registry: &Registry, options: &RunOptions, secrets: &mut Secrets) -> RunOutcome {
@@ -265,13 +352,15 @@ fn execute(registry: &Registry, options: &RunOptions, secrets: &mut Secrets) -> 
                 .unwrap_or_else(|| PathBuf::from(bundle::DEFAULT_DIRECTORY)),
         ))
     };
+    let mut record = options.record.clone().map(FailureBundles::record);
 
     let bus = EventBus::new();
-    runner::run(
+    runner::run_with_record(
         &cases,
         registry,
         &bus,
         bundles.as_mut(),
+        record.as_mut(),
         &options.filters,
         secrets,
         options.jobs,

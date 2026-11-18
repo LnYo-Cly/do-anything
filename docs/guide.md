@@ -28,6 +28,7 @@ The complete reference for `da`: installation options, building from source, the
   - [Browser steps](#browser-steps)
   - [`log.file`](#logfile)
 - [Failure bundles](#failure-bundles)
+- [Run records and HTML reports](#run-records-and-html-reports)
 - [Output](#output)
 - [Exit codes](#exit-codes)
 
@@ -145,6 +146,9 @@ da run cases/ --tag smoke --skip-tag slow
 da run cases/ --jobs 4
 da run cases/ --bundle-dir /tmp/da-failures
 da run cases/ --no-bundle
+da run cases/ --record evidence/
+da report evidence/
+da report evidence/ -o evidence.html --shareable
 da --output json run cases/
 da lint cases/
 da lint cases/ --var token=abc
@@ -1567,7 +1571,7 @@ case result and the rest of the bundle are unaffected.
 | `suite` | Suite the case declares, or `null`. |
 | `layer` | Layer the case declares, or `null`. |
 | `tags` | Tags the case declares, or `[]`. |
-| `status` | `failed` or `error`. |
+| `status` | `passed`, `failed` or `error`. A failure bundle contains only the last two; a run record also contains `passed`. |
 | `created_at` | Unix milliseconds. |
 
 `schema_version` stays `1`: the classification fields are an addition to the
@@ -1588,6 +1592,90 @@ error and in the `bundle_errors` list of `--output json`.
 > into a case file, a `--vars-file` or a `--var` value is not: treat a bundle as
 > sensitive and keep its directory out of version control; `.da/` is in this
 > repository's `.gitignore`.
+
+## Run records and HTML reports
+
+A failure bundle exists only after a case does not pass. To keep the same
+evidence for **every** selected case, including the ones that pass, use
+`--record`:
+
+```sh
+da run cases/ --record evidence/
+da report evidence/
+```
+
+`--record <directory>` writes the same per-case layout as a failure bundle,
+directly into the directory you name:
+
+```text
+evidence/
+├── 0-login-returns-a-token/
+│   ├── case.yaml
+│   ├── report.json
+│   ├── browser/
+│   │   ├── screenshot.png
+│   │   └── dom.html
+│   └── meta.json                  written last
+└── 1-a-case-that-failed/
+    └── ...
+```
+
+The directory must be empty or absent. A run record is never mixed with an
+older one, and `da` does not delete a directory it did not create. The runner
+asks every open session for its evidence before closing it, so a passing case
+now has a screenshot and DOM snapshot too. Without `--record`, a passing case
+still takes no screenshot: the zero-overhead rule for ordinary runs is
+unchanged.
+
+`--record` and failure bundles are independent. Failure bundles still go to
+`.da/failures` (or `--bundle-dir`) unless `--no-bundle` is given. A failing case
+can therefore appear in both places, written from the same collected evidence.
+An error while writing either copy is listed in `bundle_errors`, printed on
+standard error, and does not change the run's exit code.
+
+`da report <directory>` reads only complete case directories, meaning a
+directory whose `meta.json` exists. Incomplete staging directories are ignored
+and the cases are ordered by the numeric prefix of their directory names. It
+writes `<directory>/report.html` by default, or the file named by
+`-o <file.html>`, and reports the path and counts on standard output. Use
+`--output json` for one JSON object. A missing directory, or a directory with no
+complete case, is a usage error (exit 2).
+
+The report contains an overview, a step timeline for each case, the assertions
+with their expected and actual values, and side-by-side cards for the observed
+HTTP response, database rows, CLI output, network requests, log lines, DOM
+snapshot and interface screenshot. An optional step that did not reach its
+assertions appears as `SKIPPED` with the reason, is counted in the report's
+skipped total, and does not stop the rest of the case from being recorded. It is
+one static HTML file: CSS is inline,
+there is no front-end framework, no script and no external reference. The
+document carries this policy, so opening it from disk cannot fetch anything:
+
+```html
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+```
+
+Every value from a case, a step result, a DOM snapshot or an assertion is HTML
+escaped, and URL schemes are entity-encoded in the text, so page content cannot
+inject markup or start a request. The renderer reads the already-redacted
+`report.json` and text evidence; it does not read `case.yaml` or expand
+environment variables, so the recording step remains the single place that
+redacts secrets.
+
+Screenshots are embedded as `data:` URIs only when all of these hold:
+
+- the report is not `--shareable`;
+- the case's `meta.json` does not say `"local_only": true`;
+- the image is at most **2 MiB**;
+- the report's total embedded image size stays at or below **10 MiB**.
+
+Otherwise the screenshot is not embedded and its card says exactly why (the
+sharing mode, the `local_only` marker, the single-image limit or the total
+budget). A `--shareable` report therefore contains no `data:image/` at all,
+while it still keeps the DOM text, logs and results. Text evidence can still be
+sensitive: review a report before publishing it, and use the recording
+directory's `.gitignore` rules the same way you would for `.da/failures`.
 
 ## Output
 
@@ -1718,3 +1806,7 @@ Diagnostics never go to standard output.
 
 When several kinds of problem occur in one run, the most fundamental one wins:
 3, then 4, then 5, then 1.
+
+`da report` returns 2 when the record directory is missing, is not a directory,
+or contains no complete case record. It returns 4 when the HTML file cannot be
+written.
