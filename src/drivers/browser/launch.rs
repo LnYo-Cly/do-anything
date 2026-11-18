@@ -1126,10 +1126,10 @@ where
         return Ok(());
     }
 
-    // `taskkill /T` can exit non-zero (for example 128) when a short-lived
-    // Chrome child exits mid-walk even though the target process was killed,
-    // and Windows kernel rundown can keep the terminated PID visible to
-    // `tasklist` for several seconds. Poll until the PID disappears or times out.
+    // A pid can stay visible after `taskkill` because the process is still
+    // terminating, or because Windows reused the pid for an unrelated process.
+    // Poll until the pid disappears or the deadline passes, then let the
+    // command-line ownership probe decide whether it is still our browser.
     let deadline = Instant::now() + wait_timeout;
     loop {
         match pid_exists(pid) {
@@ -1172,9 +1172,9 @@ where
     }
 }
 
-/// Terminates a process that still owns `profile` after the first `taskkill`,
-/// bounded to one extra attempt and a short wait. Fail-closed: a process that
-/// is still visible and still owns the profile is reported as an error.
+/// Terminates a pid that still matches the recorded profile after the first
+/// `taskkill`, bounded to one extra attempt and a short wait. Fail-closed: a
+/// process that is still visible and still owns the profile is an error.
 #[cfg(windows)]
 fn retry_kill_owned_process<R, E>(
     pid: u32,
