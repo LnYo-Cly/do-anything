@@ -593,6 +593,12 @@ $ da session stop s-1794974416388-44376-0
   whose refs replace the previous table for that session. Passing a stale or
   unknown `ref` fails immediately and asks for a fresh `snapshot`. Static `ref`
   fields are invalid in case files (`da lint` and `da run` refuse them).
+- **Main-document scope for snapshots & `ref`s**: `da session snapshot` reads
+  the main document's accessibility tree (showing `<iframe>` elements as
+  `Iframe` nodes without descending into child documents), and 7-tier `ref`
+  locator synthesis targets main-document elements. Inside `da session step`,
+  steps that use explicit `within` locators still enter same-origin `<iframe>`
+  and `<frame>` elements and export verbatim into replayable YAML.
 - **7-tier locator synthesis on export**: each `ref`-targeted step resolves the
   live element (stepping up from `StaticText` or wrapper nodes to the enclosing
   interactive element) and picks the first unique, live-verified locator in
@@ -1533,6 +1539,10 @@ an execution error (exit 1) instead of clicking the wrong coordinates.
 Cross-origin frames (including `<iframe sandbox>` without `allow-same-origin`)
 fail immediately as an execution error (exit 1) without waiting out
 `timeout_ms`, because the browser blocks access to their `contentDocument`.
+
+Inside [`da session`](#interactive-sessions-da-session), `snapshot` and `ref`
+targets stay scoped to the main document (showing frames as `Iframe` nodes),
+while explicit `within` locators work in `da session step` and export verbatim.
 
 `browser.type` keeps its original `text` argument as the text to type. Because
 `text` is also a locator, the two meanings are separated by `value`: when `value`
