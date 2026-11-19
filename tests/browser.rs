@@ -2164,8 +2164,9 @@ fn schema_and_lint_validate_testid_within_nth_and_testid_attribute() {
     assert_eq!(
         exit_code(&valid_lint),
         Some(0),
-        "lint must accept valid case: {}",
-        stdout(&valid_lint)
+        "lint must accept valid case: stdout: {}\nstderr: {}",
+        stdout(&valid_lint),
+        stderr(&valid_lint)
     );
 
     let invalid_cases = [
@@ -2350,7 +2351,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "hidden-testid must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2477,7 +2484,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "ambiguous-within must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2571,7 +2584,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "nth-oob must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2677,8 +2696,13 @@ steps:
         &["--output", "json", "run", path_str(&many_case)],
         &[("DA_LOCATOR_SECRET", secret.to_string())],
     );
-    assert_eq!(exit_code(&output), Some(1));
     let raw_stdout = stdout(&output);
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "many-redacted must fail: stdout: {raw_stdout}\nstderr: {}",
+        stderr(&output)
+    );
     assert!(
         !raw_stdout.contains(secret),
         "secret leaked in JSON stdout: {raw_stdout}"
@@ -2826,7 +2850,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "disabled-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2858,7 +2888,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "aria-disabled-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2891,7 +2927,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "disabled-type must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2923,7 +2965,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "moving-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2955,7 +3003,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "occluded-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2988,7 +3042,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "occluded-type must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -3534,6 +3594,163 @@ fn session_creation_recovers_from_target_crash_and_reports_diagnostics_when_all_
     assert!(
         fail_msg.contains("Target.targetCrashed") && fail_msg.contains("target crashed"),
         "expected crash diagnostic in failure message, got: {fail_msg}"
+    );
+}
+
+#[test]
+fn session_creation_recovers_from_silent_attach_to_target_hang() {
+    let dir = TempDir::new("browser-attach-target-stall");
+
+    let (port, server) = spawn_mock_devtools(|mut socket| {
+        let create1 = read_mock_cdp(&mut socket).expect("create1");
+        assert_eq!(create1["method"], "Target.createTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": create1["id"], "result": { "targetId": "t-1" } }),
+        );
+        let attach1 = read_mock_cdp(&mut socket).expect("attach1");
+        assert_eq!(attach1["method"], "Target.attachToTarget");
+        // Never answer Target.attachToTarget for t-1; expect Target.closeTarget
+        // within ATTACH_ENABLE_TIMEOUT and retry on t-2.
+        let close1 = read_mock_cdp(&mut socket).expect("close1");
+        assert_eq!(close1["method"], "Target.closeTarget");
+        assert_eq!(close1["params"]["targetId"], "t-1");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": close1["id"], "result": { "success": true } }),
+        );
+
+        let create2 = read_mock_cdp(&mut socket).expect("create2");
+        assert_eq!(create2["method"], "Target.createTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": create2["id"], "result": { "targetId": "t-2" } }),
+        );
+        let attach2 = read_mock_cdp(&mut socket).expect("attach2");
+        assert_eq!(attach2["method"], "Target.attachToTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": attach2["id"], "result": { "sessionId": "s-2" } }),
+        );
+
+        while let Some(cmd) = read_mock_cdp(&mut socket) {
+            let method = cmd["method"].as_str().unwrap_or_default();
+            let result = match method {
+                "Page.enable" | "Runtime.enable" | "Network.enable" | "Page.navigate" => json!({}),
+                "Runtime.evaluate" => {
+                    let expr = cmd["params"]["expression"].as_str().unwrap_or_default();
+                    if expr == "location.href" {
+                        json!({ "result": { "value": "http://127.0.0.1/ok" } })
+                    } else {
+                        json!({ "result": { "value": "Recovered After Attach Stall" } })
+                    }
+                }
+                "Target.closeTarget" => {
+                    send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "success": true } }),
+                    );
+                    break;
+                }
+                other => panic!("unexpected CDP command: {other}"),
+            };
+            send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": result }));
+        }
+    });
+
+    let case = dir.write(
+        "recover-attach-stall.yaml",
+        &format!(
+            "name: recover attachToTarget stall\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{port}\"\n      url: \"http://127.0.0.1/ok\"\n    expect:\n      - path: $.title\n        equals: \"Recovered After Attach Stall\"\n"
+        ),
+    );
+    let started = Instant::now();
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    server.join().expect("mock server finish");
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "silent Target.attachToTarget stall must recover inside LAUNCH_TIMEOUT, took {:?}",
+        started.elapsed()
+    );
+
+    // 2. When connected to an existing browser and all owned-target attach attempts stall,
+    //    `connect` mode must fail fast inside LAUNCH_TIMEOUT without sending `Browser.close`
+    //    or retrying browser creation.
+    let (fail_port, fail_server) = spawn_mock_devtools(|mut socket| {
+        for attempt in 1..=3 {
+            let tid = format!("t-fail-{attempt}");
+            let create = read_mock_cdp(&mut socket).expect("create");
+            assert_eq!(create["method"], "Target.createTarget");
+            send_mock_cdp(
+                &mut socket,
+                &json!({ "id": create["id"], "result": { "targetId": tid } }),
+            );
+            let attach = read_mock_cdp(&mut socket).expect("attach");
+            assert_eq!(attach["method"], "Target.attachToTarget");
+            if attempt < 3 {
+                let close = read_mock_cdp(&mut socket).expect("close");
+                assert_eq!(close["method"], "Target.closeTarget");
+                assert_eq!(close["params"]["targetId"], tid);
+                send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": close["id"], "result": { "success": true } }),
+                );
+            }
+        }
+        if let Some(extra) = read_mock_cdp(&mut socket) {
+            panic!(
+                "connect mode must preserve browser ownership and not retry or send extra CDP command: {extra}"
+            );
+        }
+    });
+
+    let fail_case = dir.write(
+        "connect-attach-stall-fail.yaml",
+        &format!(
+            "name: connect attachToTarget stall fails preserving browser\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{fail_port}\"\n      url: \"http://127.0.0.1/fail\"\n"
+        ),
+    );
+    let fail_started = Instant::now();
+    let fail_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&fail_case),
+            "--no-bundle",
+        ],
+    );
+    fail_server.join().expect("fail mock server finish");
+    assert!(
+        fail_started.elapsed() < Duration::from_secs(25),
+        "3 stalled Target.attachToTarget attempts must fail inside LAUNCH_TIMEOUT, took {:?}",
+        fail_started.elapsed()
+    );
+    assert_eq!(
+        exit_code(&fail_out),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&fail_out),
+        stderr(&fail_out)
+    );
+    let fail_json = json_stdout(&fail_out);
+    let fail_msg = case_error(&fail_json);
+    assert!(
+        fail_msg.contains("attempt 1:")
+            && fail_msg.contains("attempt 3:")
+            && fail_msg.contains("Target.attachToTarget"),
+        "expected attempt diagnostics in failure message, got: {fail_msg}"
     );
 }
 
@@ -4520,7 +4737,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&unscoped_role_out), Some(1));
+    assert_eq!(
+        exit_code(&unscoped_role_out),
+        Some(1),
+        "unscoped-role must fail: stdout: {}\nstderr: {}",
+        stdout(&unscoped_role_out),
+        stderr(&unscoped_role_out)
+    );
     let unscoped_role_json = json_stdout(&unscoped_role_out);
     let unscoped_role_err = case_error(&unscoped_role_json);
     assert!(
@@ -4554,7 +4777,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&dialog_out), Some(1));
+    assert_eq!(
+        exit_code(&dialog_out),
+        Some(1),
+        "iframe-unhandled-dialog must fail: stdout: {}\nstderr: {}",
+        stdout(&dialog_out),
+        stderr(&dialog_out)
+    );
     let dialog_json = json_stdout(&dialog_out);
     let dialog_ms = dialog_json["cases"][0]["steps"][1]["duration_ms"]
         .as_u64()
@@ -4742,7 +4971,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&top_out), Some(1));
+    assert_eq!(
+        exit_code(&top_out),
+        Some(1),
+        "top-blocked must fail: stdout: {}\nstderr: {}",
+        stdout(&top_out),
+        stderr(&top_out)
+    );
     let top_json = json_stdout(&top_out);
     let top_err = case_error(&top_json);
     assert!(
@@ -4776,7 +5011,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&inner_out), Some(1));
+    assert_eq!(
+        exit_code(&inner_out),
+        Some(1),
+        "inner-blocked must fail: stdout: {}\nstderr: {}",
+        stdout(&inner_out),
+        stderr(&inner_out)
+    );
     let inner_json = json_stdout(&inner_out);
     let inner_err = case_error(&inner_json);
     assert!(
@@ -5356,7 +5597,13 @@ steps:
             path_str(&bundle_root),
         ],
     );
-    assert_eq!(exit_code(&bundle_out), Some(1));
+    assert_eq!(
+        exit_code(&bundle_out),
+        Some(1),
+        "unmappable-transform-bundle must fail: stdout: {}\nstderr: {}",
+        stdout(&bundle_out),
+        stderr(&bundle_out)
+    );
     let bundle_json = json_stdout(&bundle_out);
     let bundle_rel = bundle_json["cases"][0]["bundle"]
         .as_str()

@@ -67,6 +67,8 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 800;
 /// How long starting the browser and opening its page may take.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of fresh browser launches tried when post-startup connect/attach stalls.
+const MAX_LAUNCH_ATTEMPTS: usize = 2;
 /// How often an element or URL is looked at again.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -2002,20 +2004,31 @@ impl BrowserSession {
 
     /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
-        let browser = Launched::launch_with_mode(
-            args.headless,
-            args.width,
-            args.height,
-            Deadline::after(LAUNCH_TIMEOUT),
-            detached,
+        let deadline = Deadline::after(LAUNCH_TIMEOUT);
+        let (browser, (connection, page, target_id)) = launch_browser_with_retry(
+            deadline,
+            MAX_LAUNCH_ATTEMPTS,
+            |attempt_deadline| {
+                Launched::launch_with_mode(
+                    args.headless,
+                    args.width,
+                    args.height,
+                    attempt_deadline,
+                    detached,
+                )
+            },
+            |browser, attempt_deadline| {
+                let mut connection = Connection::connect(browser.websocket_url(), attempt_deadline)
+                    .map_err(|error| {
+                        format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
+                    })?;
+                let (page, target_id) = attach(&mut connection, attempt_deadline)?;
+                Ok((connection, page, target_id))
+            },
+            Launched::abort,
         )?;
         let port = browser.port();
         let websocket_url = browser.websocket_url().to_string();
-        let mut connection = Connection::connect(&websocket_url, Deadline::after(LAUNCH_TIMEOUT))
-            .map_err(|error| {
-                format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
-            })?;
-        let (page, target_id) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
         let network = network::NetworkState::new(&page);
 
         Ok(Self {
@@ -3180,10 +3193,12 @@ const MAX_TARGET_DIAGNOSTIC_EVENTS: usize = 5;
 /// it yet, so closing a stalled/crashed tab and opening a replacement is safe
 /// and idempotent inside the existing `LAUNCH_TIMEOUT` budget.
 const MAX_ATTACH_ATTEMPTS: usize = 3;
-/// Per-attempt budget for `Page.enable` / `Runtime.enable` / `Network.enable`.
+/// Per-attempt budget for `Target.createTarget`, `Target.attachToTarget`, and
+/// domain setup (`Page.enable` / `Runtime.enable` / `Network.enable`).
 ///
-/// Healthy targets answer in tens of milliseconds; capping each attempt at 5 s
-/// lets a silent renderer hang abort and retry within the 30 s `LAUNCH_TIMEOUT`.
+/// Healthy targets answer in tens of milliseconds; capping each step at 5 s
+/// lets a silent renderer or startup attach hang abort and retry within the 30 s
+/// `LAUNCH_TIMEOUT`.
 const ATTACH_ENABLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long `attach` waits for `Target.closeTarget` when cleaning up a failed fresh tab.
 const ATTACH_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -3242,23 +3257,33 @@ fn attach_with_enable_timeout(
             Ok(attached) => return Ok(attached),
             Err(failure) => {
                 let mut effective_kind = failure.kind;
-                attempt_errors.push(failure.message);
+                let mut attempt_error = failure.message;
                 if let Some(target_id) = failure.target_id.as_deref()
                     && !failure.target_destroyed
                     && effective_kind == AttachFailureKind::TargetFailed
                     && !deadline.passed()
                     && attempt < MAX_ATTACH_ATTEMPTS
                 {
-                    if let Err(CdpError::Transport(_)) = connection.call(
+                    if let Err(close_error) = connection.call(
                         "Target.closeTarget",
                         json!({ "targetId": target_id }),
                         None,
                         deadline.capped(ATTACH_CLOSE_TIMEOUT),
                     ) {
-                        effective_kind = AttachFailureKind::BrowserFailed;
+                        match close_error {
+                            // The target may have closed itself right after failing.
+                            CdpError::Method { message, .. } if message.contains("No target") => {}
+                            other => {
+                                effective_kind = AttachFailureKind::BrowserFailed;
+                                attempt_error = format!(
+                                    "{attempt_error}; cleanup failed (`Target.closeTarget` on `{target_id}`): {other}"
+                                );
+                            }
+                        }
                     }
                     let _ = connection.take_messages();
                 }
+                attempt_errors.push(attempt_error);
                 if decide_attach_retry(
                     attempt,
                     MAX_ATTACH_ATTEMPTS,
@@ -3281,6 +3306,54 @@ struct AttachScope<'a> {
     session_id: Option<&'a str>,
 }
 
+/// Attempts to launch and attach a fresh browser up to `max_attempts` times
+/// inside `deadline`.
+///
+/// Failures before a browser process reports its debug port (such as a missing
+/// binary) fail immediately; post-startup connect/attach failures immediately
+/// abort the wedged process and retry while `deadline` has budget left, or stop
+/// and report both errors if abort/cleanup itself fails.
+fn launch_browser_with_retry<B, C>(
+    deadline: Deadline,
+    max_attempts: usize,
+    mut spawn_browser: impl FnMut(Deadline) -> Result<B, String>,
+    mut connect_and_attach: impl FnMut(&B, Deadline) -> Result<C, String>,
+    mut abort_browser: impl FnMut(B) -> Result<(), String>,
+) -> Result<(B, C), String>
+where
+    C: Sized,
+{
+    let mut errors = Vec::with_capacity(max_attempts);
+    for attempt in 1..=max_attempts {
+        let browser = spawn_browser(deadline)?;
+        match connect_and_attach(&browser, deadline) {
+            Ok(attached) => return Ok((browser, attached)),
+            Err(error) => {
+                if let Err(cleanup_error) = abort_browser(browser) {
+                    errors.push(format!("{error}; browser cleanup failed: {cleanup_error}"));
+                    break;
+                }
+                errors.push(error);
+                if attempt >= max_attempts || deadline.passed() {
+                    break;
+                }
+            }
+        }
+    }
+    if errors.len() == 1 {
+        return Err(errors.pop().unwrap_or_default());
+    }
+    let summary = errors
+        .into_iter()
+        .enumerate()
+        .map(|(index, error)| format!("launch attempt {}: {error}", index + 1))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "could not attach to a freshly started browser: {summary}"
+    ))
+}
+
 /// Attempts once to create a fresh `about:blank` target, attach to it, and
 /// enable `Page`, `Runtime`, and `Network`.
 fn attach_once(
@@ -3298,7 +3371,7 @@ fn attach_once(
             target_id: None,
             session_id: None,
         },
-        deadline,
+        deadline.capped(enable_timeout),
     )?;
     let target_id = target
         .get("targetId")
@@ -3330,7 +3403,7 @@ fn attach_existing_target(
             target_id: Some(target_id),
             session_id: None,
         },
-        deadline,
+        deadline.capped(enable_timeout),
     )?;
     let page = attached
         .get("sessionId")
@@ -6667,6 +6740,357 @@ mod tests {
             (page2.as_str(), target2.as_str()),
             ("session-2", "target-2")
         );
+    }
+
+    #[test]
+    fn attach_recovers_when_attach_to_target_stalls_silently() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            assert_eq!(create1["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+
+            let attach1 = read_cdp_request(&mut socket);
+            assert_eq!(attach1["method"], "Target.attachToTarget");
+            assert_eq!(attach1["params"]["targetId"], "target-1");
+            // Never answer Target.attachToTarget on target-1; wait for Target.closeTarget.
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            assert_eq!(close1["params"]["targetId"], "target-1");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": close1["id"], "result": { "success": true } }).to_string(),
+                ))
+                .expect("close target-1");
+
+            let create2 = read_cdp_request(&mut socket);
+            assert_eq!(create2["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create2["id"], "result": { "targetId": "target-2" } })
+                        .to_string(),
+                ))
+                .expect("create target-2");
+            let attach2 = read_cdp_request(&mut socket);
+            assert_eq!(attach2["method"], "Target.attachToTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach2["id"], "result": { "sessionId": "session-2" } })
+                        .to_string(),
+                ))
+                .expect("attach session-2");
+            for expected in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], expected);
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": cmd["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("reply domain enable on session-2");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let started = std::time::Instant::now();
+        let (page, target) = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(120),
+        )
+        .expect("attach must recover on target-2 after silent Target.attachToTarget stall");
+        drop(conn);
+        server.join().expect("mock server finish");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Target.attachToTarget hang must abort at enable_timeout instead of outer deadline, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!((page.as_str(), target.as_str()), ("session-2", "target-2"));
+    }
+
+    #[test]
+    fn attach_fails_fast_when_attach_to_target_stalls_every_attempt() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            for attempt in 1..=MAX_ATTACH_ATTEMPTS {
+                let tid = format!("target-{attempt}");
+                let create = read_cdp_request(&mut socket);
+                assert_eq!(create["method"], "Target.createTarget");
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": create["id"], "result": { "targetId": tid } }).to_string(),
+                    ))
+                    .expect("create target");
+
+                let attach_cmd = read_cdp_request(&mut socket);
+                assert_eq!(attach_cmd["method"], "Target.attachToTarget");
+                if attempt < MAX_ATTACH_ATTEMPTS {
+                    let close_cmd = read_cdp_request(&mut socket);
+                    assert_eq!(close_cmd["method"], "Target.closeTarget");
+                    assert_eq!(close_cmd["params"]["targetId"], tid);
+                    socket
+                        .send(tungstenite::Message::text(
+                            json!({ "id": close_cmd["id"], "result": { "success": true } })
+                                .to_string(),
+                        ))
+                        .expect("close target");
+                }
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let started = std::time::Instant::now();
+        let err = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(100),
+        )
+        .expect_err("attach must give up after MAX_ATTACH_ATTEMPTS");
+        drop(conn);
+        server.join().expect("mock server finish");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "3 stalled Target.attachToTarget attempts must fail at 3 * enable_timeout, took {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("attempt 1:"), "{err}");
+        assert!(err.contains("attempt 3:"), "{err}");
+        assert!(err.contains("Target.attachToTarget"), "{err}");
+        assert!(err.contains("no CDP events"), "{err}");
+    }
+
+    #[test]
+    fn launch_browser_with_retry_recovers_after_wedged_attach_and_respects_budget() {
+        // 1. First launched browser stalls on attach; it is aborted and attempt 2 succeeds.
+        let mut spawns = 0usize;
+        let mut aborted = Vec::new();
+        let (browser, session) = launch_browser_with_retry(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                spawns += 1;
+                Ok(format!("browser-{spawns}"))
+            },
+            |browser, _| {
+                if browser == "browser-1" {
+                    Err("Target.attachToTarget stalled".to_string())
+                } else {
+                    Ok("attached-2".to_string())
+                }
+            },
+            |browser| {
+                aborted.push(browser);
+                Ok(())
+            },
+        )
+        .expect("second browser launch must recover");
+        assert_eq!(spawns, 2);
+        assert_eq!(aborted, vec!["browser-1".to_string()]);
+        assert_eq!(
+            (browser.as_str(), session.as_str()),
+            ("browser-2", "attached-2")
+        );
+
+        // 2. Pre-startup spawn failure (e.g. missing binary) does not retry.
+        let mut spawn_calls = 0usize;
+        let spawn_err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                spawn_calls += 1;
+                Err("could not find Chrome".to_string())
+            },
+            |_, _| unreachable!(),
+            |_| unreachable!(),
+        )
+        .expect_err("spawn failure must fail immediately");
+        assert_eq!(spawn_calls, 1);
+        assert!(spawn_err.contains("could not find Chrome"), "{spawn_err}");
+
+        // 3. Exhausting all launch attempts surfaces diagnostics from every attempt.
+        let mut attempts = 0usize;
+        let mut aborted_all = Vec::new();
+        let err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                attempts += 1;
+                Ok(format!("b-{attempts}"))
+            },
+            |b, _| Err(format!("{b}: attach failed")),
+            |b| {
+                aborted_all.push(b);
+                Ok(())
+            },
+        )
+        .expect_err("exhausted launches must fail");
+        assert_eq!(aborted_all, vec!["b-1".to_string(), "b-2".to_string()]);
+        assert!(
+            err.contains("launch attempt 1: b-1: attach failed"),
+            "{err}"
+        );
+        assert!(
+            err.contains("launch attempt 2: b-2: attach failed"),
+            "{err}"
+        );
+
+        // 4. Exhausted outer deadline stops after attempt 1 instead of spawning past LAUNCH_TIMEOUT.
+        let mut deadline_spawns = 0usize;
+        let deadline_err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::ZERO),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                deadline_spawns += 1;
+                Ok("b-1".to_string())
+            },
+            |_, _| Err("stalled".to_string()),
+            |_| Ok(()),
+        )
+        .expect_err("expired deadline must not spawn attempt 2");
+        assert_eq!(deadline_spawns, 1);
+        assert_eq!(deadline_err, "stalled");
+
+        // 5. Abort/cleanup failure stops retrying and reports both attach and cleanup errors.
+        let mut cleanup_spawns = 0usize;
+        let cleanup_err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                cleanup_spawns += 1;
+                Ok(format!("b-{cleanup_spawns}"))
+            },
+            |_, _| Err("Target.attachToTarget stalled".to_string()),
+            |b| Err(format!("could not kill {b}")),
+        )
+        .expect_err("abort failure must stop retrying and surface cleanup error");
+        assert_eq!(cleanup_spawns, 1);
+        assert!(
+            cleanup_err.contains("Target.attachToTarget stalled"),
+            "{cleanup_err}"
+        );
+        assert!(cleanup_err.contains("could not kill b-1"), "{cleanup_err}");
+    }
+
+    #[test]
+    fn attach_stops_retrying_and_reports_target_close_cleanup_error() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            assert_eq!(create1["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+
+            let attach1 = read_cdp_request(&mut socket);
+            assert_eq!(attach1["method"], "Target.attachToTarget");
+            // Never answer Target.attachToTarget; fail Target.closeTarget cleanup with a protocol error.
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            assert_eq!(close1["params"]["targetId"], "target-1");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": close1["id"],
+                        "error": { "code": -32000, "message": "close refused" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send closeTarget error");
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let err = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(100),
+        )
+        .expect_err("Target.closeTarget error must stop attach retry and report cleanup error");
+        drop(conn);
+        server.join().expect("mock server finish");
+
+        assert!(err.contains("Target.attachToTarget"), "{err}");
+        assert!(err.contains("Target.closeTarget"), "{err}");
+        assert!(err.contains("close refused"), "{err}");
+        assert!(
+            !err.contains("attempt 2:"),
+            "must not retry after cleanup failure: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_treats_already_closed_target_on_cleanup_as_recoverable() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+
+            let attach1 = read_cdp_request(&mut socket);
+            assert_eq!(attach1["method"], "Target.attachToTarget");
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": close1["id"],
+                        "error": { "code": -32000, "message": "No target with given id found" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send No target error");
+
+            let create2 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create2["id"], "result": { "targetId": "target-2" } })
+                        .to_string(),
+                ))
+                .expect("create target-2");
+            let attach2 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach2["id"], "result": { "sessionId": "session-2" } })
+                        .to_string(),
+                ))
+                .expect("attach session-2");
+            for expected in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], expected);
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": cmd["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("reply domain enable");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let (page, target) = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(100),
+        )
+        .expect("already-closed target on cleanup must still allow retry");
+        drop(conn);
+        server.join().expect("mock server finish");
+        assert_eq!((page.as_str(), target.as_str()), ("session-2", "target-2"));
     }
 
     #[test]
