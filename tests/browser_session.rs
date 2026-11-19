@@ -1327,6 +1327,10 @@ fn stop_kills_live_chrome_even_when_debug_port_handle_is_closed() {
     let browser_handle = state["handles"]["browser"]
         .as_object_mut()
         .expect("browser handle object");
+    let captured_pid = browser_handle["pid"]
+        .as_u64()
+        .expect("captured browser pid must be present");
+    assert!(captured_pid > 0, "captured browser pid must be nonzero");
     browser_handle.insert("port".to_string(), json!(closed_port));
     browser_handle.insert(
         "websocket_url".to_string(),
@@ -1344,13 +1348,14 @@ fn stop_kills_live_chrome_even_when_debug_port_handle_is_closed() {
     assert_eq!(
         stop.status.code(),
         Some(0),
-        "stop must kill live Chrome by pid even if debug port is unreachable: stdout={} stderr={}",
+        "stop must kill live Chrome by pid {captured_pid} even if debug port is unreachable: stdout={} stderr={}",
         String::from_utf8_lossy(&stop.stdout),
         String::from_utf8_lossy(&stop.stderr)
     );
     assert!(
         !is_port_open(real_port),
-        "real Chrome debug port {real_port} must be closed after stop even when handle port was closed"
+        "real Chrome debug port {real_port} (captured pid {captured_pid}, profile {}) must be closed after stop even when handle port {closed_port} was closed",
+        profile_dir.display()
     );
     assert!(
         !profile_dir.exists(),
@@ -1477,6 +1482,122 @@ fn stop_reports_error_when_browser_port_remains_listening_after_cleanup() {
     );
 
     // Restore original handle and confirm real cleanup succeeds cleanly.
+    fs::create_dir_all(&session_dir).expect("recreate session dir for cleanup");
+    fs::write(&state_path, &original_state).expect("restore state.json");
+    let cleanup = run_da_in(dir.path(), &["session", "stop", &id]);
+    guard.active = false;
+    assert_eq!(cleanup.status.code(), Some(0), "{:?}", cleanup);
+    assert!(!is_port_open(real_port));
+    assert!(!profile_dir.exists());
+    assert!(!session_dir.exists());
+}
+
+#[test]
+fn stop_refuses_tampered_dead_pid_and_closed_port_when_profile_port_is_still_listening() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let server = PageServer::start(BTreeMap::from([(
+        "/p".to_string(),
+        "<!doctype html><html><body><p>surviving</p></body></html>".to_string(),
+    )]));
+    let dir = TempDir::new("browser-stale-port-unverified-pid");
+
+    let started = json_stdout(&run_da_in(dir.path(), &["session", "start"]));
+    let id = started["session_id"].as_str().unwrap().to_string();
+    let session_dir = dir.path().join(started["dir"].as_str().unwrap());
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/p")),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{:?}", open);
+    let (real_port, profile_dir) = read_browser_handle(&session_dir);
+    assert!(is_port_open(real_port), "Chrome debug port must be open");
+
+    let state_path = session_dir.join("state.json");
+    let original_state = fs::read_to_string(&state_path).expect("read original state.json");
+    struct RestoreStopGuard {
+        work_dir: PathBuf,
+        session_dir: PathBuf,
+        session_id: String,
+        original_state: String,
+        active: bool,
+    }
+    impl Drop for RestoreStopGuard {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = fs::create_dir_all(&self.session_dir);
+                let _ = fs::write(self.session_dir.join("state.json"), &self.original_state);
+                let _ = run_da_in(&self.work_dir, &["session", "stop", &self.session_id]);
+            }
+        }
+    }
+    let mut guard = RestoreStopGuard {
+        work_dir: dir.path().to_path_buf(),
+        session_dir: session_dir.clone(),
+        session_id: id.clone(),
+        original_state: original_state.clone(),
+        active: true,
+    };
+
+    let closed_listener = support::bind_browser_safe_listener();
+    let closed_port = closed_listener.local_addr().unwrap().port();
+    drop(closed_listener);
+    let dead_pid = spawn_dead_pid();
+
+    let mut state: Value = serde_json::from_str(&original_state).expect("parse state.json");
+    let browser_handle = state["handles"]["browser"]
+        .as_object_mut()
+        .expect("browser handle object");
+    browser_handle.insert("pid".to_string(), json!(dead_pid));
+    browser_handle.insert("port".to_string(), json!(closed_port));
+    browser_handle.insert(
+        "websocket_url".to_string(),
+        json!(format!(
+            "ws://127.0.0.1:{closed_port}/devtools/browser/unreachable"
+        )),
+    );
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize state"),
+    )
+    .expect("write tampered state.json");
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(
+        stop.status.code(),
+        Some(4),
+        "stop must refuse unverified pid while profile DevTools port {real_port} is open: stdout={} stderr={}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let stop_json = json_stdout(&stop);
+    assert_eq!(stop_json["ok"], false, "ok must be false: {stop_json}");
+    let errors = stop_json["errors"].as_array().expect("errors array");
+    assert!(
+        errors.iter().any(|err| {
+            err.as_str()
+                .is_some_and(|msg| msg.contains(&real_port.to_string()))
+        }),
+        "errors must report surviving profile debug port {real_port}: {stop_json}"
+    );
+    assert!(
+        is_port_open(real_port),
+        "unrelated/unverified-pid stop must leave Chrome debug port {real_port} untouched"
+    );
+    assert!(
+        profile_dir.exists(),
+        "temp profile must not be deleted while its DevTools port {real_port} is still open"
+    );
+
     fs::create_dir_all(&session_dir).expect("recreate session dir for cleanup");
     fs::write(&state_path, &original_state).expect("restore state.json");
     let cleanup = run_da_in(dir.path(), &["session", "stop", &id]);

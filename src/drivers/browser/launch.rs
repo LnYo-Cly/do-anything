@@ -151,7 +151,8 @@ impl Launched {
         let profile = self.profile.take()?;
         let child_pid = self.child.take().map(|child| child.id());
         let detached_pid = self.detached_pid.take();
-        let pid = child_pid.or(detached_pid)?;
+        let spawned_pid = child_pid.or(detached_pid)?;
+        let pid = resolve_detached_browser_pid(spawned_pid, &profile);
         Some(DetachedProcess {
             pid,
             profile,
@@ -586,8 +587,10 @@ fn dispose_detached_with(
         exit_timeout,
         default_grace_window(),
         is_port_listening,
+        read_profile_devtools_port,
         default_pid_exists,
         pid_matches_profile,
+        default_find_profile_pids,
         force_kill_pid,
         remove_profile,
     )
@@ -617,8 +620,10 @@ where
         exit_timeout,
         default_grace_window(),
         is_port_listening,
+        read_profile_devtools_port,
         default_pid_exists,
         pid_matches_profile,
+        default_find_profile_pids,
         kill,
         remove_profile,
     )
@@ -651,11 +656,68 @@ fn default_pid_exists(pid: u32) -> Option<bool> {
     }
 }
 
+fn read_profile_devtools_port(profile: &Path) -> Option<u16> {
+    let port_file = profile.join("DevToolsActivePort");
+    let meta = fs::symlink_metadata(&port_file).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(&port_file).ok()?;
+    parse_devtools_active_port(&text).map(|(port, _)| port)
+}
+
+#[cfg(any(unix, test))]
+fn parse_singleton_lock_target(target: &str) -> Option<u32> {
+    let (_, pid_str) = target.trim().rsplit_once('-')?;
+    let pid = pid_str.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+#[cfg(unix)]
+fn read_singleton_lock_pid(profile: &Path) -> Option<u32> {
+    let target = fs::read_link(profile.join("SingletonLock")).ok()?;
+    parse_singleton_lock_target(target.to_str()?)
+}
+
+fn resolve_detached_browser_pid(spawned_pid: u32, profile: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        if let Some(lock_pid) = read_singleton_lock_pid(profile)
+            && lock_pid != spawned_pid
+            && pid_matches_profile(lock_pid, profile) == PidProfileMatch::Matches
+        {
+            return lock_pid;
+        }
+        spawned_pid
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = profile;
+        spawned_pid
+    }
+}
+
+fn default_find_profile_pids(profile: &Path) -> Result<Vec<u32>, String> {
+    #[cfg(unix)]
+    {
+        find_profile_pids_unix(profile)
+    }
+    #[cfg(windows)]
+    {
+        find_profile_pids_windows(profile)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = profile;
+        Ok(Vec::new())
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "internal callback seam for pure unit tests without touching real processes or disk"
 )]
-fn dispose_detached_with_ops<P, E, V, K, R>(
+fn dispose_detached_with_ops<P, Dp, E, V, Fp, K, R>(
     pid: Option<u32>,
     port: Option<u16>,
     profile: Option<&Path>,
@@ -663,15 +725,19 @@ fn dispose_detached_with_ops<P, E, V, K, R>(
     exit_timeout: Duration,
     grace_window: Duration,
     mut port_listening: P,
+    mut read_profile_port: Dp,
     mut pid_exists: E,
     mut verify: V,
+    mut find_profile_pids: Fp,
     mut kill: K,
     mut remove_dir: R,
 ) -> Result<(), String>
 where
     P: FnMut(u16) -> bool,
+    Dp: FnMut(&Path) -> Option<u16>,
     E: FnMut(u32) -> Option<bool>,
     V: FnMut(u32, &Path) -> PidProfileMatch,
+    Fp: FnMut(&Path) -> Result<Vec<u32>, String>,
     K: FnMut(u32, Option<&Path>) -> Result<(), String>,
     R: FnMut(&Path) -> Result<(), String>,
 {
@@ -692,21 +758,29 @@ where
     let mut errors = Vec::new();
     let deadline = Instant::now() + exit_timeout;
 
-    let mut port_open = port.is_some_and(&mut port_listening);
+    let mut handle_port_open = port.is_some_and(&mut port_listening);
     if let Some(port) = port
-        && port_open
+        && handle_port_open
     {
         while port_listening(port) && Instant::now() < deadline {
             thread::sleep(POLL_INTERVAL);
         }
-        port_open = port_listening(port);
+        handle_port_open = port_listening(port);
     }
 
+    let profile_port = read_profile_port(profile).filter(|p| Some(*p) != port);
+    let profile_port_open = profile_port.is_some_and(&mut port_listening);
+    let any_port_open = handle_port_open || profile_port_open;
+
     let mut kill_attempted = false;
+    let mut ownership_confirmed = false;
+    let mut killed_primary_pid = None;
     match pid {
-        Some(pid) if port_open => match verify(pid, profile) {
+        Some(pid) if any_port_open => match verify(pid, profile) {
             PidProfileMatch::Matches => {
+                ownership_confirmed = true;
                 kill_attempted = true;
+                killed_primary_pid = Some(pid);
                 if let Err(err) = kill(pid, Some(profile)) {
                     errors.push(err);
                 }
@@ -723,7 +797,7 @@ where
             }
         },
         Some(pid) => {
-            ensure_profile_process_stopped_with(
+            let outcome = ensure_profile_process_stopped_with(
                 pid,
                 profile,
                 grace_window,
@@ -732,24 +806,75 @@ where
                 &mut verify,
                 &mut kill,
             );
+            ownership_confirmed = outcome.ownership_confirmed;
+            kill_attempted = outcome.kill_attempted;
+            if outcome.kill_attempted {
+                killed_primary_pid = Some(pid);
+            }
         }
         None => {
             errors.push("could not confirm browser process ownership: missing pid".to_string());
         }
     }
 
-    if let Some(port) = port
-        && port_open
+    if ownership_confirmed {
+        cleanup_remaining_profile_pids(
+            profile,
+            exit_timeout,
+            grace_window,
+            killed_primary_pid,
+            &mut kill_attempted,
+            &mut errors,
+            &mut find_profile_pids,
+            &mut kill,
+        );
+    } else if errors.is_empty() {
+        verify_no_unconfirmed_profile_pids(
+            profile,
+            grace_window,
+            &mut errors,
+            &mut find_profile_pids,
+        );
+    }
+
+    let settle_window = if kill_attempted || ownership_confirmed {
+        exit_timeout.min(Duration::from_secs(2))
+    } else {
+        Duration::ZERO
+    };
+    let mut tracked_ports = Vec::new();
+    if let Some(p) = port {
+        tracked_ports.push(p);
+    }
+    if let Some(p) = profile_port
+        && !tracked_ports.contains(&p)
     {
-        if kill_attempted {
-            let socket_deadline = Instant::now() + Duration::from_secs(1);
-            while port_listening(port) && Instant::now() < socket_deadline {
+        tracked_ports.push(p);
+    }
+    for tracked_port in tracked_ports {
+        if port_listening(tracked_port) && !settle_window.is_zero() {
+            let socket_deadline = Instant::now() + settle_window;
+            let mut swept_during_settle = false;
+            while port_listening(tracked_port) && Instant::now() < socket_deadline {
                 thread::sleep(POLL_INTERVAL);
+                if port_listening(tracked_port) && ownership_confirmed && !swept_during_settle {
+                    swept_during_settle = true;
+                    cleanup_remaining_profile_pids(
+                        profile,
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        killed_primary_pid,
+                        &mut kill_attempted,
+                        &mut errors,
+                        &mut find_profile_pids,
+                        &mut kill,
+                    );
+                }
             }
         }
-        if port_listening(port) {
+        if port_listening(tracked_port) {
             errors.push(format!(
-                "browser debug port {port} is still listening after cleanup"
+                "browser debug port {tracked_port} is still listening after cleanup"
             ));
         }
     }
@@ -763,6 +888,16 @@ where
                 if let Err(kill_err) = kill(pid, Some(profile)) {
                     errors.push(kill_err);
                 }
+                cleanup_remaining_profile_pids(
+                    profile,
+                    exit_timeout,
+                    Duration::ZERO,
+                    Some(pid),
+                    &mut kill_attempted,
+                    &mut errors,
+                    &mut find_profile_pids,
+                    &mut kill,
+                );
                 if errors.is_empty()
                     && let Err(retry_err) = remove_dir(profile)
                 {
@@ -785,6 +920,112 @@ where
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+fn poll_remaining_profile_pids<Fp>(
+    profile: &Path,
+    settle_window: Duration,
+    skip_pid: Option<u32>,
+    errors: &mut Vec<String>,
+    find_profile_pids: &mut Fp,
+) -> Option<Vec<u32>>
+where
+    Fp: FnMut(&Path) -> Result<Vec<u32>, String>,
+{
+    let mut read_filtered = || match find_profile_pids(profile) {
+        Ok(pids) => Ok(pids
+            .into_iter()
+            .filter(|candidate| Some(*candidate) != skip_pid)
+            .collect::<Vec<_>>()),
+        Err(err) => {
+            errors.push(err);
+            Err(())
+        }
+    };
+    let mut remaining = read_filtered().ok()?;
+    if !remaining.is_empty() && !settle_window.is_zero() {
+        let settle = Instant::now() + settle_window;
+        while !remaining.is_empty() && Instant::now() < settle {
+            thread::sleep(POLL_INTERVAL);
+            remaining = read_filtered().ok()?;
+        }
+    }
+    Some(remaining)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared helper for bounded profile-owned process cleanup after pid ownership is confirmed"
+)]
+fn cleanup_remaining_profile_pids<Fp, K>(
+    profile: &Path,
+    exit_timeout: Duration,
+    grace_window: Duration,
+    skip_pid: Option<u32>,
+    kill_attempted: &mut bool,
+    errors: &mut Vec<String>,
+    find_profile_pids: &mut Fp,
+    kill: &mut K,
+) where
+    Fp: FnMut(&Path) -> Result<Vec<u32>, String>,
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+{
+    let settle_window = if *kill_attempted {
+        Duration::ZERO
+    } else {
+        grace_window.min(Duration::from_millis(300))
+    };
+    let Some(targets) =
+        poll_remaining_profile_pids(profile, settle_window, skip_pid, errors, find_profile_pids)
+    else {
+        return;
+    };
+    if targets.is_empty() {
+        return;
+    }
+
+    for extra_pid in &targets {
+        *kill_attempted = true;
+        if let Err(err) = kill(*extra_pid, Some(profile)) {
+            errors.push(err);
+        }
+    }
+
+    let wait_budget = exit_timeout.min(Duration::from_secs(1));
+    let Some(surviving) =
+        poll_remaining_profile_pids(profile, wait_budget, skip_pid, errors, find_profile_pids)
+    else {
+        return;
+    };
+    if !surviving.is_empty() {
+        errors.push(format!(
+            "browser process(es) {:?} for temporary profile `{}` are still running after cleanup",
+            surviving,
+            profile.display()
+        ));
+    }
+}
+
+fn verify_no_unconfirmed_profile_pids<Fp>(
+    profile: &Path,
+    grace_window: Duration,
+    errors: &mut Vec<String>,
+    find_profile_pids: &mut Fp,
+) where
+    Fp: FnMut(&Path) -> Result<Vec<u32>, String>,
+{
+    let Some(remaining) =
+        poll_remaining_profile_pids(profile, grace_window, None, errors, find_profile_pids)
+    else {
+        return;
+    };
+    if !remaining.is_empty() {
+        errors.push(format!(
+            "could not confirm browser process ownership while process(es) {:?} for temporary profile `{}` remain active",
+            remaining,
+            profile.display()
+        ));
     }
 }
 
@@ -864,6 +1105,11 @@ enum PidProfileMatch {
     Unknown,
 }
 
+struct StopCheckOutcome {
+    ownership_confirmed: bool,
+    kill_attempted: bool,
+}
+
 /// Checks whether a process `pid` is still alive and owns `--user-data-dir=<profile>`
 /// after its debug port stopped listening, allowing a short grace window for a
 /// clean post-`Browser.close` exit before force-killing.
@@ -875,7 +1121,8 @@ fn ensure_profile_process_stopped_with<E, V, K>(
     pid_exists: &mut E,
     verify: &mut V,
     kill: &mut K,
-) where
+) -> StopCheckOutcome
+where
     E: FnMut(u32) -> Option<bool>,
     V: FnMut(u32, &Path) -> PidProfileMatch,
     K: FnMut(u32, Option<&Path>) -> Result<(), String>,
@@ -883,28 +1130,47 @@ fn ensure_profile_process_stopped_with<E, V, K>(
     #[cfg(windows)]
     {
         match pid_exists(pid) {
-            Some(false) => return,
+            Some(false) => {
+                return StopCheckOutcome {
+                    ownership_confirmed: false,
+                    kill_attempted: false,
+                };
+            }
             // Give a closing browser a brief window to exit cleanly after closing
             // its debug port so the fast `tasklist` check avoids spawning PowerShell.
             Some(true) if !grace_window.is_zero() => {
                 thread::sleep(grace_window);
                 if pid_exists(pid) == Some(false) {
-                    return;
+                    return StopCheckOutcome {
+                        ownership_confirmed: false,
+                        kill_attempted: false,
+                    };
                 }
             }
             Some(true) | None => {}
         }
         match verify(pid, profile) {
-            PidProfileMatch::DoesNotMatch => {}
+            PidProfileMatch::DoesNotMatch => StopCheckOutcome {
+                ownership_confirmed: false,
+                kill_attempted: false,
+            },
             PidProfileMatch::Matches => {
                 if let Err(err) = kill(pid, Some(profile)) {
                     errors.push(err);
+                }
+                StopCheckOutcome {
+                    ownership_confirmed: true,
+                    kill_attempted: true,
                 }
             }
             PidProfileMatch::Unknown => {
                 errors.push(format!(
                     "could not verify command line for surviving browser pid {pid}"
                 ));
+                StopCheckOutcome {
+                    ownership_confirmed: false,
+                    kill_attempted: false,
+                }
             }
         }
     }
@@ -912,12 +1178,20 @@ fn ensure_profile_process_stopped_with<E, V, K>(
     {
         let _ = pid_exists;
         match verify(pid, profile) {
-            PidProfileMatch::DoesNotMatch => return,
+            PidProfileMatch::DoesNotMatch => {
+                return StopCheckOutcome {
+                    ownership_confirmed: false,
+                    kill_attempted: false,
+                };
+            }
             PidProfileMatch::Unknown => {
                 errors.push(format!(
                     "could not verify command line for surviving browser pid {pid}"
                 ));
-                return;
+                return StopCheckOutcome {
+                    ownership_confirmed: false,
+                    kill_attempted: false,
+                };
             }
             PidProfileMatch::Matches => {}
         }
@@ -925,23 +1199,39 @@ fn ensure_profile_process_stopped_with<E, V, K>(
         while Instant::now() < grace_deadline {
             thread::sleep(Duration::from_millis(50));
             match verify(pid, profile) {
-                PidProfileMatch::DoesNotMatch => return,
+                PidProfileMatch::DoesNotMatch => {
+                    return StopCheckOutcome {
+                        ownership_confirmed: true,
+                        kill_attempted: false,
+                    };
+                }
                 PidProfileMatch::Matches => {}
                 PidProfileMatch::Unknown => {
                     errors.push(format!(
                         "could not verify command line for surviving browser pid {pid}"
                     ));
-                    return;
+                    return StopCheckOutcome {
+                        ownership_confirmed: true,
+                        kill_attempted: false,
+                    };
                 }
             }
         }
         if let Err(err) = kill(pid, Some(profile)) {
             errors.push(err);
         }
+        StopCheckOutcome {
+            ownership_confirmed: true,
+            kill_attempted: true,
+        }
     }
     #[cfg(not(any(windows, unix)))]
     {
         let _ = (pid, profile, grace_window, errors, pid_exists, verify, kill);
+        StopCheckOutcome {
+            ownership_confirmed: false,
+            kill_attempted: false,
+        }
     }
 }
 
@@ -1221,15 +1511,269 @@ fn run_unix_kill(args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
         .status()
 }
 
+#[cfg(any(unix, test))]
+fn parse_proc_stat_state(stat_text: &str) -> Option<char> {
+    let (_, rest) = stat_text.rsplit_once(')')?;
+    rest.trim_start().chars().next()
+}
+
+#[cfg(any(unix, test))]
+fn is_dead_or_zombie_state(state: char) -> bool {
+    matches!(state, 'Z' | 'X' | 'x')
+}
+
+#[cfg(any(unix, test))]
+fn proc_pid_exists_for_profile(proc_root: &Path, pid: u32, profile: &Path) -> Option<Option<bool>> {
+    if !proc_root.is_dir() {
+        return None;
+    }
+    let pid_dir = proc_root.join(pid.to_string());
+    match fs::read(pid_dir.join("cmdline")) {
+        Ok(bytes) if !bytes.is_empty() => {
+            let text = String::from_utf8_lossy(&bytes);
+            Some(Some(cmdline_matches_profile(&text, profile)))
+        }
+        Ok(_) => {
+            // During Linux `do_exit()`, `exit_mm()` clears `/proc/<pid>/cmdline`
+            // before sibling threads finish `exit_files()` (closing open sockets).
+            // Treat a non-zombie process with an empty cmdline as still exiting.
+            match fs::read_to_string(pid_dir.join("stat")) {
+                Ok(stat) => {
+                    let zombie = parse_proc_stat_state(&stat).is_some_and(is_dead_or_zombie_state);
+                    Some(Some(!zombie))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Some(false)),
+                Err(_) => Some(None),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Some(false)),
+        Err(_) => Some(None),
+    }
+}
+
+#[cfg(any(unix, test))]
+fn parse_ps_stat_and_args(stdout: &str) -> Option<(&str, &str)> {
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())?
+        .trim_start();
+    match line.find(char::is_whitespace) {
+        Some(idx) => Some((&line[..idx], line[idx..].trim_start())),
+        None => Some((line, "")),
+    }
+}
+
+#[cfg(any(unix, test))]
+fn scan_proc_profile_pids(
+    proc_root: &Path,
+    profile: &Path,
+    self_pid: u32,
+) -> Result<Option<Vec<u32>>, String> {
+    if !proc_root.is_dir() {
+        return Ok(None);
+    }
+    let entries = fs::read_dir(proc_root).map_err(|error| {
+        format!(
+            "could not inspect `{}` for temporary browser profile `{}`: {error}",
+            proc_root.display(),
+            profile.display()
+        )
+    })?;
+    let mut pids = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == 0 || pid == self_pid {
+            continue;
+        }
+        let pid_dir = entry.path();
+        if let Ok(stat) = fs::read_to_string(pid_dir.join("stat"))
+            && parse_proc_stat_state(&stat).is_some_and(is_dead_or_zombie_state)
+        {
+            continue;
+        }
+        let Ok(bytes) = fs::read(pid_dir.join("cmdline")) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let cmdline = String::from_utf8_lossy(&bytes);
+        if cmdline_matches_profile(&cmdline, profile) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(Some(pids))
+}
+
+#[cfg(any(unix, test))]
+fn parse_ps_profile_pids(stdout: &str, profile: &Path, self_pid: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(pid_end) = trimmed.find(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = trimmed[..pid_end].parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || pid == self_pid {
+            continue;
+        }
+        let after_pid = trimmed[pid_end..].trim_start();
+        let Some(stat_end) = after_pid.find(char::is_whitespace) else {
+            continue;
+        };
+        let stat = &after_pid[..stat_end];
+        if stat.chars().next().is_some_and(is_dead_or_zombie_state) {
+            continue;
+        }
+        let args = after_pid[stat_end..].trim_start();
+        if cmdline_matches_profile(args, profile) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(unix)]
+fn find_profile_pids_unix(profile: &Path) -> Result<Vec<u32>, String> {
+    if let Some(pids) = scan_proc_profile_pids(Path::new("/proc"), profile, std::process::id())? {
+        return Ok(pids);
+    }
+    let output = Command::new("ps")
+        .args(["-ww", "-A", "-o", "pid=,stat=,args="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not inspect running processes for temporary profile `{}`: {error}",
+                profile.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not inspect running processes for temporary profile `{}` (`ps` exited with {})",
+            profile.display(),
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_ps_profile_pids(&stdout, profile, std::process::id()))
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_profile_pids(stdout: &str, profile: &Path, self_pid: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for line in stdout.lines() {
+        let Some((pid_part, cmdline)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(pid) = pid_part.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || pid == self_pid {
+            continue;
+        }
+        if cmdline_matches_profile(cmdline, profile) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(windows)]
+fn find_profile_pids_windows(profile: &Path) -> Result<Vec<u32>, String> {
+    if !profile.exists() {
+        return Ok(Vec::new());
+    }
+    let powershell = windows_system_tool(
+        &["WindowsPowerShell", "v1.0", "powershell.exe"],
+        "powershell.exe",
+    );
+    let script = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+                  Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | \
+                  ForEach-Object { ([string]$_.ProcessId) + [char]9 + $_.CommandLine }";
+    let output = Command::new(powershell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not inspect running processes for temporary profile `{}`: {error}",
+                profile.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not inspect running processes for temporary profile `{}` (PowerShell exited with {})",
+            profile.display(),
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_windows_profile_pids(
+        &stdout,
+        profile,
+        std::process::id(),
+    ))
+}
+
 #[cfg(unix)]
 fn unix_pid_exists_for_profile(pid: u32, profile: Option<&Path>) -> Option<bool> {
-    match profile {
-        Some(path) => match unix_pid_matches_profile(pid, path) {
-            PidProfileMatch::Matches => Some(true),
-            PidProfileMatch::DoesNotMatch => Some(false),
-            PidProfileMatch::Unknown => None,
-        },
-        None => Some(is_unix_pid_alive(pid)),
+    let Some(path) = profile else {
+        return Some(is_unix_pid_alive(pid));
+    };
+    if let Some(status) = proc_pid_exists_for_profile(Path::new("/proc"), pid, path) {
+        return status;
+    }
+    if let Ok(output) = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "stat=,args="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some((stat, args)) = parse_ps_stat_and_args(&text) {
+                if stat.chars().next().is_some_and(is_dead_or_zombie_state) {
+                    return Some(false);
+                }
+                if !args.is_empty() {
+                    return Some(cmdline_matches_profile(args, path));
+                }
+                return Some(true);
+            }
+            return Some(is_unix_pid_alive(pid));
+        }
+        if !is_unix_pid_alive(pid) {
+            return Some(false);
+        }
+        return None;
+    }
+    if !is_unix_pid_alive(pid) {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -2893,11 +3437,13 @@ mod tests {
             Duration::ZERO,
             Duration::ZERO,
             |_| true,
+            |_| None,
             |_| Some(true),
             |_, _| {
                 verify_calls += 1;
                 PidProfileMatch::Matches
             },
+            |_| Ok(Vec::new()),
             |_, _| {
                 kill_calls += 1;
                 Ok(())
@@ -2934,8 +3480,10 @@ mod tests {
                 Duration::ZERO,
                 Duration::ZERO,
                 |_| false,
+                |_| None,
                 |_| Some(false),
                 |_, _| PidProfileMatch::DoesNotMatch,
+                |_| Ok(Vec::new()),
                 |_, _| {
                     kill_calls += 1;
                     Ok(())
@@ -2960,8 +3508,10 @@ mod tests {
                 Duration::ZERO,
                 Duration::ZERO,
                 |_| true,
+                |_| None,
                 |_| Some(true),
                 |_, _| PidProfileMatch::DoesNotMatch,
+                |_| Ok(Vec::new()),
                 |_, _| {
                     kill_calls += 1;
                     Ok(())
@@ -2986,8 +3536,10 @@ mod tests {
                 Duration::ZERO,
                 Duration::ZERO,
                 |_| false,
+                |_| None,
                 |_| Some(true),
                 |_, _| PidProfileMatch::Unknown,
+                |_| Ok(Vec::new()),
                 |_, _| {
                     kill_calls += 1;
                     Ok(())
@@ -3012,8 +3564,10 @@ mod tests {
                 Duration::ZERO,
                 Duration::ZERO,
                 |_| true,
+                |_| None,
                 |_| Some(true),
                 |_, _| PidProfileMatch::Matches,
+                |_| Ok(Vec::new()),
                 |_, _| {
                     kill_calls += 1;
                     Err("kill failed".to_string())
@@ -3040,8 +3594,10 @@ mod tests {
                 Duration::ZERO,
                 Duration::ZERO,
                 |_| false,
+                |_| None,
                 |_| Some(true),
                 |_, _| PidProfileMatch::DoesNotMatch,
+                |_| Ok(Vec::new()),
                 |_, _| {
                     kill_calls += 1;
                     Ok(())
@@ -3345,5 +3901,371 @@ mod tests {
                 .is_err()
         );
         assert_eq!(zero_limit_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dispose_detached_reports_surviving_profile_devtools_port_when_handle_port_is_closed() {
+        let profile = create_profile().expect("create temp profile");
+        let closed_listener = TcpListener::bind("127.0.0.1:0").expect("bind dummy port");
+        let closed_port = closed_listener.local_addr().expect("addr").port();
+        drop(closed_listener);
+
+        let live_listener = TcpListener::bind("127.0.0.1:0").expect("bind live devtools port");
+        let real_port = live_listener.local_addr().expect("addr").port();
+        fs::write(
+            profile.join("DevToolsActivePort"),
+            format!("{real_port}\n/devtools/browser/test\n"),
+        )
+        .expect("write DevToolsActivePort");
+
+        let mut dead = Command::new(std::env::current_exe().expect("current exe"))
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn dead helper");
+        let dead_pid = dead.id();
+        let _ = dead.wait();
+
+        let result = dispose_detached(Some(dead_pid), Some(closed_port), Some(&profile));
+        let profile_survived = profile.exists();
+        drop(live_listener);
+        let _ = fs::remove_dir_all(&profile);
+
+        let err = result.expect_err(
+            "dispose_detached must report surviving profile DevToolsActivePort even when handle port is closed",
+        );
+        assert!(
+            err.contains(&real_port.to_string()),
+            "error must name surviving real port {real_port}: {err}"
+        );
+        assert!(
+            profile_survived,
+            "temp profile must not be deleted while its DevToolsActivePort listener is still open"
+        );
+    }
+
+    #[test]
+    fn dispose_detached_kills_surviving_owned_sibling_when_handle_port_is_closed() {
+        let profile = create_profile().expect("create temp profile");
+        let closed_listener = TcpListener::bind("127.0.0.1:0").expect("bind dummy port");
+        let closed_port = closed_listener.local_addr().expect("addr").port();
+        drop(closed_listener);
+
+        let mut primary = spawn_sleeping_process_for_profile(Some(&profile));
+        let mut child_helper = spawn_sleeping_process_for_profile(Some(&profile));
+        let primary_pid = primary.id();
+        thread::sleep(Duration::from_millis(300));
+
+        let result = dispose_detached(Some(primary_pid), Some(closed_port), Some(&profile));
+        let primary_exited = wait_for_exit(&mut primary, Duration::from_secs(2));
+        let helper_exited = wait_for_exit(&mut child_helper, Duration::from_secs(2));
+        if primary_exited.is_err() {
+            let _ = primary.kill();
+            let _ = primary.wait();
+        }
+        if helper_exited.is_err() {
+            let _ = child_helper.kill();
+            let _ = child_helper.wait();
+        }
+        let _ = fs::remove_dir_all(&profile);
+
+        assert!(result.is_ok(), "dispose_detached failed: {result:?}");
+        assert!(
+            primary_exited.is_ok(),
+            "primary owned process must be terminated"
+        );
+        assert!(
+            helper_exited.is_ok(),
+            "surviving owned process sharing the temporary profile must also be terminated"
+        );
+    }
+
+    #[test]
+    fn dispose_detached_with_ops_verifies_profile_port_and_surviving_owned_processes() {
+        let temp_root = std::env::temp_dir();
+        let owned = temp_root.join(format!("{PROFILE_PREFIX}-7777-0"));
+
+        // 1. Stale closed handle port + live profile DevTools port + Matches -> kills and closes real port.
+        let real_port_open = std::cell::Cell::new(true);
+        let mut killed = Vec::new();
+        let mut removed = 0usize;
+        let res = dispose_detached_with_ops(
+            Some(7777),
+            Some(9001),
+            Some(&owned),
+            &temp_root,
+            Duration::from_millis(50),
+            Duration::ZERO,
+            |port| port == 9222 && real_port_open.get(),
+            |_| Some(9222),
+            |_| Some(true),
+            |_, _| PidProfileMatch::Matches,
+            |_| Ok(Vec::new()),
+            |pid, _| {
+                killed.push(pid);
+                real_port_open.set(false);
+                Ok(())
+            },
+            |_| {
+                removed += 1;
+                Ok(())
+            },
+        );
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(killed, vec![7777]);
+        assert_eq!(removed, 1);
+
+        // 2. Stale closed handle port + live profile port stays open after kill -> error, profile kept.
+        let mut removed = 0usize;
+        let err = dispose_detached_with_ops(
+            Some(7777),
+            Some(9001),
+            Some(&owned),
+            &temp_root,
+            Duration::ZERO,
+            Duration::ZERO,
+            |port| port == 9222,
+            |_| Some(9222),
+            |_| Some(true),
+            |_, _| PidProfileMatch::Matches,
+            |_| Ok(Vec::new()),
+            |_, _| Ok(()),
+            |_| {
+                removed += 1;
+                Ok(())
+            },
+        )
+        .expect_err("surviving profile port after kill must fail");
+        assert!(err.contains("9222"), "{err}");
+        assert_eq!(removed, 0);
+
+        // 3. Confirmed pid ownership + surviving owned child refuses to exit -> error naming child pid, profile kept.
+        let mut removed = 0usize;
+        let mut killed = Vec::new();
+        let err = dispose_detached_with_ops(
+            Some(7777),
+            Some(9001),
+            Some(&owned),
+            &temp_root,
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| false,
+            |_| None,
+            |_| Some(true),
+            |_, _| PidProfileMatch::Matches,
+            |_| Ok(vec![8888]),
+            |pid, _| {
+                killed.push(pid);
+                Ok(())
+            },
+            |_| {
+                removed += 1;
+                Ok(())
+            },
+        )
+        .expect_err("surviving owned child after cleanup must fail");
+        assert!(err.contains("8888"), "{err}");
+        assert!(killed.contains(&8888), "{killed:?}");
+        assert_eq!(removed, 0);
+
+        // 4. Unconfirmed pid (DoesNotMatch) + surviving owned profile process -> refuses kill and keeps profile.
+        let mut removed = 0usize;
+        let mut killed = Vec::new();
+        let err = dispose_detached_with_ops(
+            Some(7777),
+            Some(9001),
+            Some(&owned),
+            &temp_root,
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| false,
+            |_| None,
+            |_| Some(false),
+            |_, _| PidProfileMatch::DoesNotMatch,
+            |_| Ok(vec![9999]),
+            |pid, _| {
+                killed.push(pid);
+                Ok(())
+            },
+            |_| {
+                removed += 1;
+                Ok(())
+            },
+        )
+        .expect_err("unconfirmed pid with active owned process must refuse removal");
+        assert!(err.contains("9999"), "{err}");
+        assert!(
+            killed.is_empty(),
+            "unconfirmed ownership must never kill any pid"
+        );
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn singleton_lock_and_profile_port_helpers_validate_and_parse() {
+        assert_eq!(parse_singleton_lock_target("runnervm-12345"), Some(12345));
+        assert_eq!(parse_singleton_lock_target("host-with-dashes-42"), Some(42));
+        assert_eq!(parse_singleton_lock_target("host-0"), None);
+        assert_eq!(parse_singleton_lock_target("invalid"), None);
+
+        let profile = create_profile().expect("create temp profile");
+        assert_eq!(read_profile_devtools_port(&profile), None);
+        fs::write(
+            profile.join("DevToolsActivePort"),
+            "41234\n/devtools/browser/abc\n",
+        )
+        .expect("write DevToolsActivePort");
+        assert_eq!(read_profile_devtools_port(&profile), Some(41234));
+        fs::write(profile.join("DevToolsActivePort"), "invalid\n").expect("write malformed port");
+        assert_eq!(read_profile_devtools_port(&profile), None);
+        let _ = fs::remove_dir_all(&profile);
+    }
+
+    #[test]
+    fn proc_pid_exists_distinguishes_exiting_process_zombie_and_recycled_pid() {
+        let fixture = IsolatedProfileFixture::new("proc-exit");
+        let missing_proc = fixture.path().join("missing-proc");
+        let profile = Path::new("/tmp/da-chrome-profile-42-0");
+        assert_eq!(
+            proc_pid_exists_for_profile(&missing_proc, 123, profile),
+            None
+        );
+
+        let proc_root = fixture.path().join("proc");
+        fs::create_dir_all(&proc_root).expect("create proc root");
+        assert_eq!(
+            proc_pid_exists_for_profile(&proc_root, 123, profile),
+            Some(Some(false))
+        );
+
+        let pid_dir = proc_root.join("123");
+        fs::create_dir_all(&pid_dir).expect("create pid dir");
+        // Live matching cmdline -> Some(Some(true))
+        fs::write(
+            pid_dir.join("cmdline"),
+            b"/opt/google/chrome/chrome\0--user-data-dir=/tmp/da-chrome-profile-42-0\0",
+        )
+        .expect("write matching cmdline");
+        assert_eq!(
+            proc_pid_exists_for_profile(&proc_root, 123, profile),
+            Some(Some(true))
+        );
+
+        // Empty cmdline while state is 'S' (still in kernel do_exit teardown) -> Some(Some(true))
+        fs::write(pid_dir.join("cmdline"), b"").expect("write empty cmdline");
+        fs::write(pid_dir.join("stat"), "123 (chrome) S 1 123 123 0 -1 0\n").expect("write S stat");
+        assert_eq!(
+            proc_pid_exists_for_profile(&proc_root, 123, profile),
+            Some(Some(true))
+        );
+
+        // Empty cmdline while state is 'Z' (zombie) -> Some(Some(false))
+        fs::write(pid_dir.join("stat"), "123 (chrome) Z 1 123 123 0 -1 0\n").expect("write Z stat");
+        assert_eq!(
+            proc_pid_exists_for_profile(&proc_root, 123, profile),
+            Some(Some(false))
+        );
+
+        // Recycled PID with non-empty unrelated cmdline -> Some(Some(false))
+        fs::write(pid_dir.join("cmdline"), b"/usr/bin/sleep\x0030\0")
+            .expect("write unrelated cmdline");
+        assert_eq!(
+            proc_pid_exists_for_profile(&proc_root, 123, profile),
+            Some(Some(false))
+        );
+    }
+
+    #[test]
+    fn scan_proc_profile_pids_finds_live_owned_processes_and_skips_zombies_and_self() {
+        let fixture = IsolatedProfileFixture::new("proc-scan");
+        let missing = fixture.path().join("no-proc");
+        let profile = Path::new("/tmp/da-chrome-profile-42-0");
+        assert_eq!(
+            scan_proc_profile_pids(&missing, profile, 999).expect("missing proc"),
+            None
+        );
+
+        let proc_root = fixture.path().join("proc");
+        fs::create_dir_all(proc_root.join("101")).unwrap();
+        fs::write(proc_root.join("101/stat"), "101 (chrome) S 1 101 101\n").unwrap();
+        fs::write(
+            proc_root.join("101/cmdline"),
+            b"/opt/google/chrome/chrome\0--user-data-dir=/tmp/da-chrome-profile-42-0\0",
+        )
+        .unwrap();
+
+        fs::create_dir_all(proc_root.join("102")).unwrap();
+        fs::write(proc_root.join("102/stat"), "102 (chrome) S 101 101 101\n").unwrap();
+        fs::write(
+            proc_root.join("102/cmdline"),
+            b"/opt/google/chrome/chrome\0--type=utility\0--user-data-dir=/tmp/da-chrome-profile-42-0\0",
+        )
+        .unwrap();
+
+        // Zombie matching profile must be skipped.
+        fs::create_dir_all(proc_root.join("103")).unwrap();
+        fs::write(proc_root.join("103/stat"), "103 (chrome) Z 1 101 101\n").unwrap();
+        fs::write(
+            proc_root.join("103/cmdline"),
+            b"/opt/google/chrome/chrome\0--user-data-dir=/tmp/da-chrome-profile-42-0\0",
+        )
+        .unwrap();
+
+        // Prefix-extended profile must not match.
+        fs::create_dir_all(proc_root.join("104")).unwrap();
+        fs::write(proc_root.join("104/stat"), "104 (chrome) S 1 104 104\n").unwrap();
+        fs::write(
+            proc_root.join("104/cmdline"),
+            b"/opt/google/chrome/chrome\0--user-data-dir=/tmp/da-chrome-profile-42-00\0",
+        )
+        .unwrap();
+
+        // Self pid must be skipped.
+        fs::create_dir_all(proc_root.join("999")).unwrap();
+        fs::write(proc_root.join("999/stat"), "999 (da) R 1 999 999\n").unwrap();
+        fs::write(
+            proc_root.join("999/cmdline"),
+            b"da\0--user-data-dir=/tmp/da-chrome-profile-42-0\0",
+        )
+        .unwrap();
+
+        let found = scan_proc_profile_pids(&proc_root, profile, 999)
+            .expect("scan proc")
+            .expect("proc exists");
+        assert_eq!(found, vec![101, 102]);
+    }
+
+    #[test]
+    fn unix_ps_parsers_filter_zombies_self_and_match_profile() {
+        let profile = Path::new("/tmp/da-chrome-profile-42-0");
+        assert_eq!(
+            parse_ps_stat_and_args("  Ss   /Applications/Google Chrome --user-data-dir=x "),
+            Some(("Ss", "/Applications/Google Chrome --user-data-dir=x "))
+        );
+        assert_eq!(parse_ps_stat_and_args("Z"), Some(("Z", "")));
+
+        let ps_all = "\
+  101 S    /usr/bin/chrome --user-data-dir=/tmp/da-chrome-profile-42-0 --headless=new\n\
+  102 S    /usr/bin/chrome --type=gpu --user-data-dir=/tmp/da-chrome-profile-42-0\n\
+  103 Z+   /usr/bin/chrome --user-data-dir=/tmp/da-chrome-profile-42-0\n\
+  104 S    /usr/bin/chrome --user-data-dir=/tmp/da-chrome-profile-42-00\n\
+  999 R    da --user-data-dir=/tmp/da-chrome-profile-42-0\n";
+        assert_eq!(parse_ps_profile_pids(ps_all, profile, 999), vec![101, 102]);
+    }
+
+    #[test]
+    fn parse_windows_profile_pids_filters_self_and_matches_exact_profile() {
+        let profile = Path::new(r"G:\Temp\da-chrome-profile-42-0");
+        let output = "\
+101\t\"C:\\Program Files\\Google\\Chrome\\chrome.exe\" --user-data-dir=G:\\Temp\\da-chrome-profile-42-0\n\
+102\t\"C:\\Program Files\\Google\\Chrome\\chrome.exe\" --type=utility --user-data-dir=\"G:\\Temp\\da-chrome-profile-42-0\"\n\
+103\t\"C:\\Program Files\\Google\\Chrome\\chrome.exe\" --user-data-dir=G:\\Temp\\da-chrome-profile-42-00\n\
+999\tda.exe --user-data-dir=G:\\Temp\\da-chrome-profile-42-0\n";
+        assert_eq!(
+            parse_windows_profile_pids(output, profile, 999),
+            vec![101, 102]
+        );
     }
 }
