@@ -1066,7 +1066,7 @@ const OWNERSHIP_PROBE_INTERVAL: Duration = Duration::from_millis(150);
 /// belongs to another process, so the browser that owned the profile is gone.
 /// An ownership that stays [`PidProfileMatch::Unknown`] is returned as such so
 /// the caller can stay fail-closed.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn settle_pid_profile_match(
     pid: u32,
     profile: &Path,
