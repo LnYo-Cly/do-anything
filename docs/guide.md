@@ -24,6 +24,7 @@ The complete reference for `da`: installation options, building from source, the
   - [Assertions](#assertions)
   - [Optional steps](#optional-steps)
   - [Retrying read-only steps](#retrying-read-only-steps)
+  - [Cleanup with `finally`](#cleanup-with-finally)
   - [`http.request`](#httprequest)
   - [`cli.run`](#clirun)
   - [`db.query`](#dbquery)
@@ -874,7 +875,7 @@ Redaction has limits that matter when you choose a value:
 
 `da schema` prints a [JSON Schema](https://json-schema.org/) (draft 2020-12) for
 one case file. The schema follows the parser: only `name`, `project`, `suite`,
-`layer`, `tags`, `vars`, `observe` and `steps` at the top level; one registered
+`layer`, `tags`, `vars`, `observe`, `steps` and `finally` at the top level; one registered
 step name per step, plus optional `optional`, `retry`, `expect` and `save`, where a step
 that saves may not be optional; one registered observer
 and its arguments per entry of `observe`; the four comparisons with their value
@@ -1142,6 +1143,60 @@ that attempt, keeping only the last attempt's result and observations:
 - `retry` is a case-file feature. `da session step` rejects a step that carries
   `retry` with an invalid-input error instead of running or ignoring the policy;
   an interactive caller sends each attempt explicitly.
+
+### Cleanup with `finally`
+
+`finally:` is an optional, non-empty list of cleanup steps at the top level of
+a case. It uses the exact same step syntax, argument schemas, `optional`,
+`retry`, `expect` and `save` rules as `steps:`.
+
+```yaml
+name: Create and always remove an order
+steps:
+  - http.request:
+      method: POST
+      url: http://127.0.0.1:8080/orders
+      json: { item: book }
+    expect:
+      - path: $.status
+        equals: 201
+    save:
+      order_id: $.body.id
+  - http.request:
+      url: http://127.0.0.1:8080/orders/${order_id}
+    expect:
+      - path: $.body.state
+        equals: confirmed
+finally:
+  - http.request:
+      method: DELETE
+      url: http://127.0.0.1:8080/orders/${order_id}
+    optional: true
+```
+
+Execution and evidence guarantees:
+
+- **Always runs before sessions close.** Every step in `finally:` runs in
+  declaration order after `steps:` finishes — whether `steps:` passed, failed
+  an assertion, or stopped on an error — and before sessions close. A failing
+  or errored `finally:` step never skips the remaining `finally:` steps.
+- **Failure evidence is locked in before cleanup.** When `steps:` did not pass
+  and failure bundles (or `--record`) are enabled, `da` collects session
+  evidence (such as browser screenshots and DOM snapshots) **before** entering
+  `finally:`. Cleanup actions that navigate away or delete records therefore
+  cannot overwrite the failure scene.
+- **Cleanup failures still fail the case.** When `steps:` passed and one or
+  more `finally:` steps fail or error, `da` collects session evidence after
+  `finally:` finishes (before closing sessions) and gives the case the first
+  failing `finally:` step's problem. When `steps:` already failed, the case
+  keeps the main failure as `error` and records each `finally:` outcome under
+  `finally`.
+- **Variables and `optional: true`.** Static checks (`da lint` and preflight)
+  allow `finally:` steps to reference `vars:` as well as variables saved in
+  `steps:` or earlier `finally:` steps. If an earlier step failed before
+  writing a `save` variable, referencing `${name}` in `finally:` fails as an
+  execution error — or add `optional: true` to that cleanup step so it is
+  cleanly `skipped` while remaining `finally:` steps continue.
 
 ### `http.request`
 
@@ -2025,7 +2080,9 @@ Summary: 1 case (0 passed, 1 failed, 0 errors, 0 filtered), 2 steps (1 passed, 1
 ```
 
 `bundle` is the directory of the case's failure bundle, or `null` when the case
-passed or bundles are off. `bundle_errors` lists the bundles that could not be
+passed or bundles are off. When a case declares `finally:`, its cleanup step
+reports appear under `finally` on that case object (omitted when no `finally:`
+block is present). `bundle_errors` lists the bundles that could not be
 written; they never change the exit code. Every case also carries its
 `project`, `suite`, `layer` (`null` when not declared) and `tags` (`[]` when
 none), and `summary.filtered` counts the cases the filters excluded.

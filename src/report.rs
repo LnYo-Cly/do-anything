@@ -199,16 +199,20 @@ impl CaseRecord {
             .to_string()
     }
 
-    fn steps(&self) -> usize {
+    fn step_count(&self, field: &str) -> usize {
         self.report
-            .get("steps")
+            .get(field)
             .and_then(Value::as_array)
             .map_or(0, Vec::len)
     }
 
-    fn skipped_steps(&self) -> usize {
+    fn steps(&self) -> usize {
+        self.step_count("steps") + self.step_count("finally")
+    }
+
+    fn skipped_in(&self, field: &str) -> usize {
         self.report
-            .get("steps")
+            .get(field)
             .and_then(Value::as_array)
             .map_or(0, |steps| {
                 steps
@@ -216,6 +220,10 @@ impl CaseRecord {
                     .filter(|step| step.get("status").and_then(Value::as_str) == Some("skipped"))
                     .count()
             })
+    }
+
+    fn skipped_steps(&self) -> usize {
+        self.skipped_in("steps") + self.skipped_in("finally")
     }
 
     fn meta_text(&self, field: &str) -> Option<String> {
@@ -594,6 +602,16 @@ fn render_case(
             }
             html.push_str("</div>\n");
         }
+    }
+
+    if let Some(finally) = case.report.get("finally").and_then(Value::as_array)
+        && !finally.is_empty()
+    {
+        html.push_str("<div class=\"steps finally\"><h3>Cleanup (finally)</h3>\n");
+        for (position, step) in finally.iter().enumerate() {
+            render_step(html, position, step);
+        }
+        html.push_str("</div>\n");
     }
 
     render_case_evidence(html, case, shareable, budget);

@@ -31,6 +31,8 @@ pub struct Case {
     pub observe: Vec<Observation>,
     /// Steps, executed in order until one fails.
     pub steps: Vec<Step>,
+    /// Cleanup steps executed in order after `steps`, before sessions close.
+    pub finally: Vec<Step>,
 }
 
 /// One observation declared by a case.
@@ -196,6 +198,113 @@ struct RawCase {
     #[serde(default)]
     observe: RawObservations,
     steps: Vec<Spanned<RawStep>>,
+    #[serde(default)]
+    finally: RawFinally,
+}
+
+/// The optional `finally:` step list as written.
+///
+/// Kept distinct from `Option<Vec<...>>` so an explicit `finally:` with `null`
+/// or a non-list value is rejected instead of silently treated as omitted.
+#[derive(Debug, Default)]
+struct RawFinally {
+    steps: Vec<Spanned<RawStep>>,
+}
+
+impl<'de> Deserialize<'de> for RawFinally {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FinallyVisitor;
+
+        impl<'de> Visitor<'de> for FinallyVisitor {
+            type Value = RawFinally;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a non-empty list of cleanup steps")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<RawFinally, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut steps = Vec::new();
+                while let Some(step) = seq.next_element::<Spanned<RawStep>>()? {
+                    steps.push(step);
+                }
+                if steps.is_empty() {
+                    return Err(A::Error::custom(
+                        "the `finally` block has no steps; add at least one step or remove `finally`",
+                    ));
+                }
+                Ok(RawFinally { steps })
+            }
+
+            fn visit_map<A>(self, _: A) -> Result<RawFinally, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                Err(A::Error::custom(finally_expects("a mapping")))
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<RawFinally, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(finally_expects("a string")))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<RawFinally, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(finally_expects("a number")))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<RawFinally, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(finally_expects("a number")))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<RawFinally, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(finally_expects("a number")))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<RawFinally, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(finally_expects("a boolean")))
+            }
+
+            fn visit_unit<E>(self) -> Result<RawFinally, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(finally_expects("null")))
+            }
+
+            fn visit_none<E>(self) -> Result<RawFinally, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(finally_expects("null")))
+            }
+        }
+
+        deserializer.deserialize_any(FinallyVisitor)
+    }
+}
+
+/// The message a `finally:` block that is not a list reports.
+fn finally_expects(found: &str) -> String {
+    format!("`finally` must be a list of steps, found {found}")
 }
 
 /// The `observe:` mapping as written, keeping the location of every entry.
@@ -963,7 +1072,7 @@ fn normalize_and_parse_step(mut raw: Spanned<RawStep>) -> Result<Step, Problem> 
         });
         raw.value.fields.push((name, action_loc, args));
     }
-    parse_step(1, raw)
+    parse_step("step 1", raw)
 }
 
 /// Renders a message at the place in a case file it belongs to.
@@ -988,6 +1097,7 @@ fn build_case(raw: Spanned<RawCase>) -> Result<Case, Problem> {
         tags,
         observe,
         steps: raw_steps,
+        finally: raw_finally,
     } = raw.value;
 
     let mut expanded = BTreeMap::new();
@@ -1017,13 +1127,20 @@ fn build_case(raw: Spanned<RawCase>) -> Result<Case, Problem> {
 
     let mut steps = Vec::with_capacity(raw_steps.len());
     for (index, step) in raw_steps.into_iter().enumerate() {
-        steps.push(parse_step(index + 1, step)?);
+        let label = format!("step {}", index + 1);
+        steps.push(parse_step(&label, step)?);
     }
     if steps.is_empty() {
         return Err(Problem {
             location: document,
             message: "the case has no steps; add at least one step under `steps`".to_string(),
         });
+    }
+
+    let mut finally = Vec::with_capacity(raw_finally.steps.len());
+    for (index, step) in raw_finally.steps.into_iter().enumerate() {
+        let label = format!("finally step {}", index + 1);
+        finally.push(parse_step(&label, step)?);
     }
 
     Ok(Case {
@@ -1035,6 +1152,7 @@ fn build_case(raw: Spanned<RawCase>) -> Result<Case, Problem> {
         tags: classification_tags(tags, document)?,
         observe: parse_observations(observe)?,
         steps,
+        finally,
     })
 }
 
@@ -1168,7 +1286,7 @@ fn classification_tags(tags: Vec<String>, location: Location) -> Result<Vec<Stri
     Ok(tags)
 }
 
-fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
+fn parse_step(step_label: &str, step: Spanned<RawStep>) -> Result<Step, Problem> {
     let location = step.referenced;
     let RawStep {
         mut fields,
@@ -1186,7 +1304,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
                 return Err(Problem {
                     location: node.referenced,
                     message: format!(
-                        "step {index}: `optional` must be true or false, found {}",
+                        "{step_label}: `optional` must be true or false, found {}",
                         kind_name(&other)
                     ),
                 });
@@ -1199,7 +1317,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
             let Some(field) = fields.pop() else {
                 return Err(Problem {
                     location,
-                    message: format!("step {index}: expected one step name"),
+                    message: format!("{step_label}: expected one step name"),
                 });
             };
             field
@@ -1208,7 +1326,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
             return Err(Problem {
                 location,
                 message: format!(
-                    "step {index}: expected one step name such as `sample.call`, found none"
+                    "{step_label}: expected one step name such as `sample.call`, found none"
                 ),
             });
         }
@@ -1217,7 +1335,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
             return Err(Problem {
                 location,
                 message: format!(
-                    "step {index}: expected exactly one step name, found {count}: {}",
+                    "{step_label}: expected exactly one step name, found {count}: {}",
                     names.join(", ")
                 ),
             });
@@ -1228,7 +1346,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
         return Err(Problem {
             location: args.referenced,
             message: format!(
-                "step {index}: `{action}` takes a mapping of arguments, found {}",
+                "{step_label}: `{action}` takes a mapping of arguments, found {}",
                 args.value.kind()
             ),
         });
@@ -1241,14 +1359,14 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
     let (retry, retry_location) = match retry {
         None => (None, Location::UNKNOWN),
         Some((retry_location, node)) => (
-            Some(parse_retry(index, retry_location, node)?),
+            Some(parse_retry(step_label, retry_location, node)?),
             retry_location,
         ),
     };
 
     let expect = match expect {
         None => Vec::new(),
-        Some(node) => parse_expectation_list(index, "`expect`", node)?,
+        Some(node) => parse_expectation_list(step_label, "`expect`", node)?,
     };
 
     let save_location = save.as_ref().map(|(location, _)| *location);
@@ -1262,7 +1380,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
                         return Err(Problem {
                             location: value.referenced,
                             message: format!(
-                                "step {index}: the `save` path for `{name}` must be a string, found {}",
+                                "{step_label}: the `save` path for `{name}` must be a string, found {}",
                                 kind_name(&value.value)
                             ),
                         });
@@ -1270,7 +1388,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
                     validate_path(&path).map_err(|message| Problem {
                         location: value.referenced,
                         message: format!(
-                            "step {index}: the `save` path for `{name}` is invalid: {message}"
+                            "{step_label}: the `save` path for `{name}` is invalid: {message}"
                         ),
                     })?;
                     saved.push(SavedValue { name, path });
@@ -1281,7 +1399,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
                 return Err(Problem {
                     location: node.referenced,
                     message: format!(
-                        "step {index}: `save` must be a mapping of variable names to JSON paths, found {}",
+                        "{step_label}: `save` must be a mapping of variable names to JSON paths, found {}",
                         other.kind()
                     ),
                 });
@@ -1296,7 +1414,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
         return Err(Problem {
             location: save_location,
             message: format!(
-                "step {index}: `optional: true` cannot be combined with `save`; remove `save`, or drop `optional` so the step always sets the variable"
+                "{step_label}: `optional: true` cannot be combined with `save`; remove `save`, or drop `optional` so the step always sets the variable"
             ),
         });
     }
@@ -1316,7 +1434,7 @@ fn parse_step(index: usize, step: Spanned<RawStep>) -> Result<Step, Problem> {
 }
 
 fn parse_expectation_list(
-    step: usize,
+    step_label: &str,
     field: &str,
     node: Spanned<RawNodes>,
 ) -> Result<Vec<Expectation>, Problem> {
@@ -1324,14 +1442,14 @@ fn parse_expectation_list(
         RawNodes::List(items) => {
             let mut expectations = Vec::with_capacity(items.len());
             for (position, item) in items.iter().enumerate() {
-                expectations.push(parse_expectation(step, position + 1, item)?);
+                expectations.push(parse_expectation(step_label, position + 1, item)?);
             }
             Ok(expectations)
         }
         other => Err(Problem {
             location: node.referenced,
             message: format!(
-                "step {step}: {field} must be a list of assertions, found {}",
+                "{step_label}: {field} must be a list of assertions, found {}",
                 other.kind()
             ),
         }),
@@ -1339,7 +1457,7 @@ fn parse_expectation_list(
 }
 
 fn parse_retry(
-    step: usize,
+    step_label: &str,
     key_location: Location,
     node: Spanned<RawRetry>,
 ) -> Result<RetryPolicy, Problem> {
@@ -1349,7 +1467,7 @@ fn parse_retry(
             return Err(Problem {
                 location: node.referenced,
                 message: format!(
-                    "step {step}: `retry` must be a mapping with `until` and `timeout_ms`, found {kind}"
+                    "{step_label}: `retry` must be a mapping with `until` and `timeout_ms`, found {kind}"
                 ),
             });
         }
@@ -1359,33 +1477,33 @@ fn parse_retry(
         return Err(Problem {
             location,
             message: format!(
-                "step {step}: unknown field `{field}` in `retry`; expected `until`, `timeout_ms` or `interval_ms`"
+                "{step_label}: unknown field `{field}` in `retry`; expected `until`, `timeout_ms` or `interval_ms`"
             ),
         });
     }
 
     let until_node = until.ok_or_else(|| Problem {
         location: key_location,
-        message: format!("step {step}: `retry` requires `until`"),
+        message: format!("{step_label}: `retry` requires `until`"),
     })?;
     let until_location = until_node.referenced;
-    let until = parse_expectation_list(step, "`retry.until`", until_node)?;
+    let until = parse_expectation_list(step_label, "`retry.until`", until_node)?;
     if until.is_empty() {
         return Err(Problem {
             location: until_location,
-            message: format!("step {step}: `retry.until` must contain at least one assertion"),
+            message: format!("{step_label}: `retry.until` must contain at least one assertion"),
         });
     }
 
     let timeout_node = timeout_ms.ok_or_else(|| Problem {
         location: key_location,
-        message: format!("step {step}: `retry` requires `timeout_ms`"),
+        message: format!("{step_label}: `retry` requires `timeout_ms`"),
     })?;
-    let timeout_ms = parse_positive_ms(step, "timeout_ms", timeout_node)?;
+    let timeout_ms = parse_positive_ms(step_label, "timeout_ms", timeout_node)?;
 
     let interval_ms = match interval_ms {
         None => DEFAULT_RETRY_INTERVAL_MS,
-        Some(node) => parse_positive_ms(step, "interval_ms", node)?,
+        Some(node) => parse_positive_ms(step_label, "interval_ms", node)?,
     };
 
     Ok(RetryPolicy {
@@ -1395,25 +1513,25 @@ fn parse_retry(
     })
 }
 
-fn parse_positive_ms(step: usize, field: &str, node: Spanned<Value>) -> Result<u64, Problem> {
+fn parse_positive_ms(step_label: &str, field: &str, node: Spanned<Value>) -> Result<u64, Problem> {
     match node.value {
         Value::Number(number) => match number.as_u64() {
             Some(0) => Err(Problem {
                 location: node.referenced,
-                message: format!("step {step}: `retry.{field}` must be at least 1"),
+                message: format!("{step_label}: `retry.{field}` must be at least 1"),
             }),
             Some(ms) => Ok(ms),
             None => Err(Problem {
                 location: node.referenced,
                 message: format!(
-                    "step {step}: `retry.{field}` must be a positive integer, found {number}"
+                    "{step_label}: `retry.{field}` must be a positive integer, found {number}"
                 ),
             }),
         },
         other => Err(Problem {
             location: node.referenced,
             message: format!(
-                "step {step}: `retry.{field}` must be a positive integer, found {}",
+                "{step_label}: `retry.{field}` must be a positive integer, found {}",
                 kind_name(&other)
             ),
         }),
@@ -1423,7 +1541,7 @@ fn parse_positive_ms(step: usize, field: &str, node: Spanned<Value>) -> Result<u
 const COMPARISONS: [&str; 4] = ["equals", "not_equals", "contains", "exists"];
 
 fn parse_expectation(
-    step: usize,
+    step_label: &str,
     position: usize,
     item: &Spanned<Value>,
 ) -> Result<Expectation, Problem> {
@@ -1432,7 +1550,7 @@ fn parse_expectation(
         return Err(Problem {
             location,
             message: format!(
-                "step {step}: assertion {position} must be a mapping with `path` and one comparison, found {}",
+                "{step_label}: assertion {position} must be a mapping with `path` and one comparison, found {}",
                 kind_name(&item.value)
             ),
         });
@@ -1445,7 +1563,7 @@ fn parse_expectation(
             return Err(Problem {
                 location,
                 message: format!(
-                    "step {step}: assertion {position}: `path` must be a string, found {}",
+                    "{step_label}: assertion {position}: `path` must be a string, found {}",
                     kind_name(&other)
                 ),
             });
@@ -1453,14 +1571,14 @@ fn parse_expectation(
         None => {
             return Err(Problem {
                 location,
-                message: format!("step {step}: assertion {position}: `path` is required"),
+                message: format!("{step_label}: assertion {position}: `path` is required"),
             });
         }
     };
     validate_path(&path).map_err(|message| Problem {
         location,
         message: format!(
-            "step {step}: assertion {position}: `{path}` is not a valid JSON path: {message}"
+            "{step_label}: assertion {position}: `{path}` is not a valid JSON path: {message}"
         ),
     })?;
 
@@ -1475,7 +1593,7 @@ fn parse_expectation(
         return Err(Problem {
             location,
             message: format!(
-                "step {step}: assertion {position}: unknown field(s) {}; use one of {}",
+                "{step_label}: assertion {position}: unknown field(s) {}; use one of {}",
                 unknown.join(", "),
                 COMPARISONS.join(", ")
             ),
@@ -1486,7 +1604,7 @@ fn parse_expectation(
             return Err(Problem {
                 location,
                 message: format!(
-                    "step {step}: assertion {position}: expected one of {}",
+                    "{step_label}: assertion {position}: expected one of {}",
                     COMPARISONS.join(", ")
                 ),
             });
@@ -1497,7 +1615,7 @@ fn parse_expectation(
             return Err(Problem {
                 location,
                 message: format!(
-                    "step {step}: assertion {position}: expected exactly one comparison, found {}",
+                    "{step_label}: assertion {position}: expected exactly one comparison, found {}",
                     names.join(", ")
                 ),
             });
@@ -1512,7 +1630,7 @@ fn parse_expectation(
                 return Err(Problem {
                     location,
                     message: format!(
-                        "step {step}: assertion {position}: `contains` compares a string or an array, found {}; use `equals` for other values",
+                        "{step_label}: assertion {position}: `contains` compares a string or an array, found {}; use `equals` for other values",
                         kind_name(&expected)
                     ),
                 });
@@ -1525,7 +1643,7 @@ fn parse_expectation(
                 return Err(Problem {
                     location,
                     message: format!(
-                        "step {step}: assertion {position}: `exists` takes true or false, found {}",
+                        "{step_label}: assertion {position}: `exists` takes true or false, found {}",
                         kind_name(&other)
                     ),
                 });
@@ -1535,7 +1653,7 @@ fn parse_expectation(
             return Err(Problem {
                 location,
                 message: format!(
-                    "step {step}: assertion {position}: `{other}` is not a comparison; use one of {}",
+                    "{step_label}: assertion {position}: `{other}` is not a comparison; use one of {}",
                     COMPARISONS.join(", ")
                 ),
             });
@@ -2718,6 +2836,14 @@ steps:
             parse_single_step(r#"{"use":"sample.ping"}"#).expect("use without with must default");
         assert_eq!(no_with.action, "sample.ping");
         assert_eq!(no_with.args, serde_json::json!({}));
+
+        let optional_save_err =
+            parse_single_step("sample.call:\n  target: a\noptional: true\nsave:\n  id: $.id\n")
+                .expect_err("single-step parser must enforce the same optional+save rule");
+        assert!(
+            optional_save_err.contains("step 1"),
+            "got: {optional_save_err}"
+        );
     }
 
     #[test]
@@ -2732,5 +2858,49 @@ steps:
             refs,
             BTreeSet::from(["SECOND_VAR".to_string(), "TOKEN_ONE".to_string()])
         );
+    }
+
+    #[test]
+    fn parses_optional_finally_steps_and_rejects_empty_or_non_list_finally() {
+        let omitted = parse("name: No finally\nsteps:\n  - sample.call:\n      target: local\n")
+            .expect("omitted finally must parse");
+        assert!(omitted.finally.is_empty());
+
+        let with_finally = parse(
+            "name: With finally\nsteps:\n  - sample.call:\n      target: local\nfinally:\n  - sample.cleanup:\n      target: first\n    optional: true\n  - sample.cleanup:\n      target: second\n",
+        )
+        .expect("non-empty finally must parse");
+        assert_eq!(with_finally.finally.len(), 2);
+        assert_eq!(with_finally.finally[0].action, "sample.cleanup");
+        assert!(with_finally.finally[0].optional);
+        assert_eq!(with_finally.finally[1].action, "sample.cleanup");
+        assert!(!with_finally.finally[1].optional);
+
+        let empty_err = parse(
+            "name: Empty finally\nsteps:\n  - sample.call:\n      target: local\nfinally: []\n",
+        )
+        .expect_err("empty finally list must be rejected");
+        assert!(empty_err.contains("finally"), "got: {empty_err}");
+
+        for bad in [
+            "finally:\n",
+            "finally: {}\n",
+            "finally: \"step\"\n",
+            "finally: 3\n",
+        ] {
+            let text =
+                format!("name: Bad finally\nsteps:\n  - sample.call:\n      target: local\n{bad}");
+            let error = parse(&text).expect_err("non-list finally must be rejected");
+            assert!(
+                error.contains("`finally` must be a list of steps"),
+                "{bad:?}: got: {error}"
+            );
+        }
+
+        let structural = parse(
+            "name: Structural error in finally\nsteps:\n  - sample.call:\n      target: local\nfinally:\n  - sample.cleanup:\n      target: a\n    optional: true\n    save:\n      id: $.id\n",
+        )
+        .expect_err("finally step enforces the same step rules");
+        assert!(structural.contains("finally step 1"), "got: {structural}");
     }
 }

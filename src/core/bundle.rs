@@ -386,6 +386,7 @@ mod tests {
                 assertions: Vec::new(),
                 error: None,
             }],
+            finally: Vec::new(),
             error: None,
             close_errors: Vec::new(),
             bundle: None,

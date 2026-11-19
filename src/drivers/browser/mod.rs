@@ -7003,6 +7003,7 @@ mod tests {
                 },
                 second_step,
             ],
+            finally: Vec::new(),
         };
 
         let outcome = runner::run(
