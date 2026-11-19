@@ -15,6 +15,7 @@ The complete reference for `da`: installation options, building from source, the
     - [Observers and parallel runs](#observers-and-parallel-runs)
   - [Sessions](#sessions)
   - [Interactive sessions (`da session`)](#interactive-sessions-da-session)
+  - [Model Context Protocol (`da mcp`)](#model-context-protocol-da-mcp)
   - [Classification and filtering](#classification-and-filtering)
   - [Linting](#linting)
   - [Secrets](#secrets)
@@ -82,10 +83,13 @@ cargo build
 
 The binary is written to `target/debug/da` (`target\debug\da.exe` on Windows).
 The `http` feature provides the `http.request` step, `cli` provides `cli.run`,
-`log` provides the `log.file` observer, `db` provides `db.query` and `browser`
-provides the `browser.*` steps; these five are enabled by default. The `browser`
-feature adds about 0.5 MiB to the release binary and needs a Chrome or Chromium
-installed on the machine; it never downloads a browser. Build a subset with
+`log` provides the `log.file` observer, `db` provides `db.query`, `browser`
+provides the `browser.*` steps and `mcp` provides `da mcp`; these six are
+enabled by default. The `browser` feature adds about 0.5 MiB to the release
+binary and needs a Chrome or Chromium installed on the machine; it never
+downloads a browser. The `mcp` feature adds about 54 KiB to a build with no
+drivers and about 82 KiB to the default build; it has no dependency and no
+async runtime. Build a subset with
 `--no-default-features --features http,cli,log,db`, build only one driver with
 `--no-default-features --features cli`, or build nothing extra with
 `--no-default-features`.
@@ -627,6 +631,104 @@ $ da session stop s-1794974416388-44376-0
   JSON outputs and never written into session logs or handles. `da session stop`
   and idle reaping close detached Chrome instances and delete both
   `.da/sessions/<id>/` and Chrome's temporary profile directory.
+
+### Model Context Protocol (`da mcp`)
+
+Some coding-agent hosts have no shell tool and can only reach the outside world
+through the [Model Context Protocol](https://modelcontextprotocol.io/). `da mcp`
+serves the same transport-neutral session protocol as `da session` over standard
+input and output, so such a host can explore a service step by step and export a
+replayable case without running a command. The server is synchronous, adds no
+dependency and needs no async runtime, and it lives behind its own `mcp` cargo
+feature.
+
+A host starts it as an ordinary stdio server, for example:
+
+```json
+{
+  "mcpServers": {
+    "da": {
+      "command": "da",
+      "args": ["mcp"],
+      "cwd": "."
+    }
+  }
+}
+```
+
+The process runs until standard input reaches end of file. Standard output
+carries responses only, and each one is flushed before the next request is read,
+so no diagnostic can be mistaken for a response. `--sessions-dir` and
+`--idle-timeout-ms` mean the same thing they mean for `da session`, and the
+sessions it creates are the `.da/sessions/<id>/` directories `da session list`
+and `da session export` already use.
+
+#### Framing and methods
+
+Every message is JSON-RPC 2.0. Two framings are accepted: one JSON object per
+line, and the `Content-Length` framing the Language Server Protocol uses. A
+response always uses the framing of the request it answers, so a host that
+speaks only one of them needs no negotiation.
+
+| Method | Result |
+| --- | --- |
+| `initialize` | `protocolVersion` (echoed when this server knows it, otherwise the newest one it speaks), `capabilities.tools`, `serverInfo` and `instructions` |
+| `notifications/initialized` | Nothing: JSON-RPC forbids answering a notification |
+| `ping` | `{}` |
+| `tools/list` | The fixed six tools with their compact `inputSchema` |
+| `tools/call` | The result of one tool |
+
+An unknown method answers `-32601`, a body that is not JSON answers `-32700`,
+and a `tools/call` that names no tool answers `-32602`.
+
+#### The six tools
+
+The list never changes with the build. One tool per registered step would grow
+with every driver and would differ between feature combinations, which spends a
+model's context on descriptions it cannot use.
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `session_start` | none | `session_id` of a new session |
+| `step` | `session_id`, `use`, optional `with`, `expect`, `save` | The step result, its assertions and, after a browser step, a fresh `snapshot` |
+| `snapshot` | `session_id`, optional `ref`, `max_depth`, `max_nodes` | The accessibility tree without running a step |
+| `export` | `session_id`, optional `name`, `include_reads`, `out` | The YAML case, byte for byte what `da session export --yaml` writes |
+| `run` | `paths`, optional `vars`, `jobs` | The same JSON report `da --output json run` prints |
+| `session_stop` | `session_id` | Closes every resource and removes the session directory |
+
+`step` is the only generic step tool: `use` names a registered step, `with`
+holds the arguments a case file nests under that name, and `expect` and `save`
+mean what they mean in a case file. The step goes through the case parser, so a
+session step and a case step accept exactly the same shape:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"step","arguments":{"session_id":"s-1794974416388-44376-0","use":"http.request","with":{"method":"GET","url":"http://127.0.0.1:8080/health"},"expect":[{"path":"$.status","equals":200}]}}}
+```
+
+#### Correcting a refused step
+
+When the arguments do not satisfy the step's schema, the tool result is an error
+whose payload carries that step's complete JSON Schema under `arguments_schema`,
+so the model can fix the call instead of guessing. A `use` that names no
+registered step lists the steps the build has in `available_steps` instead, which
+also tells a host why a step is missing:
+
+```json
+{
+  "ok": false,
+  "session_id": "s-1794974416388-44376-0",
+  "error": {"kind": "invalid_input", "message": "`cli.run` invalid arguments: missing field `command`"},
+  "arguments_schema": {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}}},
+  "hint": "`with` must satisfy `arguments_schema` for `cli.run`; fix the arguments and call `step` again with the same `session_id`."
+}
+```
+
+#### Secrets
+
+Every tool output passes through the same `Secrets` redaction as the command
+line: a value read through `${env:NAME}` becomes `***`, in results, in error
+messages and in the exported case, including its percent-encoded and base64
+forms. The exported YAML keeps the `${env:NAME}` reference, never the value.
 
 ### Classification and filtering
 

@@ -6,6 +6,8 @@
 pub mod core;
 pub mod drivers;
 pub mod exit;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod report;
 pub mod session;
 
