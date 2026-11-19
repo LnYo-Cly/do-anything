@@ -4,9 +4,9 @@ vars:
   title: Agent proof note
   body: Written through the accessibility snapshot only.
   # The example app's PostgreSQL connection, taken from the environment so no
-  # credential lives in this file: export DATABASE_URL before linting or
+  # credential lives in this file: export DA_TEST_POSTGRES_URL before linting or
   # running this case.
-  db_url: ${env:DATABASE_URL}
+  db_url: ${env:DA_TEST_POSTGRES_URL}
 steps:
   # --- UI layer: drive the real page -------------------------------
   - browser.open:
