@@ -120,6 +120,16 @@ enum Command {
     },
     /// Print the JSON Schema for the case file format.
     Schema,
+    /// Serve the Model Context Protocol on standard input and output.
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// Directory that stores session state. Defaults to `.da/sessions`.
+        #[arg(long, value_name = "DIR")]
+        sessions_dir: Option<PathBuf>,
+        /// Idle timeout in milliseconds before sessions are reaped. Defaults to 1800000.
+        #[arg(long, value_name = "MS")]
+        idle_timeout_ms: Option<u64>,
+    },
     /// Manage persistent interactive sessions for step-by-step exploration.
     Session {
         /// Directory that stores session state. Defaults to `.da/sessions`.
@@ -305,6 +315,18 @@ fn main() -> ExitCode {
             lint(&paths, default_output, &registry, &sources)
         }
         Command::Schema => print_schema(&registry, default_output),
+        #[cfg(feature = "mcp")]
+        Command::Mcp {
+            sessions_dir,
+            idle_timeout_ms,
+        } => do_anything::mcp::serve(
+            &registry,
+            do_anything::mcp::Options {
+                sessions_dir: sessions_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
+                idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
+            },
+        )
+        .into(),
         Command::Session {
             sessions_dir,
             idle_timeout_ms,
