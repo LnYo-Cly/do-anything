@@ -288,23 +288,10 @@ fn text_report(outcome: &RunOutcome, secrets: &Secrets) -> Rendered {
             millis(case.duration)
         ));
         for step in &case.steps {
-            if let Some(problem) = &step.error {
-                // A skipped step keeps the problem that skipped it. The note
-                // says the case went on, so a reader does not take the line for
-                // a failure of the run. A step that never ran has no problem
-                // and still prints nothing.
-                let note = if step.status == StepStatus::Skipped {
-                    " (optional)"
-                } else {
-                    ""
-                };
-                stdout.push_str(&format!("  {}{note}: {}\n", step.name, problem.message));
-            }
-            for assertion in &step.assertions {
-                if !assertion.passed {
-                    stdout.push_str(&format!("    {}\n", describe(assertion)));
-                }
-            }
+            render_step_text(&mut stdout, step, false);
+        }
+        for step in &case.finally {
+            render_step_text(&mut stdout, step, true);
         }
         for close_error in &case.close_errors {
             stdout.push_str(&format!("  close: {close_error}\n"));
@@ -335,6 +322,30 @@ fn text_report(outcome: &RunOutcome, secrets: &Secrets) -> Rendered {
     Rendered {
         stdout: secrets.redact(&stdout),
         stderr: secrets.redact(&bundle_errors(report)),
+    }
+}
+
+/// Renders one step's diagnostic lines (its problem and any failed assertions).
+fn render_step_text(stdout: &mut String, step: &StepReport, is_finally: bool) {
+    if let Some(problem) = &step.error {
+        // A skipped step keeps the problem that skipped it. The note says the
+        // case went on, so a reader does not take the line for a failure of the
+        // run. A step that never ran has no problem and still prints nothing.
+        let prefix = if is_finally { "finally " } else { "" };
+        let note = if step.status == StepStatus::Skipped {
+            " (optional)"
+        } else {
+            ""
+        };
+        stdout.push_str(&format!(
+            "  {prefix}{}{note}: {}\n",
+            step.name, problem.message
+        ));
+    }
+    for assertion in &step.assertions {
+        if !assertion.passed {
+            stdout.push_str(&format!("    {}\n", describe(assertion)));
+        }
     }
 }
 
@@ -467,20 +478,35 @@ fn summary_value(summary: &Summary, duration: std::time::Duration) -> Value {
 /// A failure bundle uses this for its `report.json`, so the bundle and the
 /// command output cannot describe the same case differently.
 pub fn case_json(case: &CaseReport) -> Value {
-    json!({
-        "file": paths::display(&case.file),
-        "name": case.name,
-        "project": case.project,
-        "suite": case.suite,
-        "layer": case.layer,
-        "tags": case.tags,
-        "status": case.status.as_str(),
-        "duration_ms": millis(case.duration),
-        "bundle": case.bundle.as_ref().map(|path| paths::display(path)),
-        "steps": case.steps.iter().map(step_value).collect::<Vec<Value>>(),
-        "error": case.error.as_ref().map(problem_value),
-        "close_errors": case.close_errors,
-    })
+    let mut object = Map::new();
+    object.insert("file".to_string(), json!(paths::display(&case.file)));
+    object.insert("name".to_string(), json!(case.name));
+    object.insert("project".to_string(), json!(case.project));
+    object.insert("suite".to_string(), json!(case.suite));
+    object.insert("layer".to_string(), json!(case.layer));
+    object.insert("tags".to_string(), json!(case.tags));
+    object.insert("status".to_string(), json!(case.status.as_str()));
+    object.insert("duration_ms".to_string(), json!(millis(case.duration)));
+    object.insert(
+        "bundle".to_string(),
+        json!(case.bundle.as_ref().map(|path| paths::display(path))),
+    );
+    object.insert(
+        "steps".to_string(),
+        Value::Array(case.steps.iter().map(step_value).collect()),
+    );
+    if !case.finally.is_empty() {
+        object.insert(
+            "finally".to_string(),
+            Value::Array(case.finally.iter().map(step_value).collect()),
+        );
+    }
+    object.insert(
+        "error".to_string(),
+        json!(case.error.as_ref().map(problem_value)),
+    );
+    object.insert("close_errors".to_string(), json!(case.close_errors));
+    Value::Object(object)
 }
 
 fn step_value(step: &StepReport) -> Value {
@@ -553,6 +579,7 @@ mod tests {
                         message: "1 of 1 assertions failed".to_string(),
                     }),
                 }],
+                finally: Vec::new(),
                 error: Some(Problem {
                     kind: ProblemKind::Assertion,
                     message: "1 of 1 assertions failed".to_string(),
@@ -606,6 +633,7 @@ mod tests {
                         error: None,
                     },
                 ],
+                finally: Vec::new(),
                 error: None,
                 close_errors: Vec::new(),
                 bundle: None,
@@ -1044,5 +1072,76 @@ mod tests {
         let json = render_lint(&report, Format::Json, &secrets);
         assert!(!json.stdout.contains("s3cr3t-value"), "{}", json.stdout);
         assert!(json.stdout.contains("***"), "{}", json.stdout);
+    }
+
+    #[test]
+    fn json_and_text_render_finally_steps_and_redact_secrets() {
+        let RunOutcome::Completed(mut report) = failing_outcome() else {
+            panic!("the fixture must be a completed run");
+        };
+        let without_finally = render(
+            &RunOutcome::Completed(report.clone()),
+            Format::Json,
+            &Secrets::new(),
+        );
+        let without_value: Value =
+            serde_json::from_str(&without_finally.stdout).expect("stdout must be JSON");
+        assert!(
+            without_value["cases"][0].get("finally").is_none(),
+            "empty finally list should stay omitted for compatibility: {without_value}"
+        );
+
+        report.cases[0].finally = vec![
+            StepReport {
+                name: "sample.cleanup".to_string(),
+                status: StepStatus::Error,
+                duration: Duration::from_millis(2),
+                result: Some(json!({ "token": "s3cr3t-value" })),
+                assertions: Vec::new(),
+                error: Some(Problem {
+                    kind: ProblemKind::Execution,
+                    message: "cleanup failed for s3cr3t-value".to_string(),
+                }),
+            },
+            StepReport {
+                name: "sample.optional_cleanup".to_string(),
+                status: StepStatus::Skipped,
+                duration: Duration::from_millis(1),
+                result: None,
+                assertions: Vec::new(),
+                error: Some(Problem {
+                    kind: ProblemKind::Execution,
+                    message: "missing id".to_string(),
+                }),
+            },
+        ];
+        let outcome = RunOutcome::Completed(report);
+        let mut secrets = Secrets::new();
+        secrets.record("s3cr3t-value");
+
+        let text = render(&outcome, Format::Text, &secrets);
+        assert!(!text.stdout.contains("s3cr3t-value"), "{}", text.stdout);
+        assert!(
+            text.stdout
+                .contains("  finally sample.cleanup: cleanup failed for ***"),
+            "got: {}",
+            text.stdout
+        );
+        assert!(
+            text.stdout
+                .contains("  finally sample.optional_cleanup (optional): missing id"),
+            "got: {}",
+            text.stdout
+        );
+
+        let json = render(&outcome, Format::Json, &secrets);
+        assert!(!json.stdout.contains("s3cr3t-value"), "{}", json.stdout);
+        let value: Value = serde_json::from_str(&json.stdout).expect("stdout must be JSON");
+        assert_eq!(value["cases"][0]["finally"][0]["result"]["token"], "***");
+        assert_eq!(
+            value["cases"][0]["finally"][0]["error"]["message"],
+            "cleanup failed for ***"
+        );
+        assert_eq!(value["cases"][0]["finally"][1]["status"], "skipped");
     }
 }

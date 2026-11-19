@@ -285,51 +285,87 @@ pub fn preflight(
             }
         }
         for (index, step) in loaded.case.steps.iter().enumerate() {
-            let position = index + 1;
-            match case::interpolate(&step.args, &vars, secrets) {
-                Err(error) => errors.push(positioned(
-                    loaded,
-                    step.location_of(&error.pointer),
-                    format!("step {position}: {}", error.message),
-                )),
-                Ok(args) => match registry.get(&step.action) {
-                    None => errors.push(positioned(
-                        loaded,
-                        step.location,
-                        format!(
-                            "step {position}: `{}` is not a registered step; {hint}",
-                            step.action
-                        ),
-                    )),
-                    Some(definition) => {
-                        if let Err(message) = (definition.validate)(&args) {
-                            // Arguments are validated as one mapping, so the
-                            // mapping start is the node the message names.
-                            errors.push(positioned(
-                                loaded,
-                                step.args_location,
-                                format!("step {position}: `{}` {message}", step.action),
-                            ));
-                        }
-                        if step.retry.is_some()
-                            && let Err(message) = (definition.check_retry)(&args)
-                        {
-                            errors.push(positioned(
-                                loaded,
-                                step.retry_location,
-                                format!("step {position}: `{}` {message}", step.action),
-                            ));
-                        }
-                    }
-                },
-            }
-            for saved in &step.save {
-                vars.insert(saved.name.clone(), format!("${{{}}}", saved.name));
-            }
+            let label = format!("step {}", index + 1);
+            check_step(
+                loaded,
+                &label,
+                step,
+                registry,
+                &mut vars,
+                secrets,
+                &hint,
+                &mut errors,
+            );
+        }
+        for (index, step) in loaded.case.finally.iter().enumerate() {
+            let label = format!("finally step {}", index + 1);
+            check_step(
+                loaded,
+                &label,
+                step,
+                registry,
+                &mut vars,
+                secrets,
+                &hint,
+                &mut errors,
+            );
         }
     }
 
     errors
+}
+
+#[allow(clippy::too_many_arguments)] // Preflight helper threads the shared validation inputs without duplicating `steps` and `finally` checks.
+fn check_step(
+    loaded: &LoadedCase,
+    label: &str,
+    step: &Step,
+    registry: &Registry,
+    vars: &mut BTreeMap<String, String>,
+    secrets: &mut Secrets,
+    hint: &str,
+    errors: &mut Vec<CaseError>,
+) {
+    match case::interpolate(&step.args, vars, secrets) {
+        Err(error) => errors.push(positioned(
+            loaded,
+            step.location_of(&error.pointer),
+            format!("{label}: {}", error.message),
+        )),
+        Ok(args) => match registry.get(&step.action) {
+            None => errors.push(positioned(
+                loaded,
+                step.location,
+                format!(
+                    "{label}: `{}` is not a registered step; {hint}",
+                    step.action
+                ),
+            )),
+            Some(definition) => {
+                if let Err(message) = (definition.validate)(&args) {
+                    // Arguments are validated as one mapping, so the
+                    // mapping start is the node the message names.
+                    errors.push(positioned(
+                        loaded,
+                        step.args_location,
+                        format!("{label}: `{}` {message}", step.action),
+                    ));
+                }
+                if step.retry.is_some()
+                    && let Err(message) = (definition.check_retry)(&args)
+                {
+                    errors.push(positioned(
+                        loaded,
+                        step.retry_location,
+                        format!("{label}: `{}` {message}", step.action),
+                    ));
+                }
+            }
+        },
+    }
+    for saved in &step.save {
+        vars.insert(saved.name.clone(), format!("${{{}}}", saved.name));
+    }
 }
 
 /// The names an unknown observer message can offer.
@@ -441,6 +477,13 @@ fn run_case(
             Err(problem) => (Vec::new(), Some(problem)),
         };
 
+    let ctx = StepContext {
+        case_index: index,
+        registry,
+        bus,
+        secrets,
+    };
+
     for (position, step) in loaded.case.steps.iter().enumerate() {
         if stopped.is_some() {
             steps.push(StepReport {
@@ -454,97 +497,67 @@ fn run_case(
             continue;
         }
 
-        bus.emit(Event::StepStarted {
-            case: index,
-            step: position,
-            name: step.action.clone(),
-        });
-        let step_started = Instant::now();
-        let mut report = StepReport {
-            name: step.action.clone(),
-            status: StepStatus::Passed,
-            duration: Duration::ZERO,
-            result: None,
-            assertions: Vec::new(),
-            error: None,
-        };
-
-        match execute_step(
+        let (report, problem) = run_one_step(
+            &ctx,
+            position,
             step,
-            registry,
             &mut vars,
-            secrets,
             &mut observations,
             &mut sessions,
-        ) {
-            Ok((result, assertions)) => {
-                let failed = assertions.iter().filter(|item| !item.passed).count();
-                if failed == 0 {
-                    report.status = StepStatus::Passed;
-                } else {
-                    report.status = StepStatus::Failed;
-                    report.error = Some(Problem {
-                        kind: ProblemKind::Assertion,
-                        message: format!("{failed} of {} assertions failed", assertions.len()),
-                    });
-                }
-                report.result = Some(result);
-                report.assertions = assertions;
-            }
-            Err(problem) => {
-                report.status = StepStatus::Error;
-                report.error = Some(problem);
-            }
-        }
-
-        // An optional step that ran but did not reach its assertions is allowed
-        // to be absent: it becomes `skipped` and the case continues. The
-        // problem stays in the report so a reader still sees why. Only an
-        // environment or input error means the case cannot go on, and that is
-        // exactly the distinction `ProblemKind` already draws.
-        let skipped = step.optional
-            && report.error.as_ref().is_some_and(|problem| {
-                matches!(
-                    problem.kind,
-                    ProblemKind::Assertion | ProblemKind::Execution | ProblemKind::Timeout
-                )
-            });
-        if skipped {
-            report.status = StepStatus::Skipped;
-        }
-
-        report.duration = step_started.elapsed();
-        bus.emit(Event::StepFinished {
-            case: index,
-            step: position,
-            name: report.name.clone(),
-            status: report.status,
-            duration: report.duration,
-        });
-        if let Some(problem) = &report.error
-            && !skipped
-        {
-            stopped = Some(problem.clone());
+        );
+        if let Some(problem) = problem {
+            stopped = Some(problem);
         }
         steps.push(report);
     }
 
-    // Evidence is collected before the sessions release their resources. A
-    // failure bundle asks only for a case that did not pass; the record writer
-    // asks for every case, which is what `--record` adds. An ordinary passing
-    // case never asks, even though its sessions are still open here.
-    let status_before_close = match stopped.as_ref().map(|problem| problem.kind) {
+    // Lock in the failure scene before `finally` runs whenever main `steps` did
+    // not pass and evidence will be written: cleanup actions (such as navigating
+    // away or deleting records) must never overwrite the original failure state.
+    let main_failed = stopped.is_some();
+    let mut evidence = if main_failed && (collect_failure_evidence || collect_passing_evidence) {
+        Some(sessions.collect_evidence())
+    } else {
+        None
+    };
+
+    let mut finally_reports = Vec::with_capacity(loaded.case.finally.len());
+    let mut finally_error: Option<Problem> = None;
+    for (position, step) in loaded.case.finally.iter().enumerate() {
+        let (report, problem) = run_one_step(
+            &ctx,
+            loaded.case.steps.len() + position,
+            step,
+            &mut vars,
+            &mut observations,
+            &mut sessions,
+        );
+        if finally_error.is_none()
+            && let Some(problem) = problem
+        {
+            finally_error = Some(problem);
+        }
+        finally_reports.push(report);
+    }
+
+    // When main `steps` passed, evidence could not be captured before `finally`;
+    // collect it after `finally` if a `finally` step failed or `--record` asks
+    // for every case, right before sessions close.
+    let mut error = stopped.or(finally_error);
+    let status_before_close = match error.as_ref().map(|problem| problem.kind) {
         None => CaseStatus::Passed,
         Some(ProblemKind::Assertion) => CaseStatus::Failed,
         Some(_) => CaseStatus::Error,
     };
-    let evidence = if (collect_failure_evidence && status_before_close != CaseStatus::Passed)
-        || collect_passing_evidence
-    {
-        sessions.collect_evidence()
-    } else {
-        Vec::new()
-    };
+    let evidence = evidence.take().unwrap_or_else(|| {
+        if (collect_failure_evidence && status_before_close != CaseStatus::Passed)
+            || collect_passing_evidence
+        {
+            sessions.collect_evidence()
+        } else {
+            Vec::new()
+        }
+    });
 
     // Every session belongs to this case and is closed here, whatever path the
     // case took. `close_all` removes a session before closing it, so a failing
@@ -552,7 +565,6 @@ fn run_case(
     let close_errors = sessions.close_all();
 
     let mut status = status_before_close;
-    let mut error = stopped;
     // A case that already failed or errored keeps its own verdict; the close
     // errors are attached to the report without replacing the problem. A case
     // that would otherwise pass becomes an environment error, because a
@@ -577,12 +589,101 @@ fn run_case(
             status,
             duration: started.elapsed(),
             steps,
+            finally: finally_reports,
             error,
             close_errors,
             bundle: None,
         },
         evidence,
     }
+}
+
+/// Shared execution context passed to [`run_one_step`].
+struct StepContext<'a, 'b> {
+    case_index: usize,
+    registry: &'a Registry,
+    bus: &'a EventBus,
+    secrets: &'a Mutex<&'b mut Secrets>,
+}
+
+/// Runs one step from `steps` or `finally`, emitting events and returning its
+/// report plus any non-skipped problem that should affect the case verdict.
+fn run_one_step(
+    ctx: &StepContext<'_, '_>,
+    step_index: usize,
+    step: &Step,
+    vars: &mut BTreeMap<String, String>,
+    observations: &mut [ObservationSlot],
+    sessions: &mut Sessions,
+) -> (StepReport, Option<Problem>) {
+    ctx.bus.emit(Event::StepStarted {
+        case: ctx.case_index,
+        step: step_index,
+        name: step.action.clone(),
+    });
+    let step_started = Instant::now();
+    let mut report = StepReport {
+        name: step.action.clone(),
+        status: StepStatus::Passed,
+        duration: Duration::ZERO,
+        result: None,
+        assertions: Vec::new(),
+        error: None,
+    };
+
+    match execute_step(
+        step,
+        ctx.registry,
+        vars,
+        ctx.secrets,
+        observations,
+        sessions,
+    ) {
+        Ok((result, assertions)) => {
+            let failed = assertions.iter().filter(|item| !item.passed).count();
+            if failed == 0 {
+                report.status = StepStatus::Passed;
+            } else {
+                report.status = StepStatus::Failed;
+                report.error = Some(Problem {
+                    kind: ProblemKind::Assertion,
+                    message: format!("{failed} of {} assertions failed", assertions.len()),
+                });
+            }
+            report.result = Some(result);
+            report.assertions = assertions;
+        }
+        Err(problem) => {
+            report.status = StepStatus::Error;
+            report.error = Some(problem);
+        }
+    }
+
+    // An optional step that ran (or could not expand an un-saved variable)
+    // is allowed to be absent: it becomes `skipped` and the case continues.
+    // The problem stays in the report so a reader still sees why. Only an
+    // environment or input error means the case cannot go on.
+    let skipped = step.optional
+        && report.error.as_ref().is_some_and(|problem| {
+            matches!(
+                problem.kind,
+                ProblemKind::Assertion | ProblemKind::Execution | ProblemKind::Timeout
+            )
+        });
+    if skipped {
+        report.status = StepStatus::Skipped;
+    }
+
+    report.duration = step_started.elapsed();
+    ctx.bus.emit(Event::StepFinished {
+        case: ctx.case_index,
+        step: step_index,
+        name: report.name.clone(),
+        status: report.status,
+        duration: report.duration,
+    });
+    let problem = if skipped { None } else { report.error.clone() };
+    (report, problem)
 }
 
 /// The one problem a case reports when its sessions could not be closed.
@@ -973,6 +1074,7 @@ mod tests {
             tags: Vec::new(),
             observe: Vec::new(),
             steps,
+            finally: Vec::new(),
         }
     }
 
@@ -3232,5 +3334,94 @@ mod tests {
             "sleep exhausting the remaining budget must prevent starting a new attempt"
         );
         assert!(slept);
+    }
+
+    #[test]
+    fn finally_steps_run_in_order_and_can_chain_saved_variables() {
+        let mut main_create = echo(json!("created-id"), Vec::new());
+        main_create.save = vec![SavedValue {
+            name: "created".to_string(),
+            path: "$".to_string(),
+        }];
+        let mut fin_one = echo(json!("fin-${created}"), Vec::new());
+        fin_one.save = vec![SavedValue {
+            name: "fin_val".to_string(),
+            path: "$".to_string(),
+        }];
+        let fin_two = echo(json!("after-${fin_val}"), Vec::new());
+
+        let mut case = test_case("finally-vars", vec![main_create]);
+        case.finally = vec![fin_one, fin_two];
+
+        let outcome = run(
+            &[LoadedCase {
+                path: "finally-vars.yaml".into(),
+                case,
+            }],
+            &registry(),
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let report = one_case(outcome);
+        assert_eq!(report.finally.len(), 2);
+        assert_eq!(
+            report.finally[1].result,
+            Some(json!("after-fin-created-id"))
+        );
+    }
+
+    #[test]
+    fn finally_unwritten_save_variable_errors_unless_optional_and_never_skips_later_finally() {
+        let mut main_fail = failing("test.execution");
+        main_fail.save = vec![SavedValue {
+            name: "resource_id".to_string(),
+            path: "$.id".to_string(),
+        }];
+
+        let non_optional_cleanup = echo(json!("${resource_id}"), Vec::new());
+        let mut optional_cleanup = echo(json!("${resource_id}"), Vec::new());
+        optional_cleanup.optional = true;
+        let final_cleanup = echo(json!("always"), Vec::new());
+
+        let mut case = test_case("finally-unwritten-save", vec![main_fail]);
+        case.finally = vec![non_optional_cleanup, optional_cleanup, final_cleanup];
+
+        let loaded_case = vec![LoadedCase {
+            path: "finally-unwritten.yaml".into(),
+            case,
+        }];
+        assert!(
+            preflight(&loaded_case, &registry(), &mut Secrets::new()).is_empty(),
+            "preflight must allow finally steps to reference main step save variables"
+        );
+
+        let outcome = run(
+            &loaded_case,
+            &registry(),
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert_eq!(outcome.exit_code(), crate::exit::ExitCode::TestFailure);
+        let report = one_case(outcome);
+        assert_eq!(report.status, CaseStatus::Error);
+        assert_eq!(report.finally.len(), 3);
+        assert_eq!(report.finally[0].status, StepStatus::Error);
+        assert!(
+            report.finally[0].error.as_ref().is_some_and(
+                |e| e.kind == ProblemKind::Execution && e.message.contains("resource_id")
+            ),
+            "got: {:?}",
+            report.finally[0]
+        );
+        assert_eq!(report.finally[1].status, StepStatus::Skipped);
+        assert_eq!(report.finally[2].status, StepStatus::Passed);
+        assert_eq!(report.finally[2].result, Some(json!("always")));
     }
 }

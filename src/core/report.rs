@@ -131,6 +131,8 @@ pub struct CaseReport {
     pub duration: Duration,
     /// Every step, including the ones skipped after a failure.
     pub steps: Vec<StepReport>,
+    /// Cleanup steps executed after `steps`.
+    pub finally: Vec<StepReport>,
     /// The problem that made the case fail, if any.
     pub error: Option<Problem>,
     /// Sessions that could not be closed, in the order they were closed.
@@ -199,7 +201,7 @@ impl RunReport {
                 CaseStatus::Failed => summary.cases_failed += 1,
                 CaseStatus::Error => summary.cases_errored += 1,
             }
-            for step in &case.steps {
+            for step in case.steps.iter().chain(&case.finally) {
                 summary.steps += 1;
                 match step.status {
                     StepStatus::Passed => summary.steps_passed += 1,
@@ -218,7 +220,7 @@ impl RunReport {
             if let Some(problem) = &case.error {
                 kinds.push(problem.kind);
             }
-            for step in &case.steps {
+            for step in case.steps.iter().chain(&case.finally) {
                 // A skipped step keeps the problem that skipped it, so that the
                 // reader can see why an optional step did not run. That problem
                 // is not part of the run's verdict: the case continued past it.
@@ -310,6 +312,7 @@ mod tests {
                         message: "problem".to_string(),
                     }),
                 }],
+                finally: Vec::new(),
                 error: Some(Problem {
                     kind,
                     message: "problem".to_string(),
@@ -420,5 +423,52 @@ mod tests {
 
         assert_eq!(summary.filtered, 3);
         assert_eq!(summary.cases, 1, "filtered cases are not run cases");
+    }
+
+    #[test]
+    fn summary_and_exit_code_include_finally_steps() {
+        let mut report = report_with(ProblemKind::Assertion);
+        report.cases[0].finally = vec![
+            StepReport {
+                name: "test.cleanup".to_string(),
+                status: StepStatus::Passed,
+                duration: Duration::ZERO,
+                result: None,
+                assertions: Vec::new(),
+                error: None,
+            },
+            StepReport {
+                name: "test.broken_cleanup".to_string(),
+                status: StepStatus::Error,
+                duration: Duration::ZERO,
+                result: None,
+                assertions: Vec::new(),
+                error: Some(Problem {
+                    kind: ProblemKind::Environment,
+                    message: "cleanup target down".to_string(),
+                }),
+            },
+            StepReport {
+                name: "test.optional_cleanup".to_string(),
+                status: StepStatus::Skipped,
+                duration: Duration::ZERO,
+                result: None,
+                assertions: Vec::new(),
+                error: Some(Problem {
+                    kind: ProblemKind::Execution,
+                    message: "optional skip".to_string(),
+                }),
+            },
+        ];
+
+        let summary = report.summary();
+        assert_eq!(summary.steps, 4);
+        assert_eq!(summary.steps_passed, 1);
+        assert_eq!(summary.steps_errored, 2);
+        assert_eq!(summary.steps_skipped, 1);
+        assert_eq!(
+            RunOutcome::Completed(report).exit_code(),
+            ExitCode::Environment
+        );
     }
 }

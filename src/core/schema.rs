@@ -1,8 +1,8 @@
 //! JSON Schema for the case file format.
 //!
 //! The schema mirrors the rules `case::parse` enforces: the top level has
-//! exactly `name`, the four classification fields, `vars`, `observe` and
-//! `steps`; a step carries exactly one registered step name plus optional
+//! exactly `name`, the four classification fields, `vars`, `observe`,
+//! `steps` and optional `finally`; a step carries exactly one registered step name plus optional
 //! `optional`, `retry`, `expect` and `save`, and a `save` needs a step that is
 //! not optional; an observation carries exactly one registered observer plus
 //! its arguments; and every assertion uses one of the four comparisons. Step
@@ -118,6 +118,12 @@ pub fn case_schema(registry: &Registry) -> Value {
             "steps": {
                 "type": "array",
                 "description": "Steps executed in order until one fails.",
+                "minItems": 1,
+                "items": step_items.clone()
+            },
+            "finally": {
+                "type": "array",
+                "description": "Cleanup steps executed in order after `steps`, before sessions close.",
                 "minItems": 1,
                 "items": step_items
             }
@@ -540,5 +546,28 @@ mod tests {
             assert_eq!(branch["required"][0], "path");
             assert_eq!(branch["required"].as_array().map(Vec::len), Some(2));
         }
+    }
+
+    #[test]
+    fn finally_schema_is_optional_non_empty_and_mirrors_steps() {
+        let with_steps = case_schema(&registry());
+        assert_eq!(with_steps["properties"]["finally"]["type"], "array");
+        assert_eq!(with_steps["properties"]["finally"]["minItems"], 1);
+        assert_eq!(
+            with_steps["properties"]["finally"]["items"],
+            with_steps["properties"]["steps"]["items"]
+        );
+        assert!(
+            with_steps["required"]
+                .as_array()
+                .is_some_and(|required| !required.iter().any(|field| field == "finally")),
+            "`finally` must stay optional"
+        );
+
+        let without_steps = case_schema(&Registry::new());
+        assert_eq!(
+            without_steps["properties"]["finally"]["items"],
+            Value::Bool(false)
+        );
     }
 }

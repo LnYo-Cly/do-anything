@@ -19,7 +19,7 @@ use do_anything::core::registry::{Registry, StepDefinition, StepError};
 use do_anything::core::report::{CaseStatus, ProblemKind, RunOutcome, StepStatus};
 use do_anything::core::runner;
 use do_anything::core::secrets::Secrets;
-use do_anything::core::session::{Session, Sessions};
+use do_anything::core::session::{Evidence, Session, Sessions};
 use do_anything::exit::ExitCode;
 use serde_json::{Value, json};
 use serde_saphyr::Location;
@@ -41,6 +41,9 @@ static CLOSED: AtomicUsize = AtomicUsize::new(0);
 /// counters.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Chronological log of stateful session mutations, evidence captures, and closes.
+static STATE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 fn test_guard() -> MutexGuard<'static, ()> {
     TEST_LOCK
         .lock()
@@ -50,6 +53,24 @@ fn test_guard() -> MutexGuard<'static, ()> {
 fn reset_counts() {
     CREATED.store(0, Ordering::SeqCst);
     CLOSED.store(0, Ordering::SeqCst);
+    STATE_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+fn state_log() -> Vec<String> {
+    STATE_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn push_state_log(entry: String) {
+    STATE_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(entry);
 }
 
 fn created() -> usize {
@@ -85,8 +106,28 @@ impl Session for FailingSession {
     }
 }
 
+/// A session whose state can change across steps and whose evidence captures
+/// the state at the moment `collect_evidence` is called.
+struct StatefulSession {
+    state: String,
+}
+
+impl Session for StatefulSession {
+    fn close(&mut self) -> Result<(), String> {
+        CLOSED.fetch_add(1, Ordering::SeqCst);
+        push_state_log(format!("close:{}", self.state));
+        Ok(())
+    }
+
+    fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
+        push_state_log(format!("evidence:{}", self.state));
+        Ok(vec![Evidence::text("state.txt", self.state.clone())?])
+    }
+}
+
 const KIND: &str = "test.session";
 const BROKEN_KIND: &str = "test.broken";
+const STATEFUL_KIND: &str = "test.stateful";
 
 fn open_session(args: &Value, sessions: &mut Sessions) -> Result<usize, StepError> {
     let label = args
@@ -183,6 +224,25 @@ fn wait(args: &Value, _sessions: &mut Sessions) -> Result<Value, StepError> {
     Ok(json!({ "waited": millis }))
 }
 
+fn set_state(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let state = args
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let session = sessions
+        .get_or_create(STATEFUL_KIND, || {
+            CREATED.fetch_add(1, Ordering::SeqCst);
+            Ok(StatefulSession {
+                state: String::new(),
+            })
+        })
+        .map_err(StepError::Execution)?;
+    session.state = state.clone();
+    push_state_log(format!("set:{state}"));
+    Ok(json!({ "state": state, "ok": true }))
+}
+
 /// An observer that reports the session the step opened.
 struct SessionObserver;
 
@@ -238,7 +298,7 @@ impl Observer for BrokenCollect {
 
 fn registry() -> Registry {
     let mut registry = Registry::new();
-    let steps: [(&str, &str, StepFn); 10] = [
+    let steps: [(&str, &str, StepFn); 11] = [
         ("test.open", "Opens the fake session on first use.", open),
         ("test.read", "Reads the fake session.", read),
         (
@@ -261,6 +321,7 @@ fn registry() -> Registry {
         ("test.timeout", "Times out.", timeout),
         ("test.assert_false", "Returns false.", assert_false),
         ("test.wait", "Waits.", wait),
+        ("test.set_state", "Sets stateful session state.", set_state),
     ];
     for (name, description, run) in steps {
         registry
@@ -359,6 +420,7 @@ fn case(name: &str, steps: Vec<Step>) -> Case {
         tags: Vec::new(),
         observe: Vec::new(),
         steps,
+        finally: Vec::new(),
     }
 }
 
@@ -699,4 +761,156 @@ fn sessions_are_not_shared_between_cases_under_jobs_4() {
         .filter_map(|case| case.steps[2].result.as_ref()?.get("id")?.as_u64())
         .collect();
     assert_eq!(ids.len(), 4, "the four sessions must be distinct: {ids:?}");
+}
+
+#[test]
+fn finally_preserves_main_failure_evidence_and_runs_every_finally_step() {
+    let _guard = test_guard();
+    reset_counts();
+    let dir = TempDir::new("finally-pre-cleanup-evidence");
+    let source = dir.write(
+        "case.yaml",
+        "name: pre-cleanup evidence\nsteps:\n  - test.set_state:\n      state: failed-page\n",
+    );
+
+    let mut main_step = step_with("test.set_state", json!({ "state": "failed-page" }));
+    main_step.expect = vec![Expectation {
+        path: "$.ok".to_string(),
+        matcher: Matcher::Equals(json!(false)),
+    }];
+
+    let mut finally_fail = step_with("test.set_state", json!({ "state": "cleaned-up" }));
+    finally_fail.expect = vec![Expectation {
+        path: "$.ok".to_string(),
+        matcher: Matcher::Equals(json!(false)),
+    }];
+    let finally_after = step_with("test.set_state", json!({ "state": "second-cleanup" }));
+
+    let mut test_case = case("pre-cleanup evidence", vec![main_step]);
+    test_case.finally = vec![finally_fail, finally_after];
+
+    let mut bundles = FailureBundles::new(dir.path().join("failures"));
+    let outcome = runner::run(
+        &[LoadedCase {
+            path: source,
+            case: test_case,
+        }],
+        &registry(),
+        &EventBus::new(),
+        Some(&mut bundles),
+        &Filters::default(),
+        &mut Secrets::new(),
+        1,
+    );
+
+    assert_eq!(outcome.exit_code(), ExitCode::TestFailure, "{outcome:?}");
+    let RunOutcome::Completed(report) = outcome else {
+        panic!("the run must complete");
+    };
+    let case_report = &report.cases[0];
+    assert_eq!(case_report.status, CaseStatus::Failed);
+    assert_eq!(
+        case_report.error.as_ref().map(|problem| problem.kind),
+        Some(ProblemKind::Assertion)
+    );
+    assert_eq!(case_report.finally.len(), 2);
+    assert_eq!(case_report.finally[0].status, StepStatus::Failed);
+    assert_eq!(
+        case_report.finally[1].status,
+        StepStatus::Passed,
+        "a failing finally step must not skip remaining finally steps"
+    );
+
+    let bundle = case_report
+        .bundle
+        .as_ref()
+        .expect("a failed case must write a failure bundle");
+    let captured = std::fs::read_to_string(bundle.join("test.stateful/state.txt"))
+        .expect("the stateful session evidence file must be written");
+    assert_eq!(
+        captured, "failed-page",
+        "cleanup in finally must not overwrite the main failure evidence"
+    );
+    assert_eq!(
+        state_log(),
+        vec![
+            "set:failed-page",
+            "evidence:failed-page",
+            "set:cleaned-up",
+            "set:second-cleanup",
+            "close:second-cleanup",
+        ]
+    );
+    assert_eq!(created(), 1);
+    assert_eq!(closed(), 1);
+}
+
+#[test]
+fn finally_failure_after_passing_main_steps_collects_evidence_before_close() {
+    let _guard = test_guard();
+    reset_counts();
+    let dir = TempDir::new("finally-failure-evidence");
+    let source = dir.write(
+        "case.yaml",
+        "name: finally failure evidence\nsteps:\n  - test.set_state:\n      state: main-ok\n",
+    );
+
+    let main_step = step_with("test.set_state", json!({ "state": "main-ok" }));
+    let mut finally_fail = step_with("test.set_state", json!({ "state": "cleanup-failed" }));
+    finally_fail.expect = vec![Expectation {
+        path: "$.ok".to_string(),
+        matcher: Matcher::Equals(json!(false)),
+    }];
+    let finally_after = step_with("test.set_state", json!({ "state": "cleanup-final" }));
+
+    let mut test_case = case("finally failure evidence", vec![main_step]);
+    test_case.finally = vec![finally_fail, finally_after];
+
+    let mut bundles = FailureBundles::new(dir.path().join("failures"));
+    let outcome = runner::run(
+        &[LoadedCase {
+            path: source,
+            case: test_case,
+        }],
+        &registry(),
+        &EventBus::new(),
+        Some(&mut bundles),
+        &Filters::default(),
+        &mut Secrets::new(),
+        1,
+    );
+
+    assert_eq!(outcome.exit_code(), ExitCode::TestFailure, "{outcome:?}");
+    let RunOutcome::Completed(report) = outcome else {
+        panic!("the run must complete");
+    };
+    let case_report = &report.cases[0];
+    assert_eq!(case_report.status, CaseStatus::Failed);
+    assert_eq!(
+        case_report.error.as_ref().map(|problem| problem.kind),
+        Some(ProblemKind::Assertion)
+    );
+    assert_eq!(case_report.finally.len(), 2);
+    assert_eq!(case_report.finally[0].status, StepStatus::Failed);
+    assert_eq!(case_report.finally[1].status, StepStatus::Passed);
+
+    let bundle = case_report
+        .bundle
+        .as_ref()
+        .expect("a failing finally must write a failure bundle");
+    let captured = std::fs::read_to_string(bundle.join("test.stateful/state.txt"))
+        .expect("the stateful session evidence file must be written");
+    assert_eq!(captured, "cleanup-final");
+    assert_eq!(
+        state_log(),
+        vec![
+            "set:main-ok",
+            "set:cleanup-failed",
+            "set:cleanup-final",
+            "evidence:cleanup-final",
+            "close:cleanup-final",
+        ]
+    );
+    assert_eq!(created(), 1);
+    assert_eq!(closed(), 1);
 }
