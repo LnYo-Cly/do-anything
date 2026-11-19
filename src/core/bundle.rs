@@ -148,7 +148,7 @@ impl FailureBundles {
         }
         // The metadata comes last: it is what tells a reader that the rest of
         // the directory is complete.
-        if let Err(detail) = write_meta(&final_dir, case, secrets) {
+        if let Err(detail) = write_meta(&final_dir, case, secrets, evidence) {
             let _ = std::fs::remove_dir_all(&final_dir);
             return Err(self.failure_message(case, detail));
         }
@@ -265,22 +265,43 @@ fn stage_evidence(
     Ok(())
 }
 
-fn write_meta(dir: &Path, case: &CaseReport, secrets: &Secrets) -> Result<(), String> {
-    write_json(
-        &dir.join("meta.json"),
-        &secrets.redact_json(&json!({
-            "schema_version": SCHEMA_VERSION,
-            "da_version": env!("CARGO_PKG_VERSION"),
-            "case_file": paths::display(&case.file),
-            "case_name": case.name,
-            "project": case.project,
-            "suite": case.suite,
-            "layer": case.layer,
-            "tags": case.tags,
-            "status": case.status.as_str(),
-            "created_at": now_millis(),
-        })),
-    )
+fn write_meta(
+    dir: &Path,
+    case: &CaseReport,
+    secrets: &Secrets,
+    evidence: &[SessionEvidence],
+) -> Result<(), String> {
+    let local_only_reason = case.local_only_reason.clone().or_else(|| {
+        let reasons: Vec<&str> = evidence
+            .iter()
+            .filter_map(|group| group.local_only_reason.as_deref())
+            .collect();
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; "))
+        }
+    });
+    let local_only = case.local_only
+        || local_only_reason.is_some()
+        || evidence.iter().any(|group| group.evidence_is_local_only);
+    let mut meta = json!({
+        "schema_version": SCHEMA_VERSION,
+        "da_version": env!("CARGO_PKG_VERSION"),
+        "case_file": paths::display(&case.file),
+        "case_name": case.name,
+        "project": case.project,
+        "suite": case.suite,
+        "layer": case.layer,
+        "tags": case.tags,
+        "status": case.status.as_str(),
+        "local_only": local_only,
+        "created_at": now_millis(),
+    });
+    if let Some(reason) = local_only_reason {
+        meta["local_only_reason"] = Value::String(reason);
+    }
+    write_json(&dir.join("meta.json"), &secrets.redact_json(&meta))
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -390,6 +411,8 @@ mod tests {
             error: None,
             close_errors: Vec::new(),
             bundle: None,
+            local_only: false,
+            local_only_reason: None,
         }
     }
 
@@ -451,6 +474,8 @@ mod tests {
         assert_eq!(meta["layer"], json!("cli"));
         assert_eq!(meta["tags"], json!(["smoke", "fast"]));
         assert_eq!(meta["status"], json!("failed"));
+        assert_eq!(meta["local_only"], json!(false));
+        assert!(meta.get("local_only_reason").is_none());
         assert!(
             meta["created_at"].as_u64().is_some_and(|millis| millis > 0),
             "got: {meta}"
@@ -492,11 +517,15 @@ mod tests {
                         .expect("the binary evidence name is valid"),
                 ],
                 error: None,
+                evidence_is_local_only: false,
+                local_only_reason: None,
             },
             SessionEvidence {
                 kind: "test.broken".to_string(),
                 files: Vec::new(),
                 error: Some("could not read s3cr3t-value".to_string()),
+                evidence_is_local_only: false,
+                local_only_reason: None,
             },
         ];
 
@@ -668,6 +697,45 @@ mod tests {
         assert_eq!(safe_name("***"), "case");
         assert_eq!(safe_name(""), "case");
         assert_eq!(safe_name("登录失败"), "登录失败");
-        assert!(safe_name(&"x".repeat(200)).chars().count() <= MAX_NAME);
+        assert_eq!(safe_name(&"x".repeat(200)).chars().count(), MAX_NAME);
+    }
+
+    #[test]
+    fn local_only_session_evidence_writes_meta_flag_and_redacted_reason() {
+        use crate::core::session::Evidence;
+
+        let dir = fixture("local-only-meta");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: LocalOnly\nsteps: []\n")
+            .expect("the case file must be written");
+        let mut bundles = FailureBundles::new(dir.join("failures"));
+        let mut secrets = Secrets::new();
+        secrets.record("s3cr3t-token");
+        let mut case = failing_case(source);
+        case.local_only = true;
+        case.local_only_reason =
+            Some("connected target s3cr3t-token holds external state".to_string());
+        let evidence = vec![SessionEvidence {
+            kind: "test.local".to_string(),
+            files: vec![Evidence::text("info.txt", "ok").expect("valid name")],
+            error: None,
+            evidence_is_local_only: true,
+            local_only_reason: case.local_only_reason.clone(),
+        }];
+
+        let bundle = bundles
+            .write_with_evidence(0, &case, &secrets, &evidence)
+            .expect("bundle must be written");
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.join("meta.json")).expect("meta must be readable"),
+        )
+        .expect("meta must be JSON");
+        assert_eq!(meta["local_only"], json!(true));
+        assert_eq!(
+            meta["local_only_reason"],
+            json!("connected target *** holds external state")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

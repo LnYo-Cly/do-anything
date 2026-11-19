@@ -325,6 +325,7 @@ fn handle_step(
         None
     };
 
+    let local_only_reason = sessions.local_only_reason();
     let detached = sessions.detach_all();
     state.handles = detached.handles;
     state.last_active_ms = store::now_ms();
@@ -368,6 +369,10 @@ fn handle_step(
     }
     if !detached.errors.is_empty() {
         payload["detach_errors"] = json!(detached.errors);
+    }
+    if let Some(reason) = local_only_reason {
+        payload["local_only"] = json!(true);
+        payload["local_only_reason"] = json!(reason);
     }
 
     SessionResponse {

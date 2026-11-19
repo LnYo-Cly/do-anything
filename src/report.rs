@@ -173,6 +173,7 @@ struct CaseRecord {
     report: Value,
     evidence: Vec<EvidenceFile>,
     local_only: bool,
+    local_only_reason: Option<String>,
 }
 
 impl CaseRecord {
@@ -333,9 +334,15 @@ fn read_cases(root: &Path) -> Result<Vec<CaseRecord>, ReportError> {
             .get("local_only")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let local_only_reason = meta
+            .get("local_only_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .map(str::to_string);
         let evidence = read_evidence(&directory)?;
         cases.push(CaseRecord {
             local_only,
+            local_only_reason,
             directory,
             meta,
             report,
@@ -576,6 +583,17 @@ fn render_case(
         html.push_str("</p>");
     }
     html.push_str("</div></header>\n");
+    if case.local_only {
+        let detail = case
+            .local_only_reason
+            .as_deref()
+            .unwrap_or("session used unmanaged external state");
+        let _ = writeln!(
+            html,
+            "<p class=\"note\"><strong>Local-only evidence:</strong> kept local only ({}).</p>",
+            escape_text(detail)
+        );
+    }
 
     if let Some(problem) = case.report.get("error").and_then(Value::as_object) {
         html.push_str("<p class=\"problem\"><strong>Case problem:</strong> ");
@@ -911,10 +929,13 @@ fn render_case_evidence(
                         .to_string(),
                 )
             } else if case.local_only {
-                Some(
-                    "meta.json marks this case `local_only: true`, so its screenshot is not embedded"
-                        .to_string(),
-                )
+                Some(match case.local_only_reason.as_deref() {
+                    Some(reason) => format!(
+                        "meta.json marks this case `local_only: true` ({}), so its screenshot is not embedded",
+                        escape_text(reason)
+                    ),
+                    None => "meta.json marks this case `local_only: true`, so its screenshot is not embedded".to_string(),
+                })
             } else if image.len > SINGLE_IMAGE_LIMIT {
                 budget.omit();
                 Some(format!(

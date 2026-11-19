@@ -329,6 +329,10 @@ fn valid_arguments(step: &str) -> Value {
         "browser.wait" => json!({"css": "#name"}),
         "browser.read" => json!({"css": "#name"}),
         "browser.screenshot" => json!({"path": "screen.png"}),
+        "browser.set_cookies" => {
+            json!({"cookies": [{"name": "sid", "value": "abc", "url": "http://127.0.0.1:1/"}]})
+        }
+        "browser.save_state" => json!({"path": "state.json"}),
         "cli.run" => json!({"command": "da"}),
         "http.request" => json!({"url": "http://127.0.0.1:1/health"}),
         "db.query" => json!({"url": "sqlite:app.db", "sql": "SELECT 1"}),
@@ -965,6 +969,193 @@ fn the_schema_is_valid_when_no_step_is_registered() {
         !jsonschema::is_valid(schema, &instance),
         "a build without steps must not accept a case with a step"
     );
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn browser_open_profile_and_set_cookies_schema_match_validate() {
+    let validator = validator(schema());
+
+    let with_profile = json!({
+        "name": "Named profile",
+        "steps": [{
+            "browser.open": {
+                "url": "http://127.0.0.1:8080/",
+                "profile": "admin_ci-1",
+                "headless": false
+            }
+        }]
+    });
+    assert!(
+        validator.is_valid(&with_profile),
+        "named profile must validate: {with_profile}"
+    );
+
+    for bad_profile in [
+        json!(""),
+        json!("../etc"),
+        json!("a/b"),
+        json!("a\\b"),
+        json!("bad name"),
+        json!(null),
+    ] {
+        let mut instance = with_profile.clone();
+        instance["steps"][0]["browser.open"]["profile"] = bad_profile.clone();
+        assert!(
+            !validator.is_valid(&instance),
+            "invalid profile {bad_profile} must be rejected by schema"
+        );
+    }
+
+    let both_connect_and_profile = json!({
+        "name": "Conflict",
+        "steps": [{
+            "browser.open": {
+                "url": "http://127.0.0.1:8080/",
+                "connect": "http://127.0.0.1:9222",
+                "profile": "admin"
+            }
+        }]
+    });
+    assert!(
+        !validator.is_valid(&both_connect_and_profile),
+        "connect and profile must be mutually exclusive in schema"
+    );
+
+    let set_cookies_valid = json!({
+        "name": "Set cookies and local storage",
+        "steps": [{
+            "browser.set_cookies": {
+                "cookies": [{
+                    "name": "sid",
+                    "value": "tok123",
+                    "url": "http://127.0.0.1:8080/",
+                    "http_only": true,
+                    "same_site": "Lax"
+                }],
+                "local_storage": {
+                    "http://127.0.0.1:8080": {
+                        "token": "tok123"
+                    }
+                }
+            }
+        }]
+    });
+    assert!(
+        validator.is_valid(&set_cookies_valid),
+        "valid browser.set_cookies must validate: {set_cookies_valid}"
+    );
+
+    for (label, bad_args) in [
+        ("empty object", json!({})),
+        ("empty cookies", json!({"cookies": []})),
+        (
+            "missing url and domain",
+            json!({"cookies": [{"name": "sid", "value": "tok"}]}),
+        ),
+        (
+            "empty cookie name",
+            json!({"cookies": [{"name": "", "value": "tok", "url": "http://127.0.0.1:8080/"}]}),
+        ),
+        (
+            "empty cookie value",
+            json!({"cookies": [{"name": "sid", "value": "", "url": "http://127.0.0.1:8080/"}]}),
+        ),
+        (
+            "null cookie url",
+            json!({"cookies": [{"name": "sid", "value": "tok", "url": null, "domain": "127.0.0.1"}]}),
+        ),
+        ("empty local_storage map", json!({"local_storage": {}})),
+        (
+            "empty origin items",
+            json!({"local_storage": {"current": {}}}),
+        ),
+    ] {
+        let instance = json!({
+            "name": "Invalid set_cookies",
+            "steps": [{ "browser.set_cookies": bad_args }]
+        });
+        assert!(
+            !validator.is_valid(&instance),
+            "browser.set_cookies ({label}) must fail schema: {instance}"
+        );
+    }
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn browser_storage_state_schema_match_validate() {
+    let validator = validator(schema());
+
+    let loads_state = json!({
+        "name": "Reuse a saved login",
+        "steps": [{
+            "browser.open": {
+                "url": "http://127.0.0.1:8080/orders",
+                "storage_state": "state/admin.json"
+            }
+        }]
+    });
+    assert!(
+        validator.is_valid(&loads_state),
+        "a storage-state file must validate: {loads_state}"
+    );
+
+    for bad_path in [json!(""), json!(null)] {
+        let mut instance = loads_state.clone();
+        instance["steps"][0]["browser.open"]["storage_state"] = bad_path.clone();
+        assert!(
+            !validator.is_valid(&instance),
+            "invalid storage_state {bad_path} must be rejected by schema"
+        );
+    }
+
+    let connected_with_state = json!({
+        "name": "Conflict",
+        "steps": [{
+            "browser.open": {
+                "url": "http://127.0.0.1:8080/",
+                "connect": "http://127.0.0.1:9222",
+                "storage_state": "state/admin.json"
+            }
+        }]
+    });
+    assert!(
+        !validator.is_valid(&connected_with_state),
+        "connect and storage_state must be mutually exclusive in schema"
+    );
+
+    let saves_state = json!({
+        "name": "Save the login",
+        "steps": [{
+            "browser.save_state": {
+                "path": "state/admin.json"
+            }
+        }]
+    });
+    assert!(
+        validator.is_valid(&saves_state),
+        "a valid browser.save_state must validate: {saves_state}"
+    );
+
+    for (label, bad_args) in [
+        ("missing path", json!({})),
+        ("empty path", json!({"path": ""})),
+        ("null path", json!({"path": null})),
+        (
+            "unknown argument",
+            json!({"path": "state.json", "cookies": []}),
+        ),
+    ] {
+        let instance = json!({
+            "name": "Invalid save_state",
+            "steps": [{ "browser.save_state": bad_args }]
+        });
+        assert!(
+            !validator.is_valid(&instance),
+            "browser.save_state ({label}) must fail schema: {instance}"
+        );
+    }
 }
 
 /// Every file directly inside `dir` with the given extension, sorted by path.

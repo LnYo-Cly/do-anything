@@ -26,14 +26,16 @@ mod network;
 mod snapshot;
 mod synthesis;
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use schemars::{JsonSchema, schema_for};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use self::cdp::{
@@ -51,7 +53,7 @@ use crate::core::session::{Evidence, Session, Sessions};
 pub const SESSION_KIND: &str = "browser";
 
 /// Step names, in the order they are registered.
-pub const STEP_NAMES: [&str; 7] = [
+pub const STEP_NAMES: [&str; 9] = [
     "browser.open",
     "browser.click",
     "browser.type",
@@ -59,6 +61,8 @@ pub const STEP_NAMES: [&str; 7] = [
     "browser.wait",
     "browser.read",
     "browser.screenshot",
+    "browser.set_cookies",
+    "browser.save_state",
 ];
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -87,6 +91,8 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         )?,
         read_step()?,
         screenshot_step()?,
+        set_cookies_step()?,
+        save_state_step()?,
     ] {
         registry.register(definition)?;
     }
@@ -106,18 +112,98 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
 /// Default HTML attribute matched by `testid` locators.
 const DEFAULT_TESTID_ATTRIBUTE: &str = "data-testid";
 
-/// Builds `browser.open`, whose `connect` is a plain string in the schema.
+/// Builds `browser.open`, whose `connect`, `profile` and `storage_state` are
+/// plain strings in the schema.
 fn open_step() -> Result<StepDefinition, String> {
     let mut definition = step::<OpenArgs>(
         STEP_NAMES[0],
-        "Opens `url` in the case's browser, or in a browser the user already runs when `connect` is given, and returns the page's `url` and `title`.",
+        "Opens `url` in the case's browser, in a named persistent profile when `profile` is given, or in a browser the user already runs when `connect` is given, and returns the page's `url` and `title`. A `storage_state` file supplies cookies and `localStorage` from an earlier `browser.save_state` before the navigation.",
         validate_open,
         run_open,
     )?;
     string_property(&mut definition.args_schema, "connect");
+    string_property(&mut definition.args_schema, "profile");
+    string_property(&mut definition.args_schema, "storage_state");
     string_property(&mut definition.args_schema, "testid_attribute");
     apply_dialog_schema(&mut definition.args_schema);
+    if let Value::Object(entries) = &mut definition.args_schema {
+        entries.insert(
+            "allOf".to_string(),
+            json!([
+                { "not": { "required": ["connect", "profile"] } },
+                { "not": { "required": ["connect", "storage_state"] } },
+            ]),
+        );
+    }
     Ok(definition)
+}
+
+/// Builds `browser.save_state`, whose `path` names the JSON file to write.
+fn save_state_step() -> Result<StepDefinition, String> {
+    let mut definition = step::<SaveStateArgs>(
+        STEP_NAMES[8],
+        "Saves the browser's cookies and the current origin's `localStorage` to `path` so a later run can load them with `browser.open: { storage_state: ... }`, and returns the `path` and how many items it wrote.",
+        validate_save_state,
+        run_save_state,
+    )?;
+    string_property(&mut definition.args_schema, "path");
+    Ok(definition)
+}
+
+/// Builds `browser.set_cookies`, keeping its nested schema self-contained without `$defs`.
+fn set_cookies_step() -> Result<StepDefinition, String> {
+    let args_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "cookies": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Cookies to inject into the browser session via CDP `Network.setCookies`.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "value"],
+                    "anyOf": [
+                        { "required": ["url"] },
+                        { "required": ["domain"] }
+                    ],
+                    "properties": {
+                        "name": { "type": "string", "minLength": 1 },
+                        "value": { "type": "string", "minLength": 1 },
+                        "url": { "type": "string", "minLength": 1 },
+                        "domain": { "type": "string", "minLength": 1 },
+                        "path": { "type": "string", "minLength": 1 },
+                        "http_only": { "type": "boolean" },
+                        "secure": { "type": "boolean" },
+                        "same_site": { "type": "string", "enum": ["Strict", "Lax", "None"] }
+                    }
+                }
+            },
+            "local_storage": {
+                "type": "object",
+                "minProperties": 1,
+                "description": "Per-origin `localStorage` entries (origin URL or `current`) to inject into the browser session.",
+                "additionalProperties": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "additionalProperties": { "type": "string" }
+                }
+            }
+        },
+        "anyOf": [
+            { "required": ["cookies"] },
+            { "required": ["local_storage"] }
+        ]
+    });
+    Ok(StepDefinition {
+        name: STEP_NAMES[7],
+        description: "Injects cookies and optional `localStorage` entries into the browser session, returning `cookies_set` and `local_storage_set`.",
+        args_schema,
+        validate: validate_set_cookies,
+        check_retry: disallow_retry,
+        run: run_set_cookies,
+    })
 }
 
 /// Builds `browser.click`, with optional `dialog` handling.
@@ -517,10 +603,21 @@ struct OpenArgs {
     url: String,
     /// Loopback DevTools endpoint of a browser the user already runs, for
     /// example `http://127.0.0.1:9222`. The case opens a new tab there and
-    /// closes only that tab. Cannot be combined with `headless`, `width` or
-    /// `height`.
+    /// closes only that tab. Cannot be combined with `headless`, `width`,
+    /// `height`, or `profile`.
     #[serde(default)]
     connect: Option<String>,
+    /// Named persistent browser profile directory under `.da/profiles/<name>`,
+    /// preserved across runs. Cannot be combined with `connect`.
+    #[schemars(extend("minLength" = 1, "pattern" = "^[A-Za-z0-9_-]+$"))]
+    #[serde(default)]
+    profile: Option<String>,
+    /// JSON file written by `browser.save_state` whose cookies and
+    /// `localStorage` are applied before the navigation. Cannot be combined
+    /// with `connect`.
+    #[schemars(extend("minLength" = 1))]
+    #[serde(default)]
+    storage_state: Option<String>,
     /// Run Chrome without a visible window. Defaults to `true`.
     #[serde(default = "default_headless")]
     headless: bool,
@@ -544,6 +641,99 @@ struct OpenArgs {
     /// How to respond if navigating opens a JavaScript dialog.
     #[serde(default)]
     dialog: Option<DialogArg>,
+}
+
+/// Cookie `SameSite` attribute for `browser.set_cookies` and `browser.save_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+enum CookieSameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+impl CookieSameSite {
+    fn as_cdp(self) -> &'static str {
+        match self {
+            Self::Strict => "Strict",
+            Self::Lax => "Lax",
+            Self::None => "None",
+        }
+    }
+
+    fn from_cdp(value: Option<&str>) -> Option<Self> {
+        match value {
+            Some("Strict") => Some(Self::Strict),
+            Some("Lax") => Some(Self::Lax),
+            Some("None") => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// One cookie passed to `browser.set_cookies`, or stored in a storage-state file.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CookieArg {
+    name: String,
+    value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secure: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    same_site: Option<CookieSameSite>,
+}
+
+/// Arguments of `browser.set_cookies`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetCookiesArgs {
+    #[serde(default)]
+    cookies: Option<Vec<CookieArg>>,
+    #[serde(default)]
+    local_storage: Option<BTreeMap<String, BTreeMap<String, String>>>,
+}
+
+/// Version of the storage-state file this `da` reads and writes.
+const STORAGE_STATE_VERSION: u32 = 1;
+
+/// Largest storage-state file `browser.open` reads, in bytes.
+const STORAGE_STATE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A JSON file that carries cookies and `localStorage` between runs.
+///
+/// `browser.save_state` writes it and `browser.open: { storage_state: ... }`
+/// reads it. The shape intentionally matches the `browser.set_cookies`
+/// arguments, so a file can also be copied into a case.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StorageStateFile {
+    #[serde(default = "storage_state_version")]
+    version: u32,
+    #[serde(default)]
+    cookies: Vec<CookieArg>,
+    #[serde(default)]
+    local_storage: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+fn storage_state_version() -> u32 {
+    STORAGE_STATE_VERSION
+}
+
+/// Arguments of `browser.save_state`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SaveStateArgs {
+    /// File that receives the cookies and `localStorage`. A relative path is
+    /// resolved against the directory that holds the case file.
+    #[schemars(extend("minLength" = 1))]
+    path: String,
 }
 
 /// Container locator used by `within` to narrow a search to a subtree.
@@ -1953,7 +2143,7 @@ fn code_for_char(character: char) -> String {
 /// How the case's browser was obtained.
 enum Origin {
     /// The case started this browser process and ends it when the case ends.
-    Launched(Launched),
+    Launched(Box<Launched>),
     /// Reattached to a detached browser process started by an earlier `da session`.
     Detached { pid: u32, profile: PathBuf },
     /// The case connected to the user's browser and closes only its own tab.
@@ -1980,6 +2170,11 @@ struct BrowserSession {
     /// The connected endpoint, as `connect` named it; `None` when the case
     /// started its own browser.
     connect: Option<String>,
+    /// Named persistent profile directory name, if `profile` was given.
+    profile: Option<String>,
+    /// Pending one-shot `Page.addScriptToEvaluateOnNewDocument` `(origin, script_id)`
+    /// pairs registered by `browser.set_cookies` for origins not yet loaded.
+    pending_local_storage_scripts: Vec<(String, String)>,
     /// Attribute name matched by `testid` locators in this session.
     testid_attribute: String,
     /// Snapshot `ref` table for interactive sessions.
@@ -2002,6 +2197,24 @@ impl BrowserSession {
         }
     }
 
+    /// Creates a default headless session when `browser.set_cookies` runs before
+    /// `browser.open`.
+    fn open_default(detached: bool) -> Result<Self, String> {
+        let defaults = OpenArgs {
+            url: "about:blank".to_string(),
+            connect: None,
+            profile: None,
+            storage_state: None,
+            headless: default_headless(),
+            width: default_width(),
+            height: default_height(),
+            timeout_ms: default_navigation_timeout_ms(),
+            testid_attribute: None,
+            dialog: None,
+        };
+        Self::launch(&defaults, detached)
+    }
+
     /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
         let deadline = Deadline::after(LAUNCH_TIMEOUT);
@@ -2009,12 +2222,13 @@ impl BrowserSession {
             deadline,
             MAX_LAUNCH_ATTEMPTS,
             |attempt_deadline| {
-                Launched::launch_with_mode(
+                Launched::launch_with_mode_and_profile(
                     args.headless,
                     args.width,
                     args.height,
                     attempt_deadline,
                     detached,
+                    args.profile.as_deref(),
                 )
             },
             |browser, attempt_deadline| {
@@ -2033,7 +2247,7 @@ impl BrowserSession {
 
         Ok(Self {
             connection: Some(connection),
-            origin: Some(Origin::Launched(browser)),
+            origin: Some(Origin::Launched(Box::new(browser))),
             target_id,
             page,
             network,
@@ -2043,6 +2257,8 @@ impl BrowserSession {
             width: args.width,
             height: args.height,
             connect: None,
+            profile: args.profile.clone(),
+            pending_local_storage_scripts: Vec::new(),
             testid_attribute: args
                 .testid_attribute
                 .clone()
@@ -2075,6 +2291,8 @@ impl BrowserSession {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             connect: Some(endpoint.name()),
+            profile: None,
+            pending_local_storage_scripts: Vec::new(),
             testid_attribute: testid_attribute
                 .unwrap_or(DEFAULT_TESTID_ATTRIBUTE)
                 .to_string(),
@@ -2091,11 +2309,12 @@ impl BrowserSession {
     fn reattach(handle: &Value) -> Result<Self, String> {
         let parsed: DetachedBrowserHandle = serde_json::from_value(handle.clone())
             .map_err(|error| format!("invalid browser session handle: {error}"))?;
-        let (origin, port, websocket_url, target_id) =
+        let (origin, port, websocket_url, target_id, profile_name) =
             match validate_detached_handle(&parsed, &std::env::temp_dir())? {
                 ValidatedHandle::Launched {
                     pid,
                     profile,
+                    profile_name,
                     port,
                     websocket_url,
                     target_id,
@@ -2107,6 +2326,7 @@ impl BrowserSession {
                     port,
                     websocket_url.to_string(),
                     target_id.to_string(),
+                    profile_name.map(str::to_string),
                 ),
                 ValidatedHandle::Connected {
                     port,
@@ -2117,6 +2337,7 @@ impl BrowserSession {
                     port,
                     websocket_url.to_string(),
                     target_id.to_string(),
+                    None,
                 ),
             };
         let deadline = Deadline::after(connect::CONNECT_TIMEOUT);
@@ -2139,6 +2360,8 @@ impl BrowserSession {
             width: parsed.width,
             height: parsed.height,
             connect: parsed.connect,
+            profile: profile_name,
+            pending_local_storage_scripts: parsed.pending_local_storage_scripts,
             testid_attribute: parsed.testid_attribute,
             refs: parsed.refs,
             step_metadata: None,
@@ -2184,6 +2407,13 @@ impl BrowserSession {
                 wanted_connect.as_deref().unwrap_or("none")
             ));
         }
+        if args.profile.as_deref() != self.profile.as_deref() {
+            changes.push(format!(
+                "`profile` from `{}` to `{}`",
+                self.profile.as_deref().unwrap_or("none"),
+                args.profile.as_deref().unwrap_or("none")
+            ));
+        }
         if args.headless != self.headless {
             changes.push(format!(
                 "`headless` from `{}` to `{}`",
@@ -2200,7 +2430,7 @@ impl BrowserSession {
             return Ok(());
         }
         Err(StepError::Execution(format!(
-            "`browser.open` changed {} after the browser session was created; the first `browser.open` of a case sets `connect`, `headless`, `width` and `height`, so repeat those values or open the page in a new case",
+            "`browser.open` changed {} after the browser session was created; the initial browser step sets `connect`, `profile`, `headless`, `width` and `height`, so call `browser.open` first with those options or open the page in a new case",
             changes.join(", ")
         )))
     }
@@ -2243,6 +2473,9 @@ impl BrowserSession {
     ) -> Result<(String, String), StepError> {
         let scope = self.scope();
         let deadline = Deadline::after(timeout);
+        // A preload script can only be retired after the page that runs it
+        // loaded, so the origin is read only while one is pending.
+        let has_pending_scripts = !self.pending_local_storage_scripts.is_empty();
         // Network events that arrive before a navigation still belong to a
         // request of this page, so they are merged before the rest is cleared.
         self.absorb_network();
@@ -2297,7 +2530,149 @@ impl BrowserSession {
         let title = page_evaluate(connection, &scope, "document.title", deadline, dialog)
             .map(|value| value.as_str().unwrap_or_default().to_string())
             .map_err(|failure| load_error(failure, url, "read the title of", deadline))?;
+        let loaded_origin = if has_pending_scripts {
+            page_evaluate(connection, &scope, "location.origin", deadline, dialog)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+        } else {
+            None
+        };
+        if let Some(origin) = loaded_origin {
+            self.cleanup_pending_local_storage_scripts(&origin, deadline, dialog);
+        }
         Ok((current, title))
+    }
+
+    fn cleanup_pending_local_storage_scripts(
+        &mut self,
+        loaded_origin: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) {
+        if self.pending_local_storage_scripts.is_empty() {
+            return;
+        }
+        let scope = self.scope();
+        let mut remaining = Vec::new();
+        let scripts = std::mem::take(&mut self.pending_local_storage_scripts);
+        for (origin, identifier) in scripts {
+            if origin == loaded_origin {
+                if let Some(connection) = self.connection.as_mut() {
+                    let _ = page_call(
+                        connection,
+                        &scope,
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        json!({ "identifier": identifier }),
+                        deadline,
+                        dialog,
+                    );
+                }
+            } else {
+                remaining.push((origin, identifier));
+            }
+        }
+        self.pending_local_storage_scripts = remaining;
+    }
+
+    /// Applies a storage-state file's cookies and `localStorage` to this
+    /// session. Called before the first navigation, so the opened page is
+    /// already signed in.
+    fn apply_storage_state(
+        &mut self,
+        state: &StorageStateFile,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<(), StepError> {
+        if let Some(connect) = &self.connect {
+            return Err(StepError::InvalidArguments(format!(
+                "invalid arguments: `storage_state` cannot be combined with `connect` (`{connect}`); a state file writes cookies into the browser it is loaded into"
+            )));
+        }
+        if !state.cookies.is_empty() {
+            apply_cookies(self, &state.cookies, deadline, dialog)?;
+        }
+        if !state.local_storage.is_empty() {
+            apply_local_storage(self, &state.local_storage, deadline, dialog)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the cookies of the current page and the current origin's
+    /// `localStorage` into a storage-state value.
+    fn capture_storage_state(
+        &mut self,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<StorageStateFile, StepError> {
+        let scope = self.scope();
+        let connection = self.connection_mut()?;
+        let url = page_evaluate(connection, &scope, "location.href", deadline, dialog)
+            .map_err(|failure| {
+                failure.step(
+                    "could not read the current page URL",
+                    timeout_or_environment,
+                )
+            })?
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let origin = page_evaluate(connection, &scope, "location.origin", deadline, dialog)
+            .map_err(|failure| {
+                failure.step(
+                    "could not read the current page origin",
+                    timeout_or_environment,
+                )
+            })?
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !origin.starts_with("http://") && !origin.starts_with("https://") {
+            return Err(StepError::Execution(format!(
+                "`browser.save_state` needs an open http:// or https:// page; the current page is `{url}`, so open the signed-in page with `browser.open` first"
+            )));
+        }
+        let reply = page_call(
+            connection,
+            &scope,
+            "Network.getCookies",
+            json!({ "urls": [url] }),
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| {
+            failure.step("could not read the browser cookies", timeout_or_environment)
+        })?;
+        let cookies = cookies_from_cdp(&reply, &origin);
+        let storage = page_evaluate(
+            connection,
+            &scope,
+            LOCAL_STORAGE_DUMP_BODY,
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| failure.step("could not read `localStorage`", timeout_or_environment))?;
+        let mut local_storage = BTreeMap::new();
+        if let Some(entries) = storage.as_object() {
+            let items: BTreeMap<String, String> = entries
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|text| (key.clone(), text.to_string()))
+                })
+                .collect();
+            if !items.is_empty() {
+                local_storage.insert(origin.clone(), items);
+            }
+        }
+        if cookies.is_empty() && local_storage.is_empty() {
+            return Err(StepError::Execution(format!(
+                "`browser.save_state` found no cookies or `localStorage` for `{origin}`; run it after the page signs in"
+            )));
+        }
+        Ok(StorageStateFile {
+            version: STORAGE_STATE_VERSION,
+            cookies,
+            local_storage,
+        })
     }
 
     /// Waits for the target element to exist, match uniquely (or `nth`), and be visible.
@@ -4253,6 +4628,8 @@ struct DetachedBrowserHandle {
     port: u16,
     pid: Option<u32>,
     profile: Option<String>,
+    #[serde(default)]
+    profile_name: Option<String>,
     headless: bool,
     width: u32,
     height: u32,
@@ -4260,6 +4637,8 @@ struct DetachedBrowserHandle {
     testid_attribute: String,
     #[serde(default)]
     refs: snapshot::RefStore,
+    #[serde(default)]
+    pending_local_storage_scripts: Vec<(String, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4267,6 +4646,7 @@ enum ValidatedHandle<'a> {
     Launched {
         pid: u32,
         profile: &'a Path,
+        profile_name: Option<&'a str>,
         port: u16,
         websocket_url: &'a str,
         target_id: &'a str,
@@ -4305,18 +4685,23 @@ fn validate_detached_handle<'a>(
                 "launched browser session handle is missing `profile`".to_string()
             })?;
             let profile = Path::new(profile_raw);
-            launch::validate_owned_profile_in(profile, temp_root)?;
+            if let Some(name) = parsed.profile_name.as_deref() {
+                launch::validate_named_profile_path(profile, name)?;
+            } else {
+                launch::validate_owned_profile_in(profile, temp_root)?;
+            }
             validate_launched_ws_url(&parsed.websocket_url, parsed.port)?;
             Ok(ValidatedHandle::Launched {
                 pid,
                 profile,
+                profile_name: parsed.profile_name.as_deref(),
                 port: parsed.port,
                 websocket_url: &parsed.websocket_url,
                 target_id: &parsed.target_id,
             })
         }
         "connected" => {
-            if parsed.pid.is_some() || parsed.profile.is_some() {
+            if parsed.pid.is_some() || parsed.profile.is_some() || parsed.profile_name.is_some() {
                 return Err(
                     "connected browser session handle must not specify `pid` or `profile`"
                         .to_string(),
@@ -4442,22 +4827,36 @@ where
         ValidatedHandle::Launched {
             pid,
             profile,
+            profile_name,
             port,
             websocket_url,
             ..
         } => {
             on_record_close(port);
             let mut errors = Vec::new();
-            close_and_dispose_detached_with(
-                pid,
-                port,
-                profile,
-                &mut errors,
-                port_listening,
-                verify_before_close,
-                |errs| close_browser(websocket_url, errs),
-                dispose_detached_fn,
-            );
+            if let Some(name) = profile_name {
+                close_and_dispose_detached_with(
+                    pid,
+                    port,
+                    profile,
+                    &mut errors,
+                    port_listening,
+                    |p, port, prof| launch::verify_named_process_before_close(p, port, prof, name),
+                    |errs| close_browser(websocket_url, errs),
+                    |p, port, prof| launch::dispose_detached_named(p, port, prof, name),
+                );
+            } else {
+                close_and_dispose_detached_with(
+                    pid,
+                    port,
+                    profile,
+                    &mut errors,
+                    port_listening,
+                    verify_before_close,
+                    |errs| close_browser(websocket_url, errs),
+                    dispose_detached_fn,
+                );
+            }
             if errors.is_empty() {
                 Ok(())
             } else {
@@ -4504,7 +4903,7 @@ fn close_and_dispose_detached_with<P, V, CB, D>(
 impl Session for BrowserSession {
     fn detach(&mut self) -> Result<Option<Value>, String> {
         let _ = self.connection.take();
-        let (mode, pid, profile, port, websocket_url) = match self.origin.take() {
+        let (mode, pid, profile, profile_name, port, websocket_url) = match self.origin.take() {
             Some(Origin::Launched(browser)) => {
                 let detached = browser
                     .detach()
@@ -4513,6 +4912,7 @@ impl Session for BrowserSession {
                     "launched".to_string(),
                     Some(detached.pid),
                     Some(detached.profile.to_string_lossy().into_owned()),
+                    detached.profile_name,
                     detached.port,
                     detached.websocket_url,
                 )
@@ -4521,11 +4921,13 @@ impl Session for BrowserSession {
                 "launched".to_string(),
                 Some(pid),
                 Some(profile.to_string_lossy().into_owned()),
+                self.profile.clone(),
                 self.port,
                 self.websocket_url.clone(),
             ),
             Some(Origin::Connected) => (
                 "connected".to_string(),
+                None,
                 None,
                 None,
                 self.port,
@@ -4543,16 +4945,33 @@ impl Session for BrowserSession {
             port,
             pid,
             profile,
+            profile_name,
             headless: self.headless,
             width: self.width,
             height: self.height,
             connect: self.connect.clone(),
             testid_attribute: self.testid_attribute.clone(),
             refs: self.refs.clone(),
+            pending_local_storage_scripts: self.pending_local_storage_scripts.clone(),
         };
         serde_json::to_value(handle)
             .map(Some)
             .map_err(|error| format!("could not serialize browser session handle: {error}"))
+    }
+
+    fn local_only_reason(&self) -> Option<String> {
+        if self.connect.is_some() {
+            Some(
+                "browser session connected to an external browser whose state is not managed by `da`"
+                    .to_string(),
+            )
+        } else {
+            self.profile.as_ref().map(|profile| {
+                format!(
+                    "browser session used persistent profile `{profile}` whose stored state is not managed by `da`"
+                )
+            })
+        }
     }
 
     fn snapshot(
@@ -4679,20 +5098,39 @@ impl Session for BrowserSession {
             }
             Some(Origin::Detached { pid, profile }) => {
                 let mut connection = Some(connection);
-                close_and_dispose_detached_with(
-                    pid,
-                    self.port,
-                    &profile,
-                    &mut errors,
-                    launch::is_port_listening,
-                    launch::verify_launched_process_before_close,
-                    |errs| {
-                        if let Some(mut conn) = connection.take() {
-                            send_browser_close(&mut conn, errs);
-                        }
-                    },
-                    launch::dispose_detached,
-                );
+                if let Some(name) = self.profile.as_deref() {
+                    close_and_dispose_detached_with(
+                        pid,
+                        self.port,
+                        &profile,
+                        &mut errors,
+                        launch::is_port_listening,
+                        |p, port, prof| {
+                            launch::verify_named_process_before_close(p, port, prof, name)
+                        },
+                        |errs| {
+                            if let Some(mut conn) = connection.take() {
+                                send_browser_close(&mut conn, errs);
+                            }
+                        },
+                        |p, port, prof| launch::dispose_detached_named(p, port, prof, name),
+                    );
+                } else {
+                    close_and_dispose_detached_with(
+                        pid,
+                        self.port,
+                        &profile,
+                        &mut errors,
+                        launch::is_port_listening,
+                        launch::verify_launched_process_before_close,
+                        |errs| {
+                            if let Some(mut conn) = connection.take() {
+                                send_browser_close(&mut conn, errs);
+                            }
+                        },
+                        launch::dispose_detached,
+                    );
+                }
             }
             Some(Origin::Connected) => {
                 // Only this case's tab is ours. `Browser.close` is never sent:
@@ -4849,19 +5287,28 @@ fn base64_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Rejects explicit `null` values in step arguments (including nested `within`),
-/// because `serde` otherwise maps `null` into `Option::None` while JSON Schema refuses it.
+/// Rejects explicit `null` values in step arguments (including nested objects
+/// and arrays), because `serde` otherwise maps `null` into `Option::None` while
+/// JSON Schema refuses it.
 fn reject_null_fields(value: &Value) -> Result<(), String> {
-    let Some(entries) = value.as_object() else {
-        return Ok(());
-    };
-    for (key, field) in entries {
-        if field.is_null() {
-            return Err(format!("invalid arguments: `{key}` must not be null"));
+    match value {
+        Value::Object(entries) => {
+            for (key, field) in entries {
+                if field.is_null() {
+                    return Err(format!("invalid arguments: `{key}` must not be null"));
+                }
+                reject_null_fields(field)?;
+            }
         }
-        if key == "within" || key == "dialog" {
-            reject_null_fields(field)?;
+        Value::Array(items) => {
+            for item in items {
+                if item.is_null() {
+                    return Err("invalid arguments: array elements must not be null".to_string());
+                }
+                reject_null_fields(item)?;
+            }
         }
+        _ => {}
     }
     Ok(())
 }
@@ -4899,7 +5346,32 @@ fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
+    if raw.get("storage_state").is_some_and(Value::is_null) {
+        return Err(
+            "invalid arguments: `storage_state` must be a file path like `state.json`".to_string(),
+        );
+    }
+    if let Some(path) = &args.storage_state
+        && path.trim().is_empty()
+    {
+        return Err(
+            "invalid arguments: `storage_state` must name the JSON file `browser.save_state` wrote"
+                .to_string(),
+        );
+    }
     if let Some(connect) = &args.connect {
+        if args.profile.is_some() {
+            return Err(
+                "invalid arguments: `profile` and `connect` cannot both be set; remove one"
+                    .to_string(),
+            );
+        }
+        if args.storage_state.is_some() {
+            return Err(
+                "invalid arguments: `storage_state` and `connect` cannot both be set; a state file writes cookies into your everyday browser, so load it into a browser `da` starts instead"
+                    .to_string(),
+            );
+        }
         for field in ["headless", "width", "height"] {
             if raw.get(field).is_some() {
                 return Err(format!(
@@ -4908,6 +5380,9 @@ fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
             }
         }
         Endpoint::parse(connect)?;
+    }
+    if let Some(profile) = &args.profile {
+        launch::validate_profile_name(profile)?;
     }
     if let Some(attribute) = &args.testid_attribute
         && (attribute.trim().is_empty() || attribute.chars().any(char::is_whitespace))
@@ -5022,6 +5497,179 @@ fn validate_read(args: &Value) -> Result<(), String> {
         && attribute.trim().is_empty()
     {
         return Err("invalid arguments: `attribute` must not be empty".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StorageTarget {
+    Current,
+    Origin(String),
+}
+
+fn normalize_storage_origin(raw: &str) -> Result<StorageTarget, String> {
+    if raw == "current" {
+        return Ok(StorageTarget::Current);
+    }
+    if raw.is_empty() || raw.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "invalid arguments: `local_storage` key `{raw}` must be `current` or an `http://` / `https://` origin"
+        ));
+    }
+    let stripped = raw.strip_suffix('/').unwrap_or(raw);
+    let authority = stripped
+        .strip_prefix("http://")
+        .or_else(|| stripped.strip_prefix("https://"))
+        .ok_or_else(|| {
+            format!(
+                "invalid arguments: `local_storage` key `{raw}` must be `current` or an `http://` / `https://` origin"
+            )
+        })?;
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|ch| matches!(ch, '/' | '?' | '#' | '@'))
+    {
+        return Err(format!(
+            "invalid arguments: `local_storage` key `{raw}` must be an origin without path, query, or fragment"
+        ));
+    }
+    Ok(StorageTarget::Origin(stripped.to_string()))
+}
+
+fn check_set_cookies(args: &SetCookiesArgs) -> Result<(), String> {
+    if args.cookies.is_none() && args.local_storage.is_none() {
+        return Err(
+            "invalid arguments: `browser.set_cookies` requires at least one of `cookies` or `local_storage`"
+                .to_string(),
+        );
+    }
+    if let Some(cookies) = &args.cookies {
+        check_cookie_list(cookies).map_err(|error| format!("invalid arguments: {error}"))?;
+    }
+    if let Some(storage) = &args.local_storage {
+        check_local_storage(storage, true)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Checks one `cookies` array, as given to `browser.set_cookies` or stored in a
+/// storage-state file.
+fn check_cookie_list(cookies: &[CookieArg]) -> Result<(), String> {
+    if cookies.is_empty() {
+        return Err("`cookies` must contain at least one cookie".to_string());
+    }
+    for (index, cookie) in cookies.iter().enumerate() {
+        let label = format!("cookies[{index}]");
+        if cookie.name.trim().is_empty() {
+            return Err(format!("`{label}.name` must not be empty"));
+        }
+        if cookie.value.is_empty() {
+            return Err(format!("`{label}.value` must not be empty"));
+        }
+        if cookie.url.is_none() && cookie.domain.is_none() {
+            return Err(format!("`{label}` must specify `url` or `domain`"));
+        }
+        if let Some(url) = &cookie.url {
+            if url.is_empty() || url.chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "`{label}.url` must not be empty or contain whitespace"
+                ));
+            }
+            let rest = url
+                .strip_prefix("http://")
+                .or_else(|| url.strip_prefix("https://"))
+                .ok_or_else(|| format!("`{label}.url` must start with `http://` or `https://`"))?;
+            if rest.is_empty() || rest.starts_with('/') {
+                return Err(format!("`{label}.url` must include a host"));
+            }
+        }
+        if let Some(domain) = &cookie.domain
+            && (domain.trim().is_empty() || domain.chars().any(char::is_whitespace))
+        {
+            return Err(format!(
+                "`{label}.domain` must not be empty or contain whitespace"
+            ));
+        }
+        if let Some(path) = &cookie.path
+            && (path.trim().is_empty() || path.chars().any(char::is_whitespace))
+        {
+            return Err(format!(
+                "`{label}.path` must not be empty or contain whitespace"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks one `local_storage` map. `allow_current` is false for a storage-state
+/// file, which is applied before a page exists, so `current` means nothing there.
+fn check_local_storage(
+    storage: &BTreeMap<String, BTreeMap<String, String>>,
+    allow_current: bool,
+) -> Result<(), String> {
+    if storage.is_empty() {
+        return Err("`local_storage` must contain at least one origin entry".to_string());
+    }
+    for (origin, items) in storage {
+        let target = normalize_storage_origin(origin)
+            .map_err(|error| error.trim_start_matches("invalid arguments: ").to_string())?;
+        if matches!(target, StorageTarget::Current) && !allow_current {
+            return Err(format!(
+                "`local_storage` key `{origin}` is not valid in a storage-state file; name the full `http://` or `https://` origin"
+            ));
+        }
+        if items.is_empty() {
+            return Err(format!(
+                "`local_storage` for `{origin}` must contain at least one key"
+            ));
+        }
+        for key in items.keys() {
+            if key.is_empty() {
+                return Err(format!(
+                    "`local_storage` key for `{origin}` must not be empty"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks the content of a storage-state file after it was parsed.
+fn check_storage_state(state: &StorageStateFile) -> Result<(), String> {
+    if state.version != STORAGE_STATE_VERSION {
+        return Err(format!(
+            "unsupported `version` {}; this `da` reads version {STORAGE_STATE_VERSION}",
+            state.version
+        ));
+    }
+    if state.cookies.is_empty() && state.local_storage.is_empty() {
+        return Err(
+            "it contains neither `cookies` nor `local_storage`; save it with `browser.save_state` after signing in"
+                .to_string(),
+        );
+    }
+    if !state.cookies.is_empty() {
+        check_cookie_list(&state.cookies)?;
+    }
+    if !state.local_storage.is_empty() {
+        check_local_storage(&state.local_storage, false)?;
+    }
+    Ok(())
+}
+
+fn validate_set_cookies(args: &Value) -> Result<(), String> {
+    let parsed: SetCookiesArgs = parse_for_validate(args)?;
+    check_set_cookies(&parsed)
+}
+
+fn validate_save_state(args: &Value) -> Result<(), String> {
+    let parsed: SaveStateArgs = parse_for_validate(args)?;
+    if parsed.path.trim().is_empty() {
+        return Err(
+            "invalid arguments: `path` must name the storage-state file to write".to_string(),
+        );
     }
     Ok(())
 }
@@ -5149,6 +5797,15 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         .map(Endpoint::parse)
         .transpose()
         .map_err(StepError::InvalidArguments)?;
+    // The state file is read before the browser starts, so a missing or
+    // malformed file fails closed without leaving a browser behind.
+    let storage_state = match args.storage_state.as_deref() {
+        Some(raw_path) => {
+            let path = resolve_path(raw_path, sessions);
+            Some(load_storage_state(&path)?)
+        }
+        None => None,
+    };
     let existing = sessions
         .get::<BrowserSession>(SESSION_KIND)
         .map_err(StepError::Execution)?
@@ -5167,6 +5824,13 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     }
     let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
     session.snapshot_pending = true;
+    if let Some(state) = &storage_state {
+        session.apply_storage_state(
+            state,
+            Deadline::after(Duration::from_millis(args.timeout_ms)),
+            &mut dialog,
+        )?;
+    }
     let (url, title) = session.navigate(
         &args.url,
         Duration::from_millis(args.timeout_ms),
@@ -5586,6 +6250,332 @@ fn read_located(
     Ok(result)
 }
 
+fn run_set_cookies(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let args: SetCookiesArgs = parse(args)?;
+    check_set_cookies(&args).map_err(StepError::InvalidArguments)?;
+
+    let interactive = sessions.is_interactive();
+    let session = sessions
+        .get_or_create(SESSION_KIND, || BrowserSession::open_default(interactive))
+        .map_err(StepError::Environment)?;
+
+    let deadline = Deadline::after(Duration::from_millis(DEFAULT_NAVIGATION_TIMEOUT_MS));
+    let mut dialog = DialogContext::fail_fast();
+
+    let cookies_set = if let Some(cookies) = &args.cookies {
+        apply_cookies(session, cookies, deadline, &mut dialog)?
+    } else {
+        0
+    };
+    let local_storage_set = if let Some(storage) = &args.local_storage {
+        apply_local_storage(session, storage, deadline, &mut dialog)?
+    } else {
+        0
+    };
+
+    session.snapshot_pending = true;
+    Ok(json!({
+        "cookies_set": cookies_set,
+        "local_storage_set": local_storage_set,
+    }))
+}
+
+fn apply_cookies(
+    session: &mut BrowserSession,
+    cookies: &[CookieArg],
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<usize, StepError> {
+    let mut params_list = Vec::with_capacity(cookies.len());
+    for cookie in cookies {
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".to_string(), json!(cookie.name));
+        entry.insert("value".to_string(), json!(cookie.value));
+        if let Some(url) = &cookie.url {
+            entry.insert("url".to_string(), json!(url));
+        }
+        if let Some(domain) = &cookie.domain {
+            entry.insert("domain".to_string(), json!(domain));
+        }
+        if let Some(path) = &cookie.path {
+            entry.insert("path".to_string(), json!(path));
+        }
+        if let Some(http_only) = cookie.http_only {
+            entry.insert("httpOnly".to_string(), json!(http_only));
+        }
+        if let Some(secure) = cookie.secure {
+            entry.insert("secure".to_string(), json!(secure));
+        }
+        if let Some(same_site) = cookie.same_site {
+            entry.insert("sameSite".to_string(), json!(same_site.as_cdp()));
+        }
+        params_list.push(Value::Object(entry));
+    }
+
+    let scope = session.scope();
+    let connection = session.connection_mut()?;
+    page_call(
+        connection,
+        &scope,
+        "Network.setCookies",
+        json!({ "cookies": params_list }),
+        deadline,
+        dialog,
+    )
+    .map_err(|failure| failure.step("could not set browser cookies", timeout_or_execution))?;
+    Ok(cookies.len())
+}
+
+fn apply_local_storage(
+    session: &mut BrowserSession,
+    storage: &BTreeMap<String, BTreeMap<String, String>>,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<usize, StepError> {
+    static GUARD_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let scope = session.scope();
+    let current_origin = {
+        let connection = session.connection_mut()?;
+        page_evaluate(connection, &scope, "location.origin", deadline, dialog)
+            .map_err(|failure| failure.environment("could not read the current page origin"))?
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let mut total = 0usize;
+    for (raw_origin, entries) in storage {
+        let target = normalize_storage_origin(raw_origin).map_err(StepError::InvalidArguments)?;
+        let pairs: Vec<(&String, &String)> = entries.iter().collect();
+        let encoded_pairs = serde_json::to_string(&pairs).map_err(|error| {
+            StepError::Execution(format!("could not encode local_storage entries: {error}"))
+        })?;
+
+        let matches_current = match &target {
+            StorageTarget::Current => {
+                if current_origin.is_empty() || current_origin == "null" {
+                    return Err(StepError::Execution(
+                        "cannot set `local_storage` for `current` before opening an HTTP(S) page; pass an explicit origin such as `http://127.0.0.1:8080` or run `browser.open` first".to_string(),
+                    ));
+                }
+                true
+            }
+            StorageTarget::Origin(origin) => current_origin == *origin,
+        };
+
+        if matches_current {
+            let script = format!(
+                "(function () {{ var items = {encoded_pairs}; for (var i = 0; i < items.length; i++) {{ window.localStorage.setItem(items[i][0], items[i][1]); }} return items.length; }})()"
+            );
+            let connection = session.connection_mut()?;
+            page_evaluate(connection, &scope, &script, deadline, dialog).map_err(|failure| {
+                failure.step(
+                    &format!("could not set `local_storage` for `{raw_origin}`"),
+                    timeout_or_execution,
+                )
+            })?;
+        } else if let StorageTarget::Origin(origin) = target {
+            let guard = format!(
+                "__da_ls_{}_{}",
+                std::process::id(),
+                GUARD_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let script = format!(
+                "(function () {{ try {{ if (window.location.origin !== {}) return; var guard = {}; if (window.sessionStorage.getItem(guard)) return; window.sessionStorage.setItem(guard, '1'); var items = {encoded_pairs}; for (var i = 0; i < items.length; i++) {{ window.localStorage.setItem(items[i][0], items[i][1]); }} }} catch (_) {{}} }})();",
+                json_string(&origin),
+                json_string(&guard),
+            );
+            let connection = session.connection_mut()?;
+            let reply = page_call(
+                connection,
+                &scope,
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": script }),
+                deadline,
+                dialog,
+            )
+            .map_err(|failure| {
+                failure.step(
+                    &format!("could not register `local_storage` preload for `{origin}`"),
+                    timeout_or_execution,
+                )
+            })?;
+            if let Some(identifier) = reply.get("identifier").and_then(Value::as_str) {
+                session
+                    .pending_local_storage_scripts
+                    .push((origin, identifier.to_string()));
+            }
+        }
+        total += entries.len();
+    }
+    Ok(total)
+}
+
+/// Evaluates to an object with every current `localStorage` entry.
+const LOCAL_STORAGE_DUMP_BODY: &str = "(function () { var out = {}; for (var index = 0; index < window.localStorage.length; index++) { var key = window.localStorage.key(index); out[key] = window.localStorage.getItem(key); } return out; })()";
+
+/// Reads and validates a storage-state file, failing closed on anything a
+/// later run could not apply.
+fn load_storage_state(path: &Path) -> Result<StorageStateFile, StepError> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        StepError::Environment(format!(
+            "could not read browser storage state `{}`: {error}; save it with `browser.save_state` or fix the path",
+            paths::display(path)
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(StepError::Environment(format!(
+            "browser storage state `{}` is not a regular file",
+            paths::display(path)
+        )));
+    }
+    if metadata.len() > STORAGE_STATE_MAX_BYTES {
+        return Err(StepError::Environment(format!(
+            "browser storage state `{}` is larger than {STORAGE_STATE_MAX_BYTES} bytes",
+            paths::display(path)
+        )));
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        StepError::Environment(format!(
+            "could not read browser storage state `{}`: {error}",
+            paths::display(path)
+        ))
+    })?;
+    let state: StorageStateFile = serde_json::from_str(&text).map_err(|error| {
+        StepError::Environment(format!(
+            "browser storage state `{}` is malformed: {error}; expected a JSON object written by `browser.save_state`",
+            paths::display(path)
+        ))
+    })?;
+    check_storage_state(&state).map_err(|error| {
+        StepError::Environment(format!(
+            "browser storage state `{}` is invalid: {error}",
+            paths::display(path)
+        ))
+    })?;
+    Ok(state)
+}
+
+/// Writes a storage-state file, creating its directory and keeping the file
+/// readable only by its owner where the platform allows it.
+fn write_storage_state(path: &Path, state: &StorageStateFile) -> Result<(), StepError> {
+    let mut encoded = serde_json::to_string_pretty(state).map_err(|error| {
+        StepError::Execution(format!(
+            "could not encode the browser storage state: {error}"
+        ))
+    })?;
+    encoded.push('\n');
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            StepError::Environment(format!(
+                "could not create the storage-state directory `{}`: {error}",
+                paths::display(parent)
+            ))
+        })?;
+    }
+    write_private_file(path, encoded.as_bytes()).map_err(|error| {
+        StepError::Environment(format!(
+            "could not write the browser storage state `{}`: {error}",
+            paths::display(path)
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` only applies to a newly created file; an existing state file must
+    // not keep a wider mode than the owner.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    std::io::Write::write_all(&mut file, bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+/// Maps `Network.getCookies` cookies into the `browser.set_cookies` shape.
+fn cookies_from_cdp(reply: &Value, origin: &str) -> Vec<CookieArg> {
+    let Some(entries) = reply.get("cookies").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut cookies = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(value) = entry.get("value").and_then(Value::as_str) else {
+            continue;
+        };
+        // A cookie with an empty name or value carries no state and the
+        // `browser.set_cookies` shape refuses it; skip it instead of writing a
+        // file that cannot be loaded.
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        let path = entry.get("path").and_then(Value::as_str);
+        let domain = entry
+            .get("domain")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let url = if domain.is_none() {
+            Some(match path {
+                Some(path) => format!("{origin}{path}"),
+                None => format!("{origin}/"),
+            })
+        } else {
+            None
+        };
+        cookies.push(CookieArg {
+            name: name.to_string(),
+            value: value.to_string(),
+            url,
+            domain,
+            path: path.map(str::to_string),
+            http_only: entry.get("httpOnly").and_then(Value::as_bool),
+            secure: entry.get("secure").and_then(Value::as_bool),
+            same_site: CookieSameSite::from_cdp(entry.get("sameSite").and_then(Value::as_str)),
+        });
+    }
+    cookies
+}
+
+fn run_save_state(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let args: SaveStateArgs = parse(args)?;
+    if args.path.trim().is_empty() {
+        return Err(StepError::InvalidArguments(
+            "invalid arguments: `path` must name the storage-state file to write".to_string(),
+        ));
+    }
+    let path = resolve_path(&args.path, sessions);
+    let session = session(sessions)?;
+    if let Some(connect) = &session.connect {
+        return Err(StepError::Execution(format!(
+            "refusing to save browser storage state from a connected browser (`{connect}`): its cookies belong to your everyday browser; use `browser.open` with `profile` or without `connect`"
+        )));
+    }
+    let mut dialog = DialogContext::fail_fast();
+    let state = session.capture_storage_state(Deadline::after(SCREENSHOT_TIMEOUT), &mut dialog)?;
+    let cookies = state.cookies.len();
+    let local_storage: usize = state.local_storage.values().map(BTreeMap::len).sum();
+    write_storage_state(&path, &state)?;
+    Ok(json!({
+        "path": paths::display(&path),
+        "cookies": cookies,
+        "local_storage": local_storage,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread;
@@ -5658,6 +6648,8 @@ mod tests {
             "browser.type",
             "browser.press",
             "browser.screenshot",
+            "browser.set_cookies",
+            "browser.save_state",
         ] {
             let def = definition(name);
             for args in [json!({}), within_args.clone()] {
@@ -7355,6 +8347,8 @@ mod tests {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             connect: Some("http://127.0.0.1:9222".to_string()),
+            profile: None,
+            pending_local_storage_scripts: Vec::new(),
             testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
             refs: snapshot::RefStore::default(),
             step_metadata: None,
@@ -8727,12 +9721,14 @@ mod tests {
             port: 9222,
             pid: Some(4242),
             profile: Some(owned_profile.clone()),
+            profile_name: None,
             headless: true,
             width: 1280,
             height: 800,
             connect: None,
             testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
             refs: snapshot::RefStore::default(),
+            pending_local_storage_scripts: Vec::new(),
         };
 
         assert!(matches!(
@@ -8795,12 +9791,14 @@ mod tests {
             port: 9222,
             pid: None,
             profile: None,
+            profile_name: None,
             headless: true,
             width: 1280,
             height: 800,
             connect: Some("http://127.0.0.1:9222".to_string()),
             testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
             refs: snapshot::RefStore::default(),
+            pending_local_storage_scripts: Vec::new(),
         };
 
         assert!(matches!(
@@ -9286,5 +10284,233 @@ mod tests {
             }]),
             "stale iframe retry requests leaked into final observation: {result}"
         );
+    }
+    /// A fresh directory under the temporary root, removed by the caller.
+    fn storage_temp_dir(label: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "da-storage-state-{}-{}-{label}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("storage-state test directory must be created");
+        dir
+    }
+
+    fn sample_storage_state() -> StorageStateFile {
+        StorageStateFile {
+            version: STORAGE_STATE_VERSION,
+            cookies: vec![CookieArg {
+                name: "sid".to_string(),
+                value: "s3cr3t-session".to_string(),
+                url: None,
+                domain: Some("127.0.0.1".to_string()),
+                path: Some("/".to_string()),
+                http_only: Some(true),
+                secure: Some(false),
+                same_site: Some(CookieSameSite::Lax),
+            }],
+            local_storage: BTreeMap::from([(
+                "http://127.0.0.1:8080".to_string(),
+                BTreeMap::from([("auth_token".to_string(), "s3cr3t-token".to_string())]),
+            )]),
+        }
+    }
+
+    #[test]
+    fn storage_state_round_trips_through_a_private_file() {
+        let dir = storage_temp_dir("round-trip");
+        let path = dir.join("nested/state.json");
+
+        write_storage_state(&path, &sample_storage_state())
+            .expect("the storage-state file must be written");
+
+        let text = std::fs::read_to_string(&path).expect("the state file must be readable");
+        assert!(text.contains("\"version\": 1"), "got: {text}");
+        assert!(text.contains("\"same_site\": \"Lax\""), "got: {text}");
+        assert!(
+            text.contains("http://127.0.0.1:8080"),
+            "the origin must be recorded: {text}"
+        );
+
+        let loaded = load_storage_state(&path).expect("the written file must load");
+        assert_eq!(loaded.version, STORAGE_STATE_VERSION);
+        assert_eq!(loaded.cookies.len(), 1);
+        assert_eq!(loaded.cookies[0].name, "sid");
+        assert_eq!(loaded.cookies[0].value, "s3cr3t-session");
+        assert_eq!(loaded.cookies[0].domain.as_deref(), Some("127.0.0.1"));
+        assert_eq!(loaded.cookies[0].http_only, Some(true));
+        assert_eq!(loaded.cookies[0].same_site, Some(CookieSameSite::Lax));
+        assert_eq!(
+            loaded.local_storage["http://127.0.0.1:8080"]["auth_token"],
+            "s3cr3t-token"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("the state file metadata must be readable")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "only the owner may read the state file");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn storage_state_error(path: &Path) -> String {
+        match load_storage_state(path) {
+            Ok(_) => panic!("the storage state must be refused: {}", path.display()),
+            Err(StepError::Environment(message)) => message,
+            Err(other) => {
+                panic!("a storage-state file must fail as an environment error: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn loading_storage_state_fails_closed_without_leaking_values() {
+        let dir = storage_temp_dir("fail-closed");
+
+        let missing = dir.join("missing.json");
+        let message = storage_state_error(&missing);
+        assert!(
+            message.contains("could not read browser storage state")
+                && message.contains("missing.json"),
+            "got: {message}"
+        );
+
+        let directory = dir.join("state-dir");
+        std::fs::create_dir_all(&directory).expect("the fixture directory must be created");
+        let message = storage_state_error(&directory);
+        assert!(message.contains("is not a regular file"), "got: {message}");
+
+        let malformed = dir.join("malformed.json");
+        std::fs::write(&malformed, "{\"cookies\": [{\"name\": \"sid\", ").expect("fixture");
+        let message = storage_state_error(&malformed);
+        assert!(message.contains("is malformed"), "got: {message}");
+
+        let cases = [
+            (
+                "version",
+                json!({"version": 2, "cookies": [{"name": "sid", "value": "s3cr3t-session", "url": "http://127.0.0.1/"}]}),
+                "unsupported `version`",
+            ),
+            ("empty", json!({}), "neither `cookies` nor `local_storage`"),
+            (
+                "cookie",
+                json!({"cookies": [{"name": "sid", "value": "s3cr3t-session"}]}),
+                "must specify `url` or `domain`",
+            ),
+            (
+                "origin",
+                json!({"local_storage": {"current": {"auth_token": "s3cr3t-token"}}}),
+                "not valid in a storage-state file",
+            ),
+            (
+                "unknown",
+                json!({"cookies": [{"name": "sid", "value": "s3cr3t-session", "url": "http://127.0.0.1/"}], "other": []}),
+                "is malformed",
+            ),
+        ];
+        for (label, content, expected) in cases {
+            let path = dir.join(format!("{label}.json"));
+            std::fs::write(&path, content.to_string()).expect("fixture");
+            let message = storage_state_error(&path);
+            assert!(
+                message.contains(expected),
+                "case `{label}` must name `{expected}`: {message}"
+            );
+            assert!(
+                !message.contains("s3cr3t-"),
+                "the error must not repeat cookie or token values: {message}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_state_arguments_are_checked_before_a_browser_starts() {
+        let open = definition("browser.open");
+        let save = definition("browser.save_state");
+
+        assert!(
+            (open.validate)(&json!({
+                "url": "http://127.0.0.1:8080/orders",
+                "storage_state": "state/admin.json"
+            }))
+            .is_ok()
+        );
+        for bad in [
+            json!({"url": "http://127.0.0.1:8080/", "storage_state": null}),
+            json!({"url": "http://127.0.0.1:8080/", "storage_state": ""}),
+            json!({
+                "url": "http://127.0.0.1:8080/",
+                "connect": "http://127.0.0.1:9222",
+                "storage_state": "state/admin.json"
+            }),
+        ] {
+            assert!(
+                (open.validate)(&bad).is_err(),
+                "`browser.open` must refuse {bad}"
+            );
+        }
+
+        assert!((save.validate)(&json!({"path": "state/admin.json"})).is_ok());
+        for bad in [json!({}), json!({"path": ""}), json!({"path": null})] {
+            assert!(
+                (save.validate)(&bad).is_err(),
+                "`browser.save_state` must refuse {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn cookies_from_cdp_keep_the_set_cookies_shape() {
+        let reply = json!({
+            "cookies": [
+                {
+                    "name": "sid",
+                    "value": "s3cr3t-session",
+                    "domain": "127.0.0.1",
+                    "path": "/app",
+                    "httpOnly": true,
+                    "secure": false,
+                    "sameSite": "Strict",
+                    "session": true,
+                    "priority": "Medium"
+                },
+                {
+                    "name": "empty",
+                    "value": "",
+                    "domain": "127.0.0.1",
+                    "path": "/"
+                }
+            ]
+        });
+
+        let cookies = cookies_from_cdp(&reply, "http://127.0.0.1:8080");
+        assert_eq!(cookies.len(), 1, "an empty cookie value must be skipped");
+        assert_eq!(cookies[0].name, "sid");
+        assert_eq!(cookies[0].domain.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cookies[0].path.as_deref(), Some("/app"));
+        assert_eq!(cookies[0].url, None);
+        assert_eq!(cookies[0].http_only, Some(true));
+        assert_eq!(cookies[0].secure, Some(false));
+        assert_eq!(cookies[0].same_site, Some(CookieSameSite::Strict));
+
+        let host_only = cookies_from_cdp(
+            &json!({"cookies": [{"name": "sid", "value": "v", "path": "/app"}]}),
+            "http://127.0.0.1:8080",
+        );
+        assert_eq!(
+            host_only[0].url.as_deref(),
+            Some("http://127.0.0.1:8080/app")
+        );
+        assert_eq!(host_only[0].domain, None);
     }
 }

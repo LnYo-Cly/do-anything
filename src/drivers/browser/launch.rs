@@ -10,18 +10,29 @@
 //! `Drop` impl repeats that best effort when a case never reached its close
 //! path, so no browser survives the run.
 
-use std::fs;
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use super::cdp::Deadline;
 
 /// Prefix of the temporary profile directories, also used by the close test.
 pub const PROFILE_PREFIX: &str = "da-chrome-profile";
+
+/// Default directory relative to the working directory for named persistent profiles.
+pub const DEFAULT_PROFILES_DIR: &str = ".da/profiles";
+
+/// Optional environment variable overriding the named persistent profiles root directory.
+pub const PROFILES_DIR_ENV: &str = "DA_PROFILES_DIR";
 
 /// How long a hung browser gets to exit after `Browser.close`.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,11 +40,298 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the debug-port file and the child process are polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+static ACTIVE_NAMED_PROFILES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+fn active_named_profiles() -> &'static Mutex<BTreeSet<PathBuf>> {
+    ACTIVE_NAMED_PROFILES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DetachedProfileLockRecord {
+    pid: u32,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    detached: bool,
+}
+
+/// Validates a named persistent profile identifier.
+pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!(
+            "invalid arguments: `profile` must be non-empty ASCII letters, digits, `-`, or `_`, got `{name}`"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves the directory that stores named persistent browser profiles.
+pub fn resolve_profiles_root() -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        format!("could not determine the current working directory for browser profiles: {error}")
+    })?;
+    let base = match std::env::var_os(PROFILES_DIR_ENV) {
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        }
+        _ => cwd.join(DEFAULT_PROFILES_DIR),
+    };
+    Ok(base)
+}
+
+fn ensure_safe_directory(path: &Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(format!(
+                    "refusing unsafe {label} `{}`: expected a regular directory",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(path)
+            .map_err(|create_err| {
+                format!(
+                    "could not create {label} `{}`: {create_err}",
+                    path.display()
+                )
+            }),
+        Err(error) => Err(format!(
+            "could not inspect {label} `{}`: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Exclusive lock guarding a named persistent browser profile directory.
+pub struct NamedProfileLock {
+    profile_dir: PathBuf,
+    canonical_key: PathBuf,
+    lock_path: PathBuf,
+    file: Option<File>,
+    keep_lock_file_on_drop: bool,
+}
+
+impl NamedProfileLock {
+    /// Acquires exclusive ownership of the named profile directory, failing
+    /// immediately if another process, thread, or detached session holds it.
+    pub fn acquire(name: &str) -> Result<Self, String> {
+        validate_profile_name(name)?;
+        let root = resolve_profiles_root()?;
+        ensure_safe_directory(&root, "browser profiles root")?;
+        let profile_dir = root.join(name);
+        ensure_safe_directory(&profile_dir, "browser profile directory")?;
+        let canonical_key = fs::canonicalize(&profile_dir).unwrap_or_else(|_| profile_dir.clone());
+
+        {
+            let mut active = active_named_profiles()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !active.insert(canonical_key.clone()) {
+                return Err(format!(
+                    "browser profile `{name}` is already in use by another active case or session"
+                ));
+            }
+        }
+
+        let mut lock = Self {
+            profile_dir,
+            canonical_key,
+            lock_path: root.join(format!("{name}.lock")),
+            file: None,
+            keep_lock_file_on_drop: false,
+        };
+
+        if let Ok(meta) = fs::symlink_metadata(&lock.lock_path)
+            && (meta.file_type().is_symlink() || meta.file_type().is_dir())
+        {
+            return Err(format!(
+                "refusing unsafe browser profile lock `{}`: expected a regular file",
+                lock.lock_path.display()
+            ));
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock.lock_path)
+            .map_err(|error| {
+                format!(
+                    "could not open browser profile lock `{}`: {error}",
+                    lock.lock_path.display()
+                )
+            })?;
+
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "browser profile `{name}` is already in use by another process"
+                ));
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("could not lock browser profile `{name}`: {error}"));
+            }
+        }
+
+        let mut existing = String::new();
+        let _ = file.read_to_string(&mut existing);
+        if let Ok(record) = serde_json::from_str::<DetachedProfileLockRecord>(existing.trim())
+            && record.detached
+        {
+            let port_live = record.port.is_some_and(is_port_listening);
+            let pid_live = record.pid > 0
+                && pid_matches_profile(record.pid, &lock.profile_dir) == PidProfileMatch::Matches;
+            let sibling_live = !default_find_profile_pids(&lock.profile_dir)
+                .unwrap_or_default()
+                .is_empty();
+            if port_live || pid_live || sibling_live {
+                lock.keep_lock_file_on_drop = true;
+                lock.file = Some(file);
+                return Err(format!(
+                    "browser profile `{name}` is already in use by an active detached session (pid {}); stop that session before reusing the profile",
+                    record.pid
+                ));
+            }
+        }
+
+        if let Some(port) = read_profile_devtools_port(&lock.profile_dir)
+            && is_port_listening(port)
+        {
+            lock.keep_lock_file_on_drop = true;
+            lock.file = Some(file);
+            return Err(format!(
+                "browser profile `{name}` is already in use by a running browser on debug port {port}"
+            ));
+        }
+
+        // Remove any stale DevToolsActivePort from a prior run so launch waits
+        // for the newly started Chrome instance to write its fresh port.
+        let port_file = lock.profile_dir.join("DevToolsActivePort");
+        match fs::remove_file(&port_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not clear stale DevToolsActivePort `{}`: {error}",
+                    port_file.display()
+                ));
+            }
+        }
+
+        let record = DetachedProfileLockRecord {
+            pid: std::process::id(),
+            port: None,
+            detached: false,
+        };
+        write_lock_record(&mut file, &record, &lock.lock_path)?;
+        lock.file = Some(file);
+        Ok(lock)
+    }
+
+    pub fn profile_dir(&self) -> &Path {
+        &self.profile_dir
+    }
+
+    pub fn mark_detached(&mut self, pid: u32, port: u16) -> Result<(), String> {
+        let Some(file) = self.file.as_mut() else {
+            return Err("browser profile lock was already released".to_string());
+        };
+        let record = DetachedProfileLockRecord {
+            pid,
+            port: Some(port),
+            detached: true,
+        };
+        write_lock_record(file, &record, &self.lock_path)?;
+        self.keep_lock_file_on_drop = true;
+        Ok(())
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(file) = self.file.take() {
+            if !self.keep_lock_file_on_drop {
+                let _ = file.set_len(0);
+                let _ = file.unlock();
+                drop(file);
+                let _ = fs::remove_file(&self.lock_path);
+            } else {
+                let _ = file.unlock();
+                drop(file);
+            }
+        }
+        let mut active = active_named_profiles()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.remove(&self.canonical_key);
+    }
+}
+
+impl Drop for NamedProfileLock {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+fn write_lock_record(
+    file: &mut File,
+    record: &DetachedProfileLockRecord,
+    lock_path: &Path,
+) -> Result<(), String> {
+    let encoded = serde_json::to_string(record)
+        .map_err(|error| format!("could not encode browser profile lock: {error}"))?;
+    file.set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)))
+        .and_then(|_| file.write_all(encoded.as_bytes()))
+        .and_then(|()| file.flush())
+        .map_err(|error| {
+            format!(
+                "could not write browser profile lock `{}`: {error}",
+                lock_path.display()
+            )
+        })
+}
+
+fn release_detached_profile_lock(profile: &Path, name: &str) {
+    let Some(parent) = profile.parent() else {
+        return;
+    };
+    let lock_path = parent.join(format!("{name}.lock"));
+    if let Ok(meta) = fs::symlink_metadata(&lock_path) {
+        if meta.file_type().is_symlink() || meta.file_type().is_dir() {
+            return;
+        }
+    } else {
+        return;
+    }
+    if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path)
+        && file.try_lock().is_ok()
+    {
+        let _ = file.set_len(0);
+        let _ = file.unlock();
+        drop(file);
+        let _ = fs::remove_file(&lock_path);
+    }
+}
+
 /// A browser process started for one case.
 pub struct Launched {
     child: Option<Child>,
     detached_pid: Option<u32>,
     profile: Option<PathBuf>,
+    profile_name: Option<String>,
+    profile_lock: Option<NamedProfileLock>,
     port: u16,
     websocket_url: String,
 }
@@ -41,6 +339,10 @@ pub struct Launched {
 impl Launched {
     /// Starts the browser in a pipe-isolated manner when `detached` is `true`
     /// so Windows callers capturing CLI stdout/stderr do not block after `da` exits.
+    #[allow(
+        dead_code,
+        reason = "convenience entry point kept alongside profile-aware launch"
+    )]
     pub fn launch_with_mode(
         headless: bool,
         width: u32,
@@ -48,43 +350,93 @@ impl Launched {
         deadline: Deadline,
         detached: bool,
     ) -> Result<Self, String> {
+        Self::launch_with_mode_and_profile(headless, width, height, deadline, detached, None)
+    }
+
+    /// Starts the browser with either an ephemeral temporary profile or a named
+    /// persistent profile directory under `.da/profiles/<name>`.
+    pub fn launch_with_mode_and_profile(
+        headless: bool,
+        width: u32,
+        height: u32,
+        deadline: Deadline,
+        detached: bool,
+        profile_name: Option<&str>,
+    ) -> Result<Self, String> {
         let executable = find_browser()?;
-        let profile = create_profile()?;
+        let (profile, mut profile_lock) = match profile_name {
+            Some(name) => {
+                let lock = NamedProfileLock::acquire(name)?;
+                (lock.profile_dir().to_path_buf(), Some(lock))
+            }
+            None => (create_profile()?, None),
+        };
+        let owned_name = profile_name.map(str::to_string);
+        let cleanup_profile = |lock: Option<NamedProfileLock>, path: &Path| {
+            if owned_name.is_none() {
+                let _ = remove_profile(path);
+            }
+            drop(lock);
+        };
+
         let mut args = launch_args(headless, width, height, &profile);
         args.push("about:blank".to_string());
 
         #[cfg(windows)]
         let (mut child, detached_pid) = if detached {
-            (
-                None,
-                Some(spawn_windows_isolated(&executable, &profile, &args)?),
-            )
+            match spawn_windows_isolated(&executable, &profile, &args, owned_name.is_none()) {
+                Ok(pid) => (None, Some(pid)),
+                Err(err) => {
+                    cleanup_profile(profile_lock.take(), &profile);
+                    return Err(err);
+                }
+            }
         } else {
-            (
-                Some(spawn_direct(&executable, &profile, &args, detached)?),
-                None,
-            )
+            match spawn_direct(&executable, &profile, &args, detached, owned_name.is_none()) {
+                Ok(c) => (Some(c), None),
+                Err(err) => {
+                    cleanup_profile(profile_lock.take(), &profile);
+                    return Err(err);
+                }
+            }
         };
         #[cfg(not(windows))]
-        let (mut child, detached_pid) = (
-            Some(spawn_direct(&executable, &profile, &args, detached)?),
-            None,
-        );
+        let (mut child, detached_pid) =
+            match spawn_direct(&executable, &profile, &args, detached, owned_name.is_none()) {
+                Ok(c) => (Some(c), None),
+                Err(err) => {
+                    cleanup_profile(profile_lock.take(), &profile);
+                    return Err(err);
+                }
+            };
 
         let port_file = profile.join("DevToolsActivePort");
         loop {
             if let Some(child_ref) = child.as_mut() {
                 match child_ref.try_wait() {
                     Ok(Some(status)) => {
+                        let cleanup = cleanup_failed_launch(
+                            Some(child_ref),
+                            None,
+                            &profile,
+                            owned_name.as_deref(),
+                        );
+                        drop(profile_lock.take());
                         let base = format!(
                             "`{}` exited with {status} before it was ready; set `DA_CHROME` to the Chrome or Chromium executable",
                             executable.display()
                         );
-                        return Err(append_cleanup_error(base, remove_profile(&profile).err()));
+                        return Err(append_cleanup_error(base, cleanup));
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        let cleanup = cleanup_failed_launch(Some(child_ref), None, &profile);
+                        let cleanup = cleanup_failed_launch(
+                            Some(child_ref),
+                            None,
+                            &profile,
+                            owned_name.as_deref(),
+                        );
+                        drop(profile_lock.take());
                         return Err(append_cleanup_error(
                             format!("could not watch the browser process: {error}"),
                             cleanup,
@@ -100,13 +452,21 @@ impl Launched {
                     child,
                     detached_pid,
                     profile: Some(profile),
+                    profile_name: owned_name,
+                    profile_lock,
                     port,
                     websocket_url: format!("ws://127.0.0.1:{port}{path}"),
                 });
             }
 
             if deadline.passed() {
-                let cleanup = cleanup_failed_launch(child.as_mut(), detached_pid, &profile);
+                let cleanup = cleanup_failed_launch(
+                    child.as_mut(),
+                    detached_pid,
+                    &profile,
+                    owned_name.as_deref(),
+                );
+                drop(profile_lock.take());
                 let base = format!(
                     "the browser did not report a debugging port within {} ms; set `DA_CHROME` to the Chrome or Chromium executable",
                     deadline.timeout_ms()
@@ -134,20 +494,26 @@ impl Launched {
             return None;
         }
         let profile = self.profile.take()?;
+        let profile_name = self.profile_name.take();
         let child_pid = self.child.take().map(|child| child.id());
         let detached_pid = self.detached_pid.take();
         let spawned_pid = child_pid.or(detached_pid)?;
         let pid = resolve_detached_browser_pid(spawned_pid, &profile);
+        if let Some(mut lock) = self.profile_lock.take() {
+            let _ = lock.mark_detached(pid, self.port);
+            drop(lock);
+        }
         Some(DetachedProcess {
             pid,
             profile,
+            profile_name,
             port: self.port,
             websocket_url: self.websocket_url.clone(),
         })
     }
 
     /// Waits for the process to exit, kills it when it does not, and removes
-    /// the temporary profile.
+    /// the temporary profile (named persistent profiles are always kept).
     pub fn shutdown(mut self) -> Result<(), String> {
         self.release_with_wait(true)
     }
@@ -162,6 +528,7 @@ impl Launched {
     /// or [`Drop`].
     fn release_with_wait(&mut self, wait_graceful: bool) -> Result<(), String> {
         let mut errors = Vec::new();
+        let persistent_name = self.profile_name.take();
         if let Some(mut child) = self.child.take() {
             if wait_graceful {
                 // A browser that is slow to exit (seen on loaded CI runners) is
@@ -185,17 +552,32 @@ impl Launched {
             } else {
                 Duration::ZERO
             };
-            if let Err(err) =
-                dispose_detached_with(Some(pid), Some(self.port), profile.as_deref(), exit_timeout)
-            {
+            let res = match persistent_name.as_deref() {
+                Some(name) => dispose_detached_named_with(
+                    Some(pid),
+                    Some(self.port),
+                    profile.as_deref(),
+                    name,
+                    exit_timeout,
+                ),
+                None => dispose_detached_with(
+                    Some(pid),
+                    Some(self.port),
+                    profile.as_deref(),
+                    exit_timeout,
+                ),
+            };
+            if let Err(err) = res {
                 errors.push(err);
             }
         }
         if let Some(profile) = self.profile.take()
+            && persistent_name.is_none()
             && let Err(error) = remove_profile(&profile)
         {
             errors.push(error);
         }
+        drop(self.profile_lock.take());
         if errors.is_empty() {
             Ok(())
         } else {
@@ -217,6 +599,7 @@ fn spawn_direct(
     profile: &Path,
     args: &[String],
     detached: bool,
+    remove_on_error: bool,
 ) -> Result<Child, String> {
     let mut command = Command::new(executable);
     command
@@ -232,7 +615,12 @@ fn spawn_direct(
             "could not start `{}`: {error}; set `DA_CHROME` to the Chrome or Chromium executable",
             executable.display()
         );
-        append_cleanup_error(base, remove_profile(profile).err())
+        let cleanup = if remove_on_error {
+            remove_profile(profile).err()
+        } else {
+            None
+        };
+        append_cleanup_error(base, cleanup)
     })
 }
 
@@ -241,6 +629,7 @@ fn spawn_windows_isolated(
     executable: &Path,
     profile: &Path,
     args: &[String],
+    remove_on_error: bool,
 ) -> Result<u32, String> {
     let arg_line = args
         .iter()
@@ -270,7 +659,12 @@ fn spawn_windows_isolated(
                 "could not start `{}`: {error}; set `DA_CHROME` to the Chrome or Chromium executable",
                 executable.display()
             );
-            append_cleanup_error(base, remove_profile(profile).err())
+            let cleanup = if remove_on_error {
+                remove_profile(profile).err()
+            } else {
+                None
+            };
+            append_cleanup_error(base, cleanup)
         })?;
 
     if !output.status.success() {
@@ -279,7 +673,12 @@ fn spawn_windows_isolated(
             "could not start `{}`: {stderr}; set `DA_CHROME` to the Chrome or Chromium executable",
             executable.display()
         );
-        return Err(append_cleanup_error(base, remove_profile(profile).err()));
+        let cleanup = if remove_on_error {
+            remove_profile(profile).err()
+        } else {
+            None
+        };
+        return Err(append_cleanup_error(base, cleanup));
     }
 
     let pid_text = String::from_utf8_lossy(&output.stdout);
@@ -289,7 +688,12 @@ fn spawn_windows_isolated(
             executable.display(),
             pid_text.trim()
         );
-        append_cleanup_error(base, remove_profile(profile).err())
+        let cleanup = if remove_on_error {
+            remove_profile(profile).err()
+        } else {
+            None
+        };
+        append_cleanup_error(base, cleanup)
     })
 }
 
@@ -351,18 +755,27 @@ fn cleanup_failed_launch(
     child: Option<&mut Child>,
     detached_pid: Option<u32>,
     profile: &Path,
+    profile_name: Option<&str>,
 ) -> Option<String> {
     let mut errors = Vec::new();
     if let Some(c) = child {
         if let Err(error) = kill_child_now(c) {
             errors.push(error);
         }
-    } else if let Some(pid) = detached_pid
-        && let Err(error) = kill_process(pid, Some(profile))
-    {
-        errors.push(error);
+    } else if let Some(pid) = detached_pid {
+        let kill_result = match profile_name {
+            Some(name) => kill_named_process(pid, profile, name),
+            None => kill_process(pid, Some(profile)),
+        };
+        if let Err(error) = kill_result {
+            errors.push(error);
+        }
     }
-    if let Err(error) = remove_profile(profile) {
+    // A named persistent profile belongs to the caller and is never removed,
+    // even when the launch that opened it failed.
+    if profile_name.is_none()
+        && let Err(error) = remove_profile(profile)
+    {
         errors.push(error);
     }
     if errors.is_empty() {
@@ -398,6 +811,59 @@ enum ProfileEntry {
     Missing,
     Directory,
     Unsafe,
+}
+
+/// Validates that `profile` is a safe named persistent profile directory
+/// matching `name` without traversal, symlinks, or non-canonical segments.
+pub(crate) fn validate_named_profile_path(profile: &Path, name: &str) -> Result<(), String> {
+    validate_profile_name(name)?;
+    let raw = profile
+        .to_str()
+        .ok_or_else(|| "named browser profile path must be valid UTF-8".to_string())?;
+    if raw.is_empty() {
+        return Err("named browser profile path must not be empty".to_string());
+    }
+    if !profile.is_absolute() {
+        return Err(format!(
+            "refusing unsafe named browser profile `{raw}`: path must be absolute"
+        ));
+    }
+    if raw.ends_with('/')
+        || raw.ends_with('\\')
+        || raw.ends_with("/.")
+        || raw.ends_with("\\.")
+        || raw.contains("/./")
+        || raw.contains("\\.\\")
+        || raw.contains("/.\\")
+        || raw.contains("\\./")
+    {
+        return Err(format!(
+            "refusing unsafe named browser profile `{raw}`: path must be canonical"
+        ));
+    }
+    if profile
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!(
+            "refusing unsafe named browser profile `{raw}`: path must not contain `.` or `..`"
+        ));
+    }
+    if profile.file_name().and_then(|n| n.to_str()) != Some(name) {
+        return Err(format!(
+            "refusing unsafe named browser profile `{raw}`: directory name does not match `{name}`"
+        ));
+    }
+    match fs::symlink_metadata(profile) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_dir() => Err(format!(
+            "refusing unsafe named browser profile `{raw}`: expected a regular directory"
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not inspect named browser profile `{raw}`: {error}"
+        )),
+    }
 }
 
 /// Pure validator checking that `profile` is a direct `da-chrome-profile-<pid>-<seq>`
@@ -612,6 +1078,7 @@ fn launch_args(headless: bool, width: u32, height: u32, profile: &Path) -> Vec<S
 pub struct DetachedProcess {
     pub pid: u32,
     pub profile: PathBuf,
+    pub profile_name: Option<String>,
     pub port: u16,
     pub websocket_url: String,
 }
@@ -629,6 +1096,49 @@ pub fn dispose_detached(
     profile: Option<&Path>,
 ) -> Result<(), String> {
     dispose_detached_with(pid, port, profile, EXIT_TIMEOUT)
+}
+
+/// Ensures a detached browser process using a named persistent profile is
+/// terminated and its profile lock is released without deleting the directory.
+pub fn dispose_detached_named(
+    pid: Option<u32>,
+    port: Option<u16>,
+    profile: Option<&Path>,
+    profile_name: &str,
+) -> Result<(), String> {
+    dispose_detached_named_with(pid, port, profile, profile_name, EXIT_TIMEOUT)
+}
+
+/// Named-profile disposal with an explicit wait, so a failed launch can abort
+/// without waiting `EXIT_TIMEOUT`.
+pub fn dispose_detached_named_with(
+    pid: Option<u32>,
+    port: Option<u16>,
+    profile: Option<&Path>,
+    profile_name: &str,
+    exit_timeout: Duration,
+) -> Result<(), String> {
+    let result = dispose_detached_with_validator(
+        pid,
+        port,
+        profile,
+        |path| validate_named_profile_path(path, profile_name),
+        exit_timeout,
+        default_grace_window(),
+        is_port_listening,
+        read_profile_devtools_port,
+        default_pid_exists,
+        pid_matches_profile,
+        default_find_profile_pids,
+        force_kill_pid,
+        |_| Ok(()),
+    );
+    if result.is_ok()
+        && let Some(path) = profile
+    {
+        release_detached_profile_lock(path, profile_name);
+    }
+    result
 }
 
 fn dispose_detached_with(
@@ -782,6 +1292,51 @@ fn dispose_detached_with_ops<P, Dp, E, V, Fp, K, R>(
     temp_root: &Path,
     exit_timeout: Duration,
     grace_window: Duration,
+    port_listening: P,
+    read_profile_port: Dp,
+    pid_exists: E,
+    verify: V,
+    find_profile_pids: Fp,
+    kill: K,
+    remove_dir: R,
+) -> Result<(), String>
+where
+    P: FnMut(u16) -> bool,
+    Dp: FnMut(&Path) -> Option<u16>,
+    E: FnMut(u32) -> Option<bool>,
+    V: FnMut(u32, &Path) -> PidProfileMatch,
+    Fp: FnMut(&Path) -> Result<Vec<u32>, String>,
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+    R: FnMut(&Path) -> Result<(), String>,
+{
+    dispose_detached_with_validator(
+        pid,
+        port,
+        profile,
+        |path| validate_owned_profile_in(path, temp_root),
+        exit_timeout,
+        grace_window,
+        port_listening,
+        read_profile_port,
+        pid_exists,
+        verify,
+        find_profile_pids,
+        kill,
+        remove_dir,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal callback seam shared between temporary and named persistent profile cleanup"
+)]
+fn dispose_detached_with_validator<Val, P, Dp, E, V, Fp, K, R>(
+    pid: Option<u32>,
+    port: Option<u16>,
+    profile: Option<&Path>,
+    validate_profile: Val,
+    exit_timeout: Duration,
+    grace_window: Duration,
     mut port_listening: P,
     mut read_profile_port: Dp,
     mut pid_exists: E,
@@ -791,6 +1346,7 @@ fn dispose_detached_with_ops<P, Dp, E, V, Fp, K, R>(
     mut remove_dir: R,
 ) -> Result<(), String>
 where
+    Val: FnOnce(&Path) -> Result<(), String>,
     P: FnMut(u16) -> bool,
     Dp: FnMut(&Path) -> Option<u16>,
     E: FnMut(u32) -> Option<bool>,
@@ -808,7 +1364,7 @@ where
                 .to_string(),
         });
     };
-    validate_owned_profile_in(profile, temp_root)?;
+    validate_profile(profile)?;
     if pid == Some(0) {
         return Err("could not verify or terminate browser pid 0: invalid pid".to_string());
     }
@@ -1102,22 +1658,61 @@ pub(crate) fn verify_launched_process_before_close(
     )
 }
 
+pub(crate) fn verify_named_process_before_close(
+    pid: u32,
+    port: u16,
+    profile: &Path,
+    profile_name: &str,
+) -> Result<bool, String> {
+    verify_process_before_close_with_validator(
+        pid,
+        port,
+        profile,
+        |path| validate_named_profile_path(path, profile_name),
+        pid_matches_profile,
+        is_port_listening,
+    )
+}
+
 fn verify_launched_process_before_close_with<V, P>(
     pid: u32,
     port: u16,
     profile: &Path,
     temp_root: &Path,
+    verify: V,
+    port_open: P,
+) -> Result<bool, String>
+where
+    V: FnMut(u32, &Path) -> PidProfileMatch,
+    P: FnMut(u16) -> bool,
+{
+    verify_process_before_close_with_validator(
+        pid,
+        port,
+        profile,
+        |path| validate_owned_profile_in(path, temp_root),
+        verify,
+        port_open,
+    )
+}
+
+fn verify_process_before_close_with_validator<Val, V, P>(
+    pid: u32,
+    port: u16,
+    profile: &Path,
+    validate_profile: Val,
     mut verify: V,
     mut port_open: P,
 ) -> Result<bool, String>
 where
+    Val: FnOnce(&Path) -> Result<(), String>,
     V: FnMut(u32, &Path) -> PidProfileMatch,
     P: FnMut(u16) -> bool,
 {
     if pid == 0 {
         return Err("could not verify browser pid 0 before closing".to_string());
     }
-    validate_owned_profile_in(profile, temp_root)?;
+    validate_profile(profile)?;
     match verify(pid, profile) {
         PidProfileMatch::Matches => Ok(true),
         PidProfileMatch::Unknown => Err(format!(
@@ -1294,10 +1889,20 @@ where
 }
 
 fn kill_process(pid: u32, profile: Option<&Path>) -> Result<(), String> {
-    kill_process_in(
+    kill_process_with_validator(
         pid,
         profile,
-        &std::env::temp_dir(),
+        |path| validate_owned_profile_in(path, &std::env::temp_dir()),
+        pid_matches_profile,
+        force_kill_pid,
+    )
+}
+
+fn kill_named_process(pid: u32, profile: &Path, name: &str) -> Result<(), String> {
+    kill_process_with_validator(
+        pid,
+        Some(profile),
+        |path| validate_named_profile_path(path, name),
         pid_matches_profile,
         force_kill_pid,
     )
@@ -1323,17 +1928,45 @@ where
     V: FnMut(u32, &Path) -> PidProfileMatch,
     K: FnMut(u32, Option<&Path>) -> Result<(), String>,
 {
-    kill_process_in(pid, profile, &std::env::temp_dir(), verify, kill)
+    kill_process_with_validator(
+        pid,
+        profile,
+        |path| validate_owned_profile_in(path, &std::env::temp_dir()),
+        verify,
+        kill,
+    )
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "used by kill_process_in tests"))]
 fn kill_process_in<V, K>(
     pid: u32,
     profile: Option<&Path>,
     temp_root: &Path,
+    verify: V,
+    kill: K,
+) -> Result<(), String>
+where
+    V: FnMut(u32, &Path) -> PidProfileMatch,
+    K: FnMut(u32, Option<&Path>) -> Result<(), String>,
+{
+    kill_process_with_validator(
+        pid,
+        profile,
+        |path| validate_owned_profile_in(path, temp_root),
+        verify,
+        kill,
+    )
+}
+
+fn kill_process_with_validator<Val, V, K>(
+    pid: u32,
+    profile: Option<&Path>,
+    validate_profile: Val,
     mut verify: V,
     mut kill: K,
 ) -> Result<(), String>
 where
+    Val: FnOnce(&Path) -> Result<(), String>,
     V: FnMut(u32, &Path) -> PidProfileMatch,
     K: FnMut(u32, Option<&Path>) -> Result<(), String>,
 {
@@ -1345,7 +1978,7 @@ where
             "could not verify or terminate browser pid {pid}: the session handle has no profile path"
         ));
     };
-    validate_owned_profile_in(profile, temp_root)?;
+    validate_profile(profile)?;
     match verify(pid, profile) {
         PidProfileMatch::Matches => {}
         PidProfileMatch::DoesNotMatch => return Ok(()),
@@ -2385,6 +3018,8 @@ mod tests {
             child: Some(child),
             detached_pid: Some(child_pid),
             profile: Some(profile.clone()),
+            profile_name: None,
+            profile_lock: None,
             port,
             websocket_url: format!("ws://127.0.0.1:{port}/devtools/browser/test"),
         };
@@ -2415,6 +3050,8 @@ mod tests {
             child: None,
             detached_pid: Some(child_pid),
             profile: Some(profile.clone()),
+            profile_name: None,
+            profile_lock: None,
             port,
             websocket_url: format!("ws://127.0.0.1:{port}/devtools/browser/test"),
         };
@@ -2431,6 +3068,8 @@ mod tests {
             child: None,
             detached_pid: None,
             profile: Some(profile.clone()),
+            profile_name: None,
+            profile_lock: None,
             port,
             websocket_url: format!("ws://127.0.0.1:{port}/devtools/browser/test"),
         };
@@ -4335,6 +4974,8 @@ mod tests {
             child: None,
             detached_pid: None,
             profile: Some(profile.clone()),
+            profile_name: None,
+            profile_lock: None,
             port: 0,
             websocket_url: String::new(),
         };

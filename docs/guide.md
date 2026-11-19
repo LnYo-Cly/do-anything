@@ -1525,13 +1525,15 @@ the user's browser keeps running and the user's other tabs are untouched.
 
 | Step | Arguments | Result |
 | --- | --- | --- |
-| `browser.open` | `url` required; optional `connect`, `testid_attribute` (defaults to `data-testid`), `dialog`; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title`; `dialog` when one opened |
+| `browser.open` | `url` required; optional `connect`, `profile`, `storage_state`, `testid_attribute` (defaults to `data-testid`), `dialog`; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title`; `dialog` when one opened |
 | `browser.click` | locator; optional `dialog` | `{}`, or the clicked element's `text` when it has one; `dialog` when one opened |
 | `browser.type` | locator; `text` required unless `value` is given; optional `dialog` | `{}`; `dialog` when one opened |
 | `browser.press` | `key` required, for example `Enter` or `Tab`; optional `dialog` | `{}`; `dialog` when one opened |
 | `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000; optional `dialog` | `url`; `dialog` when one opened |
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
 | `browser.screenshot` | `path` required | `path`, `bytes` |
+| `browser.set_cookies` | `cookies` (non-empty array of `{ name, value, url \| domain, path?, http_only?, secure?, same_site? }`) and/or `local_storage` (non-empty `<origin> \| current` → `{ key: value }` map); at least one of the two | `cookies_set`, `local_storage_set` |
+| `browser.save_state` | `path` required | `path`, `cookies`, `local_storage` (counts only) |
 
 A **locator** takes **exactly one** of the five ways below, plus any modifiers:
 
@@ -1809,6 +1811,230 @@ a separate profile from your everyday one. If the port is closed or the address
 is not a DevTools endpoint, `browser.open` is an environment error (exit 4) whose
 message names `--remote-debugging-port`.
 
+#### Reusing a login across runs
+
+Most suites start after signing in. Typing the password into the page on every
+run is slow, breaks when the account has a second factor or a captcha, and puts
+the password on screen. There are four ways to bring a login into a run; pick the
+one that matches what has to be shared.
+
+| Way | Use when | Where the state lives |
+| --- | --- | --- |
+| Storage-state file (`browser.save_state`, then `browser.open: { storage_state: ... }`) | An automated run can sign in once and later runs should start signed in | A JSON file the caller names |
+| Named profile (`browser.open: { profile: ... }`) | A person signs in once, or the app needs service workers, IndexedDB or other profile-scoped state | `.da/profiles/<name>/` |
+| Connected browser (`browser.open: { connect: ... }`) | The everyday browser is already signed in | The user's own browser |
+| Cookie injection (`browser.set_cookies`) | The login is an HTTP API whose token a case already holds | The running browser session only |
+
+##### Storage-state file
+
+`browser.save_state` writes the cookies of the current page and the current
+origin's `localStorage` to a JSON file. A later, independent run names that file
+in `browser.open` and the page is already signed in when it loads — no typing, no
+cookie jar of the browser to keep.
+
+```yaml
+name: Sign in once and save the state
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/login
+  - browser.type:
+      css: "#user"
+      text: alice
+  - browser.type:
+      css: "#password"
+      text: "${env:DA_PASSWORD}"
+  - browser.press:
+      key: Enter
+  - browser.wait:
+      url_contains: /account
+  - browser.save_state:
+      path: state/session.json
+```
+
+```yaml
+name: Start signed in from the saved state
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/orders
+      storage_state: state/session.json
+  - browser.read:
+      css: "#who"
+    expect:
+      - path: $.text
+        equals: "signed in as alice"
+```
+
+The file has the shape `{"version": 1, "cookies": [...],
+"local_storage": {"<origin>": {"<key>": "<value>"}}}`. Its `cookies` entries use
+the same fields as `browser.set_cookies`, so a file can also be pasted into a
+case that injects cookies directly.
+
+`browser.save_state` returns only `path` and the counts `cookies` and
+`local_storage`; no value ever enters standard output, `--output json`, a failure
+bundle or a report. A relative `path` is resolved against the directory that
+holds the case file, like `browser.screenshot`. On Unix the file is written with
+mode `0600`; on Windows it inherits the directory's access control list. The file
+is a credential: keep it out of version control and out of shared artifacts.
+
+Limits worth knowing:
+
+- `local_storage` is saved for the origin of the page that is open when
+  `browser.save_state` runs. Sign in, then save, in that order.
+- Cookies with an empty value are not written; when nothing at all is left to
+  save, the step fails instead of writing an empty file.
+- Restored cookies become session cookies in the new browser: the original
+  expiry is not saved, so the reused login lasts for that browser's lifetime.
+- The step needs an open `http://` or `https://` page and refuses a browser
+  reached through `connect`, because that browser holds your everyday cookies.
+
+`browser.open` reads the file **before** launching the browser and **before** the
+navigation: the browser starts only after the file was read and validated, and
+the cookies and `localStorage` are applied while the page is still `about:blank`.
+A file that is missing, unreadable, larger than 8 MiB, not valid JSON, of an
+unsupported `version`, or carries no usable cookies and no `localStorage` fails
+the step as an environment error (exit 4). The message names the file and the
+problem and never repeats a cookie or token value, so a public log stays safe.
+Because the file must exist at run time, `da lint` checks the argument shape but
+not the file.
+
+The argument is an ordinary string, so a variable may name the file:
+
+```yaml
+steps:
+  - browser.open:
+      url: ${base_url}/orders
+      storage_state: ${state_file}
+```
+
+```bash
+da run tests/orders --var base_url=http://127.0.0.1:8080 --var state_file=state/admin.json
+```
+
+Inside `da session`, the same two steps are available step by step:
+
+```bash
+da session step "$id" browser.save_state --arg path=state/session.json
+da session step "$id" browser.open --with '{"url": "http://127.0.0.1:8080/orders", "storage_state": "state/session.json"}'
+```
+
+##### Named profile
+
+`browser.open: { profile: admin }` starts Chrome with the persistent user data
+directory `.da/profiles/admin/` instead of a temporary one. Sign in once with a
+visible window, and every later run of that case — in another process, on another
+day — starts with that profile. Unlike a temporary profile, the directory is
+never removed when the case or the session ends.
+
+```yaml
+name: Sign in by hand once, then reuse it
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/account
+      profile: admin
+      headless: false
+  - browser.read:
+      css: "#who"
+```
+
+The name may contain ASCII letters, digits, `-` and `_`, and must not be empty.
+The default root is `.da/profiles` under the working directory; `DA_PROFILES_DIR`
+overrides it with another directory (an absolute path or one relative to the
+working directory). The root and the profile directory are created when missing
+and refused when either is a symlink or not a directory.
+
+One profile is used by one browser at a time. A second case, session or process
+that names the same profile while the first still has it open fails at once with
+`browser profile `<name>` is already in use`, instead of starting a second Chrome
+on the same directory and corrupting it. The lock lives in
+`.da/profiles/<name>.lock` and is released when the browser closes; a stale lock
+from a crashed run is reclaimed after checking that no browser process still uses
+the profile.
+
+A profile holds whatever the browser stored, including cookies and tokens that
+`da` never read. See [unmanaged state](#evidence-from-a-profile-or-a-connected-browser)
+for what that means for evidence.
+
+##### Cookie injection
+
+When the login is an API call, let `http.request` fetch the token and put it into
+the browser instead of driving the form. `browser.set_cookies` writes cookies
+through the DevTools protocol and optional `localStorage` entries, and works
+before the first `browser.open`:
+
+```yaml
+name: Inject an API login before opening the protected page
+steps:
+  - http.request:
+      method: POST
+      url: http://127.0.0.1:8080/api/login
+      json:
+        user: alice
+        password: "${env:DA_PASSWORD}"
+    save:
+      session: $.json.token
+  - browser.set_cookies:
+      cookies:
+        - name: sid
+          value: ${session}
+          url: http://127.0.0.1:8080/
+          http_only: true
+          same_site: Lax
+      local_storage:
+        "http://127.0.0.1:8080":
+          auth_token: ${session}
+  - browser.open:
+      url: http://127.0.0.1:8080/orders
+```
+
+Every cookie needs a non-empty `name` and `value` and either `url` or `domain`;
+an empty cookie array or an empty `local_storage` map is an argument error. The
+step returns `cookies_set` and `local_storage_set` counts only. A cookie name and
+value appear in a case file only as a `${var}`, and the value is redacted from
+output like any other secret (see [Secrets](#secrets)).
+
+`local_storage` is keyed by an origin or by `current`:
+
+- A key of `current` writes to the page that is open now; with no HTTP(S) page
+  open yet, the step fails at run time instead of guessing an origin.
+- A full `http://` / `https://` origin registers a one-shot script that writes
+  those keys when a document of that origin loads, so it also works before the
+  first `browser.open` of that origin.
+
+##### Which one wins
+
+- `connect` cannot be combined with `profile` or with `storage_state`; each pair
+  is an invalid-argument error reported by `da lint` (and refused before any step
+  runs under `da run`), and by `da session step` as exit 2. A connected
+  browser is somebody's everyday browser: a state file or a named profile would
+  write into it.
+- `profile` and `storage_state` may be combined. The browser starts from the
+  profile directory, then the state file is applied before the navigation. For a
+  cookie with the same name, domain and path, and for a `localStorage` key that
+  already exists, the state file wins for the page being opened. Profile state
+  the file does not mention stays as the profile left it.
+- `storage_state` is applied on every `browser.open` that names it, before that
+  navigation. `headless`, `width`, `height`, `profile` and `connect` are fixed
+  when the browser is created, like every other `browser.open` option.
+- A `browser.set_cookies` step overwrites either source from the moment it runs,
+  so it stays the last word for that session.
+
+##### Evidence from a profile or a connected browser
+
+A browser started with `profile` or reached with `connect` may show pages that
+were signed in outside `da`, so `da` cannot know every secret its evidence could
+contain. Such a case marks its evidence `local_only`: failure bundles write
+`"local_only": true` with a `"local_only_reason"`, text output prints a
+`local-only:` line, and `--output json` adds `local_only` and
+`local_only_reason`. A browser `da` starts in a temporary directory has none of
+that state; a loaded `storage_state` file does not mark the evidence local-only,
+because every value in it came through a file `da` read. Keep local-only evidence
+on the machine — `da report --shareable` omits its screenshots.
+
+Chrome 136 and later ignore `--remote-debugging-port` for the default user data
+directory, so `connect` cannot take over the Chrome you browse with. Start a
+separate Chrome with its own `--user-data-dir` for `connect`, or let `da` manage a
+named `profile` instead.
+
 The browser is closed when the case ends, whether it passed, failed an
 assertion, errored or timed out. A session belongs to one case, so `--jobs 4`
 gives four running cases four browsers. A case that never calls `browser.open`
@@ -1828,7 +2054,9 @@ Chrome is found in this order:
 
 Each case that starts its own browser gets a fresh temporary profile and a
 debugger that listens on a loopback port the operating system chooses, so two
-cases at the same time cannot share a profile or a port. Connected cases share
+cases at the same time cannot share a profile or a port. A case that names a
+`profile` uses that persistent directory instead, and the lock described above
+keeps two cases from driving one profile at the same time. Connected cases share
 the user's browser but each one opens and closes its own tab.
 
 A headless browser runs without GPU acceleration: it composites in software and

@@ -99,6 +99,10 @@ pub struct SessionEvidence {
     pub files: Vec<Evidence>,
     /// Why the session could not return its evidence, if it failed.
     pub error: Option<String>,
+    /// Whether this session's evidence contains unmanaged state and must stay local-only.
+    pub evidence_is_local_only: bool,
+    /// Why this session's evidence must stay local-only, if applicable.
+    pub local_only_reason: Option<String>,
 }
 
 /// A resource a case keeps alive across its steps.
@@ -160,6 +164,12 @@ pub trait Session: Send + AsAny {
     /// Returns structured metadata produced by the most recent step on this
     /// session, clearing it afterward.
     fn take_step_metadata(&mut self) -> Option<Value> {
+        None
+    }
+
+    /// Returns a reason why evidence from this session must stay local-only,
+    /// or `None` when source-based redaction covers all state.
+    fn local_only_reason(&self) -> Option<String> {
         None
     }
 }
@@ -296,21 +306,41 @@ impl Sessions {
     pub fn collect_evidence(&mut self) -> Vec<SessionEvidence> {
         let mut groups = Vec::new();
         for entry in &mut self.entries {
+            let local_only_reason = entry.session.local_only_reason();
+            let evidence_is_local_only = local_only_reason.is_some();
             match entry.session.evidence() {
                 Ok(files) if files.is_empty() => {}
                 Ok(files) => groups.push(SessionEvidence {
                     kind: entry.kind.to_string(),
                     files,
                     error: None,
+                    evidence_is_local_only,
+                    local_only_reason,
                 }),
                 Err(message) => groups.push(SessionEvidence {
                     kind: entry.kind.to_string(),
                     files: Vec::new(),
                     error: Some(format!("session `{}`: {message}", entry.kind)),
+                    evidence_is_local_only,
+                    local_only_reason,
                 }),
             }
         }
         groups
+    }
+
+    /// Returns the combined local-only reason across open sessions, if any.
+    pub fn local_only_reason(&self) -> Option<String> {
+        let reasons: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|entry| entry.session.local_only_reason())
+            .collect();
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; "))
+        }
     }
 
     /// Closes every open session in reverse creation order.

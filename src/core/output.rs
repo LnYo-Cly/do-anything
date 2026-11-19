@@ -299,6 +299,15 @@ fn text_report(outcome: &RunOutcome, secrets: &Secrets) -> Rendered {
         if let Some(bundle) = &case.bundle {
             stdout.push_str(&format!("  bundle: {}\n", paths::display(bundle)));
         }
+        if case.local_only {
+            let reason = case
+                .local_only_reason
+                .as_deref()
+                .unwrap_or("session holds unmanaged external state");
+            stdout.push_str(&format!(
+                "  local-only: evidence is kept local only ({reason})\n"
+            ));
+        }
     }
 
     let summary = report.summary();
@@ -506,6 +515,12 @@ pub fn case_json(case: &CaseReport) -> Value {
         json!(case.error.as_ref().map(problem_value)),
     );
     object.insert("close_errors".to_string(), json!(case.close_errors));
+    if case.local_only {
+        object.insert("local_only".to_string(), json!(true));
+        if let Some(reason) = &case.local_only_reason {
+            object.insert("local_only_reason".to_string(), json!(reason));
+        }
+    }
     Value::Object(object)
 }
 
@@ -591,6 +606,8 @@ mod tests {
                 }),
                 close_errors: Vec::new(),
                 bundle: Some(PathBuf::from(".da/failures/17-42/0-Login")),
+                local_only: false,
+                local_only_reason: None,
             }],
             filtered: 2,
             duration: Duration::from_millis(4),
@@ -642,6 +659,8 @@ mod tests {
                 error: None,
                 close_errors: Vec::new(),
                 bundle: None,
+                local_only: false,
+                local_only_reason: None,
             }],
             filtered: 0,
             duration: Duration::from_millis(5),
@@ -1148,5 +1167,35 @@ mod tests {
             "cleanup failed for ***"
         );
         assert_eq!(value["cases"][0]["finally"][1]["status"], "skipped");
+    }
+
+    #[test]
+    fn local_only_case_prints_notice_and_emits_redacted_json_fields() {
+        let RunOutcome::Completed(mut report) = failing_outcome() else {
+            panic!("the fixture must be a completed run");
+        };
+        report.cases[0].local_only = true;
+        report.cases[0].local_only_reason =
+            Some("external handle s3cr3t-value may hold unmanaged state".to_string());
+        let outcome = RunOutcome::Completed(report);
+        let mut secrets = Secrets::new();
+        secrets.record("s3cr3t-value");
+
+        let text = render(&outcome, Format::Text, &secrets);
+        assert!(!text.stdout.contains("s3cr3t-value"), "{}", text.stdout);
+        assert!(
+            text.stdout.contains("local-only: evidence is kept local only (external handle *** may hold unmanaged state)"),
+            "{}",
+            text.stdout
+        );
+
+        let json = render(&outcome, Format::Json, &secrets);
+        assert!(!json.stdout.contains("s3cr3t-value"), "{}", json.stdout);
+        let value: Value = serde_json::from_str(&json.stdout).expect("stdout must be JSON");
+        assert_eq!(value["cases"][0]["local_only"], true);
+        assert_eq!(
+            value["cases"][0]["local_only_reason"],
+            "external handle *** may hold unmanaged state"
+        );
     }
 }

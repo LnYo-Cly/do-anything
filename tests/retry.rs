@@ -187,6 +187,14 @@ fn rejects_retry_on_state_changing_browser_steps_and_accepts_read_and_wait() {
         "browser.screenshot",
         "name: Shot\nsteps:\n  - browser.screenshot:\n      path: shot.png\n    retry:\n      until:\n        - path: $.bytes\n          exists: true\n      timeout_ms: 500\n".to_string(),
     ));
+    rejected.push((
+        "browser.set_cookies",
+        "name: Cookies\nsteps:\n  - browser.set_cookies:\n      cookies:\n        - name: sid\n          value: tok\n          url: http://127.0.0.1/\n    retry:\n      until:\n        - path: $.cookies_set\n          equals: 1\n      timeout_ms: 500\n".to_string(),
+    ));
+    rejected.push((
+        "browser.save_state",
+        "name: Save\nsteps:\n  - browser.save_state:\n      path: state.json\n    retry:\n      until:\n        - path: $.path\n          exists: true\n      timeout_ms: 500\n".to_string(),
+    ));
 
     for (name, yaml) in rejected {
         assert_retry_rejected(&dir, name, &yaml);
