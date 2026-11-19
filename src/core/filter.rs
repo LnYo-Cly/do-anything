@@ -163,6 +163,7 @@ mod tests {
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             observe: Vec::new(),
             steps: Vec::new(),
+            finally: Vec::new(),
         }
     }
 

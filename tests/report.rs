@@ -782,3 +782,104 @@ steps:
     assert!(!shareable_html.contains("<img src=\"https"));
     assert!(!shareable_html.contains("</script>"));
 }
+
+#[test]
+#[cfg(all(feature = "http", feature = "cli"))]
+fn finally_cleanup_steps_are_rendered_and_counted_while_absent_finally_stays_compatible() {
+    let server = support::TestServer::start();
+    let dir = TempDir::new("report-finally");
+    let case = dir.write(
+        "finally.yaml",
+        &format!(
+            r#"name: Loopback with finally cleanup
+steps:
+  - http.request:
+      method: POST
+      url: "{base}/login"
+      json: {{ user: "alice" }}
+    save:
+      token: $.body.token
+  - http.request:
+      url: "{base}/health"
+    expect:
+      - path: $.status
+        equals: 200
+  - http.request:
+      url: "{base}/me"
+      headers: {{ Authorization: "Bearer ${{token}}" }}
+    expect:
+      - path: $.name
+        equals: alice
+finally:
+  - http.request:
+      method: DELETE
+      url: "{base}/status/500"
+    expect:
+      - path: $.status
+        equals: 204
+  - cli.run:
+      command: "{da}"
+      args: ["--version"]
+    optional: true
+    expect:
+      - path: $.exit_code
+        equals: 99
+"#,
+            base = server.url(""),
+            da = da().replace('\\', "\\\\")
+        ),
+    );
+    let record = dir.path().join("record");
+
+    let run_out = run_da(&["run", path_str(&case), "--record", path_str(&record)]);
+    assert_eq!(exit_code(&run_out), Some(1), "stderr: {}", stderr(&run_out));
+
+    // Also include a legacy record without a `finally` key alongside the new one.
+    let legacy_report = json!({
+        "status": "passed",
+        "duration_ms": 1,
+        "steps": [
+            {
+                "name": "cli.run",
+                "status": "passed",
+                "duration_ms": 1,
+                "result": {"exit_code": 0, "stdout": "legacy", "stderr": ""},
+                "assertions": [],
+                "error": null
+            }
+        ],
+        "error": null,
+        "close_errors": []
+    });
+    let mut legacy_meta = malicious_meta("Legacy case without finally");
+    legacy_meta["status"] = json!("passed");
+    write_case(&record, "1-legacy", &legacy_meta, &legacy_report, PNG);
+
+    let report_out = run_da(&["--output", "json", "report", path_str(&record)]);
+    assert_eq!(
+        exit_code(&report_out),
+        Some(0),
+        "stderr: {}",
+        stderr(&report_out)
+    );
+    let summary: Value =
+        serde_json::from_slice(&report_out.stdout).expect("report stdout must be JSON");
+    assert_eq!(summary["cases"], 2);
+    // 3 main + 2 finally in case 0, plus 1 main in legacy case 1 = 6 total steps.
+    assert_eq!(summary["steps"], 6, "summary: {summary}");
+    assert_eq!(summary["steps_skipped"], 1, "summary: {summary}");
+
+    let html = read(&record.join("report.html"));
+    assert!(
+        html.contains("Cleanup (finally)"),
+        "missing cleanup section"
+    );
+    assert!(html.contains("boom"), "missing failed cleanup body");
+    assert!(
+        html.contains("204"),
+        "missing failed cleanup expected status"
+    );
+    assert!(html.contains("SKIPPED"), "missing skipped cleanup status");
+    assert!(html.contains("Legacy case without finally"));
+    assert!(html.contains("legacy"));
+}
