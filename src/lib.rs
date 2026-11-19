@@ -7,6 +7,7 @@ pub mod core;
 pub mod drivers;
 pub mod exit;
 pub mod report;
+pub mod session;
 
 /// Dialect identifier of the case file schema.
 ///

@@ -11,7 +11,10 @@
 //! `--jobs` cannot share one.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use serde_json::Value;
 
 use crate::core::registry::is_allowed_name_character;
 
@@ -123,6 +126,52 @@ pub trait Session: Send + AsAny {
     fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
         Ok(Vec::new())
     }
+
+    /// Detaches this resource so a later process can reattach without closing it.
+    ///
+    /// Returns `Ok(Some(handle))` with an opaque JSON handle when the session
+    /// supports persistence across separate commands, or `Ok(None)` when it
+    /// only lives within one run. After `Ok(Some(_))`, [`Self::close`] and
+    /// `Drop` must leave the underlying resource running.
+    fn detach(&mut self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+
+    /// Returns an interactive snapshot of this session's current state,
+    /// optionally scoped to `scope_ref` and bounded by `max_depth` / `max_nodes`.
+    ///
+    /// Sessions that do not expose snapshots return `Ok(None)`.
+    fn snapshot(
+        &mut self,
+        scope_ref: Option<&str>,
+        max_depth: Option<usize>,
+        max_nodes: Option<usize>,
+    ) -> Result<Option<Value>, String> {
+        let _ = (scope_ref, max_depth, max_nodes);
+        Ok(None)
+    }
+
+    /// Returns a post-step snapshot only when this session participated in the
+    /// step that just ran.
+    fn snapshot_after_step(&mut self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+
+    /// Returns structured metadata produced by the most recent step on this
+    /// session, clearing it afterward.
+    fn take_step_metadata(&mut self) -> Option<Value> {
+        None
+    }
+}
+
+/// Handles returned when open sessions detach at the end of an interactive
+/// command.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DetachedSessions {
+    /// Opaque JSON handles keyed by session kind.
+    pub handles: BTreeMap<String, Value>,
+    /// Errors reported while detaching or closing non-detachable sessions.
+    pub errors: Vec<String>,
 }
 
 /// The sessions of one case, keyed by the kind the plugin chose.
@@ -136,6 +185,8 @@ pub struct Sessions {
     entries: Vec<SessionEntry>,
     /// Directory a session resolves a relative path against when it writes one.
     base_directory: Option<PathBuf>,
+    /// Whether steps execute inside an interactive `da session` command.
+    interactive: bool,
 }
 
 /// One open session and the kind it is stored under.
@@ -161,6 +212,32 @@ impl Sessions {
     /// The directory a session resolves a relative output path against.
     pub fn base_directory(&self) -> Option<&Path> {
         self.base_directory.as_deref()
+    }
+
+    /// Marks whether steps execute inside an interactive `da session` command.
+    pub fn set_interactive(&mut self, interactive: bool) {
+        self.interactive = interactive;
+    }
+
+    /// Whether steps execute inside an interactive `da session` command.
+    pub fn is_interactive(&self) -> bool {
+        self.interactive
+    }
+
+    /// Inserts a reattached session under `kind`.
+    ///
+    /// Fails if `kind` is invalid or already open in this [`Sessions`].
+    pub fn insert_reattached(
+        &mut self,
+        kind: &'static str,
+        session: Box<dyn Session>,
+    ) -> Result<(), String> {
+        check_kind(kind)?;
+        if self.entries.iter().any(|entry| entry.kind == kind) {
+            return Err(format!("session `{kind}` is already open"));
+        }
+        self.entries.push(SessionEntry { kind, session });
+        Ok(())
     }
 
     /// Returns the session of `kind`, creating it with `create` on first use.
@@ -253,6 +330,71 @@ impl Sessions {
             }
         }
         errors
+    }
+
+    /// Detaches every open session that supports persistence, closing any
+    /// non-detachable sessions instead.
+    pub fn detach_all(&mut self) -> DetachedSessions {
+        let mut out = DetachedSessions::default();
+        while let Some(mut entry) = self.entries.pop() {
+            match entry.session.detach() {
+                Ok(Some(handle)) => {
+                    out.handles.insert(entry.kind.to_string(), handle);
+                }
+                Ok(None) => {
+                    if let Err(message) = entry.session.close() {
+                        out.errors.push(format!(
+                            "could not close session `{}`: {message}",
+                            entry.kind
+                        ));
+                    }
+                }
+                Err(message) => {
+                    out.errors.push(format!(
+                        "could not detach session `{}`: {message}",
+                        entry.kind
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Collects a snapshot from the first open session that produces one.
+    pub fn collect_snapshot(
+        &mut self,
+        scope_ref: Option<&str>,
+        max_depth: Option<usize>,
+        max_nodes: Option<usize>,
+    ) -> Result<Option<(String, Value)>, String> {
+        for entry in &mut self.entries {
+            if let Some(snapshot) = entry.session.snapshot(scope_ref, max_depth, max_nodes)? {
+                return Ok(Some((entry.kind.to_string(), snapshot)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collects a post-step snapshot from any session that participated in the
+    /// step that just finished.
+    pub fn collect_step_snapshot(&mut self) -> Result<Option<(String, Value)>, String> {
+        for entry in &mut self.entries {
+            if let Some(snapshot) = entry.session.snapshot_after_step()? {
+                return Ok(Some((entry.kind.to_string(), snapshot)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collects and clears any per-step metadata produced by open sessions.
+    pub fn take_step_metadata(&mut self) -> BTreeMap<String, Value> {
+        let mut out = BTreeMap::new();
+        for entry in &mut self.entries {
+            if let Some(meta) = entry.session.take_step_metadata() {
+                out.insert(entry.kind.to_string(), meta);
+            }
+        }
+        out
     }
 }
 
@@ -705,5 +847,82 @@ mod tests {
             vec!["close 2", "close 1"],
             "the later session must close first and the failure must not stop the earlier one"
         );
+    }
+
+    #[test]
+    fn detach_all_persists_detachable_and_closes_non_detachable() {
+        #[derive(Debug)]
+        struct Detachable {
+            detached: bool,
+            log: Arc<Mutex<Vec<String>>>,
+            meta: Option<Value>,
+        }
+        impl Session for Detachable {
+            fn close(&mut self) -> Result<(), String> {
+                if !self.detached {
+                    self.log
+                        .lock()
+                        .expect("log lock")
+                        .push("close detachable".to_string());
+                }
+                Ok(())
+            }
+            fn detach(&mut self) -> Result<Option<Value>, String> {
+                self.detached = true;
+                Ok(Some(serde_json::json!({"token": 42})))
+            }
+            fn snapshot(
+                &mut self,
+                scope: Option<&str>,
+                _max_depth: Option<usize>,
+                _max_nodes: Option<usize>,
+            ) -> Result<Option<Value>, String> {
+                Ok(Some(serde_json::json!({ "scope": scope })))
+            }
+            fn take_step_metadata(&mut self) -> Option<Value> {
+                self.meta.take()
+            }
+        }
+
+        let log = Log::default();
+        let mut sessions = Sessions::new();
+        sessions
+            .get_or_create("test.plain", || Ok(tracked(&log, 10)))
+            .expect("plain must be created");
+        sessions
+            .get_or_create("test.detach", || {
+                Ok(Detachable {
+                    detached: false,
+                    log: Arc::clone(&log.0),
+                    meta: Some(serde_json::json!({ "synthesized": true })),
+                })
+            })
+            .expect("detachable must be created");
+
+        let snap = sessions
+            .collect_snapshot(Some("e1"), None, None)
+            .expect("snapshot must succeed")
+            .expect("snapshot must be present");
+        assert_eq!(snap.0, "test.detach");
+        assert_eq!(snap.1["scope"], "e1");
+
+        let meta = sessions.take_step_metadata();
+        assert_eq!(
+            meta.get("test.detach"),
+            Some(&serde_json::json!({ "synthesized": true }))
+        );
+        assert!(sessions.take_step_metadata().is_empty());
+
+        let detached = sessions.detach_all();
+        assert!(detached.errors.is_empty(), "got: {:?}", detached.errors);
+        assert_eq!(
+            detached.handles.get("test.detach"),
+            Some(&serde_json::json!({"token": 42}))
+        );
+        assert!(
+            !detached.handles.contains_key("test.plain"),
+            "non-detachable session must not return a handle"
+        );
+        assert_eq!(log.entries(), vec!["close 10"]);
     }
 }

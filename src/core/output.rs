@@ -509,6 +509,11 @@ pub fn case_json(case: &CaseReport) -> Value {
     Value::Object(object)
 }
 
+/// Renders one step report the way `report.json` shows it.
+pub fn step_json(step: &StepReport) -> Value {
+    step_value(step)
+}
+
 fn step_value(step: &StepReport) -> Value {
     json!({
         "name": step.name,

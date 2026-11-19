@@ -663,16 +663,7 @@ fn run_one_step(
     // is allowed to be absent: it becomes `skipped` and the case continues.
     // The problem stays in the report so a reader still sees why. Only an
     // environment or input error means the case cannot go on.
-    let skipped = step.optional
-        && report.error.as_ref().is_some_and(|problem| {
-            matches!(
-                problem.kind,
-                ProblemKind::Assertion | ProblemKind::Execution | ProblemKind::Timeout
-            )
-        });
-    if skipped {
-        report.status = StepStatus::Skipped;
-    }
+    let skipped = apply_optional_skip(&mut report, step.optional);
 
     report.duration = step_started.elapsed();
     ctx.bus.emit(Event::StepFinished {
@@ -898,6 +889,28 @@ fn run_attempt(
     }
 }
 
+/// Evaluates `step.expect` against `result` and applies `step.save` to `vars`
+/// when every assertion passes.
+fn evaluate_and_save(
+    step: &Step,
+    result: Value,
+    vars: &mut BTreeMap<String, String>,
+) -> Result<(Value, Vec<AssertionReport>), Problem> {
+    let assertions: Vec<AssertionReport> = step
+        .expect
+        .iter()
+        .map(|expectation| assert::evaluate(expectation, &result))
+        .collect();
+
+    // A case that already failed an assertion is not allowed to change the
+    // variables that later steps would see.
+    if assertions.iter().all(|item| item.passed) {
+        save_values(&step.save, &result, vars)?;
+    }
+
+    Ok((result, assertions))
+}
+
 fn collect_observations(
     observations: &mut [ObservationSlot],
     sessions: &mut Sessions,
@@ -918,6 +931,96 @@ fn evaluate_all(expectations: &[Expectation], result: &Value) -> Vec<AssertionRe
         .iter()
         .map(|expectation| assert::evaluate(expectation, result))
         .collect()
+}
+
+/// Executes a single interactive step against `registry` and `sessions`,
+/// returning a [`StepReport`] with the same shape as `da run`.
+pub fn run_single_step(
+    step: &Step,
+    registry: &Registry,
+    vars: &mut BTreeMap<String, String>,
+    secrets: &mut Secrets,
+    sessions: &mut Sessions,
+) -> StepReport {
+    let started = Instant::now();
+    let mut report = StepReport {
+        name: step.action.clone(),
+        status: StepStatus::Passed,
+        duration: Duration::ZERO,
+        result: None,
+        assertions: Vec::new(),
+        error: None,
+    };
+
+    let outcome: Result<(Value, Vec<AssertionReport>), Problem> = (|| {
+        let definition = registry.get(&step.action).ok_or_else(|| Problem {
+            kind: ProblemKind::InvalidInput,
+            message: format!("`{}` is not a registered step", step.action),
+        })?;
+        if step.retry.is_some() {
+            return Err(Problem {
+                kind: ProblemKind::InvalidInput,
+                message: format!(
+                    "`{}` cannot use `retry` in `da session step`: polling runs only in case files, so send one attempt or move the step into a case",
+                    step.action
+                ),
+            });
+        }
+        let args = case::interpolate(&step.args, vars, secrets).map_err(|error| Problem {
+            kind: ProblemKind::InvalidInput,
+            message: error.message,
+        })?;
+        let validation = if sessions.is_interactive() {
+            registry.validate_for_session(&step.action, &args)
+        } else {
+            (definition.validate)(&args)
+        };
+        validation.map_err(|message| Problem {
+            kind: ProblemKind::InvalidInput,
+            message: format!("`{}` {message}", step.action),
+        })?;
+        let result = (definition.run)(&args, sessions).map_err(problem_from_step_error)?;
+        evaluate_and_save(step, result, vars)
+    })();
+
+    match outcome {
+        Ok((result, assertions)) => {
+            let failed = assertions.iter().filter(|item| !item.passed).count();
+            if failed == 0 {
+                report.status = StepStatus::Passed;
+            } else {
+                report.status = StepStatus::Failed;
+                report.error = Some(Problem {
+                    kind: ProblemKind::Assertion,
+                    message: format!("{failed} of {} assertions failed", assertions.len()),
+                });
+            }
+            report.result = Some(result);
+            report.assertions = assertions;
+        }
+        Err(problem) => {
+            report.status = StepStatus::Error;
+            report.error = Some(problem);
+        }
+    }
+    apply_optional_skip(&mut report, step.optional);
+
+    report.duration = started.elapsed();
+    report
+}
+
+fn apply_optional_skip(report: &mut StepReport, optional: bool) -> bool {
+    let skipped = optional
+        && report.error.as_ref().is_some_and(|problem| {
+            matches!(
+                problem.kind,
+                ProblemKind::Assertion | ProblemKind::Execution | ProblemKind::Timeout
+            )
+        });
+    if skipped {
+        report.status = StepStatus::Skipped;
+    }
+    skipped
 }
 
 /// Adds the collected values to a step result as `observed.<name>`.
@@ -3334,6 +3437,105 @@ mod tests {
             "sleep exhausting the remaining budget must prevent starting a new attempt"
         );
         assert!(slept);
+    }
+
+    #[test]
+    fn run_single_step_persists_saved_vars_on_pass_only() {
+        let reg = registry();
+        let mut vars = BTreeMap::new();
+        let mut secrets = Secrets::new();
+        let mut sessions = Sessions::new();
+        sessions.set_interactive(true);
+
+        let pass_step = crate::core::case::parse_single_step(
+            r#"{"use":"test.echo","with":{"value":"hello"},"expect":[{"path":"$","equals":"hello"}],"save":{"greeting":"$"}}"#,
+        )
+        .expect("step must parse");
+        let report = run_single_step(&pass_step, &reg, &mut vars, &mut secrets, &mut sessions);
+        assert_eq!(report.status, StepStatus::Passed);
+        assert_eq!(vars.get("greeting").map(String::as_str), Some("hello"));
+
+        let fail_step = crate::core::case::parse_single_step(
+            r#"{"use":"test.echo","with":{"value":"bad"},"expect":[{"path":"$","equals":"good"}],"save":{"greeting":"$"}}"#,
+        )
+        .expect("step must parse");
+        let report = run_single_step(&fail_step, &reg, &mut vars, &mut secrets, &mut sessions);
+        assert_eq!(report.status, StepStatus::Failed);
+        assert_eq!(
+            vars.get("greeting").map(String::as_str),
+            Some("hello"),
+            "failed assertion must not overwrite saved variable"
+        );
+    }
+
+    #[test]
+    fn run_single_step_rejects_a_retry_policy_instead_of_ignoring_it() {
+        let reg = registry();
+        let mut vars = BTreeMap::new();
+        let mut secrets = Secrets::new();
+        let mut sessions = Sessions::new();
+        sessions.set_interactive(true);
+
+        let step = crate::core::case::parse_single_step(
+            r#"{"use":"test.echo","with":{"value":"hello"},"retry":{"until":[{"path":"$","equals":"hello"}],"timeout_ms":50}}"#,
+        )
+        .expect("step must parse");
+        assert!(
+            step.retry.is_some(),
+            "the shared parser must keep the policy for case mode"
+        );
+
+        let report = run_single_step(&step, &reg, &mut vars, &mut secrets, &mut sessions);
+        assert_eq!(report.status, StepStatus::Error);
+        let error = report.error.expect("rejection must carry its message");
+        assert_eq!(error.kind, ProblemKind::InvalidInput);
+        assert!(
+            error
+                .message
+                .contains("cannot use `retry` in `da session step`"),
+            "the limitation must be named: {}",
+            error.message
+        );
+        assert!(
+            vars.is_empty(),
+            "a rejected step must not save variables or run an attempt"
+        );
+    }
+
+    #[test]
+    fn run_single_step_optional_skips_execution_and_keeps_invalid_input_error() {
+        let reg = registry();
+        let mut vars = BTreeMap::new();
+        let mut secrets = Secrets::new();
+        let mut sessions = Sessions::new();
+        sessions.set_interactive(true);
+
+        let optional_exec =
+            crate::core::case::parse_single_step("test.execution: {}\noptional: true\n")
+                .expect("optional execution step must parse");
+        let exec_report =
+            run_single_step(&optional_exec, &reg, &mut vars, &mut secrets, &mut sessions);
+        assert_eq!(exec_report.status, StepStatus::Skipped);
+        assert_eq!(
+            exec_report.error.as_ref().map(|e| e.kind),
+            Some(ProblemKind::Execution)
+        );
+
+        let optional_invalid =
+            crate::core::case::parse_single_step("test.invalid: {}\noptional: true\n")
+                .expect("optional invalid step must parse");
+        let invalid_report = run_single_step(
+            &optional_invalid,
+            &reg,
+            &mut vars,
+            &mut secrets,
+            &mut sessions,
+        );
+        assert_eq!(invalid_report.status, StepStatus::Error);
+        assert_eq!(
+            invalid_report.error.as_ref().map(|e| e.kind),
+            Some(ProblemKind::InvalidInput)
+        );
     }
 
     #[test]

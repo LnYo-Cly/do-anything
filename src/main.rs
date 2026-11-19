@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -16,14 +16,18 @@ use do_anything::core::secrets::Secrets;
 use do_anything::drivers;
 use do_anything::exit::ExitCode as DaExitCode;
 use do_anything::report as html_report;
+use do_anything::session::export::ExportOptions;
+use do_anything::session::{
+    self, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR, SessionRequest, StepInput,
+};
 
 /// An agent-friendly, cross-layer testing tool.
 #[derive(Debug, Parser)]
 #[command(name = "da", version, about)]
 struct Cli {
     /// How command results are reported.
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
-    output: OutputFormat,
+    #[arg(long, global = true, value_enum)]
+    output: Option<OutputFormat>,
 
     #[command(subcommand)]
     command: Command,
@@ -116,6 +120,86 @@ enum Command {
     },
     /// Print the JSON Schema for the case file format.
     Schema,
+    /// Manage persistent interactive sessions for step-by-step exploration.
+    Session {
+        /// Directory that stores session state. Defaults to `.da/sessions`.
+        #[arg(long, global = true, value_name = "DIR")]
+        sessions_dir: Option<PathBuf>,
+        /// Idle timeout in milliseconds before sessions are reaped. Defaults to 1800000.
+        #[arg(long, global = true, value_name = "MS")]
+        idle_timeout_ms: Option<u64>,
+        #[command(subcommand)]
+        action: SessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Create a new interactive session directory.
+    Start,
+    /// Execute one step in an existing session.
+    Step {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// Step name (for example `browser.open`), when passing `--arg` flags.
+        action: Option<String>,
+        /// Step name (alternative to positional action).
+        #[arg(long = "use", value_name = "STEP")]
+        use_step: Option<String>,
+        /// Step argument as `KEY=VALUE`. Repeat for more than one.
+        #[arg(long = "arg", value_name = "KEY=VALUE", value_parser = parse_var)]
+        args: Vec<(String, String)>,
+        /// Step arguments mapping as YAML or JSON.
+        #[arg(long, value_name = "YAML_OR_JSON")]
+        with: Option<String>,
+        /// Complete step definition as YAML or JSON.
+        #[arg(long, value_name = "YAML_OR_JSON")]
+        step: Option<String>,
+        /// Read the step definition from a YAML or JSON file (`-` for stdin).
+        #[arg(short = 'f', long, value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Save a value from the step result as `NAME=JSONPATH`.
+        #[arg(long = "save", value_name = "NAME=JSONPATH", value_parser = parse_var)]
+        save: Vec<(String, String)>,
+    },
+    /// Take an accessibility snapshot without executing a step.
+    Snapshot {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// Optional element reference from a prior snapshot to expand within.
+        #[arg(long = "ref", value_name = "REF")]
+        scope_ref: Option<String>,
+        /// Maximum traversal depth (relative to root or `--ref`).
+        #[arg(long, value_name = "N")]
+        max_depth: Option<usize>,
+        /// Maximum nodes included before truncation.
+        #[arg(long, value_name = "N")]
+        max_nodes: Option<usize>,
+    },
+    /// Export successful steps as a deterministic, replayable YAML case.
+    Export {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// Write the exported YAML case to `FILE`.
+        #[arg(short = 'o', long = "out", value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Case `name:` written to the exported YAML.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Include read-only `browser.read` steps without `expect` or `save`.
+        #[arg(long)]
+        include_reads: bool,
+        /// Print raw YAML to stdout instead of a JSON report object.
+        #[arg(long)]
+        yaml: bool,
+    },
+    /// Close all resources and delete the session directory.
+    Stop {
+        /// Session identifier returned by `da session start`.
+        id: String,
+    },
+    /// List active sessions and reap idle ones.
+    List,
 }
 
 /// Splits a `--var name=value` argument.
@@ -158,6 +242,8 @@ fn main() -> ExitCode {
         return DaExitCode::Environment.into();
     }
 
+    let default_output = cli.output.unwrap_or(OutputFormat::Text);
+
     match cli.command {
         Command::Run {
             paths,
@@ -183,7 +269,7 @@ fn main() -> ExitCode {
                 return usage_error(&message);
             }
             run(
-                cli.output,
+                default_output,
                 &registry,
                 RunOptions {
                     paths,
@@ -206,7 +292,7 @@ fn main() -> ExitCode {
             directory,
             output_file,
             shareable,
-        } => report(cli.output, &directory, output_file, shareable),
+        } => report(default_output, &directory, output_file, shareable),
         Command::Lint {
             paths,
             vars,
@@ -216,10 +302,221 @@ fn main() -> ExitCode {
                 Ok(sources) => sources,
                 Err(message) => return usage_error(&message),
             };
-            lint(&paths, cli.output, &registry, &sources)
+            lint(&paths, default_output, &registry, &sources)
         }
-        Command::Schema => print_schema(&registry, cli.output),
+        Command::Schema => print_schema(&registry, default_output),
+        Command::Session {
+            sessions_dir,
+            idle_timeout_ms,
+            action,
+        } => run_session(
+            cli.output.unwrap_or(OutputFormat::Json),
+            &registry,
+            sessions_dir,
+            idle_timeout_ms,
+            action,
+        ),
     }
+}
+
+fn run_session(
+    format: OutputFormat,
+    registry: &Registry,
+    sessions_dir: Option<PathBuf>,
+    idle_timeout_ms: Option<u64>,
+    action: SessionCommand,
+) -> ExitCode {
+    let sessions_dir = sessions_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR));
+    let mut print_raw_yaml = false;
+
+    let request = match action {
+        SessionCommand::Start => SessionRequest::Start {
+            sessions_dir,
+            idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
+        },
+        SessionCommand::Step {
+            id,
+            action,
+            use_step,
+            args,
+            with,
+            step,
+            file,
+            save,
+        } => {
+            let step_input =
+                match resolve_step_input(action, use_step, args, with, step, file, save) {
+                    Ok(input) => input,
+                    Err(message) => {
+                        if format == OutputFormat::Json {
+                            let err = serde_json::json!({
+                                "ok": false,
+                                "error": { "kind": "usage", "message": message }
+                            });
+                            let _ = write_stdout(&format!("{err}\n"));
+                        } else {
+                            let _ = write_stderr(&format!("error: {message}\n"));
+                        }
+                        return DaExitCode::Usage.into();
+                    }
+                };
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            SessionRequest::Step {
+                sessions_dir,
+                id,
+                base_directory,
+                step: step_input,
+            }
+        }
+        SessionCommand::Snapshot {
+            id,
+            scope_ref,
+            max_depth,
+            max_nodes,
+        } => SessionRequest::Snapshot {
+            sessions_dir,
+            id,
+            scope_ref,
+            max_depth,
+            max_nodes,
+        },
+        SessionCommand::Export {
+            id,
+            out,
+            name,
+            include_reads,
+            yaml,
+        } => {
+            print_raw_yaml = yaml || (format == OutputFormat::Text && out.is_none());
+            SessionRequest::Export {
+                sessions_dir,
+                id,
+                options: ExportOptions {
+                    case_name: name,
+                    include_reads,
+                },
+                out_path: out,
+            }
+        }
+        SessionCommand::Stop { id } => SessionRequest::Stop { sessions_dir, id },
+        SessionCommand::List => SessionRequest::List {
+            sessions_dir,
+            idle_override_ms: idle_timeout_ms,
+        },
+    };
+
+    let response = session::handle(request, registry);
+    if print_raw_yaml
+        && response.exit_code == DaExitCode::Success
+        && let Some(yaml) = &response.raw_yaml
+    {
+        let _ = write_stdout(yaml);
+    } else if format == OutputFormat::Json {
+        let _ = write_stdout(&format!("{}\n", response.payload));
+    } else {
+        let rendered = serde_json::to_string_pretty(&response.payload)
+            .unwrap_or_else(|_| response.payload.to_string());
+        let _ = write_stdout(&format!("{rendered}\n"));
+    }
+    response.exit_code.into()
+}
+
+fn resolve_step_input(
+    action: Option<String>,
+    use_step: Option<String>,
+    args: Vec<(String, String)>,
+    with: Option<String>,
+    step: Option<String>,
+    file: Option<PathBuf>,
+    save: Vec<(String, String)>,
+) -> Result<StepInput, String> {
+    let chosen_action = match (action, use_step) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "pass either positional `<action>` or `--use <step>`, not both".to_string(),
+            );
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(u)) => Some(u),
+        (None, None) => None,
+    };
+
+    let sources = [
+        chosen_action.is_some() || !args.is_empty() || with.is_some() || !save.is_empty(),
+        step.is_some(),
+        file.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+
+    if sources > 1 {
+        return Err(
+            "provide one step source: stdin, `--file`, `--step`, or `<action>`/`--use` flags"
+                .to_string(),
+        );
+    }
+
+    if let Some(path) = file {
+        if path.as_os_str() == "-" {
+            let mut text = String::new();
+            io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| format!("could not read step from stdin: {error}"))?;
+            if text.trim().is_empty() {
+                return Err("stdin was empty; pass a YAML or JSON step".to_string());
+            }
+            return Ok(StepInput::Text(text));
+        }
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "could not read step file `{}`: {error}",
+                path.to_string_lossy()
+            )
+        })?;
+        return Ok(StepInput::Text(text));
+    }
+
+    if let Some(text) = step {
+        if text.trim().is_empty() {
+            return Err("`--step` must not be empty".to_string());
+        }
+        return Ok(StepInput::Text(text));
+    }
+
+    if let Some(action) = chosen_action {
+        return Ok(StepInput::Flags {
+            action,
+            with_raw: with,
+            args,
+            save,
+        });
+    }
+
+    if !args.is_empty() || with.is_some() || !save.is_empty() {
+        return Err(
+            "`--arg`, `--with`, and `--save` require a step name (`<action>` or `--use`)"
+                .to_string(),
+        );
+    }
+
+    if io::stdin().is_terminal() {
+        return Err(
+            "no step provided; pipe a YAML/JSON step on stdin, pass `--file`, `--step`, or `<action> --arg key=value`"
+                .to_string(),
+        );
+    }
+    let mut text = String::new();
+    io::stdin()
+        .read_to_string(&mut text)
+        .map_err(|error| format!("could not read step from stdin: {error}"))?;
+    if text.trim().is_empty() {
+        return Err(
+            "no step provided on stdin; pipe a YAML/JSON step, pass `--file`, `--step`, or `<action> --arg key=value`"
+                .to_string(),
+        );
+    }
+    Ok(StepInput::Text(text))
 }
 
 /// Variables that come from outside the case file, in increasing precedence.

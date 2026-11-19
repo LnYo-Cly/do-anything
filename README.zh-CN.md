@@ -147,6 +147,7 @@ HTML 是自包含的，离线可打开。`--shareable` 不嵌入任何截图，`
 | 每个用例的证据 | `da run --record evidence/` 记录通过、失败与出错的用例；`da report evidence/` 渲染成一个离线 HTML 文件 |
 | 外部输入 | 用 `--var name=value` 传入地址、令牌和路径 |
 | 不执行就检查用例 | `da lint cases/`：与 `da run` 相同的校验，一次报出所有文件的所有问题，不执行任何步骤 |
+| 交互式探测与用例导出 | `da session start \| step \| snapshot \| export \| stop`：跨命令保持会话状态并导出可重放的 YAML 用例 |
 | 机器可读的用例格式 | `da schema`：包含所有已注册步骤的 JSON Schema，编辑器也能直接使用 |
 
 完整说明见[使用指南](docs/guide.md)：[用例格式](docs/guide.md#case-files)、[输出](docs/guide.md#output)、[失败包](docs/guide.md#failure-bundles)、[用例检查](docs/guide.md#linting)、[Schema](docs/guide.md#schema)、[退出码](docs/guide.md#exit-codes)。使用指南目前只有英文版。

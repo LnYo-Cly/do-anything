@@ -23,6 +23,8 @@ mod cdp;
 mod connect;
 mod launch;
 mod network;
+mod snapshot;
+mod synthesis;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -39,7 +41,9 @@ use self::cdp::{
 use self::connect::Endpoint;
 use self::launch::Launched;
 use crate::core::paths;
-use crate::core::registry::{Registry, StepDefinition, StepError, allow_retry, disallow_retry};
+use crate::core::registry::{
+    Registry, SessionDefinition, StepDefinition, StepError, allow_retry, disallow_retry,
+};
 use crate::core::session::{Evidence, Session, Sessions};
 
 /// Session kind the browser steps share.
@@ -84,6 +88,15 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         registry.register(definition)?;
     }
     network::register(registry)?;
+    registry.register_session(SessionDefinition {
+        kind: SESSION_KIND,
+        reattach: BrowserSession::reattach_boxed,
+        dispose_handle: BrowserSession::dispose_handle,
+    })?;
+    registry.register_session_validator("browser.click", validate_click_session)?;
+    registry.register_session_validator("browser.type", validate_type_session)?;
+    registry.register_session_validator("browser.wait", validate_wait_session)?;
+    registry.register_session_validator("browser.read", validate_read_session)?;
     Ok(())
 }
 
@@ -1435,6 +1448,8 @@ fn code_for_char(character: char) -> String {
 enum Origin {
     /// The case started this browser process and ends it when the case ends.
     Launched(Launched),
+    /// Reattached to a detached browser process started by an earlier `da session`.
+    Detached { pid: u32, profile: PathBuf },
     /// The case connected to the user's browser and closes only its own tab.
     Connected,
 }
@@ -1452,6 +1467,7 @@ struct BrowserSession {
     /// The requests this page reported, bounded and merged by request id.
     network: network::NetworkState,
     port: u16,
+    websocket_url: String,
     headless: bool,
     width: u32,
     height: u32,
@@ -1460,6 +1476,12 @@ struct BrowserSession {
     connect: Option<String>,
     /// Attribute name matched by `testid` locators in this session.
     testid_attribute: String,
+    /// Snapshot `ref` table for interactive sessions.
+    refs: snapshot::RefStore,
+    /// Per-step metadata (such as synthesized locator) collected by `da session`.
+    step_metadata: Option<Value>,
+    /// Whether a browser step ran during the current interactive command.
+    snapshot_pending: bool,
 }
 
 /// One element resolved from a target, held as a CDP DOM `objectId`.
@@ -1467,29 +1489,28 @@ struct Located(String);
 
 impl BrowserSession {
     /// Creates the session described by `browser.open`.
-    fn open(args: &OpenArgs, connect: Option<&Endpoint>) -> Result<Self, String> {
+    fn open(args: &OpenArgs, connect: Option<&Endpoint>, detached: bool) -> Result<Self, String> {
         match connect {
             Some(endpoint) => Self::connect_to(endpoint, args.testid_attribute.as_deref()),
-            None => Self::launch(args),
+            None => Self::launch(args, detached),
         }
     }
 
     /// Starts the browser described by `browser.open` and attaches its page.
-    fn launch(args: &OpenArgs) -> Result<Self, String> {
-        let browser = Launched::launch(
+    fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
+        let browser = Launched::launch_with_mode(
             args.headless,
             args.width,
             args.height,
             Deadline::after(LAUNCH_TIMEOUT),
+            detached,
         )?;
         let port = browser.port();
-        let mut connection = Connection::connect(
-            browser.websocket_url(),
-            Deadline::after(LAUNCH_TIMEOUT),
-        )
-        .map_err(|error| {
-            format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
-        })?;
+        let websocket_url = browser.websocket_url().to_string();
+        let mut connection = Connection::connect(&websocket_url, Deadline::after(LAUNCH_TIMEOUT))
+            .map_err(|error| {
+                format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
+            })?;
         let (page, target_id) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
         let network = network::NetworkState::new(&page);
 
@@ -1500,6 +1521,7 @@ impl BrowserSession {
             page,
             network,
             port,
+            websocket_url,
             headless: args.headless,
             width: args.width,
             height: args.height,
@@ -1508,6 +1530,9 @@ impl BrowserSession {
                 .testid_attribute
                 .clone()
                 .unwrap_or_else(|| DEFAULT_TESTID_ATTRIBUTE.to_string()),
+            refs: snapshot::RefStore::default(),
+            step_metadata: None,
+            snapshot_pending: false,
         })
     }
 
@@ -1528,6 +1553,7 @@ impl BrowserSession {
             page,
             network,
             port: endpoint.port(),
+            websocket_url,
             headless: true,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
@@ -1535,7 +1561,95 @@ impl BrowserSession {
             testid_attribute: testid_attribute
                 .unwrap_or(DEFAULT_TESTID_ATTRIBUTE)
                 .to_string(),
+            refs: snapshot::RefStore::default(),
+            step_metadata: None,
+            snapshot_pending: false,
         })
+    }
+
+    fn reattach_boxed(handle: &Value) -> Result<Box<dyn Session>, String> {
+        Self::reattach(handle).map(|session| Box::new(session) as Box<dyn Session>)
+    }
+
+    fn reattach(handle: &Value) -> Result<Self, String> {
+        let parsed: DetachedBrowserHandle = serde_json::from_value(handle.clone())
+            .map_err(|error| format!("invalid browser session handle: {error}"))?;
+        let (origin, port, websocket_url, target_id) =
+            match validate_detached_handle(&parsed, &std::env::temp_dir())? {
+                ValidatedHandle::Launched {
+                    pid,
+                    profile,
+                    port,
+                    websocket_url,
+                    target_id,
+                } => (
+                    Origin::Detached {
+                        pid,
+                        profile: profile.to_path_buf(),
+                    },
+                    port,
+                    websocket_url.to_string(),
+                    target_id.to_string(),
+                ),
+                ValidatedHandle::Connected {
+                    port,
+                    websocket_url,
+                    target_id,
+                } => (
+                    Origin::Connected,
+                    port,
+                    websocket_url.to_string(),
+                    target_id.to_string(),
+                ),
+            };
+        let deadline = Deadline::after(connect::CONNECT_TIMEOUT);
+        let mut connection = Connection::connect(&websocket_url, deadline).map_err(|error| {
+            format!("browser session is no longer reachable at `{websocket_url}`: {error}")
+        })?;
+        let page =
+            attach_existing_target(&mut connection, &target_id, deadline, ATTACH_ENABLE_TIMEOUT)
+                .map_err(|failure| failure.message)?;
+        let network = network::NetworkState::new(&page);
+        Ok(Self {
+            connection: Some(connection),
+            origin: Some(origin),
+            target_id,
+            page,
+            network,
+            port,
+            websocket_url,
+            headless: parsed.headless,
+            width: parsed.width,
+            height: parsed.height,
+            connect: parsed.connect,
+            testid_attribute: parsed.testid_attribute,
+            refs: parsed.refs,
+            step_metadata: None,
+            snapshot_pending: false,
+        })
+    }
+
+    fn dispose_handle(handle: &Value) -> Result<(), String> {
+        dispose_handle_with(
+            handle,
+            &std::env::temp_dir(),
+            record_close,
+            launch::is_port_listening,
+            launch::verify_launched_process_before_close,
+            |websocket_url, errors| {
+                let deadline = Deadline::after(Duration::from_secs(2));
+                if let Ok(mut connection) = Connection::connect(websocket_url, deadline) {
+                    send_browser_close(&mut connection, errors);
+                }
+            },
+            |websocket_url, target_id, errors| {
+                let deadline = Deadline::after(Duration::from_secs(2));
+                if let Ok(mut connection) = Connection::connect(websocket_url, deadline) {
+                    send_target_close(&mut connection, target_id, errors);
+                }
+            },
+            launch::dispose_detached,
+        )
     }
 
     /// Refuses an option that only applies when the session is created.
@@ -1718,29 +1832,146 @@ impl BrowserSession {
             deadline,
             dialog,
             |session, target_desc, object_id, dialog| {
-                let raw = session.call_function_poll(
+                session.inspect_actionable_once(
                     target_desc,
-                    &object_id,
-                    ACTIONABLE_INSPECT_BODY,
-                    "inspect the actionability of",
+                    object_id,
+                    &mut previous_rect,
                     deadline,
                     dialog,
-                )?;
-                let inspect: ActionableInspect = serde_json::from_value(raw).map_err(|error| {
-                    LocateError::Step(StepError::Environment(format!(
-                        "the browser returned an invalid actionability state for {target_desc}: {error}"
-                    )))
-                })?;
-                match evaluate_actionable_inspect(&mut previous_rect, inspect) {
-                    Ok((x, y)) => Ok(Ok(ActionableTarget {
-                        located: Located(object_id),
-                        x,
-                        y,
-                    })),
-                    Err(reason) => Ok(Err(reason)),
-                }
+                )
             },
         )
+    }
+
+    /// Runs one non-blocking actionability check on a resolved `object_id`.
+    fn inspect_actionable_once(
+        &mut self,
+        target_desc: &str,
+        object_id: String,
+        previous_rect: &mut Option<ElementRect>,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<Result<ActionableTarget, PendingReason>, LocateError> {
+        let raw = self.call_function_poll(
+            target_desc,
+            &object_id,
+            ACTIONABLE_INSPECT_BODY,
+            "inspect the actionability of",
+            deadline,
+            dialog,
+        )?;
+        let inspect: ActionableInspect = serde_json::from_value(raw).map_err(|error| {
+            LocateError::Step(StepError::Environment(format!(
+                "the browser returned an invalid actionability state for {target_desc}: {error}"
+            )))
+        })?;
+        match evaluate_actionable_inspect(previous_rect, inspect) {
+            Ok((x, y)) => Ok(Ok(ActionableTarget {
+                located: Located(object_id),
+                x,
+                y,
+            })),
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
+
+    /// Resolves `ref_id` to a live element, synthesizes its deterministic locator,
+    /// and waits for visibility within `deadline`.
+    fn locate_ref_visible(
+        &mut self,
+        ref_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<Located, StepError> {
+        let target_desc = format!("ref `{ref_id}`");
+        let object_id = self.resolve_and_synthesize_ref(ref_id, deadline, dialog)?;
+        loop {
+            match self.call_function_poll(
+                &target_desc,
+                &object_id,
+                VISIBLE_BODY,
+                "check the visibility of",
+                deadline,
+                dialog,
+            ) {
+                Ok(Value::Bool(true)) => return Ok(Located(object_id)),
+                Ok(_) => {
+                    if deadline.passed() {
+                        return Err(pending_timeout_error(
+                            &target_desc,
+                            PendingReason::Hidden,
+                            deadline,
+                        ));
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(LocateError::Timeout) => {
+                    return Err(pending_timeout_error(
+                        &target_desc,
+                        PendingReason::Hidden,
+                        deadline,
+                    ));
+                }
+                Err(LocateError::Step(err)) => return Err(err),
+            }
+        }
+    }
+
+    /// Resolves `ref_id` to a live element, synthesizes its deterministic locator,
+    /// and waits for full actionability within `deadline`.
+    fn locate_ref_actionable(
+        &mut self,
+        ref_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<ActionableTarget, StepError> {
+        let target_desc = format!("ref `{ref_id}`");
+        let object_id = self.resolve_and_synthesize_ref(ref_id, deadline, dialog)?;
+        let mut previous_rect: Option<ElementRect> = None;
+        let mut last_reason = PendingReason::Hidden;
+        loop {
+            match self.inspect_actionable_once(
+                &target_desc,
+                object_id.clone(),
+                &mut previous_rect,
+                deadline,
+                dialog,
+            ) {
+                Ok(Ok(ready)) => return Ok(ready),
+                Ok(Err(reason)) => {
+                    last_reason = reason;
+                    if deadline.passed() {
+                        return Err(pending_timeout_error(&target_desc, last_reason, deadline));
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(LocateError::Timeout) => {
+                    return Err(pending_timeout_error(&target_desc, last_reason, deadline));
+                }
+                Err(LocateError::Step(err)) => return Err(err),
+            }
+        }
+    }
+
+    fn resolve_and_synthesize_ref(
+        &mut self,
+        ref_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<String, StepError> {
+        let scope = self.scope();
+        let refs = self.refs.clone();
+        let (object_id, _) = {
+            let connection = self.connection_mut()?;
+            snapshot::resolve_ref_object_id(connection, &scope, &refs, ref_id, deadline, dialog)?
+        };
+        let synth = synthesis::synthesize_for_object(self, &object_id, deadline, dialog)?;
+        self.step_metadata = Some(json!({
+            "ref": ref_id,
+            "synthesized_locator": synth.locator,
+            "fragile": synth.fragile,
+        }));
+        Ok(synth.object_id)
     }
 
     /// Shared polling loop for `locate_target` and `locate_actionable_target`.
@@ -2385,6 +2616,16 @@ fn attach_once(
             target_destroyed: false,
         })?
         .to_string();
+    let page = attach_existing_target(connection, &target_id, deadline, enable_timeout)?;
+    Ok((page, target_id))
+}
+
+fn attach_existing_target(
+    connection: &mut Connection,
+    target_id: &str,
+    deadline: Deadline,
+    enable_timeout: Duration,
+) -> Result<String, AttachAttemptFailure> {
     let attached = attach_call(
         connection,
         AttachStep::AttachToTarget,
@@ -2392,7 +2633,7 @@ fn attach_once(
         "Target.attachToTarget",
         json!({ "targetId": target_id, "flatten": true }),
         AttachScope {
-            target_id: Some(&target_id),
+            target_id: Some(target_id),
             session_id: None,
         },
         deadline,
@@ -2401,7 +2642,7 @@ fn attach_once(
         .get("sessionId")
         .and_then(Value::as_str)
         .ok_or_else(|| AttachAttemptFailure {
-            target_id: Some(target_id.clone()),
+            target_id: Some(target_id.to_string()),
             kind: AttachFailureKind::TargetFailed,
             message: "the browser did not return a page session id".to_string(),
             target_destroyed: false,
@@ -2409,7 +2650,7 @@ fn attach_once(
         .to_string();
     let domain_deadline = deadline.capped(enable_timeout);
     let page_scope = AttachScope {
-        target_id: Some(&target_id),
+        target_id: Some(target_id),
         session_id: Some(&page),
     };
     attach_call(
@@ -2442,7 +2683,7 @@ fn attach_once(
         page_scope,
         domain_deadline,
     )?;
-    Ok((page, target_id))
+    Ok(page)
 }
 
 /// Runs one CDP command while watching for terminal target/session events.
@@ -3221,7 +3462,353 @@ fn load_error(failure: PageFailure, url: &str, action: &str, deadline: Deadline)
     failure.step(&prefix, timeout_or_environment)
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct DetachedBrowserHandle {
+    mode: String,
+    websocket_url: String,
+    target_id: String,
+    port: u16,
+    pid: Option<u32>,
+    profile: Option<String>,
+    headless: bool,
+    width: u32,
+    height: u32,
+    connect: Option<String>,
+    testid_attribute: String,
+    #[serde(default)]
+    refs: snapshot::RefStore,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ValidatedHandle<'a> {
+    Launched {
+        pid: u32,
+        profile: &'a Path,
+        port: u16,
+        websocket_url: &'a str,
+        target_id: &'a str,
+    },
+    Connected {
+        port: u16,
+        websocket_url: &'a str,
+        target_id: &'a str,
+    },
+}
+
+fn validate_detached_handle<'a>(
+    parsed: &'a DetachedBrowserHandle,
+    temp_root: &Path,
+) -> Result<ValidatedHandle<'a>, String> {
+    if parsed.port == 0 {
+        return Err("browser session handle has invalid port 0".to_string());
+    }
+    if parsed.target_id.trim().is_empty() {
+        return Err("browser session handle has empty `target_id`".to_string());
+    }
+    match parsed.mode.as_str() {
+        "launched" => {
+            if parsed.connect.is_some() {
+                return Err(
+                    "launched browser session handle must not specify `connect`".to_string()
+                );
+            }
+            let pid = parsed
+                .pid
+                .ok_or_else(|| "launched browser session handle is missing `pid`".to_string())?;
+            if pid == 0 {
+                return Err("launched browser session handle has invalid pid 0".to_string());
+            }
+            let profile_raw = parsed.profile.as_deref().ok_or_else(|| {
+                "launched browser session handle is missing `profile`".to_string()
+            })?;
+            let profile = Path::new(profile_raw);
+            launch::validate_owned_profile_in(profile, temp_root)?;
+            validate_launched_ws_url(&parsed.websocket_url, parsed.port)?;
+            Ok(ValidatedHandle::Launched {
+                pid,
+                profile,
+                port: parsed.port,
+                websocket_url: &parsed.websocket_url,
+                target_id: &parsed.target_id,
+            })
+        }
+        "connected" => {
+            if parsed.pid.is_some() || parsed.profile.is_some() {
+                return Err(
+                    "connected browser session handle must not specify `pid` or `profile`"
+                        .to_string(),
+                );
+            }
+            let connect = parsed.connect.as_deref().ok_or_else(|| {
+                "connected browser session handle is missing `connect`".to_string()
+            })?;
+            let endpoint = Endpoint::parse(connect)?;
+            if endpoint.port() != parsed.port {
+                return Err(format!(
+                    "connected browser session handle `port` ({}) does not match `connect` port ({})",
+                    parsed.port,
+                    endpoint.port()
+                ));
+            }
+            validate_connected_ws_url(&parsed.websocket_url)?;
+            Ok(ValidatedHandle::Connected {
+                port: parsed.port,
+                websocket_url: &parsed.websocket_url,
+                target_id: &parsed.target_id,
+            })
+        }
+        other => Err(format!("unknown browser session mode `{other}`")),
+    }
+}
+
+fn validate_launched_ws_url(url: &str, port: u16) -> Result<(), String> {
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "launched browser session handle has invalid `websocket_url` `{url}`"
+        ));
+    }
+    let expected_prefix = format!("ws://127.0.0.1:{port}/");
+    if !url.starts_with(&expected_prefix) || url.len() == expected_prefix.len() {
+        return Err(format!(
+            "launched browser session handle `websocket_url` `{url}` does not match loopback port {port}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_connected_ws_url(url: &str) -> Result<(), String> {
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "connected browser session handle has invalid `websocket_url` `{url}`"
+        ));
+    }
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` must use `ws://`"
+        ));
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` is missing a path"
+        ));
+    };
+    if path.is_empty() {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` is missing a path"
+        ));
+    }
+    let Some((host, port_str)) = authority.rsplit_once(':') else {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` is missing a port"
+        ));
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` must use a loopback host"
+        ));
+    }
+    if !port_str.parse::<u16>().is_ok_and(|port| port > 0) {
+        return Err(format!(
+            "connected browser session handle `websocket_url` `{url}` has an invalid port"
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal callback seam for verifying handle disposal without real sockets or disk"
+)]
+fn dispose_handle_with<R, P, V, CB, CT, D>(
+    handle: &Value,
+    temp_root: &Path,
+    mut on_record_close: R,
+    port_listening: P,
+    verify_before_close: V,
+    mut close_browser: CB,
+    mut close_target: CT,
+    dispose_detached_fn: D,
+) -> Result<(), String>
+where
+    R: FnMut(u16),
+    P: FnMut(u16) -> bool,
+    V: FnMut(u32, u16, &Path) -> Result<bool, String>,
+    CB: FnMut(&str, &mut Vec<String>),
+    CT: FnMut(&str, &str, &mut Vec<String>),
+    D: FnMut(Option<u32>, Option<u16>, Option<&Path>) -> Result<(), String>,
+{
+    let parsed: DetachedBrowserHandle = serde_json::from_value(handle.clone())
+        .map_err(|error| format!("invalid browser session handle: {error}"))?;
+    let validated = validate_detached_handle(&parsed, temp_root)?;
+
+    match validated {
+        ValidatedHandle::Connected {
+            port,
+            websocket_url,
+            target_id,
+        } => {
+            on_record_close(port);
+            let mut errors = Vec::new();
+            close_target(websocket_url, target_id, &mut errors);
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+        ValidatedHandle::Launched {
+            pid,
+            profile,
+            port,
+            websocket_url,
+            ..
+        } => {
+            on_record_close(port);
+            let mut errors = Vec::new();
+            close_and_dispose_detached_with(
+                pid,
+                port,
+                profile,
+                &mut errors,
+                port_listening,
+                verify_before_close,
+                |errs| close_browser(websocket_url, errs),
+                dispose_detached_fn,
+            );
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared teardown helper used by both dispose_handle_with and BrowserSession::close"
+)]
+fn close_and_dispose_detached_with<P, V, CB, D>(
+    pid: u32,
+    port: u16,
+    profile: &Path,
+    errors: &mut Vec<String>,
+    mut port_listening: P,
+    mut verify_before_close: V,
+    mut close_browser: CB,
+    mut dispose_detached_fn: D,
+) where
+    P: FnMut(u16) -> bool,
+    V: FnMut(u32, u16, &Path) -> Result<bool, String>,
+    CB: FnMut(&mut Vec<String>),
+    D: FnMut(Option<u32>, Option<u16>, Option<&Path>) -> Result<(), String>,
+{
+    if port_listening(port) {
+        match verify_before_close(pid, port, profile) {
+            Ok(true) => close_browser(errors),
+            Ok(false) => {}
+            Err(error) => {
+                errors.push(error);
+                return;
+            }
+        }
+    }
+    if let Err(error) = dispose_detached_fn(Some(pid), Some(port), Some(profile)) {
+        errors.push(error);
+    }
+}
+
 impl Session for BrowserSession {
+    fn detach(&mut self) -> Result<Option<Value>, String> {
+        let _ = self.connection.take();
+        let (mode, pid, profile, port, websocket_url) = match self.origin.take() {
+            Some(Origin::Launched(browser)) => {
+                let detached = browser
+                    .detach()
+                    .ok_or_else(|| "the browser process handle was already released".to_string())?;
+                (
+                    "launched".to_string(),
+                    Some(detached.pid),
+                    Some(detached.profile.to_string_lossy().into_owned()),
+                    detached.port,
+                    detached.websocket_url,
+                )
+            }
+            Some(Origin::Detached { pid, profile }) => (
+                "launched".to_string(),
+                Some(pid),
+                Some(profile.to_string_lossy().into_owned()),
+                self.port,
+                self.websocket_url.clone(),
+            ),
+            Some(Origin::Connected) => (
+                "connected".to_string(),
+                None,
+                None,
+                self.port,
+                self.websocket_url.clone(),
+            ),
+            None => {
+                return Err("the browser session is already closed".to_string());
+            }
+        };
+
+        let handle = DetachedBrowserHandle {
+            mode,
+            websocket_url,
+            target_id: self.target_id.clone(),
+            port,
+            pid,
+            profile,
+            headless: self.headless,
+            width: self.width,
+            height: self.height,
+            connect: self.connect.clone(),
+            testid_attribute: self.testid_attribute.clone(),
+            refs: self.refs.clone(),
+        };
+        serde_json::to_value(handle)
+            .map(Some)
+            .map_err(|error| format!("could not serialize browser session handle: {error}"))
+    }
+
+    fn snapshot(
+        &mut self,
+        scope_ref: Option<&str>,
+        max_depth: Option<usize>,
+        max_nodes: Option<usize>,
+    ) -> Result<Option<Value>, String> {
+        let scope = self.scope();
+        let existing_refs = self.refs.clone();
+        let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let connection = self.connection_mut().map_err(step_error_text)?;
+        let (snap, new_refs) = snapshot::capture_snapshot(
+            connection,
+            &scope,
+            &existing_refs,
+            scope_ref,
+            max_depth,
+            max_nodes,
+            deadline,
+            &mut dialog,
+        )?;
+        self.refs = new_refs;
+        Ok(Some(snap))
+    }
+
+    fn snapshot_after_step(&mut self) -> Result<Option<Value>, String> {
+        if !self.snapshot_pending {
+            return Ok(None);
+        }
+        self.snapshot_pending = false;
+        self.snapshot(None, None, None)
+    }
+
+    fn take_step_metadata(&mut self) -> Option<Value> {
+        self.step_metadata.take()
+    }
+
     fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
         if self.connection.is_none() {
             return Err(
@@ -3301,44 +3888,33 @@ impl Session for BrowserSession {
         let mut errors = Vec::new();
         match self.origin.take() {
             Some(Origin::Launched(browser)) => {
-                if let Err(error) = connection.call(
-                    "Browser.close",
-                    json!({}),
-                    None,
-                    Deadline::after(Duration::from_secs(2)),
-                ) {
-                    match error {
-                        // Chrome may close the socket as it answers, or never
-                        // answer. The process check in `shutdown` decides
-                        // whether the close worked.
-                        CdpError::Transport(_) | CdpError::Timeout { .. } => {}
-                        error => {
-                            errors.push(format!("could not ask the browser to close: {error}"));
-                        }
-                    }
-                }
+                send_browser_close(&mut connection, &mut errors);
                 drop(connection);
                 if let Err(error) = browser.shutdown() {
                     errors.push(error);
                 }
             }
+            Some(Origin::Detached { pid, profile }) => {
+                let mut connection = Some(connection);
+                close_and_dispose_detached_with(
+                    pid,
+                    self.port,
+                    &profile,
+                    &mut errors,
+                    launch::is_port_listening,
+                    launch::verify_launched_process_before_close,
+                    |errs| {
+                        if let Some(mut conn) = connection.take() {
+                            send_browser_close(&mut conn, errs);
+                        }
+                    },
+                    launch::dispose_detached,
+                );
+            }
             Some(Origin::Connected) => {
                 // Only this case's tab is ours. `Browser.close` is never sent:
                 // the browser belongs to the user and must keep running.
-                if let Err(error) = connection.call(
-                    "Target.closeTarget",
-                    json!({ "targetId": self.target_id }),
-                    None,
-                    Deadline::after(Duration::from_secs(2)),
-                ) {
-                    match error {
-                        // The tab may have closed itself; disconnecting is
-                        // enough in that case.
-                        CdpError::Transport(_) | CdpError::Timeout { .. } => {}
-                        CdpError::Method { message, .. } if message.contains("No target") => {}
-                        error => errors.push(format!("could not close the page: {error}")),
-                    }
-                }
+                send_target_close(&mut connection, &self.target_id, &mut errors);
                 drop(connection);
             }
             None => drop(connection),
@@ -3347,6 +3923,42 @@ impl Session for BrowserSession {
             Ok(())
         } else {
             Err(errors.join("; "))
+        }
+    }
+}
+
+fn send_browser_close(connection: &mut Connection, errors: &mut Vec<String>) {
+    if let Err(error) = connection.call(
+        "Browser.close",
+        json!({}),
+        None,
+        Deadline::after(Duration::from_secs(2)),
+    ) {
+        match error {
+            // Chrome may close the socket as it answers, or never
+            // answer. The process check in `shutdown` decides
+            // whether the close worked.
+            CdpError::Transport(_) | CdpError::Timeout { .. } => {}
+            error => {
+                errors.push(format!("could not ask the browser to close: {error}"));
+            }
+        }
+    }
+}
+
+fn send_target_close(connection: &mut Connection, target_id: &str, errors: &mut Vec<String>) {
+    if let Err(error) = connection.call(
+        "Target.closeTarget",
+        json!({ "targetId": target_id }),
+        None,
+        Deadline::after(Duration::from_secs(2)),
+    ) {
+        match error {
+            // The tab may have closed itself; disconnecting is
+            // enough in that case.
+            CdpError::Transport(_) | CdpError::Timeout { .. } => {}
+            CdpError::Method { message, .. } if message.contains("No target") => {}
+            error => errors.push(format!("could not close the page: {error}")),
         }
     }
 }
@@ -3631,16 +4243,117 @@ fn validate_read(args: &Value) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefClickWaitArgs {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefTypeArgs {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefReadArgs {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    #[serde(default)]
+    attribute: Option<String>,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+fn has_ref_field(args: &Value) -> bool {
+    args.as_object().is_some_and(|map| map.contains_key("ref"))
+}
+
+fn check_ref_id(ref_id: &str) -> Result<(), String> {
+    if ref_id.trim().is_empty() {
+        return Err("invalid arguments: `ref` must not be empty".to_string());
+    }
+    Ok(())
+}
+
+fn validate_click_session(args: &Value) -> Result<(), String> {
+    if has_ref_field(args) {
+        let parsed: RefClickWaitArgs = parse_for_validate(args)?;
+        check_ref_id(&parsed.ref_id)?;
+        return check_timeout(parsed.timeout_ms);
+    }
+    validate_click(args)
+}
+
+fn validate_type_session(args: &Value) -> Result<(), String> {
+    if has_ref_field(args) {
+        let parsed: RefTypeArgs = parse_for_validate(args)?;
+        check_ref_id(&parsed.ref_id)?;
+        check_timeout(parsed.timeout_ms)?;
+        match (&parsed.text, &parsed.value) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "invalid arguments: give either `text` or `value` with `ref`, not both"
+                        .to_string(),
+                );
+            }
+            (None, None) => {
+                return Err("invalid arguments: give `text` (or `value`) with `ref`".to_string());
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    validate_type(args)
+}
+
+fn validate_wait_session(args: &Value) -> Result<(), String> {
+    if has_ref_field(args) {
+        let parsed: RefClickWaitArgs = parse_for_validate(args)?;
+        check_ref_id(&parsed.ref_id)?;
+        return check_timeout(parsed.timeout_ms);
+    }
+    validate_wait(args)
+}
+
+fn validate_read_session(args: &Value) -> Result<(), String> {
+    if has_ref_field(args) {
+        let parsed: RefReadArgs = parse_for_validate(args)?;
+        check_ref_id(&parsed.ref_id)?;
+        check_timeout(parsed.timeout_ms)?;
+        if let Some(attribute) = &parsed.attribute
+            && attribute.trim().is_empty()
+        {
+            return Err("invalid arguments: `attribute` must not be empty".to_string());
+        }
+        return Ok(());
+    }
+    validate_read(args)
+}
+
 /// Returns the case's browser session or explains how to open one.
 fn session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
-    sessions
+    let browser = sessions
         .get::<BrowserSession>(SESSION_KIND)
         .map_err(StepError::Execution)?
         .ok_or_else(|| {
             StepError::Execution(
                 "no browser session is open; run `browser.open` before this step".to_string(),
             )
-        })
+        })?;
+    browser.snapshot_pending = true;
+    Ok(browser)
 }
 
 fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -3657,9 +4370,10 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         .get::<BrowserSession>(SESSION_KIND)
         .map_err(StepError::Execution)?
         .is_some();
+    let interactive = sessions.is_interactive();
     let session = sessions
         .get_or_create(SESSION_KIND, || {
-            BrowserSession::open(&args, connect.as_ref())
+            BrowserSession::open(&args, connect.as_ref(), interactive)
         })
         .map_err(StepError::Environment)?;
     if existing {
@@ -3669,6 +4383,7 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         }
     }
     let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
+    session.snapshot_pending = true;
     let (url, title) = session.navigate(
         &args.url,
         Duration::from_millis(args.timeout_ms),
@@ -3681,6 +4396,22 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
 }
 
 fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    if has_ref_field(args) {
+        if !sessions.is_interactive() {
+            return Err(StepError::InvalidArguments(
+                "invalid arguments: `ref` is only available inside `da session`".to_string(),
+            ));
+        }
+        let parsed: RefClickWaitArgs = parse(args)?;
+        check_ref_id(&parsed.ref_id).map_err(StepError::InvalidArguments)?;
+        check_timeout(parsed.timeout_ms).map_err(StepError::InvalidArguments)?;
+        let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+        let mut dialog = DialogContext::fail_fast();
+        let session = session(sessions)?;
+        let target_desc = format!("ref `{}`", parsed.ref_id);
+        let actionable = session.locate_ref_actionable(&parsed.ref_id, deadline, &mut dialog)?;
+        return click_actionable(session, &target_desc, actionable, deadline, &mut dialog);
+    }
     let args: ClickArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let locator = Locator::from_args(
@@ -3699,11 +4430,21 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
     let actionable = session.locate_actionable_target(&target, deadline, &mut dialog)?;
+    click_actionable(session, &target_desc, actionable, deadline, &mut dialog)
+}
+
+fn click_actionable(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    actionable: ActionableTarget,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
     let located = actionable.located;
     let (x, y) = (actionable.x, actionable.y);
     for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
         session.dispatch(
-            &target_desc,
+            target_desc,
             "Input.dispatchMouseEvent",
             json!({
                 "type": event_type,
@@ -3715,19 +4456,19 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             }),
             "click",
             deadline,
-            &mut dialog,
+            dialog,
         )?;
     }
     // A click may navigate, which detaches the element. The click itself
     // succeeded, so a text that can no longer be read is not a failure unless
     // an unhandled JavaScript dialog opened.
     let text = match session.run_on(
-        &target_desc,
+        target_desc,
         &located,
         TEXT_BODY,
         "read the text of",
         deadline,
-        &mut dialog,
+        dialog,
     ) {
         Ok(value) => value.as_str().map(str::to_string),
         Err(error) if dialog.is_fail_fast_triggered() => return Err(error),
@@ -3737,10 +4478,36 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
         Some(text) if !text.trim().is_empty() => json!({ "text": text.trim() }),
         _ => json!({}),
     };
-    Ok(attach_dialog(result, &mut dialog))
+    Ok(attach_dialog(result, dialog))
 }
 
 fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    if has_ref_field(args) {
+        if !sessions.is_interactive() {
+            return Err(StepError::InvalidArguments(
+                "invalid arguments: `ref` is only available inside `da session`".to_string(),
+            ));
+        }
+        validate_type_session(args).map_err(StepError::InvalidArguments)?;
+        let parsed: RefTypeArgs = parse(args)?;
+        let text = parsed
+            .value
+            .or(parsed.text)
+            .ok_or_else(|| StepError::InvalidArguments("missing typing text".to_string()))?;
+        let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+        let mut dialog = DialogContext::fail_fast();
+        let session = session(sessions)?;
+        let target_desc = format!("ref `{}`", parsed.ref_id);
+        let actionable = session.locate_ref_actionable(&parsed.ref_id, deadline, &mut dialog)?;
+        return type_actionable(
+            session,
+            &target_desc,
+            &actionable.located,
+            &text,
+            deadline,
+            &mut dialog,
+        );
+    }
     let args: TypeArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let text = type_text(&args)
@@ -3752,30 +4519,41 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
     let actionable = session.locate_actionable_target(&target, deadline, &mut dialog)?;
-    let focused = session.run_on(
+    type_actionable(
+        session,
         &target_desc,
         &actionable.located,
-        FOCUS_BODY,
-        "focus",
+        &text,
         deadline,
         &mut dialog,
-    )?;
+    )
+}
+
+fn type_actionable(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    located: &Located,
+    text: &str,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
+    let focused = session.run_on(target_desc, located, FOCUS_BODY, "focus", deadline, dialog)?;
     if focused != Value::Bool(true) {
         return Err(action_error(
-            &target_desc,
+            target_desc,
             "focus",
             "the element did not take focus",
         ));
     }
     session.dispatch(
-        &target_desc,
+        target_desc,
         "Input.insertText",
         json!({ "text": text }),
         "type into",
         deadline,
-        &mut dialog,
+        dialog,
     )?;
-    Ok(attach_dialog(json!({}), &mut dialog))
+    Ok(attach_dialog(json!({}), dialog))
 }
 
 fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -3812,6 +4590,25 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
 }
 
 fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    if has_ref_field(args) {
+        if !sessions.is_interactive() {
+            return Err(StepError::InvalidArguments(
+                "invalid arguments: `ref` is only available inside `da session`".to_string(),
+            ));
+        }
+        let parsed: RefClickWaitArgs = parse(args)?;
+        check_ref_id(&parsed.ref_id).map_err(StepError::InvalidArguments)?;
+        check_timeout(parsed.timeout_ms).map_err(StepError::InvalidArguments)?;
+        let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+        let mut dialog = DialogContext::fail_fast();
+        let session = session(sessions)?;
+        session.locate_ref_visible(&parsed.ref_id, deadline, &mut dialog)?;
+        let scope = session.scope();
+        let connection = session.connection_mut()?;
+        let url = page_evaluate(connection, &scope, "location.href", deadline, &mut dialog)
+            .map_err(|failure| failure.environment("could not read the current URL"))?;
+        return Ok(json!({ "url": url.as_str().unwrap_or_default() }));
+    }
     let args: WaitArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let target = WaitTarget::from_args(&args).map_err(StepError::InvalidArguments)?;
@@ -3921,6 +4718,28 @@ fn write_png(path: &Path, png: &[u8]) -> Result<(), StepError> {
 }
 
 fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    if has_ref_field(args) {
+        if !sessions.is_interactive() {
+            return Err(StepError::InvalidArguments(
+                "invalid arguments: `ref` is only available inside `da session`".to_string(),
+            ));
+        }
+        validate_read_session(args).map_err(StepError::InvalidArguments)?;
+        let parsed: RefReadArgs = parse(args)?;
+        let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+        let mut dialog = DialogContext::fail_fast();
+        let session = session(sessions)?;
+        let target_desc = format!("ref `{}`", parsed.ref_id);
+        let located = session.locate_ref_visible(&parsed.ref_id, deadline, &mut dialog)?;
+        return read_located(
+            session,
+            &target_desc,
+            &located,
+            parsed.attribute.as_deref(),
+            deadline,
+            &mut dialog,
+        );
+    }
     let args: ReadArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     let locator = Locator::from_args(
@@ -3939,27 +4758,45 @@ fn run_read(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
     let located = session.locate_target(&target, deadline, &mut dialog)?;
-    let text = session.run_on(
+    read_located(
+        session,
         &target_desc,
         &located,
+        args.attribute.as_deref(),
+        deadline,
+        &mut dialog,
+    )
+}
+
+fn read_located(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    located: &Located,
+    attribute: Option<&str>,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
+    let text = session.run_on(
+        target_desc,
+        located,
         TEXT_BODY,
         "read the text of",
         deadline,
-        &mut dialog,
+        dialog,
     )?;
     let mut result = json!({ "text": text.as_str().unwrap_or_default() });
-    if let Some(attribute) = &args.attribute {
+    if let Some(attribute) = attribute {
         let body = format!(
             "if (!el) return null; return el.getAttribute({});",
             json_string(attribute)
         );
         let value = session.run_on(
-            &target_desc,
-            &located,
+            target_desc,
+            located,
             &body,
             "read the attribute of",
             deadline,
-            &mut dialog,
+            dialog,
         )?;
         result["value"] = value;
     }
@@ -5355,11 +6192,15 @@ mod tests {
             page: session_id.to_string(),
             network: network::NetworkState::new(session_id),
             port: 9222,
+            websocket_url: "ws://127.0.0.1:9222/devtools/browser/mock".to_string(),
             headless: true,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             connect: Some("http://127.0.0.1:9222".to_string()),
             testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
+            refs: snapshot::RefStore::default(),
+            step_metadata: None,
+            snapshot_pending: false,
         }
     }
 
@@ -6702,5 +7543,353 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[test]
+    fn validate_detached_handle_rejects_incomplete_and_inconsistent_launched_handles() {
+        let temp_root = std::env::temp_dir();
+        let owned_profile = temp_root
+            .join(format!("{}-9999-0", launch::PROFILE_PREFIX))
+            .to_string_lossy()
+            .into_owned();
+        let base = || DetachedBrowserHandle {
+            mode: "launched".to_string(),
+            websocket_url: "ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
+            target_id: "target-1".to_string(),
+            port: 9222,
+            pid: Some(4242),
+            profile: Some(owned_profile.clone()),
+            headless: true,
+            width: 1280,
+            height: 800,
+            connect: None,
+            testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
+            refs: snapshot::RefStore::default(),
+        };
+
+        assert!(matches!(
+            validate_detached_handle(&base(), &temp_root),
+            Ok(ValidatedHandle::Launched {
+                pid: 4242,
+                port: 9222,
+                ..
+            })
+        ));
+
+        let mut missing_pid = base();
+        missing_pid.pid = None;
+        assert!(validate_detached_handle(&missing_pid, &temp_root).is_err());
+
+        let mut zero_pid = base();
+        zero_pid.pid = Some(0);
+        assert!(validate_detached_handle(&zero_pid, &temp_root).is_err());
+
+        let mut missing_profile = base();
+        missing_profile.profile = None;
+        assert!(validate_detached_handle(&missing_profile, &temp_root).is_err());
+
+        let mut unowned_profile = base();
+        unowned_profile.profile = Some(temp_root.join("unrelated").to_string_lossy().into_owned());
+        assert!(validate_detached_handle(&unowned_profile, &temp_root).is_err());
+
+        let mut zero_port = base();
+        zero_port.port = 0;
+        assert!(validate_detached_handle(&zero_port, &temp_root).is_err());
+
+        let mut empty_target = base();
+        empty_target.target_id = "  ".to_string();
+        assert!(validate_detached_handle(&empty_target, &temp_root).is_err());
+
+        let mut hybrid_connect = base();
+        hybrid_connect.connect = Some("http://127.0.0.1:9222".to_string());
+        assert!(validate_detached_handle(&hybrid_connect, &temp_root).is_err());
+
+        let mut mismatched_port = base();
+        mismatched_port.websocket_url = "ws://127.0.0.1:9333/devtools/browser/abc".to_string();
+        assert!(validate_detached_handle(&mismatched_port, &temp_root).is_err());
+
+        let mut remote_ws = base();
+        remote_ws.websocket_url = "ws://192.0.2.10:9222/devtools/browser/abc".to_string();
+        assert!(validate_detached_handle(&remote_ws, &temp_root).is_err());
+    }
+
+    #[test]
+    fn validate_detached_handle_preserves_connected_semantics_and_rejects_hybrid_fields() {
+        let temp_root = std::env::temp_dir();
+        let owned_profile = temp_root
+            .join(format!("{}-9999-1", launch::PROFILE_PREFIX))
+            .to_string_lossy()
+            .into_owned();
+        let base = || DetachedBrowserHandle {
+            mode: "connected".to_string(),
+            websocket_url: "ws://127.0.0.1:9333/devtools/browser/mock".to_string(),
+            target_id: "target-1".to_string(),
+            port: 9222,
+            pid: None,
+            profile: None,
+            headless: true,
+            width: 1280,
+            height: 800,
+            connect: Some("http://127.0.0.1:9222".to_string()),
+            testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
+            refs: snapshot::RefStore::default(),
+        };
+
+        assert!(matches!(
+            validate_detached_handle(&base(), &temp_root),
+            Ok(ValidatedHandle::Connected { port: 9222, .. })
+        ));
+
+        let mut with_pid = base();
+        with_pid.pid = Some(4242);
+        assert!(validate_detached_handle(&with_pid, &temp_root).is_err());
+
+        let mut with_profile = base();
+        with_profile.profile = Some(owned_profile);
+        assert!(validate_detached_handle(&with_profile, &temp_root).is_err());
+
+        let mut no_connect = base();
+        no_connect.connect = None;
+        assert!(validate_detached_handle(&no_connect, &temp_root).is_err());
+
+        let mut remote_ws = base();
+        remote_ws.websocket_url = "ws://192.0.2.10:9333/devtools/browser/mock".to_string();
+        assert!(validate_detached_handle(&remote_ws, &temp_root).is_err());
+    }
+
+    #[test]
+    fn dispose_handle_with_rejects_bad_handles_and_preserves_connected_ownership() {
+        let temp_root = std::env::temp_dir();
+        let owned_profile = temp_root
+            .join(format!("{}-8888-0", launch::PROFILE_PREFIX))
+            .to_string_lossy()
+            .into_owned();
+
+        let mut record_calls = 0usize;
+        let mut close_browser_calls = 0usize;
+        let mut close_target_calls = 0usize;
+        let mut dispose_detached_calls = 0usize;
+
+        // 1. Incomplete launched handle must fail before any callback runs.
+        let incomplete = json!({
+            "mode": "launched",
+            "websocket_url": "ws://127.0.0.1:9222/devtools/browser/abc",
+            "target_id": "target-1",
+            "port": 9222,
+            "pid": null,
+            "profile": owned_profile,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        });
+        assert!(
+            dispose_handle_with(
+                &incomplete,
+                &temp_root,
+                |_| record_calls += 1,
+                |_| true,
+                |_, _, _| Ok(true),
+                |_, _| close_browser_calls += 1,
+                |_, _, _| close_target_calls += 1,
+                |_, _, _| {
+                    dispose_detached_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(record_calls, 0);
+        assert_eq!(close_browser_calls, 0);
+        assert_eq!(close_target_calls, 0);
+        assert_eq!(dispose_detached_calls, 0);
+
+        // 2. Open port with unverified pid must refuse Browser.close and dispose_detached.
+        let unverified = json!({
+            "mode": "launched",
+            "websocket_url": "ws://127.0.0.1:9222/devtools/browser/abc",
+            "target_id": "target-1",
+            "port": 9222,
+            "pid": 4242,
+            "profile": owned_profile,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": "data-testid",
+            "refs": {}
+        });
+        assert!(
+            dispose_handle_with(
+                &unverified,
+                &temp_root,
+                |_| record_calls += 1,
+                |_| true,
+                |_, _, _| Err("pid 4242 does not match temporary profile".to_string()),
+                |_, _| close_browser_calls += 1,
+                |_, _, _| close_target_calls += 1,
+                |_, _, _| {
+                    dispose_detached_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(close_browser_calls, 0);
+        assert_eq!(close_target_calls, 0);
+        assert_eq!(dispose_detached_calls, 0);
+
+        // 3. Connected handle closes only its target tab and never sends Browser.close or disposes.
+        let connected = json!({
+            "mode": "connected",
+            "websocket_url": "ws://127.0.0.1:9222/devtools/browser/abc",
+            "target_id": "target-tab-1",
+            "port": 9222,
+            "pid": null,
+            "profile": null,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": "http://127.0.0.1:9222",
+            "testid_attribute": "data-testid",
+            "refs": {}
+        });
+        assert!(
+            dispose_handle_with(
+                &connected,
+                &temp_root,
+                |_| record_calls += 1,
+                |_| true,
+                |_, _, _| Ok(true),
+                |_, _| close_browser_calls += 1,
+                |_, target_id, _| {
+                    assert_eq!(target_id, "target-tab-1");
+                    close_target_calls += 1;
+                },
+                |_, _, _| {
+                    dispose_detached_calls += 1;
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(close_target_calls, 1);
+        assert_eq!(close_browser_calls, 0);
+        assert_eq!(dispose_detached_calls, 0);
+    }
+
+    #[test]
+    fn reattach_rejects_invalid_handle_before_connecting() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let port = listener.local_addr().expect("port").port();
+        listener.set_nonblocking(true).expect("nonblocking");
+
+        let bad_handle = json!({
+            "mode": "launched",
+            "websocket_url": format!("ws://127.0.0.1:{port}/devtools/browser/mock"),
+            "target_id": "tab-1",
+            "port": port,
+            "pid": 4242,
+            "profile": std::env::temp_dir().join("not-da-profile").to_string_lossy(),
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": null,
+            "testid_attribute": DEFAULT_TESTID_ATTRIBUTE,
+            "refs": {}
+        });
+        let err = match BrowserSession::reattach(&bad_handle) {
+            Ok(_) => panic!("unowned profile handle must fail reattach before connecting"),
+            Err(err) => err,
+        };
+        assert!(err.contains("refusing"), "{err}");
+        assert!(
+            matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "reattach must not open a TCP/WS connection on an invalid handle"
+        );
+    }
+
+    #[test]
+    fn connected_session_detach_reattach_and_dispose_closes_only_target_tab() {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock CDP listener");
+        let port = listener.local_addr().expect("port").port();
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/mock");
+        let server = std::thread::spawn(move || {
+            // Connection 1: BrowserSession::reattach
+            let (stream1, _) = listener.accept().expect("accept reattach connection");
+            let _ = stream1.set_nodelay(true);
+            let mut socket1 = tungstenite::accept(stream1).expect("handshake 1");
+            let attach_cmd = read_cdp_request(&mut socket1);
+            assert_eq!(attach_cmd["method"], "Target.attachToTarget");
+            assert_eq!(attach_cmd["params"]["targetId"], "tab-connected");
+            socket1
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": attach_cmd["id"],
+                        "result": { "sessionId": "session-1" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send attach reply");
+
+            for method in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let req = read_cdp_request(&mut socket1);
+                assert_eq!(req["method"], method);
+                socket1
+                    .send(tungstenite::Message::text(
+                        json!({ "id": req["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("send domain reply");
+            }
+            while socket1.read().is_ok() {}
+
+            // Connection 2: BrowserSession::dispose_handle
+            let (stream2, _) = listener.accept().expect("accept dispose connection");
+            let _ = stream2.set_nodelay(true);
+            let mut socket2 = tungstenite::accept(stream2).expect("handshake 2");
+            let close_target = read_cdp_request(&mut socket2);
+            assert_eq!(
+                close_target["method"], "Target.closeTarget",
+                "connected dispose_handle must only close its tab, never Browser.close"
+            );
+            assert_eq!(close_target["params"]["targetId"], "tab-connected");
+            socket2
+                .send(tungstenite::Message::text(
+                    json!({ "id": close_target["id"], "result": { "success": true } }).to_string(),
+                ))
+                .expect("send closeTarget reply");
+            while socket2.read().is_ok() {}
+        });
+
+        let handle = json!({
+            "mode": "connected",
+            "websocket_url": ws_url,
+            "target_id": "tab-connected",
+            "port": port,
+            "pid": null,
+            "profile": null,
+            "headless": true,
+            "width": 1280,
+            "height": 800,
+            "connect": format!("http://127.0.0.1:{port}"),
+            "testid_attribute": DEFAULT_TESTID_ATTRIBUTE,
+            "refs": {}
+        });
+
+        let mut reattached =
+            BrowserSession::reattach(&handle).expect("connected handle must reattach");
+        let re_detached = reattached
+            .detach()
+            .expect("detach succeeds")
+            .expect("detach returns handle");
+        assert!(re_detached["pid"].is_null());
+        assert!(re_detached["profile"].is_null());
+        assert_eq!(re_detached["mode"], "connected");
+
+        BrowserSession::dispose_handle(&re_detached).expect("dispose connected handle succeeds");
+        server.join().expect("mock CDP server finishes");
     }
 }

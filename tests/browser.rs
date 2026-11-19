@@ -1961,6 +1961,7 @@ steps:
         ),
     );
 
+    let before_case = server.request_count();
     let output = run_da_in(
         dir.path(),
         &["--output", "json", "run", path_str(&case), "--no-bundle"],
@@ -1977,6 +1978,16 @@ steps:
     assert_eq!(
         value["cases"][0]["status"], "passed",
         "every network assertion must pass: {value}"
+    );
+    let targets: Vec<String> = server
+        .requests()
+        .into_iter()
+        .skip(before_case)
+        .map(|req| req.target)
+        .collect();
+    assert!(
+        !targets.iter().any(|target| target == "/favicon.ico"),
+        "browser_network page must not trigger implicit /favicon.ico requests, saw: {targets:?}"
     );
 }
 

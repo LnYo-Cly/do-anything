@@ -14,6 +14,7 @@ The complete reference for `da`: installation options, building from source, the
   - [Observers](#observers)
     - [Observers and parallel runs](#observers-and-parallel-runs)
   - [Sessions](#sessions)
+  - [Interactive sessions (`da session`)](#interactive-sessions-da-session)
   - [Classification and filtering](#classification-and-filtering)
   - [Linting](#linting)
   - [Secrets](#secrets)
@@ -478,6 +479,148 @@ session, so their behavior is unchanged: each step still opens and closes what
 it needs within the step. The `browser.*` steps use one browser session per
 case (see [Browser steps](#browser-steps)); the contract exists for the drivers
 and observers that need a resource across steps.
+
+### Interactive sessions (`da session`)
+
+`da session` lets an agent or user explore a service step-by-step across
+multiple CLI calls while keeping live resources (such as a detached browser)
+open between invocations, then exports the verified sequence as a replayable
+YAML case file. Unlike `da run` (where `Session::close` always tears down
+resources on every case exit path), `da session` detaches live handles on disk
+under `.da/sessions/<id>/` (overridable with `--sessions-dir`) and closes them
+on `da session stop` or idle timeout reap.
+
+Every `da session` subcommand prints one JSON object to stdout by default
+(except `da session export --yaml`, which prints raw YAML). A non-blocking lock
+on the session directory rejects concurrent operations on the same session ID.
+
+| Subcommand | Purpose & Key Options |
+| --- | --- |
+| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), print `session_id` |
+| `da session step <id> ...` | Reattach resources, run one step (`<step> --arg k=v`, `--use` + `--with`, `--step`, or `-f <file\|->`, optional `--save name=jsonpath`), update state, detach; returns `snapshot` after browser steps |
+| `da session snapshot <id>` | Capture the current accessibility tree without running a step (`--ref <id>`, `--max-depth`, `--max-nodes`) |
+| `da session export <id>` | Emit deterministic YAML case (`-o <file>`, `--name <title>`, `--include-reads`, `--yaml`); skips pure `browser.read` without `expect`/`save` by default |
+| `da session stop <id>` | Close all resources in the session and remove `.da/sessions/<id>/` and any temporary browser profile |
+| `da session list` | List active sessions and reap any session idle beyond `--idle-timeout-ms` (`0` reaps all idle sessions) |
+
+#### End-to-end example
+
+Start a session, open a login page, use snapshot `ref` targets (`e5`, `e9`, `e11`,
+then `e3` after navigation) with `${env:DEMO_PASS}` for the secret, read a
+greeting with an assertion, export to YAML, lint, replay with `da run`, and stop:
+
+```console
+$ da session start
+{"dir":".da/sessions/s-1794974416388-44376-0","idle_timeout_ms":1800000,"ok":true,"reap_errors":[],"reaped":[],"session_id":"s-1794974416388-44376-0"}
+
+$ da session step s-1794974416388-44376-0 browser.open --arg url=http://127.0.0.1:54030/login
+{"ok":true,"session_id":"s-1794974416388-44376-0","snapshot":{"max_depth":12,"max_nodes":150,"node_count":9,"title":"Login","tree":[{"name":"Sign in","ref":"e1","role":"heading"},{"children":[{"children":[{"name":"Username","ref":"e4","role":"StaticText"}],"ref":"e3","role":"LabelText"},{"name":"Username","ref":"e5","role":"textbox"},{"children":[{"name":"Password","ref":"e7","role":"StaticText"}],"ref":"e6","role":"LabelText"},{"name":"Password","ref":"e8","role":"textbox"},{"name":"Sign In","ref":"e9","role":"button"}],"ref":"e2","role":"form"}],"truncated":false,"url":"http://127.0.0.1:54030/login"},"step":{"assertions":[],"duration_ms":12207,"error":null,"name":"browser.open","result":{"title":"Login","url":"http://127.0.0.1:54030/login"},"status":"passed"}}
+
+$ da session step s-1794974416388-44376-0 browser.type --arg ref=e5 --arg text=alice
+{"ok":true,"session_id":"s-1794974416388-44376-0","snapshot":{"max_depth":12,"max_nodes":150,"node_count":10,"title":"Login","tree":[{"name":"Sign in","ref":"e1","role":"heading"},{"children":[{"children":[{"name":"Username","ref":"e4","role":"StaticText"}],"ref":"e3","role":"LabelText"},{"children":[{"name":"alice","ref":"e6","role":"StaticText"}],"name":"Username","ref":"e5","role":"textbox","value":"alice"},{"children":[{"name":"Password","ref":"e8","role":"StaticText"}],"ref":"e7","role":"LabelText"},{"name":"Password","ref":"e9","role":"textbox"},{"name":"Sign In","ref":"e10","role":"button"}],"ref":"e2","role":"form"}],"truncated":false,"url":"http://127.0.0.1:54030/login"},"step":{"assertions":[],"duration_ms":203,"error":null,"name":"browser.type","result":{},"status":"passed"}}
+
+$ export DEMO_PASS="s3cr3t-pw"
+$ da session step s-1794974416388-44376-0 -f - <<'EOF'
+browser.type:
+  ref: e9
+  text: "${env:DEMO_PASS}"
+EOF
+{"ok":true,"session_id":"s-1794974416388-44376-0","snapshot":{"max_depth":12,"max_nodes":150,"node_count":11,"title":"Login","tree":[{"name":"Sign in","ref":"e1","role":"heading"},{"children":[{"children":[{"name":"Username","ref":"e4","role":"StaticText"}],"ref":"e3","role":"LabelText"},{"children":[{"name":"alice","ref":"e6","role":"StaticText"}],"name":"Username","ref":"e5","role":"textbox","value":"alice"},{"children":[{"name":"Password","ref":"e8","role":"StaticText"}],"ref":"e7","role":"LabelText"},{"children":[{"name":"•••••••••","ref":"e10","role":"StaticText"}],"name":"Password","ref":"e9","role":"textbox","value":"•••••••••"},{"name":"Sign In","ref":"e11","role":"button"}],"ref":"e2","role":"form"}],"truncated":false,"url":"http://127.0.0.1:54030/login"},"step":{"assertions":[],"duration_ms":387,"error":null,"name":"browser.type","result":{},"status":"passed"}}
+
+$ da session step s-1794974416388-44376-0 browser.click --arg ref=e11
+{"ok":true,"session_id":"s-1794974416388-44376-0","snapshot":{"max_depth":12,"max_nodes":150,"node_count":3,"title":"Welcome","tree":[{"name":"Dashboard","ref":"e1","role":"heading"},{"children":[{"name":"Welcome back, Alice","ref":"e3","role":"StaticText"}],"ref":"e2","role":"paragraph"}],"truncated":false,"url":"http://127.0.0.1:54030/welcome"},"step":{"assertions":[],"duration_ms":231,"error":null,"name":"browser.click","result":{},"status":"passed"}}
+
+$ da session step s-1794974416388-44376-0 -f - <<'EOF'
+browser.read:
+  ref: e3
+expect:
+  - path: "$.text"
+    equals: Welcome back, Alice
+EOF
+{"ok":true,"session_id":"s-1794974416388-44376-0","snapshot":{"max_depth":12,"max_nodes":150,"node_count":3,"title":"Welcome","tree":[{"name":"Dashboard","ref":"e1","role":"heading"},{"children":[{"name":"Welcome back, Alice","ref":"e3","role":"StaticText"}],"ref":"e2","role":"paragraph"}],"truncated":false,"url":"http://127.0.0.1:54030/welcome"},"step":{"assertions":[{"actual":"Welcome back, Alice","comparison":"equals","expected":"Welcome back, Alice","message":null,"passed":true,"path":"$.text"}],"duration_ms":743,"error":null,"name":"browser.read","result":{"text":"Welcome back, Alice"},"status":"passed"}}
+
+$ da session export s-1794974416388-44376-0 -o login-flow.yaml --name "Login flow"
+{"case_name":"Login flow","exported_steps":5,"fragile":[],"ok":true,"path":"login-flow.yaml","session_id":"s-1794974416388-44376-0","skipped_steps":[],"yaml":"name: Login flow\nsteps:\n  - browser.open:\n      url: http://127.0.0.1:54030/login\n  - browser.type:\n      name: Username\n      role: textbox\n      text: alice\n  - browser.type:\n      name: Password\n      role: textbox\n      text: \"${env:DEMO_PASS}\"\n  - browser.click:\n      testid: submit-btn\n  - browser.read:\n      testid: greeting\n    expect:\n      - path: \"$.text\"\n        equals: Welcome back, Alice\n"}
+```
+
+Exported `login-flow.yaml` replaces transient `ref` values with live-verified
+stable locators while keeping `${env:DEMO_PASS}` untouched (never storing any
+resolved secret value inside `.da/sessions/`):
+
+```yaml
+name: Login flow
+steps:
+  - browser.open:
+      url: http://127.0.0.1:54030/login
+  - browser.type:
+      name: Username
+      role: textbox
+      text: alice
+  - browser.type:
+      name: Password
+      role: textbox
+      text: "${env:DEMO_PASS}"
+  - browser.click:
+      testid: submit-btn
+  - browser.read:
+      testid: greeting
+    expect:
+      - path: "$.text"
+        equals: Welcome back, Alice
+```
+
+Validate and replay it deterministically without interactive refs, then clean up:
+
+```console
+$ da lint login-flow.yaml
+Checked 1 file: 0 errors.
+
+$ da --output json run login-flow.yaml --no-bundle
+{"bundle_errors":[],"cases":[{"bundle":null,"close_errors":[],"duration_ms":7979,"error":null,"file":"login-flow.yaml","layer":null,"name":"Login flow","project":null,"status":"passed","steps":[{"assertions":[],"duration_ms":2690,"error":null,"name":"browser.open","result":{"title":"Login","url":"http://127.0.0.1:54030/login"},"status":"passed"},{"assertions":[],"duration_ms":296,"error":null,"name":"browser.type","result":{},"status":"passed"},{"assertions":[],"duration_ms":250,"error":null,"name":"browser.type","result":{},"status":"passed"},{"assertions":[],"duration_ms":354,"error":null,"name":"browser.click","result":{},"status":"passed"},{"assertions":[{"actual":"Welcome back, Alice","comparison":"equals","expected":"Welcome back, Alice","message":null,"passed":true,"path":"$.text"}],"duration_ms":75,"error":null,"name":"browser.read","result":{"text":"Welcome back, Alice"},"status":"passed"}],"suite":null,"tags":[]}],"errors":[],"ok":true,"summary":{"cases":1,"cases_errored":0,"cases_failed":0,"cases_passed":1,"duration_ms":8032,"filtered":0,"steps":5,"steps_errored":0,"steps_failed":0,"steps_passed":5,"steps_skipped":0}}
+
+$ da session stop s-1794974416388-44376-0
+{"errors":[],"ok":true,"session_id":"s-1794974416388-44376-0"}
+```
+
+#### Snapshots, `ref` lifecycle, and locator synthesis
+
+- **Compact AXTree format**: snapshots read Chrome's accessibility tree, skip
+  or unwrap `ignored` nodes, assign compact sequential `e1`, `e2`, … refs, and
+  preserve element state such as `value`, `checked`, `disabled`, and `expanded`.
+  Defaults cap output at `max_depth: 12` and `max_nodes: 150`, setting
+  `truncated: true` when trimmed; expand sections with `da session snapshot <id> --ref <eN>`.
+- **Use the latest snapshot**: every browser step returns a fresh `snapshot`
+  whose refs replace the previous table for that session. Passing a stale or
+  unknown `ref` fails immediately and asks for a fresh `snapshot`. Static `ref`
+  fields are invalid in case files (`da lint` and `da run` refuse them).
+- **7-tier locator synthesis on export**: each `ref`-targeted step resolves the
+  live element (stepping up from `StaticText` or wrapper nodes to the enclosing
+  interactive element) and picks the first unique, live-verified locator in
+  order: (1) `testid` (`data-testid` or `testid_attribute`), (2) `role` + `name`,
+  (3) associated `<label>` / `placeholder` as `role` + `name`, (4) exact
+  `text`, (5) stable non-generated `id` (`css: #<id>`), (6) nearest landmark
+  `within` + non-generated class selector, (7) structural CSS path marked
+  `# fragile:` in the YAML and listed in the export JSON's `fragile` array.
+  Generated hashes/utility tokens and digit-heavy IDs/classes are penalized or
+  skipped.
+- **Dialogs**: `da session` steps use the same JavaScript-dialog handling as
+  `da run`. A `ref`-targeted `browser.click`, `browser.type`, `browser.wait` or
+  `browser.read` has no `dialog` argument, so an unexpected `alert`, `confirm`,
+  `prompt` or `beforeunload` is dismissed immediately and fails that step with
+  the dialog type and its redacted message. Take a fresh snapshot and retry
+  after the page settles. Locator-targeted `browser.open`, `browser.click`,
+  `browser.type`, `browser.press` and `browser.wait` steps accept `dialog` in a
+  session exactly as they do in a case file.
+- **No `retry` in a session step**: `retry` polling belongs to the case runner
+  (`da run` / `da lint`). A `da session step` with a `retry` block is rejected
+  as an invalid-input error (exit 3) instead of silently ignoring the policy;
+  send one attempt from the session, or move the polling step into a case file.
+  Session steps still share the same YAML/JSON step schema, `use`, `with`,
+  `expect` and `save` behavior as case steps.
+- **Secrets & cleanup**: resolved `${env:...}` secret strings are redacted from
+  JSON outputs and never written into session logs or handles. `da session stop`
+  and idle reaping close detached Chrome instances and delete both
+  `.da/sessions/<id>/` and Chrome's temporary profile directory.
 
 ### Classification and filtering
 
@@ -997,6 +1140,9 @@ that attempt, keeping only the last attempt's result and observations:
   last error (or `skipped` when combined with `optional: true`).
 - An environment error (exit 4) or invalid-arguments error (exit 3) aborts
   polling immediately instead of waiting for `timeout_ms`.
+- `retry` is a case-file feature. `da session step` rejects a step that carries
+  `retry` with an invalid-input error instead of running or ignoring the policy;
+  an interactive caller sends each attempt explicitly.
 
 ### Cleanup with `finally`
 
@@ -1299,7 +1445,7 @@ Giving zero or more than one locator key, passing `name` without `role`, passing
 a negative or non-integer `nth`, giving an empty `testid_attribute`, or giving
 an invalid `within` locator is an argument error reported by `da lint` before
 anything runs. `browser.wait` keeps its `url_contains` form as an alternative to
-an element locator.
+an element locator. Inside [`da session`](#interactive-sessions-da-session), interactive steps also accept `ref: e<N>` targets from the latest snapshot, which `da session export` converts to ordinary stable locators.
 
 #### Choosing a locator
 
