@@ -29,10 +29,6 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the debug-port file and the child process are polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// `taskkill` exit code for "the process was not found" (ERROR_NOT_FOUND).
-#[cfg(windows)]
-const TASKKILL_PROCESS_NOT_FOUND: i32 = 128;
-
 /// A browser process started for one case.
 pub struct Launched {
     child: Option<Child>,
@@ -1099,6 +1095,22 @@ fn settle_pid_profile_match_with(
     last
 }
 
+/// Polls `pid_exists` up to `timeout`, returning early once the pid is gone.
+#[cfg(windows)]
+fn poll_pid_exit<E>(pid: u32, timeout: Duration, pid_exists: &mut E) -> Option<bool>
+where
+    E: FnMut(u32) -> Option<bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        match pid_exists(pid) {
+            Some(false) => return Some(false),
+            Some(true) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+            other => return other,
+        }
+    }
+}
+
 #[cfg(windows)]
 fn force_kill_with<R, E, V>(
     pid: u32,
@@ -1117,56 +1129,44 @@ where
     let status = run_taskkill(&["/PID", &pid_str, "/T", "/F"])
         .map_err(|error| format!("could not terminate browser pid {pid}: {error}"))?;
 
-    // `taskkill` exit code 128 means "the process was not found": either it had
-    // already exited between the ownership check and this call, or a short-lived
-    // Chrome child exited mid-walk. The caller verified that this pid owned the
-    // temporary profile before signalling, so there is nothing left to kill and
-    // nothing of ours survives under this pid.
-    if status.code() == Some(TASKKILL_PROCESS_NOT_FOUND) {
-        return Ok(());
-    }
-
-    // A pid can stay visible after `taskkill` because the process is still
-    // terminating, or because Windows reused the pid for an unrelated process.
+    // Do not trust `taskkill` exit 128 without probing: a `/T` tree walk can
+    // report "process not found" when a child exits mid-walk while the root
+    // browser still runs or Windows has already reused the pid.
     // Poll until the pid disappears or the deadline passes, then let the
     // command-line ownership probe decide whether it is still our browser.
-    let deadline = Instant::now() + wait_timeout;
-    loop {
-        match pid_exists(pid) {
-            Some(false) => return Ok(()),
-            Some(true) if Instant::now() < deadline => {
-                thread::sleep(POLL_INTERVAL);
+    match poll_pid_exit(pid, wait_timeout, &mut pid_exists) {
+        Some(false) => Ok(()),
+        Some(true) => {
+            let Some(path) = profile else {
+                return Err(format!(
+                    "could not verify whether browser pid {pid} exited after taskkill (`{status}`): the handle has no profile path"
+                ));
+            };
+            match settle_pid_profile_match(pid, path, &mut verify) {
+                // A recycled pid now belongs to an unrelated process; the
+                // browser that owned this profile is gone.
+                PidProfileMatch::DoesNotMatch => Ok(()),
+                PidProfileMatch::Unknown => Err(format!(
+                    "could not verify whether browser pid {pid} exited after taskkill (`{status}`): its command line could not be read"
+                )),
+                PidProfileMatch::Matches => retry_kill_owned_process(
+                    pid,
+                    path,
+                    wait_timeout,
+                    &status,
+                    &mut run_taskkill,
+                    &mut pid_exists,
+                    &mut verify,
+                ),
             }
-            Some(true) => {
-                let Some(path) = profile else {
-                    return Err(format!(
-                        "could not verify whether browser pid {pid} exited after taskkill (`{status}`): the handle has no profile path"
-                    ));
-                };
-                return match settle_pid_profile_match(pid, path, &mut verify) {
-                    // A recycled pid now belongs to an unrelated process; the
-                    // browser that owned this profile is gone.
-                    PidProfileMatch::DoesNotMatch => Ok(()),
-                    PidProfileMatch::Unknown => Err(format!(
-                        "could not verify whether browser pid {pid} exited after taskkill (`{status}`): its command line could not be read"
-                    )),
-                    PidProfileMatch::Matches => retry_kill_owned_process(
-                        pid,
-                        wait_timeout,
-                        &status,
-                        &mut run_taskkill,
-                        &mut pid_exists,
-                    ),
-                };
-            }
-            None => {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "could not terminate browser pid {pid} (taskkill exited with {status})"
-                    ))
-                };
+        }
+        None => {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "could not terminate browser pid {pid} (taskkill exited with {status})"
+                ))
             }
         }
     }
@@ -1174,36 +1174,40 @@ where
 
 /// Terminates a pid that still matches the recorded profile after the first
 /// `taskkill`, bounded to one extra attempt and a short wait. Fail-closed: a
-/// process that is still visible and still owns the profile is an error.
+/// process that is still visible and still owns the profile, or whose command
+/// line cannot be verified, is an error.
 #[cfg(windows)]
-fn retry_kill_owned_process<R, E>(
+fn retry_kill_owned_process<R, E, V>(
     pid: u32,
+    profile: &Path,
     wait_timeout: Duration,
     first_status: &std::process::ExitStatus,
     run_taskkill: &mut R,
     pid_exists: &mut E,
+    verify: &mut V,
 ) -> Result<(), String>
 where
     R: FnMut(&[&str]) -> std::io::Result<std::process::ExitStatus>,
     E: FnMut(u32) -> Option<bool>,
+    V: FnMut(u32, &Path) -> PidProfileMatch,
 {
     let pid_str = pid.to_string();
     let retry = run_taskkill(&["/PID", &pid_str, "/T", "/F"])
         .map_err(|error| format!("could not terminate browser pid {pid}: {error}"))?;
-    if retry.code() == Some(TASKKILL_PROCESS_NOT_FOUND) {
-        return Ok(());
-    }
-    let deadline = Instant::now() + wait_timeout.min(Duration::from_secs(1));
-    loop {
-        match pid_exists(pid) {
-            Some(false) => return Ok(()),
-            Some(true) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
-            Some(true) | None => {
-                return Err(format!(
-                    "could not terminate browser pid {pid}: process is still running after taskkill was retried (first taskkill: {first_status}; retry: {retry})"
-                ));
-            }
-        }
+    match poll_pid_exit(pid, wait_timeout.min(Duration::from_secs(1)), pid_exists) {
+        Some(false) => Ok(()),
+        Some(true) => match settle_pid_profile_match(pid, profile, verify) {
+            PidProfileMatch::DoesNotMatch => Ok(()),
+            PidProfileMatch::Unknown => Err(format!(
+                "could not verify whether browser pid {pid} exited after taskkill was retried (first taskkill: {first_status}; retry: {retry}): its command line could not be read"
+            )),
+            PidProfileMatch::Matches => Err(format!(
+                "could not terminate browser pid {pid}: process is still running after taskkill was retried (first taskkill: {first_status}; retry: {retry})"
+            )),
+        },
+        None => Err(format!(
+            "could not verify whether browser pid {pid} exited after taskkill was retried (first taskkill: {first_status}; retry: {retry})"
+        )),
     }
 }
 
@@ -2164,21 +2168,138 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn force_kill_treats_taskkill_not_found_as_terminated_without_a_pid_probe() {
+    fn force_kill_probes_after_taskkill_128_and_succeeds_when_target_is_gone() {
         let profile = create_profile().expect("create temp profile");
+        let mut kill_calls = 0;
+        let mut exists_calls = 0;
+        let mut verify_calls = 0;
         let result = force_kill_with(
             4242,
             Some(&profile),
             Duration::from_millis(50),
-            |_| Ok(synthetic_exit_status(128)),
-            |_| None,
-            |_, _| panic!("a 128 result proves the process is gone; no probe is needed"),
+            |_| {
+                kill_calls += 1;
+                Ok(synthetic_exit_status(128))
+            },
+            |_| {
+                exists_calls += 1;
+                Some(false)
+            },
+            |_, _| {
+                verify_calls += 1;
+                PidProfileMatch::DoesNotMatch
+            },
         );
         let _ = fs::remove_dir_all(&profile);
 
         assert!(
             result.is_ok(),
-            "taskkill exit 128 means the verified process is already gone: {result:?}"
+            "taskkill exit 128 followed by missing pid must succeed: {result:?}"
+        );
+        assert_eq!(kill_calls, 1);
+        assert!(
+            exists_calls >= 1,
+            "pid existence must be probed after taskkill exit 128"
+        );
+        assert_eq!(verify_calls, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn force_kill_after_128_accepts_recycled_pid_that_does_not_match_profile() {
+        let profile = create_profile().expect("create temp profile");
+        let mut kill_calls = 0;
+        let mut verify_calls = 0;
+        let result = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| {
+                kill_calls += 1;
+                Ok(synthetic_exit_status(128))
+            },
+            |_| Some(true),
+            |_, _| {
+                verify_calls += 1;
+                PidProfileMatch::DoesNotMatch
+            },
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        assert!(
+            result.is_ok(),
+            "recycled pid after taskkill exit 128 must succeed: {result:?}"
+        );
+        assert_eq!(kill_calls, 1);
+        assert_eq!(verify_calls, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn force_kill_after_128_retries_and_fails_when_same_browser_still_matches() {
+        let profile = create_profile().expect("create temp profile");
+        let mut kill_calls = 0;
+        let result = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| {
+                kill_calls += 1;
+                Ok(synthetic_exit_status(128))
+            },
+            |_| Some(true),
+            |_, _| PidProfileMatch::Matches,
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        let err = result.expect_err("surviving owned browser after 128 must fail");
+        assert!(
+            err.contains("4242"),
+            "error must name surviving browser pid 4242: {err}"
+        );
+        assert_eq!(kill_calls, 2, "owned browser must be retried once");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn force_kill_after_128_fails_closed_when_ownership_is_unknown() {
+        let profile = create_profile().expect("create temp profile");
+        let mut kill_calls = 0;
+        let mut verify_calls = 0;
+        let result = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| {
+                kill_calls += 1;
+                Ok(synthetic_exit_status(128))
+            },
+            |_| Some(true),
+            |_, _| {
+                verify_calls += 1;
+                PidProfileMatch::Unknown
+            },
+        );
+        let pid_exists_unknown = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| Ok(synthetic_exit_status(128)),
+            |_| None,
+            |_, _| PidProfileMatch::Unknown,
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        let err = result.expect_err("unknown ownership after 128 must fail closed");
+        assert!(
+            err.contains("could not verify whether browser pid 4242 exited after taskkill"),
+            "error must name unverified pid 4242: {err}"
+        );
+        assert_eq!(kill_calls, 1);
+        assert_eq!(verify_calls, OWNERSHIP_PROBE_ATTEMPTS);
+        assert!(
+            pid_exists_unknown.is_err(),
+            "inconclusive pid_exists after 128 must stay fail-closed"
         );
     }
 
@@ -2231,16 +2352,20 @@ mod tests {
         let pid = child.id();
         thread::sleep(Duration::from_millis(300));
 
-        let mut attempts = 0;
+        let attempts = std::cell::Cell::new(0usize);
         let result = force_kill_with(
             pid,
             Some(&profile),
             Duration::from_millis(100),
             |_| {
-                attempts += 1;
-                Ok(synthetic_exit_status(if attempts == 1 { 0 } else { 128 }))
+                attempts.set(attempts.get() + 1);
+                Ok(synthetic_exit_status(if attempts.get() == 1 {
+                    0
+                } else {
+                    128
+                }))
             },
-            |_| Some(true),
+            |_| Some(attempts.get() < 2),
             |_, _| PidProfileMatch::Matches,
         );
         let _ = child.kill();
@@ -2249,12 +2374,147 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "a second taskkill that reports the process gone must succeed: {result:?}"
+            "a second taskkill after which the pid disappears must succeed: {result:?}"
         );
         assert_eq!(
-            attempts, 2,
+            attempts.get(),
+            2,
             "the owned process must be signalled again once"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_kill_after_128_succeeds_when_target_disappears() {
+        let profile = create_profile().expect("create temp profile");
+        let attempts = std::cell::Cell::new(0usize);
+        let exists_calls = std::cell::Cell::new(0usize);
+        let result = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Ok(synthetic_exit_status(if attempts.get() == 1 {
+                    0
+                } else {
+                    128
+                }))
+            },
+            |_| {
+                exists_calls.set(exists_calls.get() + 1);
+                Some(attempts.get() < 2)
+            },
+            |_, _| PidProfileMatch::Matches,
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        assert!(
+            result.is_ok(),
+            "missing target after retry exit 128 must succeed: {result:?}"
+        );
+        assert_eq!(attempts.get(), 2);
+        assert!(exists_calls.get() >= 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_kill_after_128_accepts_recycled_pid() {
+        let profile = create_profile().expect("create temp profile");
+        let attempts = std::cell::Cell::new(0usize);
+        let mut verify_calls = 0;
+        let result = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Ok(synthetic_exit_status(if attempts.get() == 1 {
+                    0
+                } else {
+                    128
+                }))
+            },
+            |_| Some(true),
+            |_, _| {
+                verify_calls += 1;
+                if attempts.get() < 2 {
+                    PidProfileMatch::Matches
+                } else {
+                    PidProfileMatch::DoesNotMatch
+                }
+            },
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        assert!(
+            result.is_ok(),
+            "recycled pid after retry exit 128 must succeed: {result:?}"
+        );
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(verify_calls, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_kill_after_128_fails_when_same_browser_still_matches() {
+        let profile = create_profile().expect("create temp profile");
+        let mut attempts = 0;
+        let result = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| {
+                attempts += 1;
+                Ok(synthetic_exit_status(if attempts == 1 { 0 } else { 128 }))
+            },
+            |_| Some(true),
+            |_, _| PidProfileMatch::Matches,
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        let err = result.expect_err("surviving owned browser after retry exit 128 must fail");
+        assert!(
+            err.contains("4242") && err.contains("retried"),
+            "error must report surviving pid 4242 after retry: {err}"
+        );
+        assert_eq!(attempts, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_kill_after_128_fails_closed_when_ownership_is_unknown() {
+        let profile = create_profile().expect("create temp profile");
+        let attempts = std::cell::Cell::new(0usize);
+        let result = force_kill_with(
+            4242,
+            Some(&profile),
+            Duration::from_millis(20),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Ok(synthetic_exit_status(if attempts.get() == 1 {
+                    0
+                } else {
+                    128
+                }))
+            },
+            |_| Some(true),
+            |_, _| {
+                if attempts.get() < 2 {
+                    PidProfileMatch::Matches
+                } else {
+                    PidProfileMatch::Unknown
+                }
+            },
+        );
+        let _ = fs::remove_dir_all(&profile);
+
+        let err = result.expect_err("unknown ownership after retry exit 128 must fail closed");
+        assert!(
+            err.contains("4242") && err.contains("command line could not be read"),
+            "error must report unverified ownership for pid 4242: {err}"
+        );
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]
