@@ -464,6 +464,39 @@ fn route(
             thread::sleep(Duration::from_secs(5));
             html_response("200 OK", &browser_second(query))
         }
+        // A login form, the page it signs in to, and a page that writes the
+        // same state with a persistent expiry. The cookie and the
+        // `localStorage` value are the two secrets the storage-state tests
+        // assert never reach output, bundles or reports.
+        (_, "/auth/login") => html_response("200 OK", &auth_login_page()),
+        (_, "/auth/persist") => html_response("200 OK", &auth_persist_page()),
+        (_, "/auth/me") => {
+            let authorized = headers.get("cookie").is_some_and(|value| {
+                value
+                    .split(';')
+                    .any(|part| part.trim() == format!("sid={AUTH_SESSION_COOKIE}"))
+            });
+            html_response("200 OK", &auth_me_page(authorized))
+        }
+        // Reports which login source the browser sent, using labels rather than
+        // the cookie value, so a precedence test never prints a secret.
+        (_, "/auth/which") => {
+            let sent = |wanted: &str| {
+                headers.get("cookie").is_some_and(|value| {
+                    value
+                        .split(';')
+                        .any(|part| part.trim() == format!("sid={wanted}"))
+                })
+            };
+            let source = if sent(AUTH_SESSION_COOKIE) {
+                "session cookie"
+            } else if sent("state-file-session") {
+                "state file"
+            } else {
+                "none"
+            };
+            html_response("200 OK", &auth_which_page(source))
+        }
         // A fixed body with one number, one boolean and one null, so a test can
         // assert on how each JSON scalar is redacted without depending on a
         // duration or a timestamp.
@@ -790,6 +823,108 @@ fn browser_second(query: &str) -> String {
 <body>
 <p id="case">{label}</p>
 <p id="second">second page</p>
+</body></html>"#
+    )
+}
+
+/// The session cookie value the auth pages write.
+pub const AUTH_SESSION_COOKIE: &str = "s3cr3t-session";
+
+/// The `localStorage` value the auth pages write.
+pub const AUTH_LOCAL_STORAGE_TOKEN: &str = "s3cr3t-token";
+
+/// Splits a secret into two JavaScript string literals joined at runtime, so a
+/// DOM snapshot of the page never contains the whole value.
+fn js_secret(value: &str) -> String {
+    let (head, tail) = value.split_at(value.len() / 2);
+    format!("'{head}' + '{tail}'")
+}
+
+/// A login form that stores a session cookie and a `localStorage` token, then
+/// navigates to the signed-in page.
+fn auth_login_page() -> String {
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in</title></head>
+<body>
+<h1>Sign in</h1>
+<form id="form">
+<label for="user">Username</label>
+<input id="user" name="user" autocomplete="off">
+<label for="password">Password</label>
+<input id="password" name="password" type="password">
+<button id="signin" type="submit">Sign in</button>
+</form>
+<p id="login-state">signed out</p>
+<script>
+document.getElementById('form').addEventListener('submit', function (event) {{
+  event.preventDefault();
+  var session = {session};
+  document.cookie = 'sid=' + session + '; path=/';
+  window.localStorage.setItem('auth_token', {token});
+  document.getElementById('login-state').textContent = 'signing in';
+  window.location.href = '/auth/me';
+}});
+</script>
+</body></html>"#,
+        session = js_secret(AUTH_SESSION_COOKIE),
+        token = js_secret(AUTH_LOCAL_STORAGE_TOKEN),
+    )
+}
+
+/// A page that writes the same state as the login form but with a persistent
+/// cookie, so a reused browser profile still has it after a restart.
+fn auth_persist_page() -> String {
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Persist sign in</title></head>
+<body>
+<h1>Persist sign in</h1>
+<p id="persisted">pending</p>
+<script>
+var session = {session};
+document.cookie = 'sid=' + session + '; path=/; expires=Fri, 31 Dec 9999 23:59:59 GMT; SameSite=Lax';
+window.localStorage.setItem('auth_token', {token});
+document.getElementById('persisted').textContent = 'saved';
+</script>
+</body></html>"#,
+        session = js_secret(AUTH_SESSION_COOKIE),
+        token = js_secret(AUTH_LOCAL_STORAGE_TOKEN),
+    )
+}
+
+/// The page behind the login: the server checks the cookie, and the script
+/// checks `localStorage`, so a test sees which half of the state was restored.
+fn auth_me_page(authorized: bool) -> String {
+    let who = if authorized {
+        "signed in as alice"
+    } else {
+        "signed out"
+    };
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Account</title></head>
+<body>
+<h1>Account</h1>
+<p id="who">{who}</p>
+<p id="token">unknown</p>
+<script>
+var want = {token};
+document.getElementById('token').textContent =
+  window.localStorage.getItem('auth_token') === want ? 'token present' : 'token missing';
+</script>
+</body></html>"#,
+        token = js_secret(AUTH_LOCAL_STORAGE_TOKEN),
+    )
+}
+
+/// Names which login source sent the session cookie, without printing it.
+fn auth_which_page(source: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Which login</title></head>
+<body>
+<p id="source">{source}</p>
 </body></html>"#
     )
 }

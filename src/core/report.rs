@@ -144,6 +144,10 @@ pub struct CaseReport {
     pub close_errors: Vec<String>,
     /// Failure bundle directory, when one was written for this case.
     pub bundle: Option<PathBuf>,
+    /// Whether any session used unmanaged state whose evidence must stay local-only.
+    pub local_only: bool,
+    /// Why evidence for this case must stay local-only, if applicable.
+    pub local_only_reason: Option<String>,
 }
 
 /// Every case of a run.
@@ -319,6 +323,8 @@ mod tests {
                 }),
                 close_errors: Vec::new(),
                 bundle: None,
+                local_only: false,
+                local_only_reason: None,
             }],
             filtered: 0,
             duration: Duration::ZERO,

@@ -559,6 +559,9 @@ fn run_case(
         }
     });
 
+    let local_only_reason = sessions.local_only_reason();
+    let local_only = local_only_reason.is_some();
+
     // Every session belongs to this case and is closed here, whatever path the
     // case took. `close_all` removes a session before closing it, so a failing
     // close cannot be attempted twice.
@@ -593,6 +596,8 @@ fn run_case(
             error,
             close_errors,
             bundle: None,
+            local_only,
+            local_only_reason,
         },
         evidence,
     }

@@ -5754,3 +5754,954 @@ steps:
         "{report}"
     );
 }
+
+/// Asserts that neither half of the browser auth state appears in `text`.
+fn assert_no_state_secrets(label: &str, text: &str) {
+    for secret in [
+        support::AUTH_SESSION_COOKIE,
+        support::AUTH_LOCAL_STORAGE_TOKEN,
+    ] {
+        assert!(
+            !text.contains(secret),
+            "{label} must not contain the browser state value `{secret}`: {text}"
+        );
+    }
+}
+
+/// Every file under `dir`, as lossy text, so a test can search a bundle.
+fn bundle_texts(dir: &Path) -> Vec<(PathBuf, String)> {
+    files_under(dir)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap_or_default();
+            (path, String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn a_saved_storage_state_signs_a_second_run_in_without_typing() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-storage-state");
+
+    let login_case = dir.write(
+        "login.yaml",
+        &format!(
+            r##"name: sign in and save the state
+steps:
+  - browser.open:
+      url: "{login}"
+  - browser.type:
+      css: "#user"
+      text: alice
+  - browser.type:
+      css: "#password"
+      text: "hunter2-typed-once"
+  - browser.press:
+      key: Enter
+  - browser.wait:
+      url_contains: /auth/me
+  - browser.read:
+      css: "#who"
+    expect:
+      - path: $.text
+        equals: "signed in as alice"
+  - browser.save_state:
+      path: state/session.json
+"##,
+            login = server.url("/auth/login")
+        ),
+    );
+
+    let first = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&login_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&first),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&first),
+        stderr(&first)
+    );
+    let first_json = json_stdout(&first);
+    let saved = &first_json["cases"][0]["steps"][6]["result"];
+    assert!(
+        saved["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("state/session.json")),
+        "the save step must report the file it wrote: {saved}"
+    );
+    assert!(
+        saved["cookies"].as_u64().is_some_and(|count| count >= 1),
+        "the save step must report the cookies it wrote: {saved}"
+    );
+    assert!(
+        saved["local_storage"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "the save step must report the localStorage entries it wrote: {saved}"
+    );
+    assert_no_state_secrets("the first run's JSON output", &stdout(&first));
+
+    let state_path = dir.path().join("state/session.json");
+    let state_text = fs::read_to_string(&state_path).expect("the state file must exist");
+    assert!(
+        state_text.contains(support::AUTH_SESSION_COOKIE),
+        "the state file must carry the session cookie: {state_text}"
+    );
+    assert!(
+        state_text.contains(support::AUTH_LOCAL_STORAGE_TOKEN),
+        "the state file must carry the localStorage token: {state_text}"
+    );
+    assert!(
+        state_text.contains(&server.url("")),
+        "the state file must name the origin: {state_text}"
+    );
+
+    // A second, independent run: a new `da run` process and a fresh browser
+    // profile, so only the state file can sign this page in.
+    let reuse_case = dir.write(
+        "reuse.yaml",
+        &format!(
+            r##"name: reuse the saved login
+steps:
+  - browser.open:
+      url: "{me}"
+      storage_state: state/session.json
+  - browser.read:
+      css: "#who"
+    expect:
+      - path: $.text
+        equals: "signed in as alice"
+  - browser.read:
+      css: "#token"
+    expect:
+      - path: $.text
+        equals: "token present"
+"##,
+            me = server.url("/auth/me")
+        ),
+    );
+
+    let second = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&reuse_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&second),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&second),
+        stderr(&second)
+    );
+    let second_json = json_stdout(&second);
+    assert_eq!(second_json["cases"][0]["status"], "passed", "{second_json}");
+    assert_eq!(
+        second_json["cases"][0]["steps"][1]["result"]["text"], "signed in as alice",
+        "{second_json}"
+    );
+    assert_no_state_secrets("the second run's JSON output", &stdout(&second));
+
+    // The server saw the cookie on the navigation, so the page was authorized
+    // before any step typed anything.
+    let gated: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.path() == "/auth/me")
+        .collect();
+    assert!(
+        gated.iter().any(|request| request
+            .headers
+            .get("cookie")
+            .is_some_and(|header| header.contains(support::AUTH_SESSION_COOKIE))),
+        "the server must see the saved cookie on the reused login: {gated:?}"
+    );
+}
+
+#[test]
+fn a_missing_or_malformed_storage_state_fails_closed() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-storage-state-fail");
+
+    let missing_case = dir.write(
+        "missing.yaml",
+        &format!(
+            r##"name: missing state
+steps:
+  - browser.open:
+      url: "{}"
+      storage_state: state/missing.json
+"##,
+            server.url("/auth/me")
+        ),
+    );
+    let missing = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&missing_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&missing),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&missing),
+        stderr(&missing)
+    );
+    let missing_json = json_stdout(&missing);
+    let message = case_error(&missing_json);
+    assert!(
+        message.contains("could not read browser storage state")
+            && message.contains("missing.json"),
+        "got: {message}"
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.path() != "/auth/me"),
+        "a missing state file must fail before the browser opens the page"
+    );
+
+    dir.write("state/broken.json", "{\"cookies\": [");
+    let malformed_case = dir.write(
+        "malformed.yaml",
+        &format!(
+            r##"name: malformed state
+steps:
+  - browser.open:
+      url: "{}"
+      storage_state: state/broken.json
+"##,
+            server.url("/auth/me")
+        ),
+    );
+    let malformed = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&malformed_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&malformed),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&malformed),
+        stderr(&malformed)
+    );
+    let malformed_json = json_stdout(&malformed);
+    let message = case_error(&malformed_json);
+    assert!(
+        message.contains("is malformed") && message.contains("broken.json"),
+        "got: {message}"
+    );
+    assert_no_state_secrets("the failure output", &stdout(&malformed));
+
+    dir.write(
+        "state/future.json",
+        "{\"version\": 99, \"cookies\": [{\"name\": \"sid\", \"value\": \"s3cr3t-session\", \"url\": \"http://127.0.0.1/\"}]}",
+    );
+    let future_case = dir.write(
+        "future.yaml",
+        &format!(
+            r##"name: unsupported state version
+steps:
+  - browser.open:
+      url: "{}"
+      storage_state: state/future.json
+"##,
+            server.url("/auth/me")
+        ),
+    );
+    let future = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&future_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&future),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&future),
+        stderr(&future)
+    );
+    let future_json = json_stdout(&future);
+    let message = case_error(&future_json);
+    assert!(
+        message.contains("unsupported `version` 99"),
+        "got: {message}"
+    );
+    assert_no_state_secrets("the unsupported-version output", &stdout(&future));
+}
+
+#[test]
+fn storage_state_arguments_are_refused_by_lint_before_any_browser_starts() {
+    let dir = TempDir::new("browser-storage-state-lint");
+
+    let conflicted = dir.write(
+        "conflict.yaml",
+        r##"name: connected state
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/orders
+      connect: http://127.0.0.1:9222
+      storage_state: state/session.json
+"##,
+    );
+    let lint = run_da_in(dir.path(), &["lint", path_str(&conflicted)]);
+    assert_eq!(
+        exit_code(&lint),
+        Some(3),
+        "stdout: {}\nstderr: {}",
+        stdout(&lint),
+        stderr(&lint)
+    );
+    assert!(
+        stdout(&lint).contains("`storage_state` and `connect` cannot both be set"),
+        "got: {}",
+        stdout(&lint)
+    );
+
+    let empty = dir.write(
+        "empty.yaml",
+        r##"name: empty state
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/orders
+      storage_state: ""
+"##,
+    );
+    let lint = run_da_in(dir.path(), &["lint", path_str(&empty)]);
+    assert_eq!(
+        exit_code(&lint),
+        Some(3),
+        "stdout: {}\nstderr: {}",
+        stdout(&lint),
+        stderr(&lint)
+    );
+
+    let save_without_path = dir.write(
+        "save.yaml",
+        r##"name: save without a path
+steps:
+  - browser.save_state: {}
+"##,
+    );
+    let lint = run_da_in(dir.path(), &["lint", path_str(&save_without_path)]);
+    assert_eq!(
+        exit_code(&lint),
+        Some(3),
+        "stdout: {}\nstderr: {}",
+        stdout(&lint),
+        stderr(&lint)
+    );
+}
+
+#[test]
+fn saving_state_without_an_open_page_names_the_missing_step() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-save-state-no-open");
+    let case = dir.write(
+        "save.yaml",
+        r##"name: save before opening
+steps:
+  - browser.save_state:
+      path: state/session.json
+"##,
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let output_json = json_stdout(&output);
+    let message = case_error(&output_json);
+    assert!(
+        message.contains("no browser session is open"),
+        "got: {message}"
+    );
+    assert!(
+        !dir.path().join("state/session.json").exists(),
+        "a refused save must not write a state file"
+    );
+}
+
+#[test]
+fn a_named_profile_keeps_a_login_across_runs() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-profile-reuse");
+    let profile_dir = dir.path().join(".da/profiles/ci-login");
+
+    let first_case = dir.write(
+        "first.yaml",
+        &format!(
+            r##"name: write a persistent login
+steps:
+  - browser.open:
+      url: "{}"
+      profile: ci-login
+  - browser.read:
+      css: "#persisted"
+    expect:
+      - path: $.text
+        equals: "saved"
+"##,
+            server.url("/auth/persist")
+        ),
+    );
+    let first = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&first_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&first),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&first),
+        stderr(&first)
+    );
+    assert_no_state_secrets("the profile run's output", &stdout(&first));
+    assert!(
+        profile_dir.is_dir(),
+        "a named profile must survive the run that created it"
+    );
+    assert!(
+        fs::read_dir(&profile_dir)
+            .expect("the named profile must be readable")
+            .next()
+            .is_some(),
+        "the named profile must keep the browser's files"
+    );
+
+    let second_case = dir.write(
+        "second.yaml",
+        &format!(
+            r##"name: reuse the persistent login
+steps:
+  - browser.open:
+      url: "{}"
+      profile: ci-login
+  - browser.read:
+      css: "#who"
+    expect:
+      - path: $.text
+        equals: "signed in as alice"
+  - browser.read:
+      css: "#token"
+    expect:
+      - path: $.text
+        equals: "token present"
+"##,
+            server.url("/auth/me")
+        ),
+    );
+    let second = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&second_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&second),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&second),
+        stderr(&second)
+    );
+    let second_json = json_stdout(&second);
+    assert_eq!(second_json["cases"][0]["status"], "passed", "{second_json}");
+    assert_no_state_secrets("the reused profile run's output", &stdout(&second));
+    assert!(
+        profile_dir.is_dir(),
+        "the second run must keep the named profile too"
+    );
+}
+
+#[test]
+fn a_named_profile_refuses_a_second_concurrent_run() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-profile-lock");
+
+    let holding_case = dir.write(
+        "holding.yaml",
+        &format!(
+            r##"name: hold the profile
+steps:
+  - browser.open:
+      url: "{}"
+      profile: ci-lock
+"##,
+            server.url("/browser/stall")
+        ),
+    );
+    let mut holding = Command::new(da())
+        .current_dir(dir.path())
+        .args([
+            "run",
+            path_str(&holding_case),
+            "--no-bundle",
+            "--output",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the first run must start");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let stalled = server
+            .requests()
+            .iter()
+            .any(|request| request.path() == "/browser/stall");
+        if stalled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first run never opened the stalling page"
+        );
+        assert!(
+            holding
+                .try_wait()
+                .expect("the first run must be watchable")
+                .is_none(),
+            "the first run finished before the second one could compete for the profile"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let competing_case = dir.write(
+        "competing.yaml",
+        &format!(
+            r##"name: compete for the profile
+steps:
+  - browser.open:
+      url: "{}"
+      profile: ci-lock
+"##,
+            server.url("/health")
+        ),
+    );
+    let competing = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&competing_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&competing),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&competing),
+        stderr(&competing)
+    );
+    let competing_json = json_stdout(&competing);
+    let message = case_error(&competing_json);
+    assert!(
+        message.contains("already in use") && message.contains("ci-lock"),
+        "got: {message}"
+    );
+
+    let status = holding.wait().expect("the first run must finish");
+    assert!(
+        status.success(),
+        "the run that held the profile must still pass: {status}"
+    );
+    assert!(
+        dir.path().join(".da/profiles/ci-lock").is_dir(),
+        "a refused competing run must not remove the profile"
+    );
+}
+
+#[test]
+fn a_profile_failure_bundle_marks_evidence_local_only() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-profile-local-only");
+    let case = dir.write(
+        "local.yaml",
+        &format!(
+            r##"name: profile evidence
+steps:
+  - browser.open:
+      url: "{}"
+      profile: ci-evidence
+  - browser.read:
+      css: "#never-there"
+      timeout_ms: 300
+"##,
+            server.url("/auth/persist")
+        ),
+    );
+    let bundles = dir.path().join("failures");
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    assert_eq!(value["cases"][0]["local_only"], true, "{value}");
+    assert!(
+        value["cases"][0]["local_only_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("ci-evidence")),
+        "{value}"
+    );
+    assert_no_state_secrets("the local-only output", &stdout(&output));
+
+    let bundle = PathBuf::from(
+        value["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must name its bundle"),
+    );
+    let meta: Value = serde_json::from_str(
+        &fs::read_to_string(bundle.join("meta.json")).expect("the bundle must hold meta.json"),
+    )
+    .expect("meta.json must be JSON");
+    assert_eq!(meta["local_only"], true, "{meta}");
+    assert!(
+        meta["local_only_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("ci-evidence")),
+        "{meta}"
+    );
+
+    for (path, text) in bundle_texts(&bundle) {
+        assert_no_state_secrets(
+            &format!("the failure bundle file {}", path.display()),
+            &text,
+        );
+    }
+
+    // A case that starts its own browser keeps its evidence shareable.
+    let ephemeral = dir.write(
+        "ephemeral.yaml",
+        &format!(
+            r##"name: ephemeral evidence
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.read:
+      css: "#never-there"
+      timeout_ms: 300
+"##,
+            server.url("/auth/persist")
+        ),
+    );
+    let ephemeral_output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&ephemeral),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(exit_code(&ephemeral_output), Some(1));
+    let ephemeral_json = json_stdout(&ephemeral_output);
+    assert!(
+        ephemeral_json["cases"][0].get("local_only").is_none(),
+        "an ephemeral browser must not mark its evidence local-only: {ephemeral_json}"
+    );
+    let ephemeral_bundle = PathBuf::from(
+        ephemeral_json["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must name its bundle"),
+    );
+    let ephemeral_meta: Value = serde_json::from_str(
+        &fs::read_to_string(ephemeral_bundle.join("meta.json"))
+            .expect("the bundle must hold meta.json"),
+    )
+    .expect("meta.json must be JSON");
+    assert_eq!(ephemeral_meta["local_only"], false, "{ephemeral_meta}");
+}
+
+#[test]
+fn set_cookies_signs_the_page_in_before_and_after_it_opens() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-set-cookies");
+    let origin = server.url("");
+
+    let before_open = dir.write(
+        "before.yaml",
+        &format!(
+            r##"name: inject before opening
+steps:
+  - browser.set_cookies:
+      cookies:
+        - name: sid
+          value: "{cookie}"
+          url: "{origin}/"
+          http_only: true
+          same_site: Lax
+      local_storage:
+        "{origin}":
+          auth_token: "{token}"
+  - browser.open:
+      url: "{me}"
+  - browser.read:
+      css: "#who"
+    expect:
+      - path: $.text
+        equals: "signed in as alice"
+  - browser.read:
+      css: "#token"
+    expect:
+      - path: $.text
+        equals: "token present"
+"##,
+            cookie = support::AUTH_SESSION_COOKIE,
+            token = support::AUTH_LOCAL_STORAGE_TOKEN,
+            origin = origin,
+            me = server.url("/auth/me")
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&before_open),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_no_state_secrets("the set_cookies output", &stdout(&output));
+
+    let after_open = dir.write(
+        "after.yaml",
+        &format!(
+            r##"name: inject after opening
+steps:
+  - browser.open:
+      url: "{login}"
+  - browser.set_cookies:
+      cookies:
+        - name: sid
+          value: "{cookie}"
+          url: "{origin}/"
+          http_only: true
+          same_site: Lax
+      local_storage:
+        current:
+          auth_token: "{token}"
+  - browser.open:
+      url: "{me}"
+  - browser.read:
+      css: "#who"
+    expect:
+      - path: $.text
+        equals: "signed in as alice"
+  - browser.read:
+      css: "#token"
+    expect:
+      - path: $.text
+        equals: "token present"
+"##,
+            cookie = support::AUTH_SESSION_COOKIE,
+            token = support::AUTH_LOCAL_STORAGE_TOKEN,
+            origin = origin,
+            login = server.url("/auth/login"),
+            me = server.url("/auth/me")
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&after_open),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_no_state_secrets("the after-open set_cookies output", &stdout(&output));
+}
+
+#[test]
+fn a_storage_state_file_wins_over_a_profile_login() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-storage-state-precedence");
+
+    // The profile stores a persistent session cookie of its own.
+    let seed_case = dir.write(
+        "seed.yaml",
+        &format!(
+            r##"name: seed the profile
+steps:
+  - browser.open:
+      url: "{}"
+      profile: ci-precedence
+  - browser.read:
+      css: "#persisted"
+    expect:
+      - path: $.text
+        equals: "saved"
+"##,
+            server.url("/auth/persist")
+        ),
+    );
+    let seed = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&seed_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&seed),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&seed),
+        stderr(&seed)
+    );
+
+    // A state file names a different value for the same cookie, and the page
+    // reports which one arrived without ever printing a cookie value.
+    dir.write(
+        "state/override.json",
+        &format!(
+            "{{\"version\":1,\"cookies\":[{{\"name\":\"sid\",\"value\":\"state-file-session\",\"url\":\"{}/\"}}]}}",
+            server.url("")
+        ),
+    );
+    let override_case = dir.write(
+        "override.yaml",
+        &format!(
+            r##"name: the state file wins
+steps:
+  - browser.open:
+      url: "{}"
+      profile: ci-precedence
+      storage_state: state/override.json
+  - browser.read:
+      css: "#source"
+    expect:
+      - path: $.text
+        equals: "state file"
+"##,
+            server.url("/auth/which")
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&override_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_no_state_secrets("the precedence output", &stdout(&output));
+}
