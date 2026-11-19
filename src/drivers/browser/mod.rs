@@ -28,6 +28,7 @@ mod synthesis;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use schemars::{JsonSchema, schema_for};
@@ -66,6 +67,8 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 800;
 /// How long starting the browser and opening its page may take.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of fresh browser launches tried when post-startup connect/attach stalls.
+const MAX_LAUNCH_ATTEMPTS: usize = 2;
 /// How often an element or URL is looked at again.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -784,41 +787,354 @@ const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long removing the masks may take after the screenshot itself.
 const MASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// JavaScript that covers every visible editable field with an opaque box.
-///
-/// `position: fixed` uses the viewport rectangle `getBoundingClientRect`
-/// returns, and `z-index` is the largest value a browser accepts. The element
-/// stays in the page only until the screenshot is captured; cleanup is a
-/// separate call so it can run after a failed capture too. The page is not
-/// notified when the masks appear or disappear.
-const MASK_INPUTS_SCRIPT: &str = r#"(function () {
-  var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
-  var fields = document.querySelectorAll('input, textarea, select, [contenteditable]');
-  var masks = [];
-  for (var i = 0; i < fields.length; i++) {
-    var el = fields[i];
-    if (el.nodeType !== 1) continue;
-    var tag = el.tagName;
-    var field = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
-    if (!field && !el.isContentEditable) continue;
-    if (tag === 'INPUT' && skipped.indexOf((el.type || 'text').toLowerCase()) !== -1) continue;
-    var style = window.getComputedStyle(el);
-    var rect = el.getBoundingClientRect();
-    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || rect.width <= 0 || rect.height <= 0) continue;
-    var mask = document.createElement('div');
-    mask.setAttribute('data-da-screenshot-mask', '');
-    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + rect.left + 'px;top:' + rect.top + 'px;width:' + rect.width + 'px;height:' + rect.height + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
-    document.documentElement.appendChild(mask);
-    masks.push(mask);
+/// Shared JavaScript helpers for frame traversal, coordinate transforms, and visibility.
+const FRAME_HELPERS_JS: &str = r#"
+var isBoxVisible = function (node, win) {
+  if (!node || node.nodeType !== 1) return false;
+  var view = win || (node.ownerDocument && node.ownerDocument.defaultView) || window;
+  var style = view.getComputedStyle(node);
+  var rect = node.getBoundingClientRect();
+  return style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    style.visibility !== 'collapse' &&
+    rect.width > 0 &&
+    rect.height > 0;
+};
+var collectEnclosingFrames = function (node) {
+  var frames = [];
+  var doc = node.nodeType === 9 ? node : node.ownerDocument;
+  var win = doc && doc.defaultView;
+  var topWin = window;
+  try {
+    topWin = window.top || window;
+  } catch (e) {
+    return null;
   }
-  return masks.length;
-})()"#;
+  while (win && win !== topWin) {
+    var frame = null;
+    try {
+      frame = win.frameElement;
+    } catch (e) {
+      return null;
+    }
+    if (!frame || !frame.isConnected) return null;
+    frames.unshift(frame);
+    doc = frame.ownerDocument;
+    win = doc && doc.defaultView;
+  }
+  return frames;
+};
+var areEnclosingFramesVisible = function (frames) {
+  for (var i = 0; i < frames.length; i++) {
+    if (!isBoxVisible(frames[i], null)) return false;
+  }
+  return true;
+};
+var checkAxisAlignedTransform = function (node, win) {
+  if (win.SVGElement && node instanceof win.SVGElement) {
+    return { ok: false, reason: 'SVG ancestor transforms cannot be mapped to viewport coordinates' };
+  }
+  var cs = win.getComputedStyle(node);
+  var sx = 1;
+  var sy = 1;
+  if (cs.transform && cs.transform !== 'none') {
+    var m = null;
+    try {
+      m = new (win.DOMMatrix || DOMMatrix)(cs.transform);
+    } catch (e) {
+      return { ok: false, reason: 'CSS transform `' + cs.transform + '` could not be parsed' };
+    }
+    if (!m.is2D || !isFinite(m.a) || !isFinite(m.b) || !isFinite(m.c) || !isFinite(m.d) || !isFinite(m.e) || !isFinite(m.f)) {
+      return { ok: false, reason: '3D CSS transform `' + cs.transform + '` cannot be mapped as a 2D viewport coordinate' };
+    }
+    if (Math.abs(m.b) > 1e-6 || Math.abs(m.c) > 1e-6) {
+      return { ok: false, reason: 'rotated or skewed CSS transform `' + cs.transform + '` cannot be mapped to axis-aligned viewport coordinates' };
+    }
+    if (m.a <= 0 || m.d <= 0) {
+      return { ok: false, reason: 'non-positive or reflected CSS transform `' + cs.transform + '` cannot be mapped' };
+    }
+    sx *= m.a;
+    sy *= m.d;
+  }
+  if (cs.rotate && cs.rotate !== 'none') {
+    var rm = String(cs.rotate).trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(deg|rad|grad|turn)$/i);
+    if (!rm || !isFinite(parseFloat(rm[1])) || Math.abs(parseFloat(rm[1])) > 1e-6) {
+      return { ok: false, reason: 'CSS `rotate: ' + cs.rotate + '` cannot be mapped to axis-aligned viewport coordinates' };
+    }
+  }
+  if (cs.scale && cs.scale !== 'none') {
+    var sp = String(cs.scale).trim().split(/\s+/);
+    var s0 = Number(sp[0]);
+    var s1 = sp.length > 1 ? Number(sp[1]) : s0;
+    var s2 = sp.length > 2 ? Number(sp[2]) : 1;
+    if (sp.length > 3 || !isFinite(s0) || !isFinite(s1) || !isFinite(s2) || s0 <= 0 || s1 <= 0 || Math.abs(s2 - 1) > 1e-6) {
+      return { ok: false, reason: 'CSS `scale: ' + cs.scale + '` cannot be mapped to 2D viewport coordinates' };
+    }
+    sx *= s0;
+    sy *= s1;
+  }
+  if (cs.translate && cs.translate !== 'none') {
+    var tp = String(cs.translate).trim().split(/\s+/);
+    if (tp.length > 2) {
+      var tz = parseFloat(tp[2]);
+      if (!isFinite(tz) || Math.abs(tz) > 1e-6) {
+        return { ok: false, reason: '3D CSS `translate: ' + cs.translate + '` cannot be mapped' };
+      }
+    }
+  }
+  if (cs.offsetPath && cs.offsetPath !== 'none') {
+    return { ok: false, reason: 'CSS `offset-path` transform cannot be mapped' };
+  }
+  if (cs.zoom && cs.zoom !== 'normal') {
+    var zm = parseFloat(cs.zoom);
+    if (String(cs.zoom).indexOf('%') !== -1) zm /= 100;
+    if (!isFinite(zm) || zm <= 0) {
+      return { ok: false, reason: 'non-positive CSS `zoom: ' + cs.zoom + '` cannot be mapped' };
+    }
+    sx *= zm;
+    sy *= zm;
+  }
+  return { ok: true, sx: sx, sy: sy };
+};
+var checkTransformChain = function (startNode, doc) {
+  var win = (doc && doc.defaultView) || window;
+  var sx = 1;
+  var sy = 1;
+  var cur = startNode;
+  while (cur && cur.nodeType === 1) {
+    var step = checkAxisAlignedTransform(cur, win);
+    if (!step.ok) return step;
+    sx *= step.sx;
+    sy *= step.sy;
+    cur = cur.parentElement || (cur.parentNode && cur.parentNode.host) || null;
+  }
+  return { ok: true, sx: sx, sy: sy };
+};
+var frameTransform = function (frame) {
+  var doc = frame.ownerDocument || document;
+  var fv = doc.defaultView || window;
+  var chain = checkTransformChain(frame, doc);
+  if (!chain.ok) return chain;
+  var fr = frame.getBoundingClientRect();
+  var fs = fv.getComputedStyle(frame);
+  var cssBl = parseFloat(fs.borderLeftWidth) || 0;
+  var cssBt = parseFloat(fs.borderTopWidth) || 0;
+  var borderLeft = frame.clientLeft > cssBl + 0.5 ? frame.clientLeft : (cssBl || frame.clientLeft || 0);
+  var borderTop = frame.clientTop > cssBt + 0.5 ? frame.clientTop : (cssBt || frame.clientTop || 0);
+  var padLeft = parseFloat(fs.paddingLeft) || 0;
+  var padTop = parseFloat(fs.paddingTop) || 0;
+  var borderRight = parseFloat(fs.borderRightWidth) || 0;
+  var borderBottom = parseFloat(fs.borderBottomWidth) || 0;
+  var padRight = parseFloat(fs.paddingRight) || 0;
+  var padBottom = parseFloat(fs.paddingBottom) || 0;
+  var cssW = parseFloat(fs.width);
+  var cssH = parseFloat(fs.height);
+  var isBorderBox = fs.boxSizing === 'border-box';
+  var localW = isFinite(cssW) && cssW > 0
+    ? (isBorderBox ? cssW : cssW + borderLeft + borderRight + padLeft + padRight)
+    : frame.offsetWidth;
+  var localH = isFinite(cssH) && cssH > 0
+    ? (isBorderBox ? cssH : cssH + borderTop + borderBottom + padTop + padBottom)
+    : frame.offsetHeight;
+  if (!isFinite(localW) || localW <= 0 || !isFinite(localH) || localH <= 0 || !isFinite(fr.width) || fr.width <= 0 || !isFinite(fr.height) || fr.height <= 0) {
+    return { ok: false, reason: 'enclosing frame has non-positive layout dimensions' };
+  }
+  if (Math.abs(fr.width - localW * chain.sx) > Math.max(2, localW * chain.sx * 0.02) ||
+      Math.abs(fr.height - localH * chain.sy) > Math.max(2, localH * chain.sy * 0.02)) {
+    return { ok: false, reason: 'enclosing frame bounding box does not match axis-aligned transform geometry' };
+  }
+  var sx = fr.width / localW;
+  var sy = fr.height / localH;
+  return {
+    ok: true,
+    rect: fr,
+    sx: sx,
+    sy: sy,
+    ox: fr.left + sx * (borderLeft + padLeft),
+    oy: fr.top + sy * (borderTop + padTop),
+    contentRight: fr.right - sx * (borderRight + padRight),
+    contentBottom: fr.bottom - sy * (borderBottom + padBottom)
+  };
+};
+"#;
 
-/// JavaScript that removes every mask this module added.
+/// JavaScript that covers every visible editable field with an opaque box,
+/// including fields inside accessible same-origin and nested iframes.
+///
+/// `position: fixed` uses top-level viewport coordinates (`ox + sx * rect.left`,
+/// `oy + sy * rect.top`) so a single overlay at the highest `z-index` covers fields
+/// across nested scaled frames, except in `<frameset>` documents where masks live on
+/// each frame document itself. Fails clearly instead of leaving uncovered pixels if
+/// a frame or root element has a CSS transform that cannot be mapped accurately.
+static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"(function () {{
+{FRAME_HELPERS_JS}
+  var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
+  var masks = [];
+  var isFrameset = Boolean(document.body && document.body.tagName === 'FRAMESET');
+  var fail = function (reason) {{
+    for (var m = 0; m < masks.length; m++) {{
+      masks[m].remove();
+    }}
+    return {{ ok: false, reason: reason }};
+  }};
+  var measureHostMap = function (hostDoc) {{
+    var root = hostDoc && hostDoc.documentElement;
+    if (!root) return {{ ok: false, reason: 'document root element is missing' }};
+    var win = hostDoc.defaultView || window;
+    var chain = checkTransformChain(root, hostDoc);
+    if (!chain.ok) return chain;
+    var rcs = win.getComputedStyle(root);
+    var rootMoved = (rcs.transform && rcs.transform !== 'none') ||
+      (rcs.scale && rcs.scale !== 'none') ||
+      (rcs.translate && rcs.translate !== 'none') ||
+      Math.abs(chain.sx - 1) > 1e-6 ||
+      Math.abs(chain.sy - 1) > 1e-6;
+    if (!rootMoved) {{
+      return {{ ok: true, ox: 0, oy: 0, sx: 1, sy: 1 }};
+    }}
+    var probe = hostDoc.createElement('div');
+    probe.style.cssText = 'position:fixed;box-sizing:border-box;left:0px;top:0px;width:100px;height:100px;border:0;padding:0;margin:0;visibility:hidden;pointer-events:none;';
+    root.appendChild(probe);
+    var pr = probe.getBoundingClientRect();
+    probe.remove();
+    if (!isFinite(pr.width) || !isFinite(pr.height) || pr.width <= 0 || pr.height <= 0) {{
+      return {{ ok: false, reason: 'document root has collapsed transform geometry' }};
+    }}
+    return {{ ok: true, ox: pr.left, oy: pr.top, sx: pr.width / 100, sy: pr.height / 100 }};
+  }};
+  var topHost = isFrameset ? {{ ok: true, ox: 0, oy: 0, sx: 1, sy: 1 }} : measureHostMap(document);
+  var appendMask = function (hostDoc, hostMap, left, top, width, height) {{
+    if (!hostDoc || !hostDoc.documentElement || width <= 0 || height <= 0) return true;
+    var cssLeft = (left - hostMap.ox) / hostMap.sx;
+    var cssTop = (top - hostMap.oy) / hostMap.sy;
+    var cssW = width / hostMap.sx;
+    var cssH = height / hostMap.sy;
+    var mask = hostDoc.createElement('div');
+    mask.setAttribute('data-da-screenshot-mask', '');
+    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + cssLeft + 'px;top:' + cssTop + 'px;width:' + cssW + 'px;height:' + cssH + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
+    hostDoc.documentElement.appendChild(mask);
+    masks.push(mask);
+    var mr = mask.getBoundingClientRect();
+    if (!isFinite(mr.width) || mr.width <= 0 || !isFinite(mr.height) || mr.height <= 0 ||
+        mr.left > left + 1 || mr.top > top + 1 ||
+        mr.right < left + width - 1 || mr.bottom < top + height - 1) {{
+      return false;
+    }}
+    return true;
+  }};
+  var collectDoc = function (doc, ox, oy, sx, sy, clip, blockedReason) {{
+    var win = doc.defaultView || window;
+    var fields = doc.querySelectorAll('input, textarea, select, [contenteditable]');
+    for (var i = 0; i < fields.length; i++) {{
+      var el = fields[i];
+      if (el.nodeType !== 1) continue;
+      var tag = el.tagName;
+      var field = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+      if (!field && !el.isContentEditable) continue;
+      if (tag === 'INPUT' && skipped.indexOf((el.type || 'text').toLowerCase()) !== -1) continue;
+      if (!isBoxVisible(el, win)) continue;
+      if (blockedReason) return fail(blockedReason);
+      var rect = el.getBoundingClientRect();
+      if (isFrameset && doc !== document) {{
+        var frameHost = measureHostMap(doc);
+        if (!frameHost.ok) return fail(frameHost.reason);
+        if (!appendMask(doc, frameHost, rect.left, rect.top, rect.width, rect.height)) {{
+          return fail('screenshot mask could not cover transformed field');
+        }}
+        continue;
+      }}
+      var left = ox + sx * rect.left;
+      var top = oy + sy * rect.top;
+      var right = ox + sx * rect.right;
+      var bottom = oy + sy * rect.bottom;
+      if (clip) {{
+        left = Math.max(left, clip.left);
+        top = Math.max(top, clip.top);
+        right = Math.min(right, clip.right);
+        bottom = Math.min(bottom, clip.bottom);
+      }}
+      if (right <= left || bottom <= top) continue;
+      if (!appendMask(document, topHost, left, top, right - left, bottom - top)) {{
+        return fail('screenshot mask could not cover transformed field');
+      }}
+    }}
+    var frames = doc.querySelectorAll('iframe, frame');
+    for (var j = 0; j < frames.length; j++) {{
+      var frame = frames[j];
+      if (!isBoxVisible(frame, win)) continue;
+      var childDoc = null;
+      try {{
+        childDoc = frame.contentDocument;
+      }} catch (e) {{
+        childDoc = null;
+      }}
+      if (!childDoc) continue;
+      if (blockedReason) {{
+        var blockedErr = collectDoc(childDoc, 0, 0, 1, 1, null, blockedReason);
+        if (blockedErr) return blockedErr;
+        continue;
+      }}
+      var fTr = frameTransform(frame);
+      if (!fTr.ok) {{
+        var trErr = collectDoc(childDoc, 0, 0, 1, 1, null, fTr.reason);
+        if (trErr) return trErr;
+        continue;
+      }}
+      var childOx = ox + sx * fTr.ox;
+      var childOy = oy + sy * fTr.oy;
+      var childSx = sx * fTr.sx;
+      var childSy = sy * fTr.sy;
+      var nextClip = {{
+        left: childOx,
+        top: childOy,
+        right: ox + sx * fTr.contentRight,
+        bottom: oy + sy * fTr.contentBottom
+      }};
+      if (clip) {{
+        nextClip.left = Math.max(nextClip.left, clip.left);
+        nextClip.top = Math.max(nextClip.top, clip.top);
+        nextClip.right = Math.min(nextClip.right, clip.right);
+        nextClip.bottom = Math.min(nextClip.bottom, clip.bottom);
+      }}
+      if (nextClip.right <= nextClip.left || nextClip.bottom <= nextClip.top) continue;
+      var childErr = collectDoc(childDoc, childOx, childOy, childSx, childSy, nextClip, null);
+      if (childErr) return childErr;
+    }}
+    return null;
+  }};
+  var rootBlocked = topHost.ok ? null : topHost.reason;
+  var err = collectDoc(document, 0, 0, 1, 1, null, rootBlocked);
+  if (err) return err;
+  return {{ ok: true, count: masks.length }};
+}})()"#
+    )
+});
+
+/// JavaScript that removes every mask this module added across the top document
+/// and any accessible same-origin frames.
 const REMOVE_MASKS_SCRIPT: &str = r#"(function () {
-  var masks = document.querySelectorAll('[data-da-screenshot-mask]');
-  for (var i = 0; i < masks.length; i++) masks[i].remove();
-  return masks.length;
+  var removed = 0;
+  var cleanDoc = function (doc) {
+    var masks = doc.querySelectorAll('[data-da-screenshot-mask]');
+    for (var i = 0; i < masks.length; i++) {
+      masks[i].remove();
+      removed++;
+    }
+    var frames = doc.querySelectorAll('iframe, frame');
+    for (var j = 0; j < frames.length; j++) {
+      var childDoc = null;
+      try {
+        childDoc = frames[j].contentDocument;
+      } catch (e) {
+        childDoc = null;
+      }
+      if (childDoc) cleanDoc(childDoc);
+    }
+  };
+  cleanDoc(document);
+  return removed;
 })()"#;
 
 /// A deterministic way to name one element.
@@ -1008,7 +1324,7 @@ impl Locator {
                 json_string(selector)
             ),
             Self::Xpath(expression) => format!(
-                "var snap = document.evaluate({}, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\nvar matches = [];\nfor (var i = 0; i < snap.snapshotLength; i++) {{\n  var node = snap.snapshotItem(i);\n  if (node && node.nodeType === 1 && (root === document || (node !== root && root.contains(node)))) matches.push(node);\n}}\nvar hiddenFound = false;",
+                "var doc = root.nodeType === 9 ? root : (root.ownerDocument || document);\nvar snap = doc.evaluate({}, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\nvar matches = [];\nfor (var i = 0; i < snap.snapshotLength; i++) {{\n  var node = snap.snapshotItem(i);\n  if (node && node.nodeType === 1 && (root === doc || (node !== root && root.contains(node)))) matches.push(node);\n}}\nvar hiddenFound = false;",
                 json_string(expression)
             ),
             Self::TestId(id) => format!(
@@ -1032,14 +1348,84 @@ impl Locator {
 }
 
 /// The body of a focus lookup, run with the located element as `el`.
-const FOCUS_BODY: &str = "if (!el) return false; el.focus(); return document.activeElement === el;";
+const FOCUS_BODY: &str = "if (!el || !el.isConnected) return false; el.focus(); return (el.ownerDocument || document).activeElement === el;";
 
 /// The body of a text read, run with the located element as `el`.
 const TEXT_BODY: &str =
     "if (!el) return ''; return String(el.textContent === null ? '' : el.textContent).trim();";
 
 /// The body of a visibility read, run with the located element as `el`.
-const VISIBLE_BODY: &str = "if (!el || el.nodeType !== 1) return false; var style = window.getComputedStyle(el); var rect = el.getBoundingClientRect(); return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;";
+static VISIBLE_BODY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{FRAME_HELPERS_JS}
+if (!el || el.nodeType !== 1 || !el.isConnected) return false;
+var frames = collectEnclosingFrames(el);
+if (!frames || !areEnclosingFramesVisible(frames)) return false;
+return isBoxVisible(el, null);"#
+    )
+});
+
+/// Inspects a matched `within` container (`this`) and returns either the
+/// container element itself, the `contentDocument` of a ready same-origin frame,
+/// or a JSON status string (`missing`, `loading`, `cross_origin`).
+const ENTER_CONTAINER_SCRIPT: &str = r#"function () {
+  var el = this;
+  if (!el || el.nodeType !== 1) {
+    return JSON.stringify({ status: 'missing' });
+  }
+  var tag = el.tagName ? el.tagName.toUpperCase() : '';
+  if (tag !== 'IFRAME' && tag !== 'FRAME') {
+    return el;
+  }
+  if (!el.isConnected) {
+    return JSON.stringify({ status: 'missing' });
+  }
+  var doc = null;
+  try {
+    doc = el.contentDocument;
+  } catch (e) {
+    return JSON.stringify({ status: 'cross_origin' });
+  }
+  if (!doc) {
+    var hasWindow = false;
+    try {
+      hasWindow = el.contentWindow !== null;
+    } catch (e) {
+      hasWindow = true;
+    }
+    if (hasWindow || el.hasAttribute('sandbox')) {
+      return JSON.stringify({ status: 'cross_origin' });
+    }
+    return JSON.stringify({ status: 'missing' });
+  }
+  if (!el.hasAttribute('srcdoc')) {
+    var rawSrc = el.getAttribute('src');
+    if (rawSrc !== null) {
+      var trimmed = String(rawSrc).trim();
+      if (trimmed !== '' && trimmed.toLowerCase().indexOf('javascript:') !== 0) {
+        try {
+          var base = (el.ownerDocument && el.ownerDocument.baseURI) || location.href;
+          var targetUrl = new URL(trimmed, base);
+          var docUrl = String(doc.URL || '');
+          if (targetUrl.href !== 'about:blank' && docUrl === 'about:blank') {
+            var hostOrigin = (el.ownerDocument && el.ownerDocument.defaultView && el.ownerDocument.defaultView.location)
+              ? el.ownerDocument.defaultView.location.origin
+              : location.origin;
+            if (targetUrl.origin !== hostOrigin) {
+              return JSON.stringify({ status: 'cross_origin' });
+            }
+            return JSON.stringify({ status: 'loading' });
+          }
+        } catch (e) {
+        }
+      }
+    }
+  }
+  if (doc.readyState === 'loading') {
+    return JSON.stringify({ status: 'loading' });
+  }
+  return doc;
+}"#;
 
 /// Summarizes one DOM element (`el`) as `{ tag, id, text }` for multi-match diagnostics.
 const SUMMARIZE_ELEMENT_BODY: &str = r#"
@@ -1089,18 +1475,15 @@ const TEXT_COLLECT_TEMPLATE: &str = r#"var wanted = __DA_WANTED__;
 var normalize = function (value) {
   return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
 };
-var visible = function (el) {
-  var style = window.getComputedStyle(el);
-  var rect = el.getBoundingClientRect();
-  return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse' && rect.width > 0 && rect.height > 0;
-};
+var rootFrames = collectEnclosingFrames(root);
+var framesVisible = rootFrames !== null && areEnclosingFramesVisible(rootFrames);
 var all = root.querySelectorAll('*');
 var hiddenFound = false;
 var visibleMatches = [];
 for (var i = 0; i < all.length; i++) {
   var el = all[i];
   if (normalize(el.innerText) === wanted) {
-    if (visible(el)) visibleMatches.push(el);
+    if (framesVisible && isBoxVisible(el, null)) visibleMatches.push(el);
     else hiddenFound = true;
   }
 }
@@ -1116,7 +1499,10 @@ for (var j = 0; j < visibleMatches.length; j++) {
 
 /// Builds the text candidate collection snippet for one value.
 fn text_collect_script(text: &str) -> String {
-    TEXT_COLLECT_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
+    format!(
+        "{FRAME_HELPERS_JS}\n{}",
+        TEXT_COLLECT_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
+    )
 }
 
 /// One matched element summary returned for ambiguous-locator and occlusion errors.
@@ -1144,61 +1530,141 @@ impl CandidateInfo {
     }
 }
 
-/// Inspects an element (`el`) for visibility, disabled state, geometry, and hit-test.
-const ACTIONABLE_INSPECT_BODY: &str = r#"
-var summarizeNode = function (node) {
+/// Inspects an element (`el`) for visibility, disabled state, geometry, and hit-test,
+/// accumulating viewport offsets and checking `elementFromPoint` across enclosing frames.
+static ACTIONABLE_INSPECT_BODY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{FRAME_HELPERS_JS}
+var summarizeNode = function (node) {{
   var tag = node.tagName ? node.tagName.toLowerCase() : 'element';
   var id = node.id ? String(node.id) : '';
   var raw = (node.innerText && node.innerText.trim()) ? node.innerText : node.textContent;
   var text = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ').trim();
   if (text.length > 240) text = text.slice(0, 240);
-  return { tag: tag, id: id, text: text };
-};
-if (!el || el.nodeType !== 1) return { status: 'not_visible' };
-var style = window.getComputedStyle(el);
-var rect = el.getBoundingClientRect();
-if (
-  style.display === 'none' ||
-  style.visibility === 'hidden' ||
-  style.visibility === 'collapse' ||
-  rect.width <= 0 ||
-  rect.height <= 0
-) {
-  return { status: 'not_visible' };
-}
+  return {{ tag: tag, id: id, text: text }};
+}};
+if (!el || el.nodeType !== 1 || !el.isConnected) return {{ status: 'not_visible' }};
+var frames = collectEnclosingFrames(el);
+if (!frames || !areEnclosingFramesVisible(frames) || !isBoxVisible(el, null)) {{
+  return {{ status: 'not_visible' }};
+}}
 var fs = typeof el.closest === 'function' ? el.closest('fieldset[disabled]') : null;
 var inDisabledFieldset = false;
-if (fs) {
+if (fs) {{
   var legend = fs.querySelector('legend');
   if (!legend || !legend.contains(el)) inDisabledFieldset = true;
-}
+}}
 var ariaNode = typeof el.closest === 'function' ? el.closest('[aria-disabled]') : null;
 var ariaDisabled = ariaNode !== null && String(ariaNode.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
-if (el.disabled === true || el.hasAttribute('disabled') || inDisabledFieldset || ariaDisabled) {
-  return { status: 'disabled' };
-}
-var vw = window.innerWidth || document.documentElement.clientWidth || 0;
-var vh = window.innerHeight || document.documentElement.clientHeight || 0;
-var cx0 = rect.left + rect.width / 2;
-var cy0 = rect.top + rect.height / 2;
-if (cx0 < 0 || cx0 >= vw || cy0 < 0 || cy0 >= vh) {
-  el.scrollIntoView({ block: 'center', inline: 'center' });
+if (el.disabled === true || el.hasAttribute('disabled') || inDisabledFieldset || ariaDisabled) {{
+  return {{ status: 'disabled' }};
+}}
+var elDoc = el.ownerDocument || document;
+var elWin = elDoc.defaultView || window;
+var rect = el.getBoundingClientRect();
+var elVw = elWin.innerWidth || (elDoc.documentElement && elDoc.documentElement.clientWidth) || 0;
+var elVh = elWin.innerHeight || (elDoc.documentElement && elDoc.documentElement.clientHeight) || 0;
+var lx0 = rect.left + rect.width / 2;
+var ly0 = rect.top + rect.height / 2;
+if (lx0 < 0 || lx0 >= elVw || ly0 < 0 || ly0 >= elVh) {{
+  el.scrollIntoView({{ block: 'center', inline: 'center' }});
   rect = el.getBoundingClientRect();
-}
-var cx = rect.left + rect.width / 2;
-var cy = rect.top + rect.height / 2;
-var hit = document.elementFromPoint(cx, cy);
+}}
+var curX = rect.left + rect.width / 2;
+var curY = rect.top + rect.height / 2;
+for (var i = frames.length - 1; i >= 0; i--) {{
+  var f = frames[i];
+  var fDoc = f.ownerDocument || document;
+  var fWin = fDoc.defaultView || window;
+  var fb = frameTransform(f);
+  if (!fb.ok) {{
+    return {{ status: 'unmappable_transform', reason: fb.reason }};
+  }}
+  var px = fb.ox + fb.sx * curX;
+  var py = fb.oy + fb.sy * curY;
+  var fVw = fWin.innerWidth || (fDoc.documentElement && fDoc.documentElement.clientWidth) || 0;
+  var fVh = fWin.innerHeight || (fDoc.documentElement && fDoc.documentElement.clientHeight) || 0;
+  if (px < 0 || px >= fVw || py < 0 || py >= fVh) {{
+    f.scrollIntoView({{ block: 'center', inline: 'center' }});
+    fb = frameTransform(f);
+    if (!fb.ok) {{
+      return {{ status: 'unmappable_transform', reason: fb.reason }};
+    }}
+    px = fb.ox + fb.sx * curX;
+    py = fb.oy + fb.sy * curY;
+    if (px < 0 || px >= fVw || py < 0 || py >= fVh) {{
+      fWin.scrollBy(px - fVw / 2, py - fVh / 2);
+      fb = frameTransform(f);
+      if (!fb.ok) {{
+        return {{ status: 'unmappable_transform', reason: fb.reason }};
+      }}
+      px = fb.ox + fb.sx * curX;
+      py = fb.oy + fb.sy * curY;
+    }}
+  }}
+  curX = px;
+  curY = py;
+}}
+rect = el.getBoundingClientRect();
+var lx = rect.left + rect.width / 2;
+var ly = rect.top + rect.height / 2;
+var accX = lx;
+var accY = ly;
+var accLeft = rect.left;
+var accTop = rect.top;
+var accW = rect.width;
+var accH = rect.height;
+var levelChecks = [];
+for (var j = frames.length - 1; j >= 0; j--) {{
+  var frame = frames[j];
+  var fTr = frameTransform(frame);
+  if (!fTr.ok) {{
+    return {{ status: 'unmappable_transform', reason: fTr.reason }};
+  }}
+  accX = fTr.ox + fTr.sx * accX;
+  accY = fTr.oy + fTr.sy * accY;
+  accLeft = fTr.ox + fTr.sx * accLeft;
+  accTop = fTr.oy + fTr.sy * accTop;
+  accW = fTr.sx * accW;
+  accH = fTr.sy * accH;
+  levelChecks.unshift({{
+    doc: frame.ownerDocument || document,
+    x: accX,
+    y: accY,
+    target: frame
+  }});
+}}
+var topX = accX;
+var topY = accY;
+var topRect = {{ x: accLeft, y: accTop, width: accW, height: accH }};
+for (var k = 0; k < levelChecks.length; k++) {{
+  var check = levelChecks[k];
+  var fHit = check.doc.elementFromPoint(check.x, check.y);
+  if (fHit !== check.target) {{
+    return {{
+      status: 'ready_candidate',
+      rect: topRect,
+      x: topX,
+      y: topY,
+      hit_ok: false,
+      blocker: fHit ? summarizeNode(fHit) : null
+    }};
+  }}
+}}
+var hit = elDoc.elementFromPoint(lx, ly);
 var hitOk = hit !== null && (hit === el || el.contains(hit));
 var blocker = !hitOk && hit ? summarizeNode(hit) : null;
-return {
+return {{
   status: 'ready_candidate',
-  rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
-  x: cx,
-  y: cy,
+  rect: topRect,
+  x: topX,
+  y: topY,
   hit_ok: hitOk,
   blocker: blocker
-};
-"#;
+}};
+"#
+    )
+});
 
 /// Viewport rectangle used to check stability across consecutive polls.
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1224,6 +1690,9 @@ impl ElementRect {
 enum ActionableInspect {
     NotVisible,
     Disabled,
+    UnmappableTransform {
+        reason: String,
+    },
     ReadyCandidate {
         rect: ElementRect,
         x: f64,
@@ -1231,6 +1700,43 @@ enum ActionableInspect {
         hit_ok: bool,
         blocker: Option<CandidateInfo>,
     },
+}
+
+/// JavaScript returning the frame-index path from `window.top` to the document
+/// holding `this`, or `null` if detached / cross-origin.
+const FRAME_PATH_BODY: &str = r#"function () {
+  var doc = this && this.nodeType === 9 ? this : (this && this.ownerDocument);
+  var win = doc && doc.defaultView;
+  if (!win) return null;
+  var path = [];
+  try {
+    var topWin = window.top;
+    while (win !== topWin) {
+      var parent = win.parent;
+      var idx = -1;
+      for (var i = 0; i < parent.frames.length; i++) {
+        if (parent.frames[i] === win) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) return null;
+      path.unshift(idx);
+      win = parent;
+    }
+  } catch (e) {
+    return null;
+  }
+  return path;
+}"#;
+
+/// Status returned by `ENTER_CONTAINER_SCRIPT` when a `within` frame is missing, loading, or cross-origin.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum WithinContainerStatus {
+    Missing,
+    Loading,
+    CrossOrigin,
 }
 
 /// Status returned by the page candidate-resolution script when no single element was picked.
@@ -1498,20 +2004,31 @@ impl BrowserSession {
 
     /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
-        let browser = Launched::launch_with_mode(
-            args.headless,
-            args.width,
-            args.height,
-            Deadline::after(LAUNCH_TIMEOUT),
-            detached,
+        let deadline = Deadline::after(LAUNCH_TIMEOUT);
+        let (browser, (connection, page, target_id)) = launch_browser_with_retry(
+            deadline,
+            MAX_LAUNCH_ATTEMPTS,
+            |attempt_deadline| {
+                Launched::launch_with_mode(
+                    args.headless,
+                    args.width,
+                    args.height,
+                    attempt_deadline,
+                    detached,
+                )
+            },
+            |browser, attempt_deadline| {
+                let mut connection = Connection::connect(browser.websocket_url(), attempt_deadline)
+                    .map_err(|error| {
+                        format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
+                    })?;
+                let (page, target_id) = attach(&mut connection, attempt_deadline)?;
+                Ok((connection, page, target_id))
+            },
+            Launched::abort,
         )?;
         let port = browser.port();
         let websocket_url = browser.websocket_url().to_string();
-        let mut connection = Connection::connect(&websocket_url, Deadline::after(LAUNCH_TIMEOUT))
-            .map_err(|error| {
-                format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
-            })?;
-        let (page, target_id) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
         let network = network::NetworkState::new(&page);
 
         Ok(Self {
@@ -1803,7 +2320,7 @@ impl BrowserSession {
                     session.call_function_poll(
                         target_desc,
                         &object_id,
-                        VISIBLE_BODY,
+                        VISIBLE_BODY.as_str(),
                         "check the visibility of",
                         deadline,
                         dialog,
@@ -1855,7 +2372,7 @@ impl BrowserSession {
         let raw = self.call_function_poll(
             target_desc,
             &object_id,
-            ACTIONABLE_INSPECT_BODY,
+            ACTIONABLE_INSPECT_BODY.as_str(),
             "inspect the actionability of",
             deadline,
             dialog,
@@ -1866,12 +2383,17 @@ impl BrowserSession {
             )))
         })?;
         match evaluate_actionable_inspect(previous_rect, inspect) {
-            Ok((x, y)) => Ok(Ok(ActionableTarget {
+            ActionablePoll::Ready(x, y) => Ok(Ok(ActionableTarget {
                 located: Located(object_id),
                 x,
                 y,
             })),
-            Err(reason) => Ok(Err(reason)),
+            ActionablePoll::Pending(reason) => Ok(Err(reason)),
+            ActionablePoll::UnmappableTransform(reason) => {
+                Err(LocateError::Step(StepError::Execution(format!(
+                    "could not map {target_desc} into viewport coordinates: {reason}"
+                ))))
+            }
         }
     }
 
@@ -1889,7 +2411,7 @@ impl BrowserSession {
             match self.call_function_poll(
                 &target_desc,
                 &object_id,
-                VISIBLE_BODY,
+                VISIBLE_BODY.as_str(),
                 "check the visibility of",
                 deadline,
                 dialog,
@@ -2059,14 +2581,25 @@ impl BrowserSession {
         deadline: Deadline,
         dialog: &mut DialogContext,
     ) -> Result<ResolvePoll, LocateError> {
+        let testid_attribute = self.testid_attribute.clone();
         let root = match &target.within {
             Some(container) => match self.resolve_target_once(container, deadline, dialog)? {
-                ResolvePoll::Found(container_id) => Some(container_id),
+                ResolvePoll::Found(container_id) => {
+                    let container_desc = container.describe_with(&testid_attribute);
+                    match self.enter_within_container(
+                        &container_desc,
+                        container_id,
+                        deadline,
+                        dialog,
+                    )? {
+                        ResolvePoll::Found(entered_id) => Some(entered_id),
+                        pending @ ResolvePoll::Pending { .. } => return Ok(pending),
+                    }
+                }
                 pending @ ResolvePoll::Pending { .. } => return Ok(pending),
             },
             None => None,
         };
-        let testid_attribute = self.testid_attribute.clone();
         let target_desc = target.describe_with(&testid_attribute);
         if let Locator::Role { role, name } = &target.locator {
             return self.resolve_role_once(
@@ -2147,6 +2680,58 @@ impl BrowserSession {
         }
     }
 
+    /// Resolves a matched `within` container into the DOM node whose subtree the
+    /// inner locator searches: the element itself, or `contentDocument` when the
+    /// element is an `<iframe>` or `<frame>`.
+    fn enter_within_container(
+        &mut self,
+        container_desc: &str,
+        object_id: String,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<ResolvePoll, LocateError> {
+        let scope = self.scope();
+        let connection = self.connection_mut().map_err(LocateError::Step)?;
+        let remote = page_call_function_remote(
+            connection,
+            &scope,
+            &object_id,
+            ENTER_CONTAINER_SCRIPT,
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(container_desc, failure))?;
+
+        match remote {
+            RemoteResult::Object(root_id) => Ok(ResolvePoll::Found(root_id)),
+            RemoteResult::Value(Value::String(raw_json)) => {
+                let status: WithinContainerStatus = serde_json::from_str(&raw_json).map_err(|error| {
+                    LocateError::Step(StepError::Environment(format!(
+                        "the browser returned an invalid container status for {container_desc}: {error}"
+                    )))
+                })?;
+                match status {
+                    WithinContainerStatus::Missing => Ok(ResolvePoll::Pending {
+                        target_desc: container_desc.to_string(),
+                        reason: PendingReason::Missing,
+                    }),
+                    WithinContainerStatus::Loading => Ok(ResolvePoll::Pending {
+                        target_desc: container_desc.to_string(),
+                        reason: PendingReason::FrameLoading,
+                    }),
+                    WithinContainerStatus::CrossOrigin => {
+                        Err(LocateError::Step(StepError::Execution(format!(
+                            "cannot enter {container_desc}: cross-origin iframes are not supported; `within` only supports same-origin iframes"
+                        ))))
+                    }
+                }
+            }
+            RemoteResult::Value(other) => Err(LocateError::Step(StepError::Environment(format!(
+                "the browser returned an unexpected value while entering {container_desc}: {other}"
+            )))),
+        }
+    }
+
     /// Runs one non-blocking resolution pass for a `role` locator inside `root`.
     #[allow(clippy::too_many_arguments)]
     // Splitting role, name, nth, root, deadline, and dialog across a single-use struct would obscure the direct poll arguments.
@@ -2167,7 +2752,7 @@ impl BrowserSession {
             let visible = self.call_function_poll(
                 target_desc,
                 &object_id,
-                VISIBLE_BODY,
+                VISIBLE_BODY.as_str(),
                 "check the visibility of",
                 deadline,
                 dialog,
@@ -2291,6 +2876,16 @@ impl BrowserSession {
             .cloned()
             .unwrap_or_default();
 
+        let root_context = match root {
+            Some(root_id) => {
+                match self.resolve_role_root_context(target_desc, root_id, deadline, dialog)? {
+                    Some(context) => Some(context),
+                    None => return Ok((false, Vec::new())),
+                }
+            }
+            None => None,
+        };
+
         let mut matched = false;
         let mut objects = Vec::new();
         for node in nodes {
@@ -2318,28 +2913,131 @@ impl BrowserSession {
                 dialog,
             )
             .map_err(|failure| locate_error(target_desc, failure))?;
-            if let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str) {
-                if let Some(root_id) = root {
-                    let connection = self.connection_mut().map_err(LocateError::Step)?;
-                    let inside = page_call_function_with_object(
-                        connection,
-                        &scope,
-                        root_id,
-                        object_id,
-                        "function (el) { return Boolean(el) && this !== el && this.contains(el); }",
-                        deadline,
-                        dialog,
-                    )
-                    .map_err(|failure| locate_error(target_desc, failure))?;
-                    if inside != Value::Bool(true) {
-                        continue;
-                    }
-                }
+            if let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str)
+                && self.node_matches_role_root(
+                    target_desc,
+                    object_id,
+                    root_context.as_ref(),
+                    deadline,
+                    dialog,
+                )?
+            {
                 matched = true;
                 objects.push(object_id.to_string());
             }
         }
         Ok((matched, objects))
+    }
+
+    /// Resolves a `role` query's `within` root into its frame-index path and an
+    /// `objectId` in that frame's own JavaScript world so `this.contains(el)` runs
+    /// in the same context as nodes returned by `DOM.resolveNode`.
+    fn resolve_role_root_context(
+        &mut self,
+        target_desc: &str,
+        root_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<Option<(Vec<Value>, String)>, LocateError> {
+        let scope = self.scope();
+        let connection = self.connection_mut().map_err(LocateError::Step)?;
+        let path = page_call_function(
+            connection,
+            &scope,
+            root_id,
+            FRAME_PATH_BODY,
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(target_desc, failure))?;
+        let Some(path_array) = path.as_array().cloned() else {
+            return Ok(None);
+        };
+        if path_array.is_empty() {
+            return Ok(Some((path_array, root_id.to_string())));
+        }
+        let described = page_call(
+            connection,
+            &scope,
+            "DOM.describeNode",
+            json!({ "objectId": root_id, "depth": 0 }),
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(target_desc, failure))?;
+        let Some(root_backend_id) = described
+            .pointer("/node/backendNodeId")
+            .and_then(Value::as_i64)
+        else {
+            return Ok(None);
+        };
+        let resolved_root = page_call(
+            connection,
+            &scope,
+            "DOM.resolveNode",
+            json!({ "backendNodeId": root_backend_id }),
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| locate_error(target_desc, failure))?;
+        Ok(resolved_root
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .map(|own_id| (path_array, own_id.to_string())))
+    }
+
+    /// Checks that an AX node belongs to the top-level document (when unscoped)
+    /// or to the exact frame and DOM subtree of `root_context` (when `within` is set).
+    fn node_matches_role_root(
+        &mut self,
+        target_desc: &str,
+        object_id: &str,
+        root_context: Option<&(Vec<Value>, String)>,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<bool, LocateError> {
+        let scope = self.scope();
+        let inside = match root_context {
+            Some((expected_path, root_id)) => {
+                let connection = self.connection_mut().map_err(LocateError::Step)?;
+                let el_path = page_call_function(
+                    connection,
+                    &scope,
+                    object_id,
+                    FRAME_PATH_BODY,
+                    deadline,
+                    dialog,
+                )
+                .map_err(|failure| locate_error(target_desc, failure))?;
+                if el_path.as_array() != Some(expected_path) {
+                    return Ok(false);
+                }
+                let connection = self.connection_mut().map_err(LocateError::Step)?;
+                page_call_function_with_object(
+                    connection,
+                    &scope,
+                    root_id,
+                    object_id,
+                    "function (el) { return Boolean(el) && this !== el && this.contains(el); }",
+                    deadline,
+                    dialog,
+                )
+                .map_err(|failure| locate_error(target_desc, failure))?
+            }
+            None => {
+                let connection = self.connection_mut().map_err(LocateError::Step)?;
+                page_call_function(
+                    connection,
+                    &scope,
+                    object_id,
+                    "function () { return window === window.top && this.ownerDocument === document; }",
+                    deadline,
+                    dialog,
+                )
+                .map_err(|failure| locate_error(target_desc, failure))?
+            }
+        };
+        Ok(inside == Value::Bool(true))
     }
 
     /// Runs one action body on a located element and maps its errors.
@@ -2418,16 +3116,25 @@ impl BrowserSession {
     fn capture_masked_png(&mut self, deadline: Deadline) -> Result<Vec<u8>, StepError> {
         let scope = self.scope();
         let mut dialog = DialogContext::fail_fast();
-        page_evaluate(
+        let mask_result = page_evaluate(
             self.connection_mut()?,
             &scope,
-            MASK_INPUTS_SCRIPT,
+            MASK_INPUTS_SCRIPT.as_str(),
             deadline,
             &mut dialog,
         )
         .map_err(|failure| {
             failure.environment("could not cover the editable fields before the screenshot")
         })?;
+        if mask_result.get("ok").and_then(Value::as_bool) != Some(true) {
+            let reason = mask_result
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("enclosing frame geometry could not be mapped");
+            return Err(StepError::Execution(format!(
+                "could not cover editable fields before the screenshot: {reason}"
+            )));
+        }
 
         let captured = page_call(
             self.connection_mut()?,
@@ -2486,10 +3193,12 @@ const MAX_TARGET_DIAGNOSTIC_EVENTS: usize = 5;
 /// it yet, so closing a stalled/crashed tab and opening a replacement is safe
 /// and idempotent inside the existing `LAUNCH_TIMEOUT` budget.
 const MAX_ATTACH_ATTEMPTS: usize = 3;
-/// Per-attempt budget for `Page.enable` / `Runtime.enable` / `Network.enable`.
+/// Per-attempt budget for `Target.createTarget`, `Target.attachToTarget`, and
+/// domain setup (`Page.enable` / `Runtime.enable` / `Network.enable`).
 ///
-/// Healthy targets answer in tens of milliseconds; capping each attempt at 5 s
-/// lets a silent renderer hang abort and retry within the 30 s `LAUNCH_TIMEOUT`.
+/// Healthy targets answer in tens of milliseconds; capping each step at 5 s
+/// lets a silent renderer or startup attach hang abort and retry within the 30 s
+/// `LAUNCH_TIMEOUT`.
 const ATTACH_ENABLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long `attach` waits for `Target.closeTarget` when cleaning up a failed fresh tab.
 const ATTACH_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -2548,23 +3257,33 @@ fn attach_with_enable_timeout(
             Ok(attached) => return Ok(attached),
             Err(failure) => {
                 let mut effective_kind = failure.kind;
-                attempt_errors.push(failure.message);
+                let mut attempt_error = failure.message;
                 if let Some(target_id) = failure.target_id.as_deref()
                     && !failure.target_destroyed
                     && effective_kind == AttachFailureKind::TargetFailed
                     && !deadline.passed()
                     && attempt < MAX_ATTACH_ATTEMPTS
                 {
-                    if let Err(CdpError::Transport(_)) = connection.call(
+                    if let Err(close_error) = connection.call(
                         "Target.closeTarget",
                         json!({ "targetId": target_id }),
                         None,
                         deadline.capped(ATTACH_CLOSE_TIMEOUT),
                     ) {
-                        effective_kind = AttachFailureKind::BrowserFailed;
+                        match close_error {
+                            // The target may have closed itself right after failing.
+                            CdpError::Method { message, .. } if message.contains("No target") => {}
+                            other => {
+                                effective_kind = AttachFailureKind::BrowserFailed;
+                                attempt_error = format!(
+                                    "{attempt_error}; cleanup failed (`Target.closeTarget` on `{target_id}`): {other}"
+                                );
+                            }
+                        }
                     }
                     let _ = connection.take_messages();
                 }
+                attempt_errors.push(attempt_error);
                 if decide_attach_retry(
                     attempt,
                     MAX_ATTACH_ATTEMPTS,
@@ -2587,6 +3306,54 @@ struct AttachScope<'a> {
     session_id: Option<&'a str>,
 }
 
+/// Attempts to launch and attach a fresh browser up to `max_attempts` times
+/// inside `deadline`.
+///
+/// Failures before a browser process reports its debug port (such as a missing
+/// binary) fail immediately; post-startup connect/attach failures immediately
+/// abort the wedged process and retry while `deadline` has budget left, or stop
+/// and report both errors if abort/cleanup itself fails.
+fn launch_browser_with_retry<B, C>(
+    deadline: Deadline,
+    max_attempts: usize,
+    mut spawn_browser: impl FnMut(Deadline) -> Result<B, String>,
+    mut connect_and_attach: impl FnMut(&B, Deadline) -> Result<C, String>,
+    mut abort_browser: impl FnMut(B) -> Result<(), String>,
+) -> Result<(B, C), String>
+where
+    C: Sized,
+{
+    let mut errors = Vec::with_capacity(max_attempts);
+    for attempt in 1..=max_attempts {
+        let browser = spawn_browser(deadline)?;
+        match connect_and_attach(&browser, deadline) {
+            Ok(attached) => return Ok((browser, attached)),
+            Err(error) => {
+                if let Err(cleanup_error) = abort_browser(browser) {
+                    errors.push(format!("{error}; browser cleanup failed: {cleanup_error}"));
+                    break;
+                }
+                errors.push(error);
+                if attempt >= max_attempts || deadline.passed() {
+                    break;
+                }
+            }
+        }
+    }
+    if errors.len() == 1 {
+        return Err(errors.pop().unwrap_or_default());
+    }
+    let summary = errors
+        .into_iter()
+        .enumerate()
+        .map(|(index, error)| format!("launch attempt {}: {error}", index + 1))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "could not attach to a freshly started browser: {summary}"
+    ))
+}
+
 /// Attempts once to create a fresh `about:blank` target, attach to it, and
 /// enable `Page`, `Runtime`, and `Network`.
 fn attach_once(
@@ -2604,7 +3371,7 @@ fn attach_once(
             target_id: None,
             session_id: None,
         },
-        deadline,
+        deadline.capped(enable_timeout),
     )?;
     let target_id = target
         .get("targetId")
@@ -2636,7 +3403,7 @@ fn attach_existing_target(
             target_id: Some(target_id),
             session_id: None,
         },
-        deadline,
+        deadline.capped(enable_timeout),
     )?;
     let page = attached
         .get("sessionId")
@@ -3279,25 +4046,38 @@ enum ResolvePoll {
 enum PendingReason {
     Missing,
     Hidden,
+    FrameLoading,
     OutOfRange { index: usize, count: usize },
     Disabled,
     Unstable,
     Occluded(Option<CandidateInfo>),
 }
 
+/// Outcome of evaluating one actionability snapshot against the prior poll's geometry.
+#[derive(Debug, PartialEq)]
+enum ActionablePoll {
+    Ready(f64, f64),
+    Pending(PendingReason),
+    UnmappableTransform(String),
+}
+
 /// Evaluates one actionability snapshot against the prior poll's geometry.
 fn evaluate_actionable_inspect(
     previous_rect: &mut Option<ElementRect>,
     inspect: ActionableInspect,
-) -> Result<(f64, f64), PendingReason> {
+) -> ActionablePoll {
     match inspect {
         ActionableInspect::NotVisible => {
             *previous_rect = None;
-            Err(PendingReason::Hidden)
+            ActionablePoll::Pending(PendingReason::Hidden)
         }
         ActionableInspect::Disabled => {
             *previous_rect = None;
-            Err(PendingReason::Disabled)
+            ActionablePoll::Pending(PendingReason::Disabled)
+        }
+        ActionableInspect::UnmappableTransform { reason } => {
+            *previous_rect = None;
+            ActionablePoll::UnmappableTransform(reason)
         }
         ActionableInspect::ReadyCandidate {
             rect,
@@ -3309,12 +4089,12 @@ fn evaluate_actionable_inspect(
             let stable = previous_rect.is_some_and(|prev| prev.same_geometry(rect));
             *previous_rect = Some(rect);
             if !hit_ok {
-                return Err(PendingReason::Occluded(blocker));
+                return ActionablePoll::Pending(PendingReason::Occluded(blocker));
             }
             if !stable {
-                return Err(PendingReason::Unstable);
+                return ActionablePoll::Pending(PendingReason::Unstable);
             }
-            Ok((x, y))
+            ActionablePoll::Ready(x, y)
         }
     }
 }
@@ -3338,6 +4118,9 @@ fn pending_timeout_error(
         )),
         PendingReason::Hidden => StepError::Execution(format!(
             "{target_desc} was found but not visible within {ms} ms; check the page and the locator"
+        )),
+        PendingReason::FrameLoading => StepError::Execution(format!(
+            "frame {target_desc} did not finish loading within {ms} ms"
         )),
         PendingReason::OutOfRange { index, count } => {
             let noun = if count == 1 { "element" } else { "elements" };
@@ -4859,12 +5642,15 @@ mod tests {
 
     #[test]
     fn only_read_and_wait_allow_retry() {
+        let within_args = json!({ "css": "#status", "within": { "css": "#embed" } });
         for name in ["browser.read", "browser.wait"] {
             let def = definition(name);
-            assert!(
-                (def.check_retry)(&json!({})).is_ok(),
-                "`{name}` must allow retry"
-            );
+            for args in [json!({}), within_args.clone()] {
+                assert!(
+                    (def.check_retry)(&args).is_ok(),
+                    "`{name}` must allow retry for {args}"
+                );
+            }
         }
         for name in [
             "browser.open",
@@ -4874,10 +5660,12 @@ mod tests {
             "browser.screenshot",
         ] {
             let def = definition(name);
-            let error = (def.check_retry)(&json!({}))
-                .err()
-                .unwrap_or_else(|| panic!("`{name}` must reject retry"));
-            assert!(error.contains("cannot use `retry`"), "{name}: {error}");
+            for args in [json!({}), within_args.clone()] {
+                let error = (def.check_retry)(&args)
+                    .err()
+                    .unwrap_or_else(|| panic!("`{name}` must reject retry for {args}"));
+                assert!(error.contains("cannot use `retry`"), "{name}: {error}");
+            }
         }
     }
 
@@ -5529,7 +6317,10 @@ mod tests {
                 blocker: Some(host.clone()),
             },
         );
-        assert_eq!(first, Err(PendingReason::Occluded(Some(host.clone()))));
+        assert_eq!(
+            first,
+            ActionablePoll::Pending(PendingReason::Occluded(Some(host.clone())))
+        );
         assert!(previous.is_some());
 
         // Second poll with unchanged geometry still reports Occluded.
@@ -5543,7 +6334,10 @@ mod tests {
                 blocker: Some(host.clone()),
             },
         );
-        assert_eq!(second, Err(PendingReason::Occluded(Some(host))));
+        assert_eq!(
+            second,
+            ActionablePoll::Pending(PendingReason::Occluded(Some(host)))
+        );
 
         // Second poll with changed geometry reports Unstable even if poll 1 was occluded.
         let moved_second = evaluate_actionable_inspect(
@@ -5556,7 +6350,10 @@ mod tests {
                 blocker: None,
             },
         );
-        assert_eq!(moved_second, Err(PendingReason::Unstable));
+        assert_eq!(
+            moved_second,
+            ActionablePoll::Pending(PendingReason::Unstable)
+        );
 
         // Unoccluded element still requires two matching polls, and Hidden resets history.
         let mut fresh = None;
@@ -5571,11 +6368,11 @@ mod tests {
                     blocker: None,
                 },
             ),
-            Err(PendingReason::Unstable)
+            ActionablePoll::Pending(PendingReason::Unstable)
         );
         assert_eq!(
             evaluate_actionable_inspect(&mut fresh, ActionableInspect::NotVisible),
-            Err(PendingReason::Hidden)
+            ActionablePoll::Pending(PendingReason::Hidden)
         );
         assert!(fresh.is_none());
         assert_eq!(
@@ -5589,7 +6386,7 @@ mod tests {
                     blocker: None,
                 },
             ),
-            Err(PendingReason::Unstable)
+            ActionablePoll::Pending(PendingReason::Unstable)
         );
         assert_eq!(
             evaluate_actionable_inspect(
@@ -5602,8 +6399,18 @@ mod tests {
                     blocker: None,
                 },
             ),
-            Ok((88.0, 26.0))
+            ActionablePoll::Ready(88.0, 26.0)
         );
+        assert_eq!(
+            evaluate_actionable_inspect(
+                &mut fresh,
+                ActionableInspect::UnmappableTransform {
+                    reason: "rotated CSS transform".to_string()
+                }
+            ),
+            ActionablePoll::UnmappableTransform("rotated CSS transform".to_string())
+        );
+        assert!(fresh.is_none());
     }
 
     fn spawn_mock_cdp<F>(handler: F) -> (String, thread::JoinHandle<()>)
@@ -5933,6 +6740,357 @@ mod tests {
             (page2.as_str(), target2.as_str()),
             ("session-2", "target-2")
         );
+    }
+
+    #[test]
+    fn attach_recovers_when_attach_to_target_stalls_silently() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            assert_eq!(create1["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+
+            let attach1 = read_cdp_request(&mut socket);
+            assert_eq!(attach1["method"], "Target.attachToTarget");
+            assert_eq!(attach1["params"]["targetId"], "target-1");
+            // Never answer Target.attachToTarget on target-1; wait for Target.closeTarget.
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            assert_eq!(close1["params"]["targetId"], "target-1");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": close1["id"], "result": { "success": true } }).to_string(),
+                ))
+                .expect("close target-1");
+
+            let create2 = read_cdp_request(&mut socket);
+            assert_eq!(create2["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create2["id"], "result": { "targetId": "target-2" } })
+                        .to_string(),
+                ))
+                .expect("create target-2");
+            let attach2 = read_cdp_request(&mut socket);
+            assert_eq!(attach2["method"], "Target.attachToTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach2["id"], "result": { "sessionId": "session-2" } })
+                        .to_string(),
+                ))
+                .expect("attach session-2");
+            for expected in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], expected);
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": cmd["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("reply domain enable on session-2");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let started = std::time::Instant::now();
+        let (page, target) = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(120),
+        )
+        .expect("attach must recover on target-2 after silent Target.attachToTarget stall");
+        drop(conn);
+        server.join().expect("mock server finish");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Target.attachToTarget hang must abort at enable_timeout instead of outer deadline, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!((page.as_str(), target.as_str()), ("session-2", "target-2"));
+    }
+
+    #[test]
+    fn attach_fails_fast_when_attach_to_target_stalls_every_attempt() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            for attempt in 1..=MAX_ATTACH_ATTEMPTS {
+                let tid = format!("target-{attempt}");
+                let create = read_cdp_request(&mut socket);
+                assert_eq!(create["method"], "Target.createTarget");
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": create["id"], "result": { "targetId": tid } }).to_string(),
+                    ))
+                    .expect("create target");
+
+                let attach_cmd = read_cdp_request(&mut socket);
+                assert_eq!(attach_cmd["method"], "Target.attachToTarget");
+                if attempt < MAX_ATTACH_ATTEMPTS {
+                    let close_cmd = read_cdp_request(&mut socket);
+                    assert_eq!(close_cmd["method"], "Target.closeTarget");
+                    assert_eq!(close_cmd["params"]["targetId"], tid);
+                    socket
+                        .send(tungstenite::Message::text(
+                            json!({ "id": close_cmd["id"], "result": { "success": true } })
+                                .to_string(),
+                        ))
+                        .expect("close target");
+                }
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let started = std::time::Instant::now();
+        let err = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(100),
+        )
+        .expect_err("attach must give up after MAX_ATTACH_ATTEMPTS");
+        drop(conn);
+        server.join().expect("mock server finish");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "3 stalled Target.attachToTarget attempts must fail at 3 * enable_timeout, took {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("attempt 1:"), "{err}");
+        assert!(err.contains("attempt 3:"), "{err}");
+        assert!(err.contains("Target.attachToTarget"), "{err}");
+        assert!(err.contains("no CDP events"), "{err}");
+    }
+
+    #[test]
+    fn launch_browser_with_retry_recovers_after_wedged_attach_and_respects_budget() {
+        // 1. First launched browser stalls on attach; it is aborted and attempt 2 succeeds.
+        let mut spawns = 0usize;
+        let mut aborted = Vec::new();
+        let (browser, session) = launch_browser_with_retry(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                spawns += 1;
+                Ok(format!("browser-{spawns}"))
+            },
+            |browser, _| {
+                if browser == "browser-1" {
+                    Err("Target.attachToTarget stalled".to_string())
+                } else {
+                    Ok("attached-2".to_string())
+                }
+            },
+            |browser| {
+                aborted.push(browser);
+                Ok(())
+            },
+        )
+        .expect("second browser launch must recover");
+        assert_eq!(spawns, 2);
+        assert_eq!(aborted, vec!["browser-1".to_string()]);
+        assert_eq!(
+            (browser.as_str(), session.as_str()),
+            ("browser-2", "attached-2")
+        );
+
+        // 2. Pre-startup spawn failure (e.g. missing binary) does not retry.
+        let mut spawn_calls = 0usize;
+        let spawn_err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                spawn_calls += 1;
+                Err("could not find Chrome".to_string())
+            },
+            |_, _| unreachable!(),
+            |_| unreachable!(),
+        )
+        .expect_err("spawn failure must fail immediately");
+        assert_eq!(spawn_calls, 1);
+        assert!(spawn_err.contains("could not find Chrome"), "{spawn_err}");
+
+        // 3. Exhausting all launch attempts surfaces diagnostics from every attempt.
+        let mut attempts = 0usize;
+        let mut aborted_all = Vec::new();
+        let err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                attempts += 1;
+                Ok(format!("b-{attempts}"))
+            },
+            |b, _| Err(format!("{b}: attach failed")),
+            |b| {
+                aborted_all.push(b);
+                Ok(())
+            },
+        )
+        .expect_err("exhausted launches must fail");
+        assert_eq!(aborted_all, vec!["b-1".to_string(), "b-2".to_string()]);
+        assert!(
+            err.contains("launch attempt 1: b-1: attach failed"),
+            "{err}"
+        );
+        assert!(
+            err.contains("launch attempt 2: b-2: attach failed"),
+            "{err}"
+        );
+
+        // 4. Exhausted outer deadline stops after attempt 1 instead of spawning past LAUNCH_TIMEOUT.
+        let mut deadline_spawns = 0usize;
+        let deadline_err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::ZERO),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                deadline_spawns += 1;
+                Ok("b-1".to_string())
+            },
+            |_, _| Err("stalled".to_string()),
+            |_| Ok(()),
+        )
+        .expect_err("expired deadline must not spawn attempt 2");
+        assert_eq!(deadline_spawns, 1);
+        assert_eq!(deadline_err, "stalled");
+
+        // 5. Abort/cleanup failure stops retrying and reports both attach and cleanup errors.
+        let mut cleanup_spawns = 0usize;
+        let cleanup_err = launch_browser_with_retry::<String, String>(
+            Deadline::after(Duration::from_secs(5)),
+            MAX_LAUNCH_ATTEMPTS,
+            |_| {
+                cleanup_spawns += 1;
+                Ok(format!("b-{cleanup_spawns}"))
+            },
+            |_, _| Err("Target.attachToTarget stalled".to_string()),
+            |b| Err(format!("could not kill {b}")),
+        )
+        .expect_err("abort failure must stop retrying and surface cleanup error");
+        assert_eq!(cleanup_spawns, 1);
+        assert!(
+            cleanup_err.contains("Target.attachToTarget stalled"),
+            "{cleanup_err}"
+        );
+        assert!(cleanup_err.contains("could not kill b-1"), "{cleanup_err}");
+    }
+
+    #[test]
+    fn attach_stops_retrying_and_reports_target_close_cleanup_error() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            assert_eq!(create1["method"], "Target.createTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+
+            let attach1 = read_cdp_request(&mut socket);
+            assert_eq!(attach1["method"], "Target.attachToTarget");
+            // Never answer Target.attachToTarget; fail Target.closeTarget cleanup with a protocol error.
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            assert_eq!(close1["params"]["targetId"], "target-1");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": close1["id"],
+                        "error": { "code": -32000, "message": "close refused" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send closeTarget error");
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let err = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(100),
+        )
+        .expect_err("Target.closeTarget error must stop attach retry and report cleanup error");
+        drop(conn);
+        server.join().expect("mock server finish");
+
+        assert!(err.contains("Target.attachToTarget"), "{err}");
+        assert!(err.contains("Target.closeTarget"), "{err}");
+        assert!(err.contains("close refused"), "{err}");
+        assert!(
+            !err.contains("attempt 2:"),
+            "must not retry after cleanup failure: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_treats_already_closed_target_on_cleanup_as_recoverable() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            let create1 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create1["id"], "result": { "targetId": "target-1" } })
+                        .to_string(),
+                ))
+                .expect("create target-1");
+
+            let attach1 = read_cdp_request(&mut socket);
+            assert_eq!(attach1["method"], "Target.attachToTarget");
+            let close1 = read_cdp_request(&mut socket);
+            assert_eq!(close1["method"], "Target.closeTarget");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": close1["id"],
+                        "error": { "code": -32000, "message": "No target with given id found" }
+                    })
+                    .to_string(),
+                ))
+                .expect("send No target error");
+
+            let create2 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": create2["id"], "result": { "targetId": "target-2" } })
+                        .to_string(),
+                ))
+                .expect("create target-2");
+            let attach2 = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": attach2["id"], "result": { "sessionId": "session-2" } })
+                        .to_string(),
+                ))
+                .expect("attach session-2");
+            for expected in ["Page.enable", "Runtime.enable", "Network.enable"] {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], expected);
+                socket
+                    .send(tungstenite::Message::text(
+                        json!({ "id": cmd["id"], "result": {} }).to_string(),
+                    ))
+                    .expect("reply domain enable");
+            }
+            while socket.read().is_ok() {}
+        });
+
+        let mut conn =
+            Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let (page, target) = attach_with_enable_timeout(
+            &mut conn,
+            Deadline::after(Duration::from_secs(3)),
+            Duration::from_millis(100),
+        )
+        .expect("already-closed target on cleanup must still allow retry");
+        drop(conn);
+        server.join().expect("mock server finish");
+        assert_eq!((page.as_str(), target.as_str()), ("session-2", "target-2"));
     }
 
     #[test]
@@ -7073,43 +8231,48 @@ mod tests {
         }
     }
 
+    fn send_mock_network_request(
+        socket: &mut MockSocket,
+        request_id: &str,
+        url: &str,
+        status: i64,
+    ) {
+        for payload in [
+            json!({
+                "sessionId": "session-1",
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": request_id,
+                    "type": "Fetch",
+                    "request": { "method": "GET", "url": url }
+                }
+            }),
+            json!({
+                "sessionId": "session-1",
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": request_id,
+                    "type": "Fetch",
+                    "response": { "url": url, "status": status }
+                }
+            }),
+            json!({
+                "sessionId": "session-1",
+                "method": "Network.loadingFinished",
+                "params": { "requestId": request_id }
+            }),
+        ] {
+            socket
+                .send(tungstenite::Message::text(payload.to_string()))
+                .expect("send mock network event");
+        }
+    }
+
     #[test]
     fn retry_with_browser_network_discards_failed_attempt_requests() {
         use crate::core::case::{Expectation, Matcher, Observation, RetryPolicy};
         use crate::core::report::CaseStatus;
         use serde_saphyr::Location;
-
-        let send_request = |socket: &mut MockSocket, request_id: &str, url: &str, status: i64| {
-            for payload in [
-                json!({
-                    "sessionId": "session-1",
-                    "method": "Network.requestWillBeSent",
-                    "params": {
-                        "requestId": request_id,
-                        "type": "Fetch",
-                        "request": { "method": "GET", "url": url }
-                    }
-                }),
-                json!({
-                    "sessionId": "session-1",
-                    "method": "Network.responseReceived",
-                    "params": {
-                        "requestId": request_id,
-                        "type": "Fetch",
-                        "response": { "url": url, "status": status }
-                    }
-                }),
-                json!({
-                    "sessionId": "session-1",
-                    "method": "Network.loadingFinished",
-                    "params": { "requestId": request_id }
-                }),
-            ] {
-                socket
-                    .send(tungstenite::Message::text(payload.to_string()))
-                    .expect("send mock network event");
-            }
-        };
 
         let mut step = mock_read_step(
             20,
@@ -7145,13 +8308,13 @@ mod tests {
             step,
             move |mut socket| {
                 mock_open_handshake(&mut socket, |sock| {
-                    send_request(sock, "req-doc", "http://127.0.0.1/app", 200);
+                    send_mock_network_request(sock, "req-doc", "http://127.0.0.1/app", 200);
                 });
 
                 // attempt 1: Execution (ambiguous)
                 let attempt1 = read_cdp_request(&mut socket);
                 assert_eq!(attempt1["method"], "Runtime.evaluate");
-                send_request(
+                send_mock_network_request(
                     &mut socket,
                     "req-exec",
                     "http://127.0.0.1/attempt1-exec",
@@ -7175,7 +8338,7 @@ mod tests {
                 // attempt 2: Timeout
                 let attempt2_loc = read_cdp_request(&mut socket);
                 assert_eq!(attempt2_loc["method"], "Runtime.evaluate");
-                send_request(
+                send_mock_network_request(
                     &mut socket,
                     "req-timeout",
                     "http://127.0.0.1/attempt2-timeout",
@@ -7213,7 +8376,12 @@ mod tests {
                 );
                 let attempt3_text = read_cdp_request(&mut socket);
                 assert_eq!(attempt3_text["method"], "Runtime.callFunctionOn");
-                send_request(&mut socket, "req-ok", "http://127.0.0.1/attempt3-ok", 200);
+                send_mock_network_request(
+                    &mut socket,
+                    "req-ok",
+                    "http://127.0.0.1/attempt3-ok",
+                    200,
+                );
                 send_mock_reply(
                     &mut socket,
                     &attempt3_text["id"],
@@ -7891,5 +9059,232 @@ mod tests {
 
         BrowserSession::dispose_handle(&re_detached).expect("dispose connected handle succeeds");
         server.join().expect("mock CDP server finishes");
+    }
+
+    #[test]
+    fn iframe_container_status_and_frame_loading_timeout_messages_parse_and_format() {
+        assert!(matches!(
+            serde_json::from_str::<WithinContainerStatus>(r#"{"status":"missing"}"#).ok(),
+            Some(WithinContainerStatus::Missing)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<WithinContainerStatus>(r#"{"status":"loading"}"#).ok(),
+            Some(WithinContainerStatus::Loading)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<WithinContainerStatus>(r#"{"status":"cross_origin"}"#).ok(),
+            Some(WithinContainerStatus::CrossOrigin)
+        ));
+
+        let err = pending_timeout_error(
+            "CSS selector `#lazy-frame`",
+            PendingReason::FrameLoading,
+            Deadline::after(Duration::from_millis(1200)),
+        );
+        assert_eq!(
+            step_error_text(err),
+            "frame CSS selector `#lazy-frame` did not finish loading within 1200 ms"
+        );
+
+        let xpath = Locator::Xpath("//button".to_string())
+            .resolve_body_with(DEFAULT_TESTID_ATTRIBUTE, None)
+            .expect("xpath locator has a page expression");
+        assert!(
+            xpath.contains("root.nodeType === 9 ? root : (root.ownerDocument || document)")
+                && xpath.contains("doc.evaluate("),
+            "xpath expression must evaluate against root's ownerDocument: {xpath}"
+        );
+
+        let unmappable: ActionableInspect = serde_json::from_str(
+            r#"{"status":"unmappable_transform","reason":"rotated CSS transform"}"#,
+        )
+        .expect("unmappable_transform status must deserialize");
+        assert!(matches!(
+            unmappable,
+            ActionableInspect::UnmappableTransform { ref reason } if reason == "rotated CSS transform"
+        ));
+    }
+
+    #[test]
+    fn retry_within_iframe_isolates_network_and_recovers_from_unexpected_dialog() {
+        use crate::core::case::{Expectation, Matcher, Observation, RetryPolicy};
+        use crate::core::report::CaseStatus;
+        use serde_saphyr::Location;
+
+        let mut step = mock_read_step(
+            5000,
+            RetryPolicy {
+                until: vec![Expectation {
+                    path: "$.text".to_string(),
+                    matcher: Matcher::Equals(json!("ready")),
+                }],
+                timeout_ms: 3000,
+                interval_ms: 10,
+            },
+        );
+        step.args = json!({
+            "css": "#status",
+            "within": { "css": "#embed" },
+            "timeout_ms": 5000
+        });
+        step.expect = vec![Expectation {
+            path: "$.observed.net.requests".to_string(),
+            matcher: Matcher::Equals(json!([{
+                "method": "GET",
+                "url": "http://127.0.0.1/attempt3-iframe-ok",
+                "status": 200,
+                "type": "Fetch",
+                "failed": null
+            }])),
+        }];
+
+        let report = run_mock_browser_retry_case(
+            "iframe retry network and dialog isolation",
+            vec![Observation {
+                name: "net".to_string(),
+                kind: network::OBSERVER_NAME.to_string(),
+                args: json!({}),
+                location: Location::UNKNOWN,
+                args_location: Location::UNKNOWN,
+            }],
+            step,
+            |mut socket| {
+                mock_open_handshake(&mut socket, |sock| {
+                    send_mock_network_request(sock, "req-doc", "http://127.0.0.1/app", 200);
+                });
+
+                // Attempt 1: resolves #embed, then enter_within_container meets an unexpected alert
+                let a1_frame = read_cdp_request(&mut socket);
+                assert_eq!(a1_frame["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &a1_frame["id"],
+                    json!({ "result": { "objectId": "frame-1" } }),
+                );
+                let a1_enter = read_cdp_request(&mut socket);
+                assert_eq!(a1_enter["method"], "Runtime.callFunctionOn");
+                send_mock_network_request(
+                    &mut socket,
+                    "req-a1",
+                    "http://127.0.0.1/attempt1-iframe-dialog",
+                    500,
+                );
+                send_mock_dialog(&mut socket, "alert", "iframe-transient");
+                let handle = read_cdp_request(&mut socket);
+                assert_eq!(handle["method"], "Page.handleJavaScriptDialog");
+                assert_eq!(handle["params"]["accept"], false);
+                send_mock_reply(&mut socket, &handle["id"], json!({}));
+                send_mock_reply(
+                    &mut socket,
+                    &a1_enter["id"],
+                    json!({ "result": { "value": null } }),
+                );
+
+                // Attempt 2: enters #embed, reads "pending" -> `until` fails and drains req-a2
+                let a2_frame = read_cdp_request(&mut socket);
+                assert_eq!(a2_frame["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_frame["id"],
+                    json!({ "result": { "objectId": "frame-2" } }),
+                );
+                let a2_enter = read_cdp_request(&mut socket);
+                assert_eq!(a2_enter["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_enter["id"],
+                    json!({ "result": { "objectId": "frame-doc-2" } }),
+                );
+                let a2_inner = read_cdp_request(&mut socket);
+                assert_eq!(a2_inner["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_inner["id"],
+                    json!({ "result": { "objectId": "elem-2" } }),
+                );
+                let a2_vis = read_cdp_request(&mut socket);
+                assert_eq!(a2_vis["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a2_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let a2_text = read_cdp_request(&mut socket);
+                assert_eq!(a2_text["method"], "Runtime.callFunctionOn");
+                send_mock_network_request(
+                    &mut socket,
+                    "req-a2",
+                    "http://127.0.0.1/attempt2-iframe-pending",
+                    200,
+                );
+                send_mock_reply(
+                    &mut socket,
+                    &a2_text["id"],
+                    json!({ "result": { "value": "pending" } }),
+                );
+
+                // Attempt 3: enters #embed, reads "ready" -> succeeds with only req-a3 observed
+                let a3_frame = read_cdp_request(&mut socket);
+                assert_eq!(a3_frame["method"], "Runtime.evaluate");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_frame["id"],
+                    json!({ "result": { "objectId": "frame-3" } }),
+                );
+                let a3_enter = read_cdp_request(&mut socket);
+                assert_eq!(a3_enter["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_enter["id"],
+                    json!({ "result": { "objectId": "frame-doc-3" } }),
+                );
+                let a3_inner = read_cdp_request(&mut socket);
+                assert_eq!(a3_inner["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_inner["id"],
+                    json!({ "result": { "objectId": "elem-3" } }),
+                );
+                let a3_vis = read_cdp_request(&mut socket);
+                assert_eq!(a3_vis["method"], "Runtime.callFunctionOn");
+                send_mock_reply(
+                    &mut socket,
+                    &a3_vis["id"],
+                    json!({ "result": { "value": true } }),
+                );
+                let a3_text = read_cdp_request(&mut socket);
+                assert_eq!(a3_text["method"], "Runtime.callFunctionOn");
+                send_mock_network_request(
+                    &mut socket,
+                    "req-a3",
+                    "http://127.0.0.1/attempt3-iframe-ok",
+                    200,
+                );
+                send_mock_reply(
+                    &mut socket,
+                    &a3_text["id"],
+                    json!({ "result": { "value": "ready" } }),
+                );
+
+                mock_close_loop(&mut socket);
+            },
+        );
+        assert_eq!(report.cases[0].status, CaseStatus::Passed, "{report:?}");
+        let result = report.cases[0].steps[1]
+            .result
+            .as_ref()
+            .expect("browser.read result must exist");
+        assert_eq!(result["text"], "ready");
+        assert_eq!(
+            result["observed"]["net"]["requests"],
+            json!([{
+                "method": "GET",
+                "url": "http://127.0.0.1/attempt3-iframe-ok",
+                "status": 200,
+                "type": "Fetch",
+                "failed": null
+            }]),
+            "stale iframe retry requests leaked into final observation: {result}"
+        );
     }
 }

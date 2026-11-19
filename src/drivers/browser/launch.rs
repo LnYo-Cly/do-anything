@@ -76,18 +76,19 @@ impl Launched {
             if let Some(child_ref) = child.as_mut() {
                 match child_ref.try_wait() {
                     Ok(Some(status)) => {
-                        let _ = remove_profile(&profile);
-                        return Err(format!(
+                        let base = format!(
                             "`{}` exited with {status} before it was ready; set `DA_CHROME` to the Chrome or Chromium executable",
                             executable.display()
-                        ));
+                        );
+                        return Err(append_cleanup_error(base, remove_profile(&profile).err()));
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        let _ = child_ref.kill();
-                        let _ = child_ref.wait();
-                        let _ = remove_profile(&profile);
-                        return Err(format!("could not watch the browser process: {error}"));
+                        let cleanup = cleanup_failed_launch(Some(child_ref), None, &profile);
+                        return Err(append_cleanup_error(
+                            format!("could not watch the browser process: {error}"),
+                            cleanup,
+                        ));
                     }
                 }
             }
@@ -105,28 +106,12 @@ impl Launched {
             }
 
             if deadline.passed() {
-                let mut cleanup_errors = Vec::new();
-                if let Some(mut c) = child.take() {
-                    if let Err(error) = c.kill().and_then(|()| c.wait().map(drop)) {
-                        cleanup_errors.push(format!("could not kill the browser process: {error}"));
-                    }
-                } else if let Some(pid) = detached_pid
-                    && let Err(error) = kill_process(pid, Some(&profile))
-                {
-                    cleanup_errors.push(error);
-                }
-                if let Err(error) = remove_profile(&profile) {
-                    cleanup_errors.push(error);
-                }
-                let cleanup = if cleanup_errors.is_empty() {
-                    String::new()
-                } else {
-                    format!("; cleanup also failed: {}", cleanup_errors.join("; "))
-                };
-                return Err(format!(
-                    "the browser did not report a debugging port within {} ms; set `DA_CHROME` to the Chrome or Chromium executable{cleanup}",
+                let cleanup = cleanup_failed_launch(child.as_mut(), detached_pid, &profile);
+                let base = format!(
+                    "the browser did not report a debugging port within {} ms; set `DA_CHROME` to the Chrome or Chromium executable",
                     deadline.timeout_ms()
-                ));
+                );
+                return Err(append_cleanup_error(base, cleanup));
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -164,27 +149,45 @@ impl Launched {
     /// Waits for the process to exit, kills it when it does not, and removes
     /// the temporary profile.
     pub fn shutdown(mut self) -> Result<(), String> {
-        self.release()
+        self.release_with_wait(true)
     }
 
-    /// Releases what is left. Called once by [`Self::shutdown`] or by `Drop`.
-    fn release(&mut self) -> Result<(), String> {
+    /// Immediately kills the process (for failed startups where `Browser.close`
+    /// was never sent) and removes the temporary profile without waiting `EXIT_TIMEOUT`.
+    pub fn abort(mut self) -> Result<(), String> {
+        self.release_with_wait(false)
+    }
+
+    /// Releases what is left. Called once by [`Self::shutdown`], [`Self::abort`],
+    /// or [`Drop`].
+    fn release_with_wait(&mut self, wait_graceful: bool) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Some(mut child) = self.child.take() {
-            // A browser that is slow to exit (seen on loaded CI runners) is
-            // still released once killing it succeeds; only a browser that
-            // cannot be stopped is a close error.
-            if let Err(error) = wait_for_exit(&mut child, EXIT_TIMEOUT)
-                && let Err(kill_error) = child.kill().and_then(|()| child.wait().map(drop))
-            {
-                errors.push(format!(
-                    "the browser did not exit within {} ms after `Browser.close` ({error}) and could not be killed: {kill_error}",
-                    EXIT_TIMEOUT.as_millis()
-                ));
+            if wait_graceful {
+                // A browser that is slow to exit (seen on loaded CI runners) is
+                // still released once killing it succeeds; only a browser that
+                // cannot be stopped is a close error.
+                if let Err(error) = wait_for_exit(&mut child, EXIT_TIMEOUT)
+                    && let Err(kill_error) = child.kill().and_then(|()| child.wait().map(drop))
+                {
+                    errors.push(format!(
+                        "the browser did not exit within {} ms after `Browser.close` ({error}) and could not be killed: {kill_error}",
+                        EXIT_TIMEOUT.as_millis()
+                    ));
+                }
+            } else if let Err(kill_error) = kill_child_now(&mut child) {
+                errors.push(kill_error);
             }
         } else if let Some(pid) = self.detached_pid.take() {
             let profile = self.profile.take();
-            if let Err(err) = dispose_detached(Some(pid), Some(self.port), profile.as_deref()) {
+            let exit_timeout = if wait_graceful {
+                EXIT_TIMEOUT
+            } else {
+                Duration::ZERO
+            };
+            if let Err(err) =
+                dispose_detached_with(Some(pid), Some(self.port), profile.as_deref(), exit_timeout)
+            {
                 errors.push(err);
             }
         }
@@ -204,7 +207,7 @@ impl Launched {
 impl Drop for Launched {
     fn drop(&mut self) {
         if self.child.is_some() || self.detached_pid.is_some() || self.profile.is_some() {
-            let _ = self.release();
+            let _ = self.release_with_wait(true);
         }
     }
 }
@@ -225,11 +228,11 @@ fn spawn_direct(
         configure_detached(&mut command);
     }
     command.spawn().map_err(|error| {
-        let _ = remove_profile(profile);
-        format!(
+        let base = format!(
             "could not start `{}`: {error}; set `DA_CHROME` to the Chrome or Chromium executable",
             executable.display()
-        )
+        );
+        append_cleanup_error(base, remove_profile(profile).err())
     })
 }
 
@@ -263,30 +266,30 @@ fn spawn_windows_isolated(
         .stderr(Stdio::piped())
         .output()
         .map_err(|error| {
-            let _ = remove_profile(profile);
-            format!(
+            let base = format!(
                 "could not start `{}`: {error}; set `DA_CHROME` to the Chrome or Chromium executable",
                 executable.display()
-            )
+            );
+            append_cleanup_error(base, remove_profile(profile).err())
         })?;
 
     if !output.status.success() {
-        let _ = remove_profile(profile);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
+        let base = format!(
             "could not start `{}`: {stderr}; set `DA_CHROME` to the Chrome or Chromium executable",
             executable.display()
-        ));
+        );
+        return Err(append_cleanup_error(base, remove_profile(profile).err()));
     }
 
     let pid_text = String::from_utf8_lossy(&output.stdout);
     pid_text.trim().parse::<u32>().map_err(|error| {
-        let _ = remove_profile(profile);
-        format!(
+        let base = format!(
             "could not read pid for `{}`: {error} (`{}`)",
             executable.display(),
             pid_text.trim()
-        )
+        );
+        append_cleanup_error(base, remove_profile(profile).err())
     })
 }
 
@@ -320,6 +323,61 @@ fn quote_win_arg(arg: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Immediately kills a child process that has not yet exited and reaps it.
+fn kill_child_now(child: &mut Child) -> Result<(), String> {
+    let watch_error = match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    if let Err(kill_error) = child.kill().and_then(|()| child.wait().map(drop)) {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Ok(());
+        }
+        return Err(match watch_error {
+            Some(watch_err) => format!(
+                "could not watch ({watch_err}) or kill the browser after startup failed: {kill_error}"
+            ),
+            None => format!("the browser could not be killed after startup failed: {kill_error}"),
+        });
+    }
+    Ok(())
+}
+
+/// Kills a failed launch's browser process and removes its temporary profile.
+fn cleanup_failed_launch(
+    child: Option<&mut Child>,
+    detached_pid: Option<u32>,
+    profile: &Path,
+) -> Option<String> {
+    let mut errors = Vec::new();
+    if let Some(c) = child {
+        if let Err(error) = kill_child_now(c) {
+            errors.push(error);
+        }
+    } else if let Some(pid) = detached_pid
+        && let Err(error) = kill_process(pid, Some(profile))
+    {
+        errors.push(error);
+    }
+    if let Err(error) = remove_profile(profile) {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    }
+}
+
+/// Appends any cleanup error to a launch failure message.
+fn append_cleanup_error(message: String, cleanup_error: Option<String>) -> String {
+    match cleanup_error {
+        Some(cleanup) => format!("{message}; cleanup failed: {cleanup}"),
+        None => message,
+    }
 }
 
 /// Waits for `child` to exit, polling until `timeout` passes.
@@ -4267,5 +4325,25 @@ mod tests {
             parse_windows_profile_pids(output, profile, 999),
             vec![101, 102]
         );
+    }
+
+    #[test]
+    fn abort_removes_profile_without_waiting_for_exit_timeout() {
+        let profile = create_profile().expect("must create temporary profile");
+        fs::write(profile.join("marker.txt"), b"temp").expect("must write marker");
+        let launched = Launched {
+            child: None,
+            detached_pid: None,
+            profile: Some(profile.clone()),
+            port: 0,
+            websocket_url: String::new(),
+        };
+        let started = Instant::now();
+        launched.abort().expect("abort must remove profile");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "abort must not sleep EXIT_TIMEOUT"
+        );
+        assert!(!profile.exists(), "abort must remove profile directory");
     }
 }

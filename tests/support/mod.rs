@@ -407,8 +407,35 @@ fn route(
         (_, "/browser/probe/iframe") => html_response("200 OK", browser_probe_iframe()),
         (_, "/browser/probe/iframe-inner") => html_response(
             "200 OK",
-            "<!doctype html><html><body><button id=\"inside-frame\">Inside Frame</button></body></html>",
+            "<!doctype html><html><body><button id=\"inside-frame\" type=\"button\" onclick=\"document.getElementById('probe-status').textContent='clicked';\">Inside Frame</button><p id=\"probe-status\">idle</p></body></html>",
         ),
+        (_, "/browser/iframes/host") => html_response("200 OK", &browser_iframes_host(query)),
+        (_, "/browser/iframes/inner") => html_response("200 OK", browser_iframes_inner()),
+        (_, "/browser/iframes/nested") => html_response("200 OK", browser_iframes_nested()),
+        (_, "/browser/iframes/occlusion") => html_response("200 OK", browser_iframes_occlusion()),
+        (_, "/browser/iframes/occ-inner") => html_response("200 OK", browser_iframes_occ_inner()),
+        (_, "/browser/iframes/slow-host") => html_response("200 OK", browser_iframes_slow_host()),
+        (_, "/browser/iframes/slow-inner") => {
+            thread::sleep(Duration::from_millis(300));
+            html_response(
+                "200 OK",
+                "<!doctype html><html><body><p id=\"slow-ready\">loaded-late</p><button id=\"slow-btn\" type=\"button\" onclick=\"document.getElementById('slow-ready').textContent='slow-clicked';\">Slow Ready</button></body></html>",
+            )
+        }
+        (_, "/browser/iframes/frameset") => html_response("200 OK", browser_iframes_frameset()),
+        (_, "/browser/iframes/scaled-host") => {
+            html_response("200 OK", &browser_iframes_scaled_host(query))
+        }
+        (_, "/browser/iframes/scaled-inner") => {
+            html_response("200 OK", browser_iframes_scaled_inner())
+        }
+        (_, "/browser/iframes/unmappable-transform") => {
+            html_response("200 OK", &browser_iframes_unmappable_transform(query))
+        }
+        (_, "/browser/iframes/retry") => html_response("200 OK", browser_iframes_retry()),
+        (_, "/browser/mask-iframe") => html_response("200 OK", browser_mask_iframe()),
+        (_, "/browser/mask-iframe-inner") => html_response("200 OK", browser_mask_iframe_inner()),
+        (_, "/browser/mask-iframe-nested") => html_response("200 OK", browser_mask_iframe_nested()),
         (_, "/browser/probe/shadow") => html_response("200 OK", browser_probe_shadow()),
         (_, "/browser/probe/new-tab") => html_response("200 OK", browser_probe_new_tab()),
         (_, "/browser/probe/new-tab-target") => html_response(
@@ -959,6 +986,350 @@ fn browser_probe_iframe() -> &'static str {
 <html><head><title>Probe Iframe</title></head>
 <body>
 <iframe id="probe-frame" src="/browser/probe/iframe-inner" width="240" height="80"></iframe>
+</body></html>"#
+}
+
+fn browser_iframes_host(query: &str) -> String {
+    let cross_port = query_value(query, "cross_port").parse::<u16>().unwrap_or(0);
+    let cross_iframe = if cross_port > 0 {
+        format!(
+            r#"<iframe id="cross-origin-frame" src="http://127.0.0.1:{cross_port}/browser/probe/iframe-inner" width="240" height="80"></iframe>"#
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Iframe Host</title></head>
+<body>
+<button id="decoy-btn" type="button"
+  style="position:fixed;left:10px;top:10px;width:140px;height:50px;"
+  onclick="document.getElementById('decoy-result').textContent='decoy-clicked';">Decoy</button>
+<p id="decoy-result" style="position:fixed;left:10px;top:72px;">decoy-idle</p>
+
+<iframe id="embed" data-testid="embed-frame" src="/browser/iframes/inner"
+  style="position:fixed;left:180px;top:240px;width:440px;height:340px;border:6px solid #333;padding:8px;margin:0;background:#fff;"></iframe>
+
+<div style="position:fixed;left:660px;top:20px;">
+  {cross_iframe}
+  <iframe id="sandboxed-frame" sandbox="" src="/browser/probe/iframe-inner" width="240" height="80"></iframe>
+</div>
+</body></html>"#
+    )
+}
+
+fn browser_iframes_inner() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Inner Frame</title></head>
+<body style="margin:0;">
+<button id="frame-btn" data-testid="frame-btn" type="button"
+  style="position:fixed;left:10px;top:10px;width:140px;height:50px;"
+  onclick="document.getElementById('frame-result').textContent='frame-clicked';">Frame Action</button>
+<p id="frame-result" style="margin:70px 0 4px 10px;">idle</p>
+
+<div id="inner-section" role="region" aria-label="Inner Panel" style="margin-left:10px;">
+  <button id="panel-btn" class="dup-btn" data-testid="panel-btn" type="button"
+    onclick="document.getElementById('frame-result').textContent='inner-panel-clicked';">Panel Save</button>
+</div>
+<div id="other-section" style="margin-left:10px;">
+  <button class="dup-btn" data-testid="panel-btn" type="button"
+    onclick="document.getElementById('frame-result').textContent='other-panel-clicked';">Other Save</button>
+</div>
+
+<div style="margin:4px 0 4px 10px;">
+  <input id="frame-input" data-testid="frame-input" aria-label="Frame Note" autocomplete="off"
+    oninput="document.getElementById('frame-result').textContent='typed:' + this.value;">
+  <button id="frame-alert-btn" type="button"
+    onclick="window.alert('inner alert'); document.getElementById('frame-result').textContent='alert-ok';">Frame Alert</button>
+  <button id="frame-confirm-btn" type="button"
+    onclick="document.getElementById('frame-result').textContent = window.confirm('Proceed inside?') ? 'confirmed' : 'dismissed';">Frame Confirm</button>
+</div>
+
+<iframe id="nested-frame" data-testid="nested-frame" src="/browser/iframes/nested"
+  style="border:4px solid #666;padding:6px;margin-left:10px;width:380px;height:140px;display:block;"></iframe>
+</body></html>"#
+}
+
+fn browser_iframes_nested() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Nested Frame</title></head>
+<body style="margin:4px;">
+<p id="nested-result">nested-idle</p>
+<div class="nested-box">
+  <button id="nested-btn" data-testid="nested-btn" type="button"
+    onclick="document.getElementById('nested-result').textContent='nested-clicked';">Nested Click</button>
+</div>
+<input id="nested-input" data-testid="nested-input" aria-label="Nested Field" autocomplete="off"
+  oninput="document.getElementById('nested-result').textContent='nested-typed:' + this.value;">
+<button id="spawn-nested-badge" type="button"
+  onclick="setTimeout(function () { var s = document.createElement('span'); s.id = 'nested-badge'; s.textContent = 'nested-ready'; document.body.appendChild(s); }, 200);">Spawn Badge</button>
+</body></html>"#
+}
+
+fn browser_iframes_occlusion() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Iframe Occlusion</title></head>
+<body style="margin:0;">
+<iframe id="occ-frame" src="/browser/iframes/occ-inner"
+  style="position:fixed;left:40px;top:40px;width:340px;height:200px;border:4px solid #333;padding:6px;background:#fff;"></iframe>
+
+<div id="top-modal-backdrop"
+  style="position:fixed;left:40px;top:40px;width:360px;height:80px;background:rgba(0,0,0,0.25);z-index:10;"
+  onclick="document.getElementById('top-modal-log').textContent='modal-clicked';">Top Modal Backdrop</div>
+
+<div id="temp-modal-backdrop"
+  style="position:fixed;left:40px;top:120px;width:360px;height:70px;background:rgba(0,0,0,0.2);z-index:10;">Temp Modal</div>
+
+<button id="uncover-iframe-modal" type="button" style="position:fixed;left:420px;top:40px;"
+  onclick="setTimeout(function () { document.getElementById('temp-modal-backdrop').style.display = 'none'; }, 250);">Uncover Modal</button>
+<p id="top-modal-log" style="position:fixed;left:420px;top:80px;">none</p>
+
+<iframe id="offscreen-frame" src="/browser/probe/iframe-inner"
+  style="margin-top:1600px;width:280px;height:120px;"></iframe>
+</body></html>"#
+}
+
+fn browser_iframes_occ_inner() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Occlusion Inner</title></head>
+<body style="margin:0;">
+<button id="top-blocked-btn" type="button"
+  style="position:fixed;left:10px;top:10px;width:200px;height:40px;"
+  onclick="document.getElementById('occ-result').textContent='top-blocked-clicked';">Top Blocked</button>
+
+<button id="temp-blocked-btn" type="button"
+  style="position:fixed;left:10px;top:80px;width:200px;height:40px;"
+  onclick="document.getElementById('occ-result').textContent='temp-blocked-clicked';">Temp Blocked</button>
+
+<div style="position:fixed;left:10px;top:135px;width:200px;height:36px;">
+  <button id="inner-blocked-btn" type="button" style="width:200px;height:36px;">Inner Blocked</button>
+  <div id="inner-overlay" style="position:absolute;inset:0;background:rgba(0,0,0,0.2);">Inner Overlay</div>
+</div>
+
+<p id="occ-result" style="position:fixed;left:220px;top:10px;">occ-idle</p>
+</body></html>"#
+}
+
+fn browser_iframes_slow_host() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Slow Iframe Host</title></head>
+<body>
+<button id="spawn-lazy-frame" type="button"
+  onclick="var f = document.createElement('iframe'); f.id = 'lazy-frame'; f.src = '/browser/iframes/slow-inner'; f.width = '240'; f.height = '80'; document.body.appendChild(f);">Spawn Lazy Frame</button>
+</body></html>"#
+}
+
+fn browser_iframes_frameset() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Frameset Host</title></head>
+<frameset cols="50%,50%">
+  <frame id="frame-left" name="left" src="/browser/probe/iframe-inner">
+  <frame id="frame-right" name="right" src="/browser/iframes/nested">
+</frameset>
+</html>"#
+}
+
+fn browser_iframes_retry() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Retry Iframe Host</title></head>
+<body style="margin:0;">
+<iframe id="retry-frame" src="/browser/dialogs/retry"
+  style="position:fixed;left:80px;top:60px;width:360px;height:180px;border:4px solid #333;padding:6px;background:#fff;"></iframe>
+</body></html>"#
+}
+
+fn browser_iframes_scaled_host(query: &str) -> String {
+    let overlay = match query_value(query, "overlay").as_str() {
+        "unscaled" => {
+            r#"<div id="unscaled-modal" style="position:fixed;left:170px;top:105px;width:50px;height:30px;background:rgba(0,0,0,0.2);z-index:10;">Unscaled Modal</div>"#
+        }
+        "scaled" => {
+            r#"<div id="scaled-modal" style="position:fixed;left:240px;top:140px;width:70px;height:40px;background:rgba(0,0,0,0.2);z-index:10;">Scaled Modal</div>"#
+        }
+        _ => "",
+    };
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Scaled Iframe Host</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="scaled-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:40px;top:40px;width:320px;height:320px;border:6px solid #333;padding:8px;margin:0;background:#fff;transform-origin:top left;transform:scale(1.5);"></iframe>
+<div id="scale-wrapper" style="position:fixed;left:580px;top:40px;transform-origin:top left;transform:scale(1.5);">
+  <iframe id="ancestor-scaled-frame" src="/browser/iframes/scaled-inner"
+    style="width:260px;height:180px;border:4px solid #333;padding:6px;margin:0;background:#fff;"></iframe>
+</div>
+{overlay}
+</body></html>"#
+    )
+}
+
+fn browser_iframes_scaled_inner() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Scaled Inner Frame</title></head>
+<body style="margin:0;background:#fff;">
+<button id="unscaled-decoy" type="button"
+  style="position:fixed;left:50px;top:20px;width:55px;height:26px;"
+  onclick="document.getElementById('decoy-hit').textContent='decoy-clicked';">Decoy</button>
+<p id="decoy-hit" style="position:fixed;left:10px;top:5px;margin:0;">idle</p>
+<button id="scaled-btn" type="button"
+  style="position:fixed;left:100px;top:50px;width:80px;height:30px;"
+  onclick="this.textContent='done';document.getElementById('scaled-result').textContent='done';">Click</button>
+<p id="scaled-result" style="position:fixed;left:10px;top:60px;margin:0;">idle</p>
+<input id="scaled-pw" type="password" value="scaled-secret" autocomplete="off"
+  style="position:fixed;left:100px;top:95px;width:120px;height:28px;background:#ff0000;color:#ff0000;border:2px solid #ff0000;padding:0;margin:0;outline:none;">
+<iframe id="nested-scaled" src="/browser/iframes/nested"
+  style="position:fixed;left:10px;top:140px;width:240px;height:120px;border:3px solid #555;padding:4px;margin:0;background:#fff;transform-origin:top left;transform:scale(1.2);"></iframe>
+</body></html>"#
+}
+
+fn browser_iframes_unmappable_transform(query: &str) -> String {
+    match query_value(query, "kind").as_str() {
+        "skew" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Skewed Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform-origin:top left;transform:skewX(20deg);"></iframe>
+</body></html>"#
+            .to_string(),
+        "flip" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Flipped Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform-origin:center;transform:scale(-1, 1);"></iframe>
+</body></html>"#
+            .to_string(),
+        "3d" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>3D Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform:perspective(400px) rotateY(35deg);"></iframe>
+</body></html>"#
+            .to_string(),
+        "ancestor_rotate" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Ancestor Rotated Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<div style="position:fixed;left:80px;top:80px;transform-origin:top left;transform:rotate(15deg);">
+  <iframe id="bad-frame" src="/browser/iframes/scaled-inner" style="width:300px;height:220px;"></iframe>
+</div>
+</body></html>"#
+            .to_string(),
+        "rotate_no_inputs" => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Rotated Frame Without Inputs</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/probe/iframe-inner"
+  style="position:fixed;left:80px;top:80px;width:240px;height:100px;transform-origin:top left;transform:rotate(25deg);"></iframe>
+</body></html>"#
+            .to_string(),
+        _ => r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Rotated Iframe</title></head>
+<body style="margin:0;background:#fff;">
+<iframe id="bad-frame" src="/browser/iframes/scaled-inner"
+  style="position:fixed;left:80px;top:80px;width:300px;height:220px;transform-origin:top left;transform:rotate(25deg);"></iframe>
+</body></html>"#
+            .to_string(),
+    }
+}
+
+fn browser_mask_iframe() -> &'static str {
+    r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>Mask Iframe Probe</title>
+<style>
+body{margin:0;font:16px sans-serif;background:#fff}
+#top-pw{position:fixed;left:20px;top:30px;width:200px;height:32px;color:#f00}
+#mask-frame{position:fixed;left:80px;top:100px;width:440px;height:260px;border:5px solid #333;padding:8px;background:#fff}
+#mask-sandbox{position:fixed;left:560px;top:100px;width:140px;height:60px}
+#mask-report{position:fixed;left:20px;top:400px}
+</style></head>
+<body>
+<input id="top-pw" type="password" value="top-secret" autocomplete="off">
+<iframe id="mask-frame" src="/browser/mask-iframe-inner"></iframe>
+<iframe id="mask-sandbox" sandbox="" src="/browser/probe/iframe-inner"></iframe>
+<p id="mask-report">not recorded</p>
+<script>
+function boxInTop(el, frames) {
+  var r = el.getBoundingClientRect();
+  var ox = 0;
+  var oy = 0;
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    var fr = f.getBoundingClientRect();
+    var fs = f.ownerDocument.defaultView.getComputedStyle(f);
+    ox += fr.left + (f.clientLeft || parseFloat(fs.borderLeftWidth) || 0) + (parseFloat(fs.paddingLeft) || 0);
+    oy += fr.top + (f.clientTop || parseFloat(fs.borderTopWidth) || 0) + (parseFloat(fs.paddingTop) || 0);
+  }
+  return { left: ox + r.left, top: oy + r.top, right: ox + r.right, bottom: oy + r.bottom };
+}
+function isRectCovered(rect, masks) {
+  for (var i = 0; i < masks.length; i++) {
+    var mask = masks[i];
+    var box = mask.getBoundingClientRect();
+    var style = window.getComputedStyle(mask);
+    if (style.opacity === '1' &&
+        style.zIndex === '2147483647' &&
+        box.left <= rect.left + 0.5 &&
+        box.top <= rect.top + 0.5 &&
+        box.right >= rect.right - 0.5 &&
+        box.bottom >= rect.bottom - 0.5) {
+      return true;
+    }
+  }
+  return false;
+}
+function recordIframeMasks() {
+  var masks = document.querySelectorAll('[data-da-screenshot-mask]');
+  if (!masks.length) return;
+  var f1 = document.getElementById('mask-frame');
+  var d1 = f1 && f1.contentDocument;
+  var f2 = d1 && d1.getElementById('nested-mask-frame');
+  var d2 = f2 && f2.contentDocument;
+  var topPw = document.getElementById('top-pw');
+  var framePw = d1 && d1.getElementById('iframe-pw');
+  var frameNote = d1 && d1.getElementById('iframe-note');
+  var nestedPw = d2 && d2.getElementById('nested-pw');
+  if (!topPw || !framePw || !frameNote || !nestedPw) return;
+  var parts = [
+    'top_pw=' + isRectCovered(boxInTop(topPw, []), masks),
+    'iframe_pw=' + isRectCovered(boxInTop(framePw, [f1]), masks),
+    'iframe_note=' + isRectCovered(boxInTop(frameNote, [f1]), masks),
+    'nested_pw=' + isRectCovered(boxInTop(nestedPw, [f1, f2]), masks)
+  ];
+  document.getElementById('mask-report').textContent = parts.join(',');
+}
+var observer = new MutationObserver(function (records) {
+  for (var i = 0; i < records.length; i++) {
+    var added = records[i].addedNodes;
+    for (var j = 0; j < added.length; j++) {
+      var node = added[j];
+      if (node.nodeType === 1 && node.hasAttribute('data-da-screenshot-mask')) {
+        recordIframeMasks();
+        return;
+      }
+    }
+  }
+});
+observer.observe(document.documentElement, { childList: true, subtree: true });
+</script>
+</body></html>"##
+}
+
+fn browser_mask_iframe_inner() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Mask Frame Inner</title></head>
+<body style="margin:0;background:#fff;">
+<input id="iframe-pw" type="password" value="iframe-secret" autocomplete="off"
+  style="position:fixed;left:16px;top:16px;width:220px;height:32px;color:#f00;">
+<textarea id="iframe-note" style="position:fixed;left:16px;top:64px;width:220px;height:40px;color:#f00;">secret note</textarea>
+<iframe id="nested-mask-frame" src="/browser/mask-iframe-nested"
+  style="position:fixed;left:16px;top:120px;width:360px;height:100px;border:3px solid #555;padding:4px;background:#fff;"></iframe>
+</body></html>"#
+}
+
+fn browser_mask_iframe_nested() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Mask Frame Nested</title></head>
+<body style="margin:0;background:#fff;">
+<input id="nested-pw" type="password" value="nested-secret" autocomplete="off"
+  style="position:fixed;left:12px;top:12px;width:200px;height:30px;color:#f00;">
 </body></html>"#
 }
 

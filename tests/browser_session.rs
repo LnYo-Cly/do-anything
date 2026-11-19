@@ -1845,3 +1845,114 @@ fn stop_refuses_incomplete_and_inconsistent_launched_handles_before_connecting()
         "dispose_handle must never send WebSocket handshake or Browser.close without confirmed pid ownership"
     );
 }
+
+#[test]
+fn session_steps_and_export_preserve_within_iframe_while_snapshot_stays_main_frame() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "/host".to_string(),
+        r##"<!doctype html>
+<html>
+<head><title>Frame Host</title></head>
+<body>
+  <h1>Host Header</h1>
+  <iframe id="embed" title="Embedded Form" src="/inner"></iframe>
+</body>
+</html>"##
+            .to_string(),
+    );
+    routes.insert(
+        "/inner".to_string(),
+        r##"<!doctype html>
+<html>
+<body>
+  <button id="inner-btn" onclick="document.getElementById('inner-msg').textContent='clicked'">Inner Save</button>
+  <p id="inner-msg">idle</p>
+</body>
+</html>"##
+            .to_string(),
+    );
+    let server = PageServer::start(routes);
+    let dir = TempDir::new("browser-session-iframe");
+
+    let id = json_stdout(&run_da_in(dir.path(), &["session", "start"]))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/host")),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{:?}", open);
+    let open_json = json_stdout(&open);
+    let tree = open_json["snapshot"]["tree"].as_array().unwrap();
+    assert!(
+        find_ref_by_role_and_name(tree, "Iframe", "Embedded Form").is_some(),
+        "main-document snapshot should include the Iframe node: {tree:?}"
+    );
+    assert!(
+        find_ref_by_role_and_name(tree, "button", "Inner Save").is_none(),
+        "main-document snapshot should not descend into iframe document: {tree:?}"
+    );
+
+    let click_step = json!({
+        "browser.click": {
+            "css": "#inner-btn",
+            "within": { "css": "#embed" }
+        }
+    })
+    .to_string();
+    let click = run_da_in(dir.path(), &["session", "step", &id, "--step", &click_step]);
+    assert_eq!(click.status.code(), Some(0), "{:?}", click);
+
+    let read_step = json!({
+        "browser.read": {
+            "css": "#inner-msg",
+            "within": { "css": "#embed" }
+        },
+        "expect": [{ "path": "$.text", "equals": "clicked" }]
+    })
+    .to_string();
+    let read = run_da_in(dir.path(), &["session", "step", &id, "--step", &read_step]);
+    assert_eq!(read.status.code(), Some(0), "{:?}", read);
+
+    let exported_path = dir.path().join("iframe_replay.yaml");
+    let export = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "export",
+            &id,
+            "-o",
+            exported_path.to_str().unwrap(),
+            "--name",
+            "Session iframe replay",
+        ],
+    );
+    assert_eq!(export.status.code(), Some(0), "{:?}", export);
+    let yaml = fs::read_to_string(&exported_path).expect("read exported YAML");
+    assert!(
+        yaml.contains("within:") && yaml.contains("#embed"),
+        "exported YAML must preserve explicit within iframe locator:\n{yaml}"
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{:?}", stop);
+
+    let replay = run_da_in(
+        dir.path(),
+        &["run", exported_path.to_str().unwrap(), "--no-bundle"],
+    );
+    assert_eq!(replay.status.code(), Some(0), "{:?}", replay);
+}

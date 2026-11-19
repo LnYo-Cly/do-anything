@@ -367,7 +367,17 @@ impl Connection {
                 Some(id),
                 deadline,
             )?;
-            let message = self.read(method, deadline)?;
+            let message = match self.read(method, deadline) {
+                Ok(message) => message,
+                Err(error) => {
+                    if matches!(error, CdpError::Timeout { .. }) {
+                        // Drop a late reply if the browser eventually answers
+                        // after the caller moved on to another target or retry.
+                        self.ignored_reply_ids.push(id);
+                    }
+                    return Err(error);
+                }
+            };
             if message.get("id").and_then(Value::as_u64) == Some(id) {
                 return command_result(method, &message);
             }
@@ -1812,6 +1822,73 @@ mod tests {
         let remaining = conn.take_messages();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0]["sessionId"], "other-session");
+
+        drop(conn);
+        server.join().expect("server finish");
+    }
+
+    #[test]
+    fn call_until_ignores_late_reply_after_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock CDP");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut socket = tungstenite::accept(stream).expect("handshake");
+
+            let first = match socket.read().expect("first cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(first["method"], "Target.attachToTarget");
+
+            // Wait for the follow-up command after the first times out, then send
+            // the late reply to `first` before answering `second`.
+            let second = match socket.read().expect("second cmd") {
+                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).expect("json"),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            assert_eq!(second["method"], "Target.closeTarget");
+            socket
+                .send(Message::text(
+                    json!({ "id": first["id"], "result": { "sessionId": "late-session" } })
+                        .to_string(),
+                ))
+                .expect("send late reply");
+            socket
+                .send(Message::text(
+                    json!({ "id": second["id"], "result": { "success": true } }).to_string(),
+                ))
+                .expect("send second reply");
+            while socket.read().is_ok() {}
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/test");
+        let mut conn =
+            Connection::connect(&url, Deadline::after(Duration::from_secs(2))).expect("connect");
+        let err = conn
+            .call_until(
+                "Target.attachToTarget",
+                json!({}),
+                None,
+                Deadline::after(Duration::from_millis(80)),
+                |_| false,
+            )
+            .expect_err("first call must time out");
+        assert!(matches!(err, CdpError::Timeout { .. }), "{err:?}");
+
+        let reply = conn
+            .call(
+                "Target.closeTarget",
+                json!({}),
+                None,
+                Deadline::after(Duration::from_secs(2)),
+            )
+            .expect("second call must succeed");
+        assert_eq!(reply["success"], json!(true));
+        assert!(
+            conn.take_messages().is_empty(),
+            "late reply to timed-out command must be dropped instead of queued"
+        );
 
         drop(conn);
         server.join().expect("server finish");

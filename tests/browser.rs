@@ -2164,8 +2164,9 @@ fn schema_and_lint_validate_testid_within_nth_and_testid_attribute() {
     assert_eq!(
         exit_code(&valid_lint),
         Some(0),
-        "lint must accept valid case: {}",
-        stdout(&valid_lint)
+        "lint must accept valid case: stdout: {}\nstderr: {}",
+        stdout(&valid_lint),
+        stderr(&valid_lint)
     );
 
     let invalid_cases = [
@@ -2350,7 +2351,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "hidden-testid must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2477,7 +2484,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "ambiguous-within must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2571,7 +2584,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "nth-oob must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2677,8 +2696,13 @@ steps:
         &["--output", "json", "run", path_str(&many_case)],
         &[("DA_LOCATOR_SECRET", secret.to_string())],
     );
-    assert_eq!(exit_code(&output), Some(1));
     let raw_stdout = stdout(&output);
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "many-redacted must fail: stdout: {raw_stdout}\nstderr: {}",
+        stderr(&output)
+    );
     assert!(
         !raw_stdout.contains(secret),
         "secret leaked in JSON stdout: {raw_stdout}"
@@ -2826,7 +2850,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "disabled-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2858,7 +2888,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "aria-disabled-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2891,7 +2927,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "disabled-type must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2923,7 +2965,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "moving-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2955,7 +3003,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "occluded-click must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -2988,7 +3042,13 @@ steps:
             "--no-bundle",
         ],
     );
-    assert_eq!(exit_code(&output), Some(1));
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "occluded-type must fail: stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
     let value = json_stdout(&output);
     let message = case_error(&value);
     assert!(
@@ -3050,7 +3110,7 @@ fn unsupported_capabilities_probe_current_behavior() {
     };
     let dir = TempDir::new("browser-probes");
 
-    // 1. iframe
+    // 1. iframe (unscoped locator stays in the main document; `within` enters same-origin iframes)
     let iframe_case = dir.write(
         "probe-iframe.yaml",
         &format!(
@@ -3080,6 +3140,31 @@ fn unsupported_capabilities_probe_current_behavior() {
     assert!(
         iframe_err.contains("could not find CSS selector `#inside-frame`"),
         "unexpected iframe probe error: {iframe_err}"
+    );
+
+    let scoped_iframe_case = dir.write(
+        "probe-iframe-within.yaml",
+        &format!(
+            "name: probe iframe within\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-frame\"\n      within:\n        css: \"#probe-frame\"\n  - browser.read:\n      css: \"#probe-status\"\n      within:\n        css: \"#probe-frame\"\n    expect:\n      - path: $.text\n        equals: clicked\n",
+            server.url("/browser/probe/iframe")
+        ),
+    );
+    let scoped_iframe_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&scoped_iframe_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&scoped_iframe_out),
+        Some(0),
+        "scoped iframe probe must succeed: stdout={}\nstderr={}",
+        stdout(&scoped_iframe_out),
+        stderr(&scoped_iframe_out)
     );
 
     // 2. shadow DOM (css misses; role finds AX node but light-DOM elementFromPoint sees shadow host)
@@ -3509,6 +3594,163 @@ fn session_creation_recovers_from_target_crash_and_reports_diagnostics_when_all_
     assert!(
         fail_msg.contains("Target.targetCrashed") && fail_msg.contains("target crashed"),
         "expected crash diagnostic in failure message, got: {fail_msg}"
+    );
+}
+
+#[test]
+fn session_creation_recovers_from_silent_attach_to_target_hang() {
+    let dir = TempDir::new("browser-attach-target-stall");
+
+    let (port, server) = spawn_mock_devtools(|mut socket| {
+        let create1 = read_mock_cdp(&mut socket).expect("create1");
+        assert_eq!(create1["method"], "Target.createTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": create1["id"], "result": { "targetId": "t-1" } }),
+        );
+        let attach1 = read_mock_cdp(&mut socket).expect("attach1");
+        assert_eq!(attach1["method"], "Target.attachToTarget");
+        // Never answer Target.attachToTarget for t-1; expect Target.closeTarget
+        // within ATTACH_ENABLE_TIMEOUT and retry on t-2.
+        let close1 = read_mock_cdp(&mut socket).expect("close1");
+        assert_eq!(close1["method"], "Target.closeTarget");
+        assert_eq!(close1["params"]["targetId"], "t-1");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": close1["id"], "result": { "success": true } }),
+        );
+
+        let create2 = read_mock_cdp(&mut socket).expect("create2");
+        assert_eq!(create2["method"], "Target.createTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": create2["id"], "result": { "targetId": "t-2" } }),
+        );
+        let attach2 = read_mock_cdp(&mut socket).expect("attach2");
+        assert_eq!(attach2["method"], "Target.attachToTarget");
+        send_mock_cdp(
+            &mut socket,
+            &json!({ "id": attach2["id"], "result": { "sessionId": "s-2" } }),
+        );
+
+        while let Some(cmd) = read_mock_cdp(&mut socket) {
+            let method = cmd["method"].as_str().unwrap_or_default();
+            let result = match method {
+                "Page.enable" | "Runtime.enable" | "Network.enable" | "Page.navigate" => json!({}),
+                "Runtime.evaluate" => {
+                    let expr = cmd["params"]["expression"].as_str().unwrap_or_default();
+                    if expr == "location.href" {
+                        json!({ "result": { "value": "http://127.0.0.1/ok" } })
+                    } else {
+                        json!({ "result": { "value": "Recovered After Attach Stall" } })
+                    }
+                }
+                "Target.closeTarget" => {
+                    send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "success": true } }),
+                    );
+                    break;
+                }
+                other => panic!("unexpected CDP command: {other}"),
+            };
+            send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": result }));
+        }
+    });
+
+    let case = dir.write(
+        "recover-attach-stall.yaml",
+        &format!(
+            "name: recover attachToTarget stall\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{port}\"\n      url: \"http://127.0.0.1/ok\"\n    expect:\n      - path: $.title\n        equals: \"Recovered After Attach Stall\"\n"
+        ),
+    );
+    let started = Instant::now();
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    server.join().expect("mock server finish");
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "silent Target.attachToTarget stall must recover inside LAUNCH_TIMEOUT, took {:?}",
+        started.elapsed()
+    );
+
+    // 2. When connected to an existing browser and all owned-target attach attempts stall,
+    //    `connect` mode must fail fast inside LAUNCH_TIMEOUT without sending `Browser.close`
+    //    or retrying browser creation.
+    let (fail_port, fail_server) = spawn_mock_devtools(|mut socket| {
+        for attempt in 1..=3 {
+            let tid = format!("t-fail-{attempt}");
+            let create = read_mock_cdp(&mut socket).expect("create");
+            assert_eq!(create["method"], "Target.createTarget");
+            send_mock_cdp(
+                &mut socket,
+                &json!({ "id": create["id"], "result": { "targetId": tid } }),
+            );
+            let attach = read_mock_cdp(&mut socket).expect("attach");
+            assert_eq!(attach["method"], "Target.attachToTarget");
+            if attempt < 3 {
+                let close = read_mock_cdp(&mut socket).expect("close");
+                assert_eq!(close["method"], "Target.closeTarget");
+                assert_eq!(close["params"]["targetId"], tid);
+                send_mock_cdp(
+                    &mut socket,
+                    &json!({ "id": close["id"], "result": { "success": true } }),
+                );
+            }
+        }
+        if let Some(extra) = read_mock_cdp(&mut socket) {
+            panic!(
+                "connect mode must preserve browser ownership and not retry or send extra CDP command: {extra}"
+            );
+        }
+    });
+
+    let fail_case = dir.write(
+        "connect-attach-stall-fail.yaml",
+        &format!(
+            "name: connect attachToTarget stall fails preserving browser\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{fail_port}\"\n      url: \"http://127.0.0.1/fail\"\n"
+        ),
+    );
+    let fail_started = Instant::now();
+    let fail_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&fail_case),
+            "--no-bundle",
+        ],
+    );
+    fail_server.join().expect("fail mock server finish");
+    assert!(
+        fail_started.elapsed() < Duration::from_secs(25),
+        "3 stalled Target.attachToTarget attempts must fail inside LAUNCH_TIMEOUT, took {:?}",
+        fail_started.elapsed()
+    );
+    assert_eq!(
+        exit_code(&fail_out),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        stdout(&fail_out),
+        stderr(&fail_out)
+    );
+    let fail_json = json_stdout(&fail_out);
+    let fail_msg = case_error(&fail_json);
+    assert!(
+        fail_msg.contains("attempt 1:")
+            && fail_msg.contains("attempt 3:")
+            && fail_msg.contains("Target.attachToTarget"),
+        "expected attempt diagnostics in failure message, got: {fail_msg}"
     );
 }
 
@@ -4289,6 +4531,1205 @@ steps:
 "##,
             server.url("/browser/dialogs/retry")
         ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["status"], "passed", "{report}");
+    assert_eq!(
+        report["cases"][0]["steps"][2]["result"]["dialog"]["type"], "confirm",
+        "{report}"
+    );
+    assert_eq!(
+        report["cases"][0]["steps"][5]["result"]["text"], "after-alert",
+        "{report}"
+    );
+}
+
+#[test]
+fn within_same_origin_and_nested_iframes_support_all_locators_and_actions() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-nested");
+    let host_url = server.url("/browser/iframes/host");
+    let slow_url = server.url("/browser/iframes/slow-host");
+    let frameset_url = server.url("/browser/iframes/frameset");
+
+    let main_case = dir.write(
+        "iframes-all-locators.yaml",
+        &format!(
+            r##"name: same-origin and nested iframes support all locators and actions
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.wait:
+      role: button
+      name: Frame Action
+      within:
+        css: "#embed"
+  - browser.click:
+      css: "#frame-btn"
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: frame-clicked
+  - browser.click:
+      xpath: "//button[@id='panel-btn']"
+      within:
+        role: region
+        name: Inner Panel
+        within:
+          testid: embed-frame
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: inner-panel-clicked
+  - browser.click:
+      text: Other Save
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: other-panel-clicked
+  - browser.type:
+      testid: frame-input
+      text: hello-iframe
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: "typed:hello-iframe"
+  - browser.click:
+      css: "#frame-confirm-btn"
+      dialog: accept
+      within:
+        css: "#embed"
+    expect:
+      - path: $.dialog.type
+        equals: confirm
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: confirmed
+  - browser.click:
+      testid: nested-btn
+      within:
+        css: ".nested-box"
+        within:
+          testid: nested-frame
+          within:
+            css: "#embed"
+  - browser.read:
+      css: "#nested-result"
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+    expect:
+      - path: $.text
+        equals: nested-clicked
+  - browser.type:
+      role: textbox
+      name: Nested Field
+      text: deep-value
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+  - browser.read:
+      css: "#nested-result"
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+    expect:
+      - path: $.text
+        equals: "nested-typed:deep-value"
+  - browser.click:
+      css: "#spawn-nested-badge"
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+  - browser.wait:
+      text: nested-ready
+      timeout_ms: 2000
+      within:
+        css: "#nested-frame"
+        within:
+          css: "#embed"
+"##
+        ),
+    );
+    let main_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&main_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&main_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&main_out),
+        stderr(&main_out)
+    );
+
+    // Unscoped `role` locator must stay in the main document and not pierce into `#embed`.
+    let unscoped_role_case = dir.write(
+        "iframe-unscoped-role.yaml",
+        &format!(
+            r##"name: unscoped role stays in main document
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.click:
+      role: button
+      name: Frame Action
+      timeout_ms: 400
+"##
+        ),
+    );
+    let unscoped_role_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&unscoped_role_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&unscoped_role_out),
+        Some(1),
+        "unscoped-role must fail: stdout: {}\nstderr: {}",
+        stdout(&unscoped_role_out),
+        stderr(&unscoped_role_out)
+    );
+    let unscoped_role_json = json_stdout(&unscoped_role_out);
+    let unscoped_role_err = case_error(&unscoped_role_json);
+    assert!(
+        unscoped_role_err.contains("could not find role `button` named `Frame Action`"),
+        "expected unscoped role miss, got: {unscoped_role_err}"
+    );
+
+    // Unhandled JS dialog inside an iframe still fails fast via DialogWatch.
+    let dialog_case = dir.write(
+        "iframe-unhandled-dialog.yaml",
+        &format!(
+            r##"name: unhandled dialog inside iframe fails fast
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.click:
+      css: "#frame-alert-btn"
+      timeout_ms: 5000
+      within:
+        css: "#embed"
+"##
+        ),
+    );
+    let dialog_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&dialog_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&dialog_out),
+        Some(1),
+        "iframe-unhandled-dialog must fail: stdout: {}\nstderr: {}",
+        stdout(&dialog_out),
+        stderr(&dialog_out)
+    );
+    let dialog_json = json_stdout(&dialog_out);
+    let dialog_ms = dialog_json["cases"][0]["steps"][1]["duration_ms"]
+        .as_u64()
+        .unwrap_or(u64::MAX);
+    assert!(
+        dialog_ms < 3000,
+        "unhandled iframe dialog must fail fast, took {dialog_ms} ms"
+    );
+    let dialog_err = case_error(&dialog_json);
+    assert!(
+        dialog_err.contains("alert") && dialog_err.contains("inner alert"),
+        "expected inner alert message, got: {dialog_err}"
+    );
+
+    // Slow-loading dynamically inserted same-origin iframe waits within timeout_ms.
+    let slow_case = dir.write(
+        "iframe-slow-ready.yaml",
+        &format!(
+            r##"name: waits for same-origin iframe document to become ready
+steps:
+  - browser.open:
+      url: "{slow_url}"
+  - browser.click:
+      css: "#spawn-lazy-frame"
+  - browser.wait:
+      css: "#slow-ready"
+      timeout_ms: 3000
+      within:
+        css: "#lazy-frame"
+  - browser.click:
+      css: "#slow-btn"
+      timeout_ms: 3000
+      within:
+        css: "#lazy-frame"
+  - browser.read:
+      css: "#slow-ready"
+      within:
+        css: "#lazy-frame"
+    expect:
+      - path: $.text
+        equals: slow-clicked
+"##
+        ),
+    );
+    let slow_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&slow_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&slow_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&slow_out),
+        stderr(&slow_out)
+    );
+
+    // <frameset> / <frame> works identically to <iframe>.
+    let frameset_case = dir.write(
+        "frameset-frame.yaml",
+        &format!(
+            r##"name: within supports frame elements in a frameset
+steps:
+  - browser.open:
+      url: "{frameset_url}"
+  - browser.click:
+      css: "#inside-frame"
+      within:
+        css: "#frame-left"
+  - browser.read:
+      css: "#probe-status"
+      within:
+        css: "#frame-left"
+    expect:
+      - path: $.text
+        equals: clicked
+"##
+        ),
+    );
+    let frameset_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&frameset_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&frameset_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&frameset_out),
+        stderr(&frameset_out)
+    );
+}
+
+#[test]
+fn within_iframe_click_accumulates_frame_offsets_instead_of_clicking_decoy() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-offset");
+    let host_url = server.url("/browser/iframes/host");
+
+    let case = dir.write(
+        "offset-click.yaml",
+        &format!(
+            r##"name: iframe click accumulates outer frame viewport offset
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.click:
+      css: "#frame-btn"
+      timeout_ms: 2000
+      within:
+        css: "#embed"
+  - browser.read:
+      css: "#frame-result"
+      within:
+        css: "#embed"
+    expect:
+      - path: $.text
+        equals: frame-clicked
+  - browser.read:
+      css: "#decoy-result"
+    expect:
+      - path: $.text
+        equals: decoy-idle
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn within_iframe_checks_top_level_and_inner_occlusion_and_scrolls_offscreen_frames() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-occlusion");
+    let url = server.url("/browser/iframes/occlusion");
+
+    // 1. Top-level modal backdrop over an iframe button blocks the click and names the backdrop.
+    let top_blocked = dir.write(
+        "top-blocked.yaml",
+        &format!(
+            r##"name: top-level backdrop over iframe button fails naming backdrop
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#top-blocked-btn"
+      timeout_ms: 400
+      within:
+        css: "#occ-frame"
+"##
+        ),
+    );
+    let top_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&top_blocked),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&top_out),
+        Some(1),
+        "top-blocked must fail: stdout: {}\nstderr: {}",
+        stdout(&top_out),
+        stderr(&top_out)
+    );
+    let top_json = json_stdout(&top_out);
+    let top_err = case_error(&top_json);
+    assert!(
+        top_err.contains("top-modal-backdrop"),
+        "expected top-modal-backdrop blocker, got: {top_err}"
+    );
+
+    // 2. Inner overlay inside the iframe blocks the click and names the inner overlay.
+    let inner_blocked = dir.write(
+        "inner-blocked.yaml",
+        &format!(
+            r##"name: inner overlay inside iframe fails naming inner overlay
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#inner-blocked-btn"
+      timeout_ms: 400
+      within:
+        css: "#occ-frame"
+"##
+        ),
+    );
+    let inner_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&inner_blocked),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&inner_out),
+        Some(1),
+        "inner-blocked must fail: stdout: {}\nstderr: {}",
+        stdout(&inner_out),
+        stderr(&inner_out)
+    );
+    let inner_json = json_stdout(&inner_out);
+    let inner_err = case_error(&inner_json);
+    assert!(
+        inner_err.contains("inner-overlay"),
+        "expected inner-overlay blocker, got: {inner_err}"
+    );
+
+    // 3. Transient top-level overlay clears -> click succeeds; offscreen iframe scrolls in -> click succeeds.
+    let recover_and_scroll = dir.write(
+        "uncover-and-scroll.yaml",
+        &format!(
+            r##"name: waits for top-level overlay to hide and scrolls offscreen iframe
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#uncover-iframe-modal"
+  - browser.click:
+      css: "#temp-blocked-btn"
+      timeout_ms: 2000
+      within:
+        css: "#occ-frame"
+  - browser.read:
+      css: "#occ-result"
+      within:
+        css: "#occ-frame"
+    expect:
+      - path: $.text
+        equals: temp-blocked-clicked
+  - browser.click:
+      css: "#inside-frame"
+      within:
+        css: "#offscreen-frame"
+  - browser.read:
+      css: "#probe-status"
+      within:
+        css: "#offscreen-frame"
+    expect:
+      - path: $.text
+        equals: clicked
+"##
+        ),
+    );
+    let recover_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&recover_and_scroll),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&recover_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&recover_out),
+        stderr(&recover_out)
+    );
+}
+
+#[test]
+fn within_cross_origin_iframe_fails_immediately_with_clear_error() {
+    let server1 = TestServer::start();
+    let Some(_guard) = chrome_test(&server1) else {
+        return;
+    };
+    let server2 = TestServer::start();
+    let dir = TempDir::new("browser-iframe-cross-origin");
+    let url = format!(
+        "{}?cross_port={}",
+        server1.url("/browser/iframes/host"),
+        server2.port()
+    );
+
+    for (name, frame_selector) in [
+        ("cross-origin-port.yaml", "#cross-origin-frame"),
+        ("cross-origin-sandbox.yaml", "#sandboxed-frame"),
+    ] {
+        let case = dir.write(
+            name,
+            &format!(
+                r##"name: cross-origin iframe fails immediately
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#inside-frame"
+      timeout_ms: 10000
+      within:
+        css: "{frame_selector}"
+"##
+            ),
+        );
+        let output = run_da_in(
+            dir.path(),
+            &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        );
+        assert_eq!(
+            exit_code(&output),
+            Some(1),
+            "{name}: stdout={}\nstderr={}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let value = json_stdout(&output);
+        let duration_ms = value["cases"][0]["steps"][1]["duration_ms"]
+            .as_u64()
+            .unwrap_or(u64::MAX);
+        assert!(
+            duration_ms < 4000,
+            "{name}: cross-origin iframe must fail immediately instead of waiting 10000 ms (took {duration_ms} ms)"
+        );
+        let message = case_error(&value);
+        assert!(
+            message.contains("cross-origin") && message.contains("same-origin"),
+            "{name}: expected clear cross-origin iframe message, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn screenshot_and_failure_evidence_cover_editable_fields_inside_same_origin_iframes() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-mask-iframe");
+    let url = server.url("/browser/mask-iframe");
+    let secret = "iframe-pw-s3cr3t-42";
+
+    let case = dir.write(
+        "mask-iframe.yaml",
+        &format!(
+            r##"name: screenshot masks editable fields inside same-origin and nested iframes
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      css: "#iframe-pw"
+      text: "${{env:DA_IFRAME_PW_SECRET}}"
+      within:
+        css: "#mask-frame"
+  - browser.screenshot:
+      path: shots/iframe-masked.png
+  - browser.read:
+      css: "#mask-report"
+    expect:
+      - path: $.text
+        equals: "top_pw=true,iframe_pw=true,iframe_note=true,nested_pw=true"
+  - browser.click:
+      css: "#iframe-pw"
+      within:
+        css: "#mask-frame"
+  - browser.read:
+      css: "#mask-report"
+    expect:
+      - path: $.text
+        equals: "force-failure-bundle"
+"##
+        ),
+    );
+    let bundles = dir.path().join("failures");
+    let output = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_IFRAME_PW_SECRET", secret.to_string())],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let raw_stdout = stdout(&output);
+    assert!(
+        !raw_stdout.contains(secret),
+        "secret leaked in JSON output: {raw_stdout}"
+    );
+    let value = json_stdout(&output);
+    // Step 3 (0-based index 3) is the mask-report expectation; it must pass before step 4 fails!
+    assert_eq!(
+        value["cases"][0]["steps"][3]["status"], "passed",
+        "mask report check inside step 3 must pass: {value}"
+    );
+    let explicit_shot = dir.path().join("shots/iframe-masked.png");
+    assert!(
+        is_png(&fs::read(&explicit_shot).expect("explicit screenshot must exist")),
+        "explicit screenshot must be a valid PNG"
+    );
+
+    let bundle_rel = value["cases"][0]["bundle"]
+        .as_str()
+        .expect("failed case must emit failure bundle");
+    let bundle_dir = PathBuf::from(bundle_rel);
+    assert!(
+        is_png(
+            &fs::read(bundle_dir.join("browser/screenshot.png"))
+                .expect("failure bundle browser/screenshot.png must exist")
+        ),
+        "failure bundle screenshot must be a valid PNG"
+    );
+    let report_json =
+        fs::read_to_string(bundle_dir.join("report.json")).expect("report.json must exist");
+    assert!(
+        !report_json.contains(secret),
+        "secret leaked in failure report.json: {report_json}"
+    );
+}
+
+#[test]
+fn within_scaled_iframe_clicks_exact_target_and_masks_screenshot_pixels() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-scaled");
+    let host_url = server.url("/browser/iframes/scaled-host");
+    let unscaled_overlay_url = server.url("/browser/iframes/scaled-host?overlay=unscaled");
+    let scaled_overlay_url = server.url("/browser/iframes/scaled-host?overlay=scaled");
+
+    // 1. Click, type, nested scaled iframe click, screenshot masking at scale(1.5),
+    //    and unscaled vs. scaled occlusion checks.
+    let case = dir.write(
+        "scaled-iframe.yaml",
+        &format!(
+            r##"name: scaled iframe click hits button and screenshot masks scaled field
+steps:
+  - browser.open:
+      url: "{host_url}"
+  - browser.type:
+      css: "#scaled-pw"
+      text: scaled-secret-value
+      within:
+        css: "#scaled-frame"
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#scaled-frame"
+  - browser.read:
+      css: "#scaled-result"
+      within:
+        css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: done
+  - browser.read:
+      css: "#decoy-hit"
+      within:
+        css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: idle
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#ancestor-scaled-frame"
+  - browser.read:
+      css: "#scaled-result"
+      within:
+        css: "#ancestor-scaled-frame"
+    expect:
+      - path: $.text
+        equals: done
+  - browser.click:
+      css: "#nested-btn"
+      within:
+        css: "#nested-scaled"
+        within:
+          css: "#scaled-frame"
+  - browser.read:
+      css: "#nested-result"
+      within:
+        css: "#nested-scaled"
+        within:
+          css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: nested-clicked
+  - browser.screenshot:
+      path: shots/scaled-masked.png
+  - browser.open:
+      url: "{unscaled_overlay_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#scaled-frame"
+  - browser.read:
+      css: "#scaled-result"
+      within:
+        css: "#scaled-frame"
+    expect:
+      - path: $.text
+        equals: done
+  - browser.open:
+      url: "{scaled_overlay_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 400
+      within:
+        css: "#scaled-frame"
+    optional: true
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let main_json = json_stdout(&output);
+    let steps = main_json["cases"][0]["steps"]
+        .as_array()
+        .expect("steps array");
+    for (idx, step) in steps.iter().enumerate() {
+        if idx == 14 {
+            assert_eq!(
+                step["status"], "skipped",
+                "optional step 14 must be skipped when occluded: {step}"
+            );
+            let err = step["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("scaled-modal"),
+                "expected scaled-modal occlusion blocker, got: {err}"
+            );
+        } else {
+            assert_eq!(step["status"], "passed", "step {idx} must pass: {step}");
+        }
+    }
+
+    // 2. Inspect actual rendered pixels of shots/scaled-masked.png via headless Chrome <canvas>.
+    let shot_bytes =
+        fs::read(dir.path().join("shots/scaled-masked.png")).expect("screenshot PNG must exist");
+    assert!(is_png(&shot_bytes), "must be a valid PNG");
+    let png_b64 = support::base64_encode(&shot_bytes);
+    let inspect_html = format!(
+        r##"<!doctype html><html><body>
+<p id="px-report">pending</p>
+<script>
+var img = new Image();
+img.onload = function () {{
+  var c = document.createElement('canvas');
+  c.width = img.width;
+  c.height = img.height;
+  var ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  var data = ctx.getImageData(0, 0, c.width, c.height).data;
+  var redCount = 0;
+  for (var i = 0; i < data.length; i += 4) {{
+    if (data[i] > 180 && data[i + 1] < 60 && data[i + 2] < 60) redCount++;
+  }}
+  var allBlack = function (x0, y0, x1, y1) {{
+    for (var y = y0; y <= y1; y++) {{
+      for (var x = x0; x <= x1; x++) {{
+        var idx = (y * c.width + x) * 4;
+        if (data[idx] !== 0 || data[idx + 1] !== 0 || data[idx + 2] !== 0) return false;
+      }}
+    }}
+    return true;
+  }};
+  var directBlack = allBlack(215, 208, 390, 248);
+  var ancestorBlack = allBlack(750, 202, 926, 241);
+  document.getElementById('px-report').textContent =
+    'red=' + redCount + ',direct=' + directBlack + ',ancestor=' + ancestorBlack;
+}};
+img.src = 'data:image/png;base64,{png_b64}';
+</script></body></html>"##
+    );
+    let inspect_url = format!(
+        "data:text/html;base64,{}",
+        support::base64_encode(inspect_html.as_bytes())
+    );
+    let inspect_case = dir.write(
+        "inspect-pixels.yaml",
+        &format!(
+            r##"name: verify scaled screenshot pixels
+steps:
+  - browser.open:
+      url: "{inspect_url}"
+  - browser.wait:
+      css: "#px-report"
+  - browser.read:
+      css: "#px-report"
+    expect:
+      - path: $.text
+        equals: "red=0,direct=true,ancestor=true"
+"##
+        ),
+    );
+    let inspect_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&inspect_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&inspect_out),
+        Some(0),
+        "pixel inspection failed: stdout={}\nstderr={}",
+        stdout(&inspect_out),
+        stderr(&inspect_out)
+    );
+}
+
+#[test]
+fn within_unmappable_frame_transform_fails_clearly_for_click_and_screenshots() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-unmappable-transform");
+
+    let rotate_url = server.url("/browser/iframes/unmappable-transform?kind=rotate");
+    let skew_url = server.url("/browser/iframes/unmappable-transform?kind=skew");
+    let flip_url = server.url("/browser/iframes/unmappable-transform?kind=flip");
+    let d3_url = server.url("/browser/iframes/unmappable-transform?kind=3d");
+    let ancestor_url = server.url("/browser/iframes/unmappable-transform?kind=ancestor_rotate");
+    let no_inputs_url = server.url("/browser/iframes/unmappable-transform?kind=rotate_no_inputs");
+
+    // 1. Check all 5 unmappable transforms fail fast on click, screenshot with fields refuses,
+    //    and decorative rotated iframe without fields allows screenshot in one session.
+    let checks_case = dir.write(
+        "unmappable-checks.yaml",
+        &format!(
+            r##"name: unmappable frame transforms fail fast and refuse uncovered screenshots
+steps:
+  - browser.open:
+      url: "{rotate_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.screenshot:
+      path: shots/should-not-exist.png
+    optional: true
+  - browser.open:
+      url: "{skew_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{flip_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{d3_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{ancestor_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      timeout_ms: 8000
+      within:
+        css: "#bad-frame"
+    optional: true
+  - browser.open:
+      url: "{no_inputs_url}"
+  - browser.screenshot:
+      path: shots/no-inputs-ok.png
+"##
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&checks_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout={}\nstderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let steps = value["cases"][0]["steps"].as_array().expect("steps array");
+    for (idx, label) in [
+        (1, "rotate"),
+        (4, "skew"),
+        (6, "flip"),
+        (8, "3d"),
+        (10, "ancestor_rotate"),
+    ] {
+        let step = &steps[idx];
+        assert_eq!(step["status"], "skipped", "{label}: {step}");
+        let duration_ms = step["duration_ms"].as_u64().unwrap_or(u64::MAX);
+        assert!(
+            duration_ms < 4000,
+            "{label}: unmappable transform must fail immediately instead of waiting 8000 ms (took {duration_ms} ms)"
+        );
+        let err = step["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("transform") && err.contains("cannot be mapped"),
+            "{label}: expected clear transform mapping error, got: {err}"
+        );
+    }
+    let shot_step = &steps[2];
+    assert_eq!(shot_step["status"], "skipped", "{shot_step}");
+    let shot_err = shot_step["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        shot_err.contains("transform") && shot_err.contains("cover"),
+        "expected screenshot refusal naming transform, got: {shot_err}"
+    );
+    assert!(
+        !dir.path().join("shots/should-not-exist.png").exists(),
+        "screenshot must not write an uncovered PNG file on failure"
+    );
+    assert_eq!(steps[12]["status"], "passed", "{}", steps[12]);
+    assert!(
+        is_png(&fs::read(dir.path().join("shots/no-inputs-ok.png")).expect("PNG must exist")),
+        "screenshot must succeed when rotated frame has no editable fields"
+    );
+
+    // 2. Failure bundle on a page with an unmappable field inside a rotated iframe must not write uncovered screenshot.png.
+    let bundle_root = dir.path().join("failures");
+    let bundle_case = dir.write(
+        "bundle-rotate.yaml",
+        &format!(
+            r##"name: failure bundle refuses uncovered screenshot in rotated iframe
+steps:
+  - browser.open:
+      url: "{rotate_url}"
+  - browser.click:
+      css: "#scaled-btn"
+      within:
+        css: "#bad-frame"
+"##
+        ),
+    );
+    let bundle_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&bundle_case),
+            "--bundle-dir",
+            path_str(&bundle_root),
+        ],
+    );
+    assert_eq!(
+        exit_code(&bundle_out),
+        Some(1),
+        "unmappable-transform-bundle must fail: stdout: {}\nstderr: {}",
+        stdout(&bundle_out),
+        stderr(&bundle_out)
+    );
+    let bundle_json = json_stdout(&bundle_out);
+    let bundle_rel = bundle_json["cases"][0]["bundle"]
+        .as_str()
+        .expect("failed case must write failure bundle");
+    let bundle_dir = PathBuf::from(bundle_rel);
+    assert!(
+        !bundle_dir.join("browser/screenshot.png").exists(),
+        "failure bundle must not emit an uncovered screenshot.png"
+    );
+    let evidence_err = fs::read_to_string(bundle_dir.join("browser/evidence-error.txt"))
+        .expect("evidence-error.txt must record why screenshot was withheld");
+    assert!(
+        evidence_err.contains("transform"),
+        "evidence-error.txt must explain the transform failure: {evidence_err}"
+    );
+}
+
+#[test]
+fn within_iframe_retry_enforces_allowlist_and_handles_dialogs() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-iframe-retry-dialogs");
+    let url = server.url("/browser/iframes/retry");
+
+    for (name, action, body) in [
+        (
+            "click-within-retry.yaml",
+            "browser.click",
+            format!(
+                "name: click within retry rejected\nsteps:\n  - browser.open:\n      url: \"{url}\"\n  - browser.click:\n      css: \"#arm-confirm\"\n      within:\n        css: \"#retry-frame\"\n    retry:\n      until:\n        - path: $.text\n          equals: ok\n      timeout_ms: 500\n"
+            ),
+        ),
+        (
+            "type-within-retry.yaml",
+            "browser.type",
+            format!(
+                "name: type within retry rejected\nsteps:\n  - browser.open:\n      url: \"{url}\"\n  - browser.type:\n      css: \"#arm-confirm\"\n      text: hi\n      within:\n        css: \"#retry-frame\"\n    retry:\n      until:\n        - path: $.text\n          equals: ok\n      timeout_ms: 500\n"
+            ),
+        ),
+    ] {
+        let bad_case = dir.write(name, &body);
+        let lint_out = run_da_in(
+            dir.path(),
+            &["--output", "json", "lint", path_str(&bad_case)],
+        );
+        assert_eq!(
+            exit_code(&lint_out),
+            Some(3),
+            "{name} must fail lint with exit 3: stdout={}\nstderr={}",
+            stdout(&lint_out),
+            stderr(&lint_out)
+        );
+        let lint_err = stderr(&lint_out);
+        let lint_stdout = stdout(&lint_out);
+        assert!(
+            (lint_stdout.contains(action) && lint_stdout.contains("cannot use `retry`"))
+                || (lint_err.contains(action) && lint_err.contains("cannot use `retry`")),
+            "{name}: expected retry disallow error, stdout={lint_stdout} stderr={lint_err}"
+        );
+    }
+
+    let case = dir.write(
+        "iframe-retry-dialogs.yaml",
+        &format!(
+            r##"name: retry on browser.wait and browser.read inside within iframe handles dialogs
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#arm-confirm"
+      within:
+        css: "#retry-frame"
+  - browser.wait:
+      css: "#status"
+      dialog: accept
+      timeout_ms: 300
+      within:
+        css: "#retry-frame"
+    retry:
+      until:
+        - path: $.dialog.type
+          equals: confirm
+      timeout_ms: 8000
+      interval_ms: 50
+    expect:
+      - path: $.dialog.message
+        equals: "Ready now?"
+      - path: $.dialog.accepted
+        equals: true
+  - browser.read:
+      css: "#status"
+      within:
+        css: "#retry-frame"
+    retry:
+      until:
+        - path: $.text
+          equals: "confirmed"
+      timeout_ms: 5000
+      interval_ms: 50
+  - browser.click:
+      css: "#arm-unexpected"
+      within:
+        css: "#retry-frame"
+  - browser.read:
+      css: "#status"
+      timeout_ms: 5000
+      within:
+        css: "#retry-frame"
+    retry:
+      until:
+        - path: $.text
+          equals: "after-alert"
+      timeout_ms: 8000
+      interval_ms: 50
+"##
+        ),
+    );
+    let lint_ok = run_da_in(dir.path(), &["--output", "json", "lint", path_str(&case)]);
+    assert_eq!(
+        exit_code(&lint_ok),
+        Some(0),
+        "iframe retry read/wait must pass lint: stdout={}\nstderr={}",
+        stdout(&lint_ok),
+        stderr(&lint_ok)
     );
 
     let output = run_da_in(
