@@ -124,6 +124,7 @@ HTML 是自包含的，离线可打开。`--shareable` 不嵌入任何截图，`
 | `cli.run` | 命令行程序（不经 shell 启动） | `exit_code`、`stdout`、`stderr`、`json` |
 | `db.query` | 用 SQLite 或 PostgreSQL 读回前一步写入的数据 | `columns`、`rows`、`row_count`、`truncated` |
 | `browser.*` | 用无界面 Chrome 操作网页（默认启用）：打开、点击、输入、上传文件、按键、等待、读取、截图、切换标签页 | `url`、`title`、`text`、`value`（`testid`、`role`、`text`、`css`、`xpath` 定位与 `within`/`nth` 修饰，严格唯一匹配与可操作性检查） |
+| `android.*` | 通过 `adb` 操作一台 Android 设备（需 `--features android`）：启动、点击、输入、截图、读取 UI 树、点击树中定位到的节点 | `package`、`component`、`count`、`nodes`、`target`、`center`、`path`、`characters`；`android.dump` 约需两秒，是唯一读取 UI 树的步骤 |
 
 断言：在任意 [JSONPath](https://www.rfc-editor.org/rfc/rfc9535.html) 上使用 `equals`、`not_equals`、`contains`、`exists`。变量：`vars`、`save`、`--var name=value` 和 `--vars-file`，以 `${name}` 引用；`${env:NAME}` 读取环境变量，其值在输出与失败包中替换为 `***`。
 
