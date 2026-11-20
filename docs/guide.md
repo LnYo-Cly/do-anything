@@ -2427,6 +2427,13 @@ Chrome is found in this order:
 3. These program names on `PATH`: `google-chrome`, `google-chrome-stable`,
    `chromium`, `chromium-browser` and `chrome`.
 
+A case that does not set `timeout_ms` on `browser.open` gets thirty seconds for
+the navigation. `DA_BROWSER_NAVIGATION_TIMEOUT_MS` raises or lowers that default:
+a value from 1000 to 600000 is used, anything else falls back to thirty seconds.
+It exists for machines that run several browsers at once, where a page that loads
+instantly on an idle machine can exceed the default only because the runner is
+contended. The value never overrides a `timeout_ms` a case names.
+
 Each case that starts its own browser gets a fresh temporary profile and a
 debugger that listens on a loopback port the operating system chooses, so two
 cases at the same time cannot share a profile or a port. A case that names a
