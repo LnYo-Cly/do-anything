@@ -613,7 +613,7 @@ fn build_step_from_flags(
 ) -> Result<Step, String> {
     let mut map = match with_raw {
         Some(text) => {
-            let parsed: Value = serde_saphyr::from_str(text)
+            let parsed = case::parse_json_value(text)
                 .map_err(|error| format!("could not parse `--with`: {error}"))?;
             match parsed {
                 Value::Object(entries) => entries,
@@ -694,7 +694,7 @@ fn coerce_arg_value(schema: Option<&Value>, raw: &str) -> Result<Value, String> 
             "false" => Ok(Value::Bool(false)),
             _ => Err(format!("expected `true` or `false`, got `{raw}`")),
         },
-        Some("array") | Some("object") => serde_saphyr::from_str::<Value>(raw)
+        Some("array") | Some("object") => case::parse_json_value(raw)
             .map_err(|error| format!("expected YAML/JSON value, got `{raw}`: {error}")),
         _ => Ok(Value::String(raw.to_string())),
     }
@@ -770,6 +770,14 @@ fn build_step_record(
         .iter()
         .map(|s| (s.name.clone(), s.path.clone()))
         .collect();
+    // A step that clicked explicit coordinates reports the viewport it ran at,
+    // so export can pin the replayed step to the same size.
+    let observed_viewport = step
+        .args
+        .get("at")
+        .and(report.result.as_ref())
+        .and_then(|result| result.get("viewport"))
+        .cloned();
     StepRecord {
         index,
         action: step.action.clone(),
@@ -782,6 +790,7 @@ fn build_step_record(
         used_ref,
         synthesized_locator,
         fragile,
+        observed_viewport,
     }
 }
 

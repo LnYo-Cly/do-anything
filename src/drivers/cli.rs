@@ -39,6 +39,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         args_schema,
         validate,
         check_retry: disallow_retry,
+        lint_warnings: crate::core::registry::no_lint_warnings,
         run,
     })
 }

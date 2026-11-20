@@ -323,6 +323,7 @@ mod tests {
                 }),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, _| Ok(Value::Null),
             })
             .expect("the test step must register");

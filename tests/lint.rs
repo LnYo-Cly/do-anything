@@ -675,3 +675,115 @@ fn a_malformed_var_exits_two_with_the_expected_form() {
         stderr(&output)
     );
 }
+
+/// A case that clicks explicit coordinates is valid, and lint says how fragile
+/// it is instead of failing it.
+#[cfg(feature = "browser")]
+#[test]
+fn a_coordinate_step_lints_with_a_fragility_warning() {
+    let dir = TempDir::new("lint-coordinates");
+    let case = dir.write(
+        "coords.yaml",
+        "name: Coordinates\nsteps:\n  - browser.open:\n      url: http://127.0.0.1:1/\n  - browser.click:\n      at: { x: 100, y: 50 }\n",
+    );
+
+    let text = run_da_in(dir.path(), &["lint", path_str(&case)]);
+    assert_eq!(
+        exit_code(&text),
+        Some(0),
+        "a coordinate step is valid: stdout={}\nstderr={}",
+        stdout(&text),
+        stderr(&text)
+    );
+    assert!(
+        stdout(&text).contains("0 errors, 2 warnings"),
+        "the summary must count the warnings: {:?}",
+        stdout(&text)
+    );
+    let warnings = stderr(&text);
+    assert!(
+        warnings.contains(&format!("{}: warning:", reported(&case))),
+        "the warning must name its file on stderr: {warnings:?}"
+    );
+    assert!(
+        warnings.contains("coordinates"),
+        "the warning must say the step uses coordinates: {warnings:?}"
+    );
+    assert!(
+        warnings.contains("<canvas>"),
+        "the warning must name the case coordinates are for: {warnings:?}"
+    );
+    assert!(
+        warnings.contains("viewport"),
+        "a bare `at` must warn that no viewport was recorded: {warnings:?}"
+    );
+    assert!(
+        warnings.contains("line 6 column 7"),
+        "the warning must name the step's arguments: {warnings:?}"
+    );
+
+    let json_out = run_da_in(dir.path(), &["--output", "json", "lint", path_str(&case)]);
+    assert_eq!(
+        exit_code(&json_out),
+        Some(0),
+        "a warning never fails lint: stdout={}\nstderr={}",
+        stdout(&json_out),
+        stderr(&json_out)
+    );
+    let value = json_stdout(&json_out);
+    assert_eq!(value["ok"], true, "got: {value}");
+    let warnings = value["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a coordinate case must report warnings: {value}"));
+    assert_eq!(
+        warnings.len(),
+        2,
+        "a bare `at` warns about coordinates and the missing viewport: {value}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| warning["file"] == reported(&case)),
+        "every warning must name its file: {value}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("explicit coordinates"))),
+        "got: {value}"
+    );
+
+    // A locator step is not fragile, so the report keeps its earlier shape.
+    let locator = dir.write(
+        "locator.yaml",
+        "name: Locator\nsteps:\n  - browser.open:\n      url: http://127.0.0.1:1/\n  - browser.click:\n      css: '#name'\n",
+    );
+    let locator_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "lint", path_str(&locator)],
+    );
+    assert_eq!(exit_code(&locator_out), Some(0));
+    let value = json_stdout(&locator_out);
+    assert!(
+        value.get("warnings").is_none(),
+        "a case without warnings must keep the earlier object shape: {value}"
+    );
+
+    // An invalid coordinate step is an error, and a warning would only repeat
+    // the same problem.
+    let invalid = dir.write(
+        "invalid.yaml",
+        "name: Invalid\nsteps:\n  - browser.open:\n      url: http://127.0.0.1:1/\n  - browser.click:\n      css: '#name'\n      at: { x: 1, y: 2 }\n",
+    );
+    let invalid_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "lint", path_str(&invalid)],
+    );
+    assert_eq!(exit_code(&invalid_out), Some(3));
+    let value = json_stdout(&invalid_out);
+    assert_eq!(value["ok"], false, "got: {value}");
+    assert!(
+        value.get("warnings").is_none(),
+        "an invalid step must not also warn: {value}"
+    );
+}

@@ -1964,9 +1964,42 @@ tabNode.addEventListener('change', function () {
 
 fn browser_probe_coords() -> &'static str {
     r#"<!doctype html>
-<html><head><title>Probe Coordinates</title></head>
+<html><head><title>Probe Coordinates</title>
+<style>
+html, body { margin: 0; padding: 0; font: 16px sans-serif; }
+#probe-canvas { display: block; }
+#probe-editor { position: absolute; left: 0; top: 120px; width: 200px; height: 40px; }
+#probe-tab-link { position: absolute; left: 220px; top: 10px; }
+#probe-shadow-host { position: absolute; left: 220px; top: 40px; width: 160px; height: 40px; }
+</style>
+</head>
 <body>
 <canvas id="probe-canvas" width="200" height="100"></canvas>
+<div id="probe-editor" contenteditable="true"></div>
+<p id="probe-status">idle</p>
+<a id="probe-tab-link" href="/browser/probe/coords?case=tab" target="_blank">Open canvas tab</a>
+<div id="probe-shadow-host"></div>
+<script>
+(function () {
+  var canvas = document.getElementById('probe-canvas');
+  var context = canvas.getContext('2d');
+  context.fillStyle = '#3355aa';
+  context.fillRect(80, 30, 40, 40);
+  canvas.addEventListener('click', function (event) {
+    document.getElementById('probe-status').textContent =
+      'canvas ' + event.clientX + ',' + event.clientY;
+  });
+  var host = document.getElementById('probe-shadow-host');
+  var root = host.attachShadow({ mode: 'open' });
+  var button = document.createElement('button');
+  button.id = 'probe-shadow-button';
+  button.textContent = 'Shadow target';
+  button.addEventListener('click', function () {
+    document.getElementById('probe-status').textContent = 'shadow-clicked';
+  });
+  root.appendChild(button);
+})();
+</script>
 </body></html>"#
 }
 

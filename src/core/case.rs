@@ -184,6 +184,19 @@ pub struct CaseError {
     pub message: String,
 }
 
+/// A valid case that relies on something fragile.
+///
+/// A warning never makes a case invalid; `da lint` reports it so the caller can
+/// decide whether a stronger contract is available. The shape matches
+/// [`CaseError`] so both can be printed the same way.
+#[derive(Debug, Clone)]
+pub struct CaseWarning {
+    /// File the warning belongs to.
+    pub file: PathBuf,
+    /// What is fragile and, where the parser knows it, where.
+    pub message: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCase {
@@ -824,17 +837,10 @@ impl<'de> Deserialize<'de> for RawArgs {
                 A: MapAccess<'de>,
             {
                 let mut entries = Vec::new();
-                while let Some(key) = map.next_key::<Value>()? {
-                    // A YAML mapping key is not always a string. The case
-                    // format is JSON, so a scalar key becomes its text form and
-                    // anything else is refused, the way `serde_json::Value`
-                    // reads an object.
-                    let key = match key {
-                        Value::String(text) => text,
-                        Value::Number(number) => number.to_string(),
-                        Value::Bool(flag) => flag.to_string(),
-                        _ => return Err(A::Error::custom("an argument name must be a scalar")),
-                    };
+                // A key is read as a string, not as an inferred YAML value, so
+                // its spelling survives: a plain `y` is an argument name, not
+                // the YAML 1.1 boolean it would become under untyped inference.
+                while let Some(key) = map.next_key::<String>()? {
                     entries.push((key, map.next_value::<Spanned<RawArgs>>()?));
                 }
                 Ok(RawArgs::Map(entries))
@@ -1016,6 +1022,18 @@ pub fn parse_single_step(text: &str) -> Result<Step, String> {
     let raw: Spanned<RawStep> =
         serde_saphyr::from_str(text).map_err(|error| parser_message(&error.to_string()))?;
     normalize_and_parse_step(raw).map_err(|problem| problem.render(text))
+}
+
+/// Parses one YAML or JSON value, keeping every mapping key as it was written.
+///
+/// The interactive session accepts step arguments as YAML or JSON. It has to
+/// follow the same key rule as a case file, where a plain `y` is an argument
+/// name rather than the YAML 1.1 boolean an untyped parse would infer.
+pub fn parse_json_value(text: &str) -> Result<Value, String> {
+    let raw: RawArgs =
+        serde_saphyr::from_str(text).map_err(|error| parser_message(&error.to_string()))?;
+    let mut strings = Vec::new();
+    Ok(raw.into_json("", Location::UNKNOWN, &mut strings))
 }
 
 fn normalize_and_parse_step(mut raw: Spanned<RawStep>) -> Result<Step, Problem> {
@@ -2075,6 +2093,27 @@ steps:
         assert_eq!(case.steps[0].expect.len(), 1);
         assert_eq!(case.steps[0].expect[0].matcher.comparison(), "equals");
         assert_eq!(case.steps[0].save[0].name, "token");
+    }
+
+    #[test]
+    fn an_argument_key_keeps_the_spelling_it_was_written_with() {
+        let case = parse(
+            "name: Keys\nsteps:\n  - sample.call:\n      x: 1\n      y: 2\n      1: numeric\n",
+        )
+        .expect("the case must parse");
+
+        let args = &case.steps[0].args;
+        assert_eq!(args.get("x"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            args.get("y"),
+            Some(&serde_json::json!(2)),
+            "a plain `y` key is the text the user wrote, not the boolean it resembles"
+        );
+        assert!(
+            args.get("true").is_none(),
+            "an unquoted `y` must not be rewritten to `true`: {args}"
+        );
+        assert_eq!(args.get("1"), Some(&serde_json::json!("numeric")));
     }
 
     #[test]

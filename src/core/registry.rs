@@ -45,6 +45,14 @@ pub struct StepDefinition {
     /// Only read-only steps may use `retry`; state-changing steps must return
     /// an error so `da lint` and preflight refuse them before execution.
     pub check_retry: fn(&Value) -> Result<(), String>,
+    /// Reports fragile but valid arguments for `da lint`.
+    ///
+    /// A warning never fails a case: the step is accepted and still runs. Lint
+    /// prints each warning where a reader can act on it, so a step that works
+    /// only on one machine or at one size can say so without blocking CI.
+    /// Steps that have nothing to warn about leave this at
+    /// [`no_lint_warnings`].
+    pub lint_warnings: fn(&Value) -> Vec<String>,
     /// Runs the step and returns its JSON result.
     ///
     /// The [`Sessions`] value belongs to the running case. A step that needs a
@@ -63,6 +71,11 @@ pub fn disallow_retry(_args: &Value) -> Result<(), String> {
 /// poll.
 pub fn allow_retry(_args: &Value) -> Result<(), String> {
     Ok(())
+}
+
+/// `lint_warnings` implementation for steps with nothing fragile to report.
+pub fn no_lint_warnings(_args: &Value) -> Vec<String> {
+    Vec::new()
 }
 
 /// A detachable session kind a driver registers so later processes can
@@ -251,6 +264,7 @@ mod tests {
             args_schema: serde_json::json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: disallow_retry,
+            lint_warnings: no_lint_warnings,
             run: |_, _| Ok(Value::Null),
         }
     }

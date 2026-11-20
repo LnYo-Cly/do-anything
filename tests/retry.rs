@@ -199,6 +199,10 @@ fn rejects_retry_on_state_changing_browser_steps_and_accepts_read_and_wait() {
         "browser.save_state",
         "name: Save\nsteps:\n  - browser.save_state:\n      path: state.json\n    retry:\n      until:\n        - path: $.path\n          exists: true\n      timeout_ms: 500\n".to_string(),
     ));
+    rejected.push((
+        "browser.switch_tab",
+        "name: Switch tab\nsteps:\n  - browser.switch_tab: {}\n    retry:\n      until:\n        - path: $.title\n          exists: true\n      timeout_ms: 500\n".to_string(),
+    ));
 
     for (name, yaml) in rejected {
         assert_retry_rejected(&dir, name, &yaml);

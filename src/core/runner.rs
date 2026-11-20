@@ -11,7 +11,9 @@ use serde_saphyr::Location;
 
 use crate::core::assert::{self, AssertionReport};
 use crate::core::bundle::FailureBundles;
-use crate::core::case::{self, CaseError, Expectation, LoadedCase, Observation, SavedValue, Step};
+use crate::core::case::{
+    self, CaseError, CaseWarning, Expectation, LoadedCase, Observation, SavedValue, Step,
+};
 use crate::core::events::{Event, EventBus};
 use crate::core::filter::{self, Filters};
 use crate::core::observer::{Observer, ObserverError};
@@ -315,6 +317,80 @@ pub fn preflight(
     errors
 }
 
+/// Every warning the registry reports for `cases`.
+///
+/// Warnings share discovery and interpolation with [`preflight`] but never make
+/// a case invalid: a case is still rejected only by [`preflight`]. `da lint`
+/// calls both and prints the warnings beside its result, so a step that is valid
+/// but fragile can say so without failing CI.
+pub fn preflight_warnings(
+    cases: &[LoadedCase],
+    registry: &Registry,
+    secrets: &mut Secrets,
+) -> Vec<CaseWarning> {
+    let mut warnings = Vec::new();
+    for loaded in cases {
+        let mut vars = loaded.case.vars.clone();
+        for (index, step) in loaded.case.steps.iter().enumerate() {
+            check_step_warnings(
+                loaded,
+                &format!("step {}", index + 1),
+                step,
+                registry,
+                &mut vars,
+                secrets,
+                &mut warnings,
+            );
+        }
+        for (index, step) in loaded.case.finally.iter().enumerate() {
+            check_step_warnings(
+                loaded,
+                &format!("finally step {}", index + 1),
+                step,
+                registry,
+                &mut vars,
+                secrets,
+                &mut warnings,
+            );
+        }
+    }
+    warnings
+}
+
+/// Collects the warnings of one step, keeping its `save` names visible to the
+/// steps after it exactly like [`check_step`] does.
+fn check_step_warnings(
+    loaded: &LoadedCase,
+    label: &str,
+    step: &Step,
+    registry: &Registry,
+    vars: &mut BTreeMap<String, String>,
+    secrets: &mut Secrets,
+    warnings: &mut Vec<CaseWarning>,
+) {
+    // A step whose arguments do not resolve, or do not satisfy its own
+    // contract, already reported an error. Warning about it would only repeat
+    // the same case twice.
+    if let Ok(args) = case::interpolate(&step.args, vars, secrets)
+        && let Some(definition) = registry.get(&step.action)
+        && (definition.validate)(&args).is_ok()
+    {
+        for warning in (definition.lint_warnings)(&args) {
+            warnings.push(CaseWarning {
+                file: loaded.path.clone(),
+                message: render_at(
+                    loaded,
+                    step.args_location,
+                    format!("{label}: `{}` {warning}", step.action),
+                ),
+            });
+        }
+    }
+    for saved in &step.save {
+        vars.insert(saved.name.clone(), format!("${{{}}}", saved.name));
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Preflight helper threads the shared validation inputs without duplicating `steps` and `finally` checks.
 fn check_step(
     loaded: &LoadedCase,
@@ -430,18 +506,22 @@ fn check_observation(
 /// The snippet needs the file text, which the parser no longer holds, so the
 /// file is read again. Loading has just read it; if it is gone now, the line and
 /// column are still reported without the snippet.
-fn positioned(loaded: &LoadedCase, location: Location, message: String) -> CaseError {
-    let message = match std::fs::read_to_string(&loaded.path) {
+fn render_at(loaded: &LoadedCase, location: Location, message: String) -> String {
+    match std::fs::read_to_string(&loaded.path) {
         Ok(text) => case::render_problem(&text, location, message),
         Err(_) => format!(
             "line {} column {}: {message}",
             location.line(),
             location.column()
         ),
-    };
+    }
+}
+
+/// Renders one case error at the place in the case file it belongs to.
+fn positioned(loaded: &LoadedCase, location: Location, message: String) -> CaseError {
     CaseError {
         file: loaded.path.clone(),
-        message,
+        message: render_at(loaded, location, message),
     }
 }
 
@@ -1201,6 +1281,7 @@ mod tests {
                     }
                 },
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |args: &Value, _sessions| {
                     Ok(args.get("value").cloned().unwrap_or(Value::Null))
                 },
@@ -1213,6 +1294,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, _| {
                     Err(StepError::Environment(
                         "the target refused the connection".to_string(),
@@ -1227,6 +1309,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |args: &Value, _sessions| {
                     let millis = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
                     std::thread::sleep(Duration::from_millis(millis));
@@ -1241,6 +1324,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, _| Ok(json!(5)),
             })
             .expect("the scalar test step must register");
@@ -1251,6 +1335,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, _| {
                     Err(StepError::Execution(
                         "the step could not finish its work".to_string(),
@@ -1265,6 +1350,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, _| {
                     Err(StepError::Timeout(
                         "the step did not finish within 10 ms".to_string(),
@@ -1279,6 +1365,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, _| {
                     Err(StepError::InvalidArguments(
                         "invalid arguments: `value` is required".to_string(),
@@ -1826,6 +1913,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, sessions| {
                     sessions
                         .get_or_create("test.session", || Ok(CountingSession))
@@ -1946,6 +2034,7 @@ mod tests {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, sessions| {
                     sessions
                         .get_or_create("test.session", || Ok(RecordCountingSession))
@@ -2665,6 +2754,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::allow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |_, _| {
                 let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
                 match n {
@@ -2756,6 +2846,7 @@ mod tests {
                     args_schema: json!({"type": "object"}),
                     validate: |_| Ok(()),
                     check_retry: crate::core::registry::allow_retry,
+                    lint_warnings: crate::core::registry::no_lint_warnings,
                     run: |_, _| {
                         CALLS.fetch_add(1, Ordering::SeqCst);
                         Err(StepError::Environment("down".to_string()))
@@ -2768,6 +2859,7 @@ mod tests {
                     args_schema: json!({"type": "object"}),
                     validate: |_| Ok(()),
                     check_retry: crate::core::registry::allow_retry,
+                    lint_warnings: crate::core::registry::no_lint_warnings,
                     run: |_, _| {
                         CALLS.fetch_add(1, Ordering::SeqCst);
                         Err(StepError::InvalidArguments("bad arg".to_string()))
@@ -2852,6 +2944,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::allow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |_, sessions| {
                 let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
                 let buffer = sessions
@@ -2939,6 +3032,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::disallow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |_, sessions| {
                 let buffer = sessions
                     .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
@@ -2954,6 +3048,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::disallow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |_, sessions| {
                 let buffer = sessions
                     .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
@@ -3020,6 +3115,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::allow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |_, _| {
                 ATTEMPTS.fetch_add(1, Ordering::SeqCst);
                 Err(StepError::Execution("not ready".to_string()))
@@ -3086,6 +3182,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::allow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |_, _| {
                 let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
                 Ok(json!({ "ready": n >= 2, "attempt": n }))
@@ -3098,6 +3195,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::allow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |args, sessions| {
                 let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
                 let buffer = sessions
@@ -3118,6 +3216,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::disallow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |_, sessions| {
                 let buffer = sessions
                     .get_or_create("test.buffered", || Ok(BufferedEvents(Vec::new())))
@@ -3305,6 +3404,7 @@ mod tests {
             args_schema: json!({"type": "object"}),
             validate: |_| Ok(()),
             check_retry: crate::core::registry::allow_retry,
+            lint_warnings: crate::core::registry::no_lint_warnings,
             run: |args, sessions| {
                 let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
                 std::thread::sleep(Duration::from_millis(60));
@@ -3630,5 +3730,72 @@ mod tests {
         assert_eq!(report.finally[1].status, StepStatus::Skipped);
         assert_eq!(report.finally[2].status, StepStatus::Passed);
         assert_eq!(report.finally[2].result, Some(json!("always")));
+    }
+
+    #[test]
+    fn preflight_warnings_collect_step_warnings_without_rejecting_the_case() {
+        let mut registry = registry();
+        registry
+            .register(StepDefinition {
+                name: "test.fragile",
+                description: "Valid but fragile.",
+                args_schema: json!({"type": "object"}),
+                validate: |_| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: |args: &Value| {
+                    vec![format!(
+                        "is fragile because `{}`",
+                        args.get("why").and_then(Value::as_str).unwrap_or("unknown")
+                    )]
+                },
+                run: |_, _| Ok(Value::Null),
+            })
+            .expect("the fragile test step must register");
+        let fragile = Step {
+            action: "test.fragile".to_string(),
+            args: json!({"why": "coordinates"}),
+            expect: Vec::new(),
+            optional: false,
+            retry: None,
+            save: Vec::new(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+            retry_location: Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        };
+        let loaded_case = loaded(vec![fragile, echo(json!("ok"), Vec::new())]);
+        let mut secrets = Secrets::new();
+
+        assert!(
+            preflight(&loaded_case, &registry, &mut Secrets::new()).is_empty(),
+            "a warning must never reject a case"
+        );
+        let warnings = preflight_warnings(&loaded_case, &registry, &mut secrets);
+
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert_eq!(warnings[0].file, std::path::PathBuf::from("case.yaml"));
+        assert!(
+            warnings[0].message.contains("`test.fragile`"),
+            "got: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("is fragile because `coordinates`"),
+            "got: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0].message.contains("line"),
+            "a warning must name its location, got: {}",
+            warnings[0].message
+        );
+        assert!(
+            preflight_warnings(&loaded_case, &registry, &mut Secrets::new())
+                .iter()
+                .all(|warning| !warning.message.contains("test.echo")),
+            "a step without a warning hook must not warn"
+        );
     }
 }

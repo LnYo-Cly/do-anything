@@ -564,6 +564,151 @@ fn browser_session_end_to_end_export_replay_secrets_and_stop_cleanup() {
 }
 
 #[test]
+fn session_coordinate_click_exports_a_pinned_viewport_and_replays() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let page = r##"<!doctype html>
+<html><head><title>Canvas</title>
+<style>html, body { margin: 0; padding: 0; } #target { display: block; }</style>
+</head>
+<body>
+<canvas id="target" width="200" height="100"></canvas>
+<p id="status">idle</p>
+<script>
+document.getElementById('target').addEventListener('click', function (event) {
+  document.getElementById('status').textContent = 'canvas ' + event.clientX + ',' + event.clientY;
+});
+</script>
+</body></html>"##
+        .to_string();
+    let server = PageServer::start(BTreeMap::from([("/coords".to_string(), page)]));
+    let dir = TempDir::new("browser-coords-session");
+    let started = json_stdout(&run_da_in(dir.path(), &["session", "start"]));
+    let id = started["session_id"].as_str().unwrap().to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/coords")),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{open:?}");
+
+    // Click the canvas with bare coordinates; the step records the live viewport.
+    let click = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.click",
+            "--with",
+            "at: {x: 100, y: 50}",
+        ],
+    );
+    assert_eq!(click.status.code(), Some(0), "{click:?}");
+    let click_json = json_stdout(&click);
+    let viewport = &click_json["step"]["result"]["viewport"];
+    let width = viewport["width"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the click must report a viewport: {click_json}"));
+    let height = viewport["height"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the click must report a viewport: {click_json}"));
+
+    // A read with an expectation proves the click hit the canvas, and exports
+    // the assertion so the replay can prove it too.
+    let read_expect = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.read:\n  css: \"#status\"\nexpect:\n  - path: $.text\n    equals: \"canvas 100,50\"\n",
+    );
+    assert_eq!(read_expect.status.code(), Some(0), "{read_expect:?}");
+
+    // Export pins the recorded viewport and marks the step fragile.
+    let exported = dir.path().join("coords-flow.yaml");
+    let exp_out = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "export",
+            &id,
+            "-o",
+            exported.to_str().unwrap(),
+            "--name",
+            "Coordinate flow",
+        ],
+    );
+    assert_eq!(exp_out.status.code(), Some(0), "{exp_out:?}");
+    let exp_json = json_stdout(&exp_out);
+    assert_eq!(exp_json["exported_steps"], 3, "{exp_json}");
+    let fragile = exp_json["fragile"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the export must report fragile steps: {exp_json}"));
+    assert_eq!(fragile.len(), 1, "{exp_json}");
+    assert_eq!(fragile[0]["action"], "browser.click", "{exp_json}");
+    assert_eq!(
+        fragile[0]["reason"], "explicit_coordinates",
+        "the export must say why the step is fragile: {exp_json}"
+    );
+    assert_eq!(fragile[0]["viewport"]["width"], json!(width), "{exp_json}");
+    assert_eq!(
+        fragile[0]["viewport"]["height"],
+        json!(height),
+        "{exp_json}"
+    );
+
+    let yaml = fs::read_to_string(&exported).unwrap();
+    assert!(
+        yaml.contains("at:"),
+        "the coordinates must be exported: {yaml}"
+    );
+    assert!(
+        yaml.contains(&format!("width: {width}")),
+        "the recorded viewport width must be exported: {yaml}"
+    );
+    assert!(
+        yaml.contains(&format!("height: {height}")),
+        "the recorded viewport height must be exported: {yaml}"
+    );
+    assert!(
+        yaml.contains("# fragile:"),
+        "the exported case must say the step is fragile: {yaml}"
+    );
+
+    // The exported case is valid (lint warns, but exits 0) and replays at the
+    // recorded size: the read expectation proves the click hit the canvas again.
+    let lint = run_da_in(dir.path(), &["lint", exported.to_str().unwrap()]);
+    assert_eq!(
+        lint.status.code(),
+        Some(0),
+        "exported YAML failed lint: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&lint.stdout),
+        String::from_utf8_lossy(&lint.stderr)
+    );
+    let replay = run_da_in(
+        dir.path(),
+        &["run", exported.to_str().unwrap(), "--no-bundle"],
+    );
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "exported YAML failed da run replay: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+}
+
+#[test]
 fn idle_reap_on_list_closes_browser_and_removes_temp_profile() {
     let Some(_guard) = chrome_guard() else {
         return;

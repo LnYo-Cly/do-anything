@@ -663,6 +663,7 @@ mod tests {
                     None => Err("invalid arguments: `value` is required".to_string()),
                 },
                 check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
                 run: |_, _: &mut Sessions| Ok(json!({"echo": "ok"})),
             })
             .expect("the test step must register");

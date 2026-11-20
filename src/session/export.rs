@@ -67,14 +67,23 @@ pub fn export_session(
 
         let args = materialize_args(record)?;
         let exported_index = exported.len() + 1;
-        if record.fragile {
-            fragile.push(json!({
+        let viewport = coordinates_viewport(&args);
+        if record.fragile || viewport.is_some() {
+            let mut entry = json!({
                 "step_index": record.index,
                 "exported_index": exported_index,
                 "action": record.action,
                 "ref": record.used_ref,
                 "locator": record.synthesized_locator,
-            }));
+            });
+            match &viewport {
+                Some(viewport) => {
+                    entry["reason"] = json!("explicit_coordinates");
+                    entry["viewport"] = viewport.clone();
+                }
+                None => entry["reason"] = json!("synthesized_locator"),
+            }
+            fragile.push(entry);
         }
 
         exported.push((record, args));
@@ -92,7 +101,13 @@ pub fn export_session(
     yaml.push_str("steps:\n");
 
     for (record, args) in &exported {
-        if record.fragile {
+        if let Some(viewport) = coordinates_viewport(args) {
+            let width = viewport.get("width").and_then(Value::as_u64).unwrap_or(0);
+            let height = viewport.get("height").and_then(Value::as_u64).unwrap_or(0);
+            yaml.push_str(&format!(
+                "  # fragile: explicit coordinates recorded at viewport {width}x{height}; replay this case at the same size\n"
+            ));
+        } else if record.fragile {
             let ref_label = record.used_ref.as_deref().unwrap_or("target");
             yaml.push_str(&format!(
                 "  # fragile: structural CSS path fallback for ref `{ref_label}`\n"
@@ -154,8 +169,43 @@ pub fn export_session(
 }
 
 /// Replaces `ref` with the synthesized deterministic locator while preserving
-/// original `${env:...}` and `${var}` placeholders.
+/// original `${env:...}` and `${var}` placeholders, and records the viewport a
+/// coordinate step ran at.
 fn materialize_args(record: &StepRecord) -> Result<Value, String> {
+    let mut args = match &record.synthesized_locator {
+        Some(_) => synthesized_locator_args(record)?,
+        None => record.raw_args.clone(),
+    };
+    pin_coordinate_viewport(record, &mut args)?;
+    Ok(args)
+}
+
+/// The `at.viewport` a coordinate step exports, if the step uses coordinates.
+fn coordinates_viewport(args: &Value) -> Option<Value> {
+    args.get("at")?.get("viewport").cloned()
+}
+
+/// Adds the recorded viewport to a bare `at`, so the exported case refuses to
+/// replay at a different size instead of clicking the wrong place.
+fn pin_coordinate_viewport(record: &StepRecord, args: &mut Value) -> Result<(), String> {
+    let Some(at) = args.get_mut("at").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    if at.get("viewport").is_some() {
+        return Ok(());
+    }
+    let viewport = record.observed_viewport.clone().ok_or_else(|| {
+        format!(
+            "step {} (`{}`) uses `at` coordinates but recorded no viewport, so the exported case could not replay at the same size",
+            record.index, record.action
+        )
+    })?;
+    at.insert("viewport".to_string(), viewport);
+    Ok(())
+}
+
+/// Replaces `ref` with the synthesized deterministic locator.
+fn synthesized_locator_args(record: &StepRecord) -> Result<Value, String> {
     let Some(locator) = &record.synthesized_locator else {
         return Ok(record.raw_args.clone());
     };

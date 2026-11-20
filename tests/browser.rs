@@ -3400,12 +3400,31 @@ steps:
         stderr(&upload_out)
     );
 
-    // 6. coordinate click (rejected by schema / argument parsing as unknown field)
+    // 6. coordinate click (a canvas painting has no DOM node to name, so `at`
+    //    coordinates click it and the page proves the click landed)
     let coords_case = dir.write(
         "probe-coords.yaml",
         &format!(
-            "name: probe coords\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      x: 100\n      \"y\": 50\n",
-            server.url("/browser/probe/coords")
+            r##"name: probe coords
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      at: {{ x: 100, y: 50 }}
+    expect:
+      - path: $.x
+        equals: 100
+      - path: $.y
+        equals: 50
+      - path: $.viewport.width
+        exists: true
+  - browser.read:
+      css: "#probe-status"
+    expect:
+      - path: $.text
+        equals: canvas 100,50
+"##,
+            url = server.url("/browser/probe/coords")
         ),
     );
     let coords_out = run_da_in(
@@ -3420,18 +3439,358 @@ steps:
     );
     assert_eq!(
         exit_code(&coords_out),
-        Some(3),
-        "unexpected coords probe exit code: stdout={}\nstderr={}",
+        Some(0),
+        "a coordinate click on a canvas must succeed: stdout={}\nstderr={}",
         stdout(&coords_out),
         stderr(&coords_out)
     );
     let coords_json = json_stdout(&coords_out);
-    let coords_err = coords_json["errors"][0]["message"]
-        .as_str()
-        .unwrap_or_default();
+    assert_eq!(
+        coords_json["cases"][0]["steps"][1]["result"]["x"],
+        json!(100),
+        "the step must report the clicked x: {coords_json}"
+    );
+    assert_eq!(
+        coords_json["cases"][0]["steps"][1]["result"]["y"],
+        json!(50),
+        "the step must report the clicked y: {coords_json}"
+    );
+}
+
+#[test]
+fn explicit_coordinates_pin_the_recorded_viewport() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-coordinates");
+    let url = server.url("/browser/probe/coords");
+
+    // A bare `at` is allowed. The step reports the live viewport, which is how a
+    // caller records the size the coordinates were measured at.
+    let bare = dir.write(
+        "bare-coords.yaml",
+        &format!(
+            r##"name: bare coordinates
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      at: {{ x: 100, y: 50 }}
+    expect:
+      - path: $.x
+        equals: 100
+      - path: $.y
+        equals: 50
+  - browser.read:
+      css: "#probe-status"
+    expect:
+      - path: $.text
+        equals: canvas 100,50
+"##
+        ),
+    );
+    let bare_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&bare), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&bare_out),
+        Some(0),
+        "a bare `at` must run: stdout={}\nstderr={}",
+        stdout(&bare_out),
+        stderr(&bare_out)
+    );
+    let bare_json = json_stdout(&bare_out);
+    let viewport = &bare_json["cases"][0]["steps"][1]["result"]["viewport"];
+    let width = viewport["width"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a coordinate step must report viewport width: {bare_json}"));
+    let height = viewport["height"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a coordinate step must report viewport height: {bare_json}"));
+    assert!(width > 0 && height > 0, "got viewport {width}x{height}");
+
+    // The same click with the recorded viewport replays at that size.
+    let pinned = dir.write(
+        "pinned-coords.yaml",
+        &format!(
+            r##"name: pinned coordinates
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      at:
+        x: 100
+        y: 50
+        viewport:
+          width: {width}
+          height: {height}
+  - browser.read:
+      css: "#probe-status"
+    expect:
+      - path: $.text
+        equals: canvas 100,50
+"##
+        ),
+    );
+    let pinned_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&pinned), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&pinned_out),
+        Some(0),
+        "a coordinate click at its recorded viewport must succeed: stdout={}\nstderr={}",
+        stdout(&pinned_out),
+        stderr(&pinned_out)
+    );
+    let pinned_json = json_stdout(&pinned_out);
+    assert_eq!(
+        pinned_json["cases"][0]["steps"][1]["result"]["viewport"],
+        json!({"width": width, "height": height}),
+        "the step must report the viewport it used: {pinned_json}"
+    );
+
+    // `browser.type` clicks the coordinates to focus the target, then types.
+    let typed = dir.write(
+        "typed-coords.yaml",
+        &format!(
+            r##"name: typed coordinates
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      at:
+        x: 100
+        y: 140
+        viewport:
+          width: {width}
+          height: {height}
+      text: hello
+  - browser.read:
+      css: "#probe-editor"
+    expect:
+      - path: $.text
+        equals: hello
+"##
+        ),
+    );
+    let typed_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&typed), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&typed_out),
+        Some(0),
+        "`browser.type` must focus the clicked coordinates and type: stdout={}\nstderr={}",
+        stdout(&typed_out),
+        stderr(&typed_out)
+    );
+    let typed_json = json_stdout(&typed_out);
+    assert_eq!(
+        typed_json["cases"][0]["steps"][1]["result"]["x"],
+        json!(100),
+        "`browser.type` must report the clicked x: {typed_json}"
+    );
+
+    // A different declared viewport fails loudly before any click is sent.
+    let mismatch_width = width + 1;
+    let mismatch = dir.write(
+        "mismatched-coords.yaml",
+        &format!(
+            r##"name: mismatched coordinates
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      at:
+        x: 100
+        y: 50
+        viewport:
+          width: {mismatch_width}
+          height: {height}
+"##
+        ),
+    );
+    let mismatch_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&mismatch),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&mismatch_out),
+        Some(1),
+        "a different live viewport must fail the step: stdout={}\nstderr={}",
+        stdout(&mismatch_out),
+        stderr(&mismatch_out)
+    );
+    let mismatch_json = json_stdout(&mismatch_out);
+    let mismatch_error = case_error(&mismatch_json);
     assert!(
-        coords_err.contains("unknown field `x`"),
-        "unexpected coords probe error: {coords_err}"
+        mismatch_error.contains(&format!("{mismatch_width}x{height}"))
+            && mismatch_error.contains(&format!("{width}x{height}")),
+        "the error must name the recorded and the live viewport: {mismatch_error}"
+    );
+    assert!(
+        mismatch_error.contains("viewport"),
+        "the error must explain the viewport mismatch: {mismatch_error}"
+    );
+
+    // A coordinate outside the live viewport is refused as well.
+    let outside = dir.write(
+        "outside-coords.yaml",
+        &format!(
+            r##"name: outside coordinates
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      at: {{ x: {outside_x}, y: 10 }}
+"##,
+            outside_x = width + 10
+        ),
+    );
+    let outside_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&outside), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&outside_out),
+        Some(1),
+        "a coordinate outside the viewport must fail the step: stdout={}\nstderr={}",
+        stdout(&outside_out),
+        stderr(&outside_out)
+    );
+    let outside_json = json_stdout(&outside_out);
+    let outside_error = case_error(&outside_json);
+    assert!(
+        outside_error.contains("outside") && outside_error.contains(&format!("{width}x{height}")),
+        "the error must name the coordinate and the viewport: {outside_error}"
+    );
+}
+
+#[test]
+fn a_coordinate_click_works_right_after_switching_tabs() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-coords-tab");
+    let case = dir.write(
+        "coords-tab.yaml",
+        &format!(
+            r##"name: coordinates after switching tabs
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      css: "#probe-tab-link"
+  - browser.switch_tab:
+      url_contains: "case=tab"
+  - browser.click:
+      at: {{ x: 100, y: 50 }}
+    expect:
+      - path: $.x
+        equals: 100
+      - path: $.y
+        equals: 50
+      - path: $.viewport.width
+        exists: true
+  - browser.read:
+      css: "#probe-status"
+    expect:
+      - path: $.text
+        equals: canvas 100,50
+"##,
+            url = server.url("/browser/probe/coords")
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "a coordinate click after `browser.switch_tab` must succeed: stdout={}\nstderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    assert!(
+        value["cases"][0]["steps"][3]["result"]["viewport"]["width"]
+            .as_u64()
+            .is_some_and(|width| width > 0),
+        "the coordinate click must report the switched tab's viewport: {value}"
+    );
+    assert_eq!(
+        value["cases"][0]["steps"][4]["assertions"][0]["passed"],
+        json!(true),
+        "the coordinate click must hit the canvas of the switched tab: {value}"
+    );
+}
+
+#[test]
+fn a_coordinate_click_reaches_into_an_open_shadow_root_page() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-coords-shadow");
+    let case = dir.write(
+        "coords-shadow.yaml",
+        &format!(
+            r##"name: coordinates on a page with an open shadow root
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.click:
+      at: {{ x: 260, y: 50 }}
+    expect:
+      - path: $.x
+        equals: 260
+      - path: $.y
+        equals: 50
+  - browser.read:
+      css: "#probe-status"
+    expect:
+      - path: $.text
+        equals: shadow-clicked
+  - browser.click:
+      at: {{ x: 100, y: 50 }}
+  - browser.read:
+      css: "#probe-status"
+    expect:
+      - path: $.text
+        equals: canvas 100,50
+  - browser.click:
+      role: button
+      name: Shadow target
+  - browser.read:
+      css: "#probe-status"
+    expect:
+      - path: $.text
+        equals: shadow-clicked
+"##,
+            url = server.url("/browser/probe/coords")
+        ),
+    );
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "coordinates must work on a page that contains an open shadow root: stdout={}\nstderr={}",
+        stdout(&output),
+        stderr(&output)
     );
 }
 
