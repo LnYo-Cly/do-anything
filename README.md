@@ -112,6 +112,7 @@ A case talks to a program or service that is already running: `da` never starts,
 | `cli.run` | Command-line programs, run without a shell | `exit_code`, `stdout`, `stderr`, `json` |
 | `db.query` | Data an earlier step wrote, read back through SQLite or PostgreSQL | `columns`, `rows`, `row_count`, `truncated` |
 | `browser.*` | Web pages in headless Chrome (enabled by default): open, click, type, upload, press, wait, read, screenshot, switch tabs | `url`, `title`, `text`, `value` (`testid`, `role`, `text`, `css`, `xpath` with `within`/`nth`, strict unique match, and actionability checks) |
+| `android.*` | One Android device over `adb` (opt-in with `--features android`): launch, tap, type, screenshot, read the UI tree, tap a node found in it | `package`, `component`, `count`, `nodes`, `target`, `center`, `path`, `characters`; `android.dump` costs about two seconds and is the only step that reads the tree |
 
 Assertions: `equals`, `not_equals`, `contains`, `exists` on any [JSONPath](https://www.rfc-editor.org/rfc/rfc9535.html). Variables: `vars`, `save`, `--var name=value` and `--vars-file`, referenced as `${name}`; `${env:NAME}` reads the environment and its value is redacted from output and bundles.
 
