@@ -2,19 +2,22 @@
 
 //! Tests for the `android.*` steps.
 //!
-//! The schema, lint and missing-adb tests need no device, so they run on every
-//! machine: a missing adb binary must be an error rather than a skip, and the
-//! message must name the setting the user can change. The tests that drive a
-//! device are gated on `DA_TEST_ANDROID`: when the device cannot be reached they
-//! print why and skip, and with `DA_TEST_ANDROID=1` they fail instead, which is
-//! what the device job sets.
+//! The schema, lint, missing-adb and deadline tests need no device, so they run
+//! on every machine: a missing adb binary must be an error rather than a skip,
+//! the message must name the setting the user can change, and a step that
+//! outlives its deadline must be killed and reported. The deadline tests point
+//! `DA_ADB` at a script that waits instead of answering, because only a program
+//! that never answers can prove a deadline. The tests that drive a device are
+//! gated on `DA_TEST_ANDROID`: when the device cannot be reached they print why
+//! and skip, and with `DA_TEST_ANDROID=1` they fail instead, which is what the
+//! device job sets.
 
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use support::TempDir;
@@ -71,6 +74,42 @@ fn note(message: &str) {
     use std::io::Write;
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(stderr, "{message}");
+}
+
+/// Writes a fake adb that runs `unix` or `windows` instead of talking to a
+/// device.
+///
+/// A script is the only way to hold an adb command open without a device: the
+/// real binary either answers in milliseconds or fails at once, and both hide
+/// the deadline. The platform decides how a text file becomes a program `da` can
+/// start — a `#!/bin/sh` script on Unix, a `.cmd` on Windows — but never what the
+/// test asserts, because both scripts do the same thing.
+fn fake_adb(dir: &TempDir, name: &str, unix: &str, windows: &str) -> String {
+    let (file, contents) = if cfg!(windows) {
+        (format!("{name}.cmd"), windows.replace('\n', "\r\n"))
+    } else {
+        (name.to_string(), format!("#!/bin/sh\n{unix}"))
+    };
+    let path = dir.write(&file, &contents);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path)
+            .expect("the fake adb must be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("the fake adb must be executable");
+    }
+    path_str(&path).to_string()
+}
+
+/// The path an error names after `kind` between backticks, for example
+/// `screenshot \``.
+fn named_path(message: &str, kind: &str) -> Option<PathBuf> {
+    let start = message.find(kind)? + kind.len();
+    let rest = &message[start..];
+    let end = rest.find('`')?;
+    Some(PathBuf::from(&rest[..end]))
 }
 
 /// Serializes the tests that drive the device: one case at a time keeps several
@@ -324,6 +363,36 @@ fn lint_refuses_an_argument_the_device_could_not_act_on() {
 }
 
 #[test]
+fn lint_refuses_a_deadline_that_cannot_work() {
+    let work = TempDir::new("android-lint-deadline");
+    for (timeout, expected) in [("0", "must be at least 1"), ("600001", "must be at most")] {
+        let case = work.write(
+            &format!("deadline-{timeout}.yaml"),
+            &format!(
+                "name: Android deadline out of range\nsteps:\n  - android.tap:\n      x: 1\n      \"y\": 2\n      timeout_ms: {timeout}\n"
+            ),
+        );
+        let output = run_da_in(work.path(), &["lint", path_str(&case)]);
+        assert_eq!(
+            exit_code(&output),
+            Some(3),
+            "a deadline of {timeout} ms is an invalid case, stdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let text = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(
+            text.contains("timeout_ms"),
+            "the message must name the argument: {text}"
+        );
+        assert!(
+            text.contains(expected),
+            "the message must give the bound: {text}"
+        );
+    }
+}
+
+#[test]
 fn an_unquoted_y_key_stays_a_coordinate() {
     let work = TempDir::new("android-lint-y");
     // The case format keeps argument keys as text, so an unquoted `y` is the
@@ -394,6 +463,184 @@ fn a_case_without_adb_fails_instead_of_skipping() {
     assert!(
         !message.contains("no-such-adb"),
         "the configured path must not leak into the output: {message}"
+    );
+}
+
+#[test]
+fn a_step_that_outlives_its_deadline_is_killed_and_named() {
+    let work = TempDir::new("android-deadline");
+    // The script waits and only then writes the marker: a process that outlives
+    // the deadline writes it, a process that was killed never does. The wait is
+    // a busy loop on Windows because `ping` takes ten seconds on some hosts and
+    // leaves a child of its own, while a `for /l` loop is a cmd builtin that
+    // ends with the shell.
+    let marker = work.path().join("survived.txt");
+    let marker_text = path_str(&marker).to_string();
+    let adb = fake_adb(
+        &work,
+        "slow-adb",
+        &format!("sleep 2\necho survived > '{marker_text}'\n"),
+        &format!(
+            "setlocal\nfor /l %%i in (1,1,2200000) do @rem\necho survived> \"{marker_text}\"\n"
+        ),
+    );
+
+    // Time the fake adb once: the test has to know how long the work would have
+    // taken on this machine, and this run is the positive control for the
+    // marker, which must appear when nothing kills the script.
+    let natural = {
+        let started = Instant::now();
+        let status = Command::new(&adb)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("the fake adb must run outside da as well");
+        assert!(
+            status.success(),
+            "the fake adb must finish when nothing kills it: {status}"
+        );
+        let natural = started.elapsed();
+        assert!(
+            marker.is_file(),
+            "the unchallenged fake adb must write {}, or the marker proves nothing",
+            marker.display()
+        );
+        std::fs::remove_file(&marker).expect("the calibration marker must be removable");
+        natural
+    };
+
+    let case = work.write(
+        "slow.yaml",
+        "name: Android step against a device that never answers\nsteps:\n  - android.tap:\n      x: 1\n      \"y\": 2\n      timeout_ms: 400\n",
+    );
+
+    let started = Instant::now();
+    let output = run_da_with_env(
+        work.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        &[("DA_ADB", adb.clone())],
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        exit_code(&output),
+        Some(5),
+        "a missed deadline is a timeout, stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    let message = report["cases"][0]["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the case must carry the deadline: {report}"));
+    assert!(
+        message.contains("`android.tap`"),
+        "the step must be named: {message}"
+    );
+    assert!(
+        message.contains("400 ms"),
+        "the deadline must be named: {message}"
+    );
+    assert!(
+        message.contains("`adb shell input tap 1 2`"),
+        "the command must be named: {message}"
+    );
+    assert!(
+        message.contains("timeout_ms"),
+        "the message must say what to raise: {message}"
+    );
+    assert!(
+        !message.contains(&adb) && !message.contains("slow-adb"),
+        "the adb path must not leak into the error: {message}"
+    );
+
+    let killed = message
+        .split("was killed after ")
+        .nth(1)
+        .and_then(|rest| rest.split(" ms").next())
+        .and_then(|text| text.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("the error must say when the command was killed: {message}"));
+    assert!(
+        killed >= 400,
+        "no command can be killed before its 400 ms deadline: {killed} ms"
+    );
+    assert!(
+        killed < natural.as_millis() as u64,
+        "the kill must come before the work would have finished: killed after {killed} ms, the work takes {natural:?}"
+    );
+    assert!(
+        elapsed < natural + Duration::from_secs(1),
+        "the run must end before the fake adb would have: {elapsed:?} against {natural:?}"
+    );
+
+    // Wait past the time the work would have taken. A process that survived the
+    // deadline writes its marker in this window; nothing else can write it.
+    if let Some(remaining) = (natural + Duration::from_secs(1)).checked_sub(started.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+    assert!(
+        !marker.exists(),
+        "the killed adb must not outlive the step and write {}",
+        marker.display()
+    );
+    note(&format!(
+        "android.tap was killed after {killed} ms of its 400 ms deadline; the fake adb takes {natural:?} when nothing kills it and the run took {elapsed:?}"
+    ));
+}
+
+#[test]
+fn a_device_that_never_answers_records_no_evidence() {
+    let work = TempDir::new("android-unreachable");
+    let adb = fake_adb(
+        &work,
+        "unreachable-adb",
+        "echo 'error: no devices/emulators found' >&2\nexit 1\n",
+        "echo error: no devices/emulators found 1>&2\nexit /b 1\n",
+    );
+    let case = work.write(
+        "dump.yaml",
+        "name: Android dump without a device\nsteps:\n  - android.dump: {}\n",
+    );
+
+    let output = run_da_with_env(
+        work.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        &[("DA_ADB", adb)],
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "a device that never answers fails the step, stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    let message = report["cases"][0]["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the case must carry an error: {report}"));
+    assert!(
+        message.contains("could not dump the UI hierarchy"),
+        "the step must say what it could not do: {message}"
+    );
+    assert!(
+        message.contains("no devices/emulators found"),
+        "a failure must keep the output adb printed: {message}"
+    );
+    assert!(
+        !message.contains("recorded in the case directory"),
+        "an unreachable device has nothing to record: {message}"
+    );
+
+    let written: Vec<String> = std::fs::read_dir(work.path())
+        .expect("the case directory must be readable")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("android-failure-"))
+        .collect();
+    assert!(
+        written.is_empty(),
+        "a device that never answered must not make the step write evidence: {written:?}"
     );
 }
 
@@ -548,6 +795,99 @@ fn a_screenshot_lands_in_the_case_directory() {
     note(&format!(
         "android.screenshot took {} ms for {bytes} bytes ({elapsed} ms including the run)",
         duration_ms(step)
+    ));
+}
+
+#[test]
+fn a_failing_step_records_the_screen_and_the_tree() {
+    let Some(_guard) = device_test() else {
+        return;
+    };
+    let dir = TempDir::new("android-device-evidence");
+    // A filter no screen can resolve: the dump itself succeeds, so the device
+    // still answers, which is exactly the failure that must leave evidence.
+    let missing = format!("da-no-such-node-{}", std::process::id());
+    let case = dir.write(
+        "fail.yaml",
+        &format!(
+            "name: Android failure evidence\nsteps:\n  - android.dump:\n      text: \"{missing}\"\n"
+        ),
+    );
+
+    let started = Instant::now();
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "a filter that names no node fails the case, stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report = json_stdout(&output);
+    let message = report["cases"][0]["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the case must carry an error: {report}"));
+    assert!(
+        message.contains(&missing),
+        "the failure must keep its own reason: {message}"
+    );
+    assert!(
+        message.contains("the device still answered"),
+        "the error must say the failure was recorded: {message}"
+    );
+
+    let screenshot = named_path(message, "screenshot `")
+        .unwrap_or_else(|| panic!("the error must name the screenshot: {message}"));
+    let tree = named_path(message, "UI tree `")
+        .unwrap_or_else(|| panic!("the error must name the UI tree: {message}"));
+
+    assert_eq!(
+        screenshot.parent(),
+        Some(dir.path()),
+        "the evidence screenshot belongs beside the case: {}",
+        screenshot.display()
+    );
+    assert_eq!(
+        tree.parent(),
+        Some(dir.path()),
+        "the evidence tree belongs beside the case: {}",
+        tree.display()
+    );
+
+    let png = std::fs::read(&screenshot).unwrap_or_else(|error| {
+        panic!(
+            "the evidence screenshot must be written to {}: {error}",
+            screenshot.display()
+        )
+    });
+    assert!(!png.is_empty(), "the evidence screenshot must not be empty");
+    assert!(
+        png.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "the evidence screenshot is a PNG"
+    );
+    let xml = std::fs::read_to_string(&tree).unwrap_or_else(|error| {
+        panic!(
+            "the evidence tree must be written to {}: {error}",
+            tree.display()
+        )
+    });
+    assert!(!xml.is_empty(), "the evidence tree must not be empty");
+    assert!(
+        xml.contains("<hierarchy") && xml.contains("<node"),
+        "the evidence tree must be the dump document: {:.200}",
+        xml
+    );
+    note(&format!(
+        "a failing android.dump wrote {} bytes of PNG and {} bytes of XML in {elapsed:?}: {} and {}",
+        png.len(),
+        xml.len(),
+        screenshot.display(),
+        tree.display()
     ));
 }
 

@@ -15,19 +15,33 @@
 //! No step softens a missing adb, a missing device or a second attached device
 //! into a skip: each fails with the action that fixes it, because a green run
 //! that drove nothing is worse than a red one.
+//!
+//! Every step has a deadline, `timeout_ms`, 30 seconds unless the case asks for
+//! another. A device that stops answering holds an adb command open for as long
+//! as nobody kills it, so the deadline kills the command and fails the step with
+//! the step, the deadline, the time that passed and the command it ran: the run
+//! ends, and the message says what to change.
+//!
+//! A step that fails on a device that still answers records what the device
+//! showed: a screenshot and the current UI tree, written into the case directory
+//! and named in the error. A failure without those files costs a debugging cycle
+//! — the report says a tap found no node, and nothing says which screen the tap
+//! was on — while a device that does not answer at all is not asked twice: the
+//! step fails at once, with what adb printed.
 
 mod adb;
 mod dump;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use self::adb::Adb;
+use self::adb::{Adb, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS};
 use self::dump::{Filter, Node, ResolveError};
 use crate::core::paths;
 use crate::core::registry::{
@@ -47,6 +61,14 @@ pub const STEP_NAMES: [&str; 6] = [
 
 /// The eight bytes every PNG starts with.
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// The longest one evidence command of a failed step may take.
+///
+/// Evidence is a record, not the work: a screenshot costs about 160 ms and a
+/// dump about 2 s on the measured container, so ten seconds is already generous,
+/// and a device that has stopped answering cannot add a second full deadline to
+/// a failure that already took one.
+const EVIDENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registers every Android step.
 ///
@@ -193,6 +215,11 @@ fn strings(schema: &mut Value, fields: &[&str]) {
     }
 }
 
+/// The deadline of one adb command when the step names none.
+fn default_timeout_ms() -> u64 {
+    DEFAULT_TIMEOUT_MS
+}
+
 /// Arguments of `android.launch`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +238,11 @@ struct LaunchArgs {
     #[schemars(extend("minLength" = 1))]
     #[serde(default)]
     serial: Option<String>,
+    /// Deadline for one adb command, in milliseconds. Defaults to 30000, and
+    /// the command is killed when the deadline passes.
+    #[schemars(extend("minimum" = 1, "maximum" = MAX_TIMEOUT_MS))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Arguments of `android.tap`.
@@ -225,6 +257,11 @@ struct TapArgs {
     #[schemars(extend("minLength" = 1))]
     #[serde(default)]
     serial: Option<String>,
+    /// Deadline for one adb command, in milliseconds. Defaults to 30000, and
+    /// the command is killed when the deadline passes.
+    #[schemars(extend("minimum" = 1, "maximum" = MAX_TIMEOUT_MS))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Arguments of `android.input_text`.
@@ -238,6 +275,11 @@ struct InputTextArgs {
     #[schemars(extend("minLength" = 1))]
     #[serde(default)]
     serial: Option<String>,
+    /// Deadline for one adb command, in milliseconds. Defaults to 30000, and
+    /// the command is killed when the deadline passes.
+    #[schemars(extend("minimum" = 1, "maximum" = MAX_TIMEOUT_MS))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Arguments of `android.screenshot`.
@@ -251,6 +293,11 @@ struct ScreenshotArgs {
     #[schemars(extend("minLength" = 1))]
     #[serde(default)]
     serial: Option<String>,
+    /// Deadline for one adb command, in milliseconds. Defaults to 30000, and
+    /// the command is killed when the deadline passes.
+    #[schemars(extend("minimum" = 1, "maximum" = MAX_TIMEOUT_MS))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Arguments of `android.dump`.
@@ -270,6 +317,11 @@ struct DumpArgs {
     #[schemars(extend("minLength" = 1))]
     #[serde(default)]
     serial: Option<String>,
+    /// Deadline for one adb command, in milliseconds. Defaults to 30000, and
+    /// the command is killed when the deadline passes.
+    #[schemars(extend("minimum" = 1, "maximum" = MAX_TIMEOUT_MS))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Arguments of `android.tap_on`.
@@ -286,6 +338,11 @@ struct TapOnArgs {
     #[schemars(extend("minLength" = 1))]
     #[serde(default)]
     serial: Option<String>,
+    /// Deadline for one adb command, in milliseconds. Defaults to 30000, and
+    /// the command is killed when the deadline passes.
+    #[schemars(extend("minimum" = 1, "maximum" = MAX_TIMEOUT_MS))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 fn validate_launch(args: &Value) -> Result<(), String> {
@@ -318,6 +375,7 @@ fn validate_tap_on(args: &Value) -> Result<(), String> {
 /// the two forms that reach the device; everything else is refused before an
 /// adb call is made.
 fn check_launch(args: &LaunchArgs) -> Result<(), String> {
+    check_timeout(args.timeout_ms)?;
     let package = text_argument(args.package.as_deref(), "package", "the package to launch")?;
     let activity = text_argument(
         args.activity.as_deref(),
@@ -364,6 +422,7 @@ fn check_launch(args: &LaunchArgs) -> Result<(), String> {
 /// The coordinates are typed as unsigned integers, so a negative or fractional
 /// pixel is refused while the arguments are parsed; only the serial is left.
 fn check_tap(args: &TapArgs) -> Result<(), String> {
+    check_timeout(args.timeout_ms)?;
     check_serial(args.serial.as_deref())
 }
 
@@ -374,6 +433,7 @@ fn check_tap(args: &TapArgs) -> Result<(), String> {
 /// it. Refusing those values is better than sending text that the device
 /// silently changes.
 fn check_input_text(args: &InputTextArgs) -> Result<(), String> {
+    check_timeout(args.timeout_ms)?;
     check_serial(args.serial.as_deref())?;
     if args.text.is_empty() {
         return Err(
@@ -397,6 +457,7 @@ fn check_input_text(args: &InputTextArgs) -> Result<(), String> {
 }
 
 fn check_screenshot(args: &ScreenshotArgs) -> Result<(), String> {
+    check_timeout(args.timeout_ms)?;
     check_serial(args.serial.as_deref())?;
     if args.path.trim().is_empty() {
         return Err("invalid arguments: `path` must name the PNG file to write".to_string());
@@ -406,6 +467,7 @@ fn check_screenshot(args: &ScreenshotArgs) -> Result<(), String> {
 
 /// Checks the arguments of `android.dump`.
 fn check_dump(args: &DumpArgs) -> Result<(), String> {
+    check_timeout(args.timeout_ms)?;
     check_serial(args.serial.as_deref())?;
     let text = text_argument(args.text.as_deref(), "text", "the text to resolve")?;
     let resource_id = text_argument(
@@ -424,6 +486,7 @@ fn check_dump(args: &DumpArgs) -> Result<(), String> {
 
 /// Checks the arguments of `android.tap_on`.
 fn check_tap_on(args: &TapOnArgs) -> Result<(), String> {
+    check_timeout(args.timeout_ms)?;
     check_serial(args.serial.as_deref())?;
     let text = text_argument(args.text.as_deref(), "text", "the text to resolve")?;
     let resource_id = text_argument(
@@ -469,6 +532,28 @@ fn check_serial(serial: Option<&str>) -> Result<(), String> {
         "the device serial, or omit it to use `DA_ANDROID_SERIAL`",
     )
     .map(|_| ())
+}
+
+/// Checks the deadline every step accepts.
+///
+/// The bounds equal the bounds of the emitted schema, so a value the schema
+/// accepts is never refused later for this argument. Zero would kill every
+/// command before it ran, and a value above [`MAX_TIMEOUT_MS`] is a typo rather
+/// than a slow device: the deadline exists to fail when the device hangs, and
+/// one that outlives the run cannot do that.
+fn check_timeout(timeout_ms: u64) -> Result<(), String> {
+    if timeout_ms == 0 {
+        return Err(
+            "invalid arguments: `timeout_ms` must be at least 1; it is the deadline of one adb command, in milliseconds"
+                .to_string(),
+        );
+    }
+    if timeout_ms > MAX_TIMEOUT_MS {
+        return Err(format!(
+            "invalid arguments: `timeout_ms` must be at most {MAX_TIMEOUT_MS} ms (ten minutes); a longer deadline cannot rescue a hung device, and `uiautomator dump` costs about two seconds"
+        ));
+    }
+    Ok(())
 }
 
 /// Parses a step's arguments.
@@ -533,27 +618,29 @@ fn reject_null_fields(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn run_launch(args: &Value, _sessions: &mut Sessions) -> Result<Value, StepError> {
+fn run_launch(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: LaunchArgs = parse(args)?;
     check_launch(&args).map_err(StepError::InvalidArguments)?;
-    let adb = Adb::from_arguments(args.serial.as_deref());
-    let package = args.package.as_deref().map(str::trim);
-    let activity = args.activity.as_deref().map(str::trim);
-    match (package, activity) {
-        (Some(package), Some(activity)) => {
-            let component = if activity.contains('/') {
-                activity.to_string()
-            } else {
-                format!("{package}/{activity}")
-            };
-            start_component(&adb, &component, Some(package))
+    let adb = Adb::from_arguments(STEP_NAMES[0], args.serial.as_deref(), args.timeout_ms);
+    with_evidence(&adb, STEP_NAMES[0], sessions, |_sessions| {
+        let package = args.package.as_deref().map(str::trim);
+        let activity = args.activity.as_deref().map(str::trim);
+        match (package, activity) {
+            (Some(package), Some(activity)) => {
+                let component = if activity.contains('/') {
+                    activity.to_string()
+                } else {
+                    format!("{package}/{activity}")
+                };
+                start_component(&adb, &component, Some(package))
+            }
+            (Some(package), None) => launch_package(&adb, package),
+            (None, Some(activity)) => start_component(&adb, activity, None),
+            (None, None) => Err(StepError::InvalidArguments(
+                "invalid arguments: `android.launch` needs `package` and/or `activity`".to_string(),
+            )),
         }
-        (Some(package), None) => launch_package(&adb, package),
-        (None, Some(activity)) => start_component(&adb, activity, None),
-        (None, None) => Err(StepError::InvalidArguments(
-            "invalid arguments: `android.launch` needs `package` and/or `activity`".to_string(),
-        )),
-    }
+    })
 }
 
 /// Starts one component with `am start`.
@@ -649,28 +736,32 @@ fn check_device_refusal(output: &str, action: &str) -> Result<(), StepError> {
     }
 }
 
-fn run_tap(args: &Value, _sessions: &mut Sessions) -> Result<Value, StepError> {
+fn run_tap(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: TapArgs = parse(args)?;
     check_tap(&args).map_err(StepError::InvalidArguments)?;
-    let adb = Adb::from_arguments(args.serial.as_deref());
-    let x = args.x.to_string();
-    let y = args.y.to_string();
-    adb.shell(
-        &["input", "tap", &x, &y],
-        &format!("tap ({}, {})", args.x, args.y),
-    )?;
-    Ok(json!({ "x": args.x, "y": args.y }))
+    let adb = Adb::from_arguments(STEP_NAMES[1], args.serial.as_deref(), args.timeout_ms);
+    with_evidence(&adb, STEP_NAMES[1], sessions, |_sessions| {
+        let x = args.x.to_string();
+        let y = args.y.to_string();
+        adb.shell(
+            &["input", "tap", &x, &y],
+            &format!("tap ({}, {})", args.x, args.y),
+        )?;
+        Ok(json!({ "x": args.x, "y": args.y }))
+    })
 }
 
-fn run_input_text(args: &Value, _sessions: &mut Sessions) -> Result<Value, StepError> {
+fn run_input_text(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: InputTextArgs = parse(args)?;
     check_input_text(&args).map_err(StepError::InvalidArguments)?;
-    let adb = Adb::from_arguments(args.serial.as_deref());
-    adb.shell(
-        &["input", "text", &escape_input_text(&args.text)],
-        "type the text into the field that has focus",
-    )?;
-    Ok(json!({ "characters": args.text.chars().count() }))
+    let adb = Adb::from_arguments(STEP_NAMES[2], args.serial.as_deref(), args.timeout_ms);
+    with_evidence(&adb, STEP_NAMES[2], sessions, |_sessions| {
+        adb.shell(
+            &["input", "text", &escape_input_text(&args.text)],
+            "type the text into the field that has focus",
+        )?;
+        Ok(json!({ "characters": args.text.chars().count() }))
+    })
 }
 
 /// Prepares text for `input text`.
@@ -700,38 +791,42 @@ fn shell_quote(value: &str) -> String {
 fn run_screenshot(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: ScreenshotArgs = parse(args)?;
     check_screenshot(&args).map_err(StepError::InvalidArguments)?;
-    let adb = Adb::from_arguments(args.serial.as_deref());
-    let png = adb.exec_out(&["screencap", "-p"], "capture the screen")?;
-    if !png.starts_with(PNG_SIGNATURE) {
-        return Err(StepError::Execution(format!(
-            "could not capture the screen: the device returned {} bytes that are not a PNG file; check that the screen is on",
-            png.len()
-        )));
-    }
-    let path = resolve_path(args.path.trim(), sessions);
-    write_bytes(&path, &png)?;
-    Ok(json!({
-        "path": paths::display(&path),
-        "bytes": png.len(),
-    }))
+    let adb = Adb::from_arguments(STEP_NAMES[3], args.serial.as_deref(), args.timeout_ms);
+    with_evidence(&adb, STEP_NAMES[3], sessions, |sessions| {
+        let png = adb.exec_out(&["screencap", "-p"], "capture the screen")?;
+        if !png.starts_with(PNG_SIGNATURE) {
+            return Err(StepError::Execution(format!(
+                "could not capture the screen: the device returned {} bytes that are not a PNG file; check that the screen is on",
+                png.len()
+            )));
+        }
+        let path = resolve_path(args.path.trim(), sessions);
+        write_bytes(&path, &png)?;
+        Ok(json!({
+            "path": paths::display(&path),
+            "bytes": png.len(),
+        }))
+    })
 }
 
-fn run_dump(args: &Value, _sessions: &mut Sessions) -> Result<Value, StepError> {
+fn run_dump(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: DumpArgs = parse(args)?;
     check_dump(&args).map_err(StepError::InvalidArguments)?;
-    let adb = Adb::from_arguments(args.serial.as_deref());
-    let nodes = read_hierarchy(&adb)?;
-    let mut result = json!({
-        "count": nodes.len(),
-        "nodes": nodes_value(&nodes),
-    });
-    if let Some(filter) = filter_of(args.text.as_deref(), args.resource_id.as_deref()) {
-        result["target"] = node_value(resolve_one(&nodes, &filter)?);
-    }
-    Ok(result)
+    let adb = Adb::from_arguments(STEP_NAMES[4], args.serial.as_deref(), args.timeout_ms);
+    with_evidence(&adb, STEP_NAMES[4], sessions, |_sessions| {
+        let nodes = read_hierarchy(&adb)?;
+        let mut result = json!({
+            "count": nodes.len(),
+            "nodes": nodes_value(&nodes),
+        });
+        if let Some(filter) = filter_of(args.text.as_deref(), args.resource_id.as_deref()) {
+            result["target"] = node_value(resolve_one(&nodes, &filter)?);
+        }
+        Ok(result)
+    })
 }
 
-fn run_tap_on(args: &Value, _sessions: &mut Sessions) -> Result<Value, StepError> {
+fn run_tap_on(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: TapOnArgs = parse(args)?;
     check_tap_on(&args).map_err(StepError::InvalidArguments)?;
     let Some(filter) = filter_of(args.text.as_deref(), args.resource_id.as_deref()) else {
@@ -740,34 +835,55 @@ fn run_tap_on(args: &Value, _sessions: &mut Sessions) -> Result<Value, StepError
                 .to_string(),
         ));
     };
-    let adb = Adb::from_arguments(args.serial.as_deref());
-    let nodes = read_hierarchy(&adb)?;
-    let target = resolve_one(&nodes, &filter)?;
-    let Some(bounds) = target.bounds else {
-        return Err(StepError::Execution(format!(
-            "the node {} has no bounds in the dump, so there is no point to tap; run `android.dump` to see the tree",
-            filter.describe()
-        )));
-    };
-    let (x, y) = bounds.center();
-    adb.shell(
-        &["input", "tap", &x.to_string(), &y.to_string()],
-        &format!("tap the node {}", filter.describe()),
-    )?;
-    Ok(json!({
-        "target": node_value(target),
-        "center": { "x": x, "y": y },
-    }))
+    let adb = Adb::from_arguments(STEP_NAMES[5], args.serial.as_deref(), args.timeout_ms);
+    with_evidence(&adb, STEP_NAMES[5], sessions, |_sessions| {
+        let nodes = read_hierarchy(&adb)?;
+        let target = resolve_one(&nodes, &filter)?;
+        let Some(bounds) = target.bounds else {
+            return Err(StepError::Execution(format!(
+                "the node {} has no bounds in the dump, so there is no point to tap; run `android.dump` to see the tree",
+                filter.describe()
+            )));
+        };
+        let (x, y) = bounds.center();
+        adb.shell(
+            &["input", "tap", &x.to_string(), &y.to_string()],
+            &format!("tap the node {}", filter.describe()),
+        )?;
+        Ok(json!({
+            "target": node_value(target),
+            "center": { "x": x, "y": y },
+        }))
+    })
 }
 
-/// Reads the UI hierarchy: one `uiautomator dump`, then one read of its file.
+/// Runs one step's device work, recording evidence when it fails.
+///
+/// This wrapper is the one place every step reports through, so a step cannot
+/// fail without asking whether the device still had something to show.
+fn with_evidence<T>(
+    adb: &Adb,
+    step: &'static str,
+    sessions: &mut Sessions,
+    body: impl FnOnce(&mut Sessions) -> Result<T, StepError>,
+) -> Result<T, StepError> {
+    match body(sessions) {
+        Ok(result) => Ok(result),
+        Err(error) => Err(record_evidence(adb, step, sessions, error)),
+    }
+}
+
+/// Dumps the UI hierarchy and returns the XML document the device wrote.
 ///
 /// A dump costs about two seconds on the measured container and the cost is
 /// fixed, which is why nothing calls this except the two steps that say so. The
 /// file goes to `/data/local/tmp`, which an adb shell can always write, and is
 /// removed again: `exec-out uiautomator dump` mixes a status line into the XML
 /// on some builds, while the file holds the document alone.
-fn read_hierarchy(adb: &Adb) -> Result<Vec<Node>, StepError> {
+///
+/// The document itself is returned rather than parsed nodes, because the failure
+/// evidence is the tree exactly as the device dumped it.
+fn dump_xml(adb: &Adb) -> Result<Vec<u8>, StepError> {
     let path = remote_dump_path();
     let dumped = adb.shell(&["uiautomator", "dump", &path], "dump the UI hierarchy")?;
     if let Some(line) = dumped
@@ -783,7 +899,12 @@ fn read_hierarchy(adb: &Adb) -> Result<Vec<Node>, StepError> {
     // The file is only an intermediate: a failure to remove it must not hide a
     // dump that was read successfully.
     let _ = adb.shell(&["rm", "-f", &path], "remove the dumped UI hierarchy");
-    let xml = String::from_utf8(xml).map_err(|_| {
+    Ok(xml)
+}
+
+/// Reads the UI hierarchy as nodes.
+fn read_hierarchy(adb: &Adb) -> Result<Vec<Node>, StepError> {
+    let xml = String::from_utf8(dump_xml(adb)?).map_err(|_| {
         StepError::Execution(
             "the UI hierarchy the device returned is not UTF-8 text; the dump may be cut off"
                 .to_string(),
@@ -927,6 +1048,100 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StepError> {
     })
 }
 
+/// Adds the screenshot and the UI tree to a failed step's error.
+///
+/// Both files go into the case directory — the directory a relative
+/// `android.screenshot` path resolves against — and the error names them, so a
+/// terminal, a report and a failure bundle all say what the device displayed
+/// when the step failed. The screenshot is taken first and is also the question
+/// whether the device still answers: when it does not come back as a PNG the
+/// device is gone, nothing is written, and the step fails with the output adb
+/// already printed instead of spending a second deadline on a tree that will
+/// not come either.
+fn record_evidence(
+    adb: &Adb,
+    step: &'static str,
+    sessions: &Sessions,
+    error: StepError,
+) -> StepError {
+    // An invalid argument never reached the device, and an environment failure
+    // says the device could not be reached at all: there is nothing to record,
+    // and a second command would hang for the same reason the first one did.
+    if !matches!(error, StepError::Execution(_) | StepError::Timeout(_)) {
+        return error;
+    }
+    let evidence = adb.bounded_by(EVIDENCE_TIMEOUT);
+    let png = match evidence.exec_out(
+        &["screencap", "-p"],
+        "capture the screen of the failed step",
+    ) {
+        Ok(png) if png.starts_with(PNG_SIGNATURE) => png,
+        // Not a failure of its own: the step already failed, and a device that
+        // returns no screenshot is the answer this question asked for.
+        _ => return error,
+    };
+    let (screenshot, tree) = evidence_paths(step, sessions);
+    let mut recorded: Vec<(&str, PathBuf, usize)> = Vec::new();
+    if let Some((path, bytes)) = record(&screenshot, &png) {
+        recorded.push(("screenshot", path, bytes));
+    }
+    // The tree is dumped after the screenshot, so a device that disappears
+    // between the two still leaves the image it showed.
+    if let Ok(xml) = dump_xml(&evidence)
+        && let Some((path, bytes)) = record(&tree, &xml)
+    {
+        recorded.push(("UI tree", path, bytes));
+    }
+    if recorded.is_empty() {
+        return error;
+    }
+    let named: Vec<String> = recorded
+        .iter()
+        .map(|(kind, path, bytes)| format!("{kind} `{}` ({bytes} bytes)", paths::display(path)))
+        .collect();
+    let note = format!(
+        "the device still answered, so the failure was recorded in the case directory: {}",
+        named.join(" and ")
+    );
+    match error {
+        StepError::Execution(message) => StepError::Execution(format!("{message}; {note}")),
+        StepError::Timeout(message) => StepError::Timeout(format!("{message}; {note}")),
+        other => other,
+    }
+}
+
+/// The two evidence files of one failed step.
+///
+/// The names carry the process id and a counter, so two failures of one run — a
+/// `retry` on the dump, or two cases that fail on the same device — never
+/// overwrite each other's evidence, and the step in the name says which step
+/// failed without opening the file.
+fn evidence_paths(step: &'static str, sessions: &Sessions) -> (PathBuf, PathBuf) {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "android-failure-{}-{}-{step}.png",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let screenshot = resolve_path(&name, sessions);
+    let tree = screenshot.with_extension("xml");
+    (screenshot, tree)
+}
+
+/// Writes one evidence file, and reports the path and the size when it did.
+///
+/// A file that cannot be written is not a failure of its own: the step has
+/// already failed, and the reason it failed is what the message must keep.
+fn record(path: &Path, bytes: &[u8]) -> Option<(PathBuf, usize)> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(path, bytes).ok()?;
+    Some((path.to_path_buf(), bytes.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1209,103 @@ mod tests {
             "android.tap",
             json!({"x": 1, "y": 2, "serial": "emulator-5554"}),
         );
+        accepts("android.dump", json!({"timeout_ms": 5000}));
+    }
+
+    /// Every step's minimal valid arguments, for the tests that only vary the
+    /// deadline.
+    fn every_step() -> [(&'static str, Value); 6] {
+        [
+            ("android.launch", json!({"package": "com.android.settings"})),
+            ("android.tap", json!({"x": 1, "y": 2})),
+            ("android.input_text", json!({"text": "hello"})),
+            ("android.screenshot", json!({"path": "shot.png"})),
+            ("android.dump", json!({})),
+            ("android.tap_on", json!({"text": "OK"})),
+        ]
+    }
+
+    #[test]
+    fn every_step_takes_a_deadline_and_refuses_zero_and_an_absurd_one() {
+        for (step, args) in every_step() {
+            let with_deadline = |timeout: Value| {
+                let mut value = args.clone();
+                value["timeout_ms"] = timeout;
+                value
+            };
+
+            accepts(step, with_deadline(json!(DEFAULT_TIMEOUT_MS)));
+            accepts(step, with_deadline(json!(1)));
+            accepts(step, with_deadline(json!(MAX_TIMEOUT_MS)));
+
+            let zero = rejects(step, with_deadline(json!(0)));
+            assert!(
+                zero.contains("`timeout_ms` must be at least 1"),
+                "`{step}` must refuse a zero deadline, got: {zero}"
+            );
+
+            let absurd = rejects(step, with_deadline(json!(MAX_TIMEOUT_MS + 1)));
+            assert!(
+                absurd.contains("`timeout_ms` must be at most"),
+                "`{step}` must refuse an absurd deadline, got: {absurd}"
+            );
+            assert!(absurd.contains("invalid arguments"), "got: {absurd}");
+        }
+    }
+
+    #[test]
+    fn the_deadline_defaults_to_thirty_seconds() {
+        assert_eq!(default_timeout_ms(), 30_000);
+
+        let args: TapArgs = parse(&json!({"x": 1, "y": 2})).expect("the arguments must parse");
+        assert_eq!(args.timeout_ms, 30_000);
+
+        let explicit: TapArgs =
+            parse(&json!({"x": 1, "y": 2, "timeout_ms": 1500})).expect("the arguments must parse");
+        assert_eq!(
+            explicit.timeout_ms, 1500,
+            "a deadline the case names must be the one that runs"
+        );
+    }
+
+    #[test]
+    fn the_emitted_schema_bounds_every_deadline() {
+        let registry = registry();
+        for (step, args) in every_step() {
+            let definition = registry
+                .get(step)
+                .unwrap_or_else(|| panic!("`{step}` must be registered"));
+            let schema = &definition.args_schema["properties"]["timeout_ms"];
+            assert_eq!(
+                schema["type"], "integer",
+                "`{step}.timeout_ms` must be an integer in the schema: {schema}"
+            );
+            assert_eq!(
+                schema["minimum"], 1,
+                "`{step}` must refuse a zero deadline in the schema: {schema}"
+            );
+            assert_eq!(
+                schema["maximum"], MAX_TIMEOUT_MS,
+                "`{step}` must bound the deadline in the schema: {schema}"
+            );
+            let with_deadline = |timeout: u64| {
+                let mut value = args.clone();
+                value["timeout_ms"] = json!(timeout);
+                value
+            };
+            assert!(
+                jsonschema::is_valid(&definition.args_schema, &with_deadline(DEFAULT_TIMEOUT_MS)),
+                "the schema of `{step}` must accept the documented default"
+            );
+            assert!(
+                !jsonschema::is_valid(&definition.args_schema, &with_deadline(0)),
+                "the schema of `{step}` must refuse a zero deadline"
+            );
+            assert!(
+                !jsonschema::is_valid(&definition.args_schema, &with_deadline(MAX_TIMEOUT_MS + 1)),
+                "the schema of `{step}` must refuse an absurd deadline"
+            );
+        }
     }
 
     #[test]
@@ -1270,5 +1582,44 @@ mod tests {
             PNG_SIGNATURE
         );
         std::fs::remove_dir_all(&dir).expect("the test directory must be removable");
+    }
+
+    #[test]
+    fn evidence_belongs_beside_the_case_and_no_two_failures_share_it() {
+        let mut sessions = Sessions::new();
+        sessions.set_base_directory("cases/shop");
+
+        let (first_png, first_xml) = evidence_paths("android.dump", &sessions);
+        let (second_png, second_xml) = evidence_paths("android.dump", &sessions);
+
+        assert_eq!(
+            first_png.parent(),
+            Some(Path::new("cases/shop")),
+            "evidence belongs in the case directory: {}",
+            first_png.display()
+        );
+        assert_eq!(
+            first_xml,
+            first_png.with_extension("xml"),
+            "the two files of one failure share one name"
+        );
+        assert_ne!(first_png, second_png, "two failures must not overwrite");
+        assert_ne!(first_xml, second_xml, "two failures must not overwrite");
+        assert_eq!(
+            first_png.extension().and_then(|part| part.to_str()),
+            Some("png")
+        );
+        assert_eq!(
+            first_xml.extension().and_then(|part| part.to_str()),
+            Some("xml")
+        );
+        assert!(
+            first_png
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("android.dump")),
+            "the step must be in the file name: {}",
+            first_png.display()
+        );
     }
 }
