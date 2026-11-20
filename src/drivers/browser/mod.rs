@@ -1178,6 +1178,27 @@ var collectDeepElements = function (root) {
   walk(root);
   return out;
 };
+var collectDeepMatches = function (root, selector) {
+  // querySelectorAll keeps standard `:scope` semantics per search root, so it is
+  // evaluated once on the root and once on every open shadow root instead of
+  // testing candidates with matches(), where `:scope` would name the candidate.
+  if (!root) return [];
+  var out = [];
+  var push = function (nodes) {
+    for (var i = 0; i < nodes.length; i++) {
+      if (out.indexOf(nodes[i]) === -1) out.push(nodes[i]);
+    }
+  };
+  push(root.querySelectorAll(selector));
+  // A `within` container can itself be a shadow host, and its own root's
+  // contents are not part of `root.querySelectorAll`.
+  if (root.shadowRoot) push(root.shadowRoot.querySelectorAll(selector));
+  var elements = collectDeepElements(root);
+  for (var i = 0; i < elements.length; i++) {
+    if (elements[i].shadowRoot) push(elements[i].shadowRoot.querySelectorAll(selector));
+  }
+  return out;
+};
 var composedContains = function (ancestor, node) {
   if (!ancestor || !node) return false;
   var cur = node;
@@ -1575,7 +1596,10 @@ impl Locator {
     fn resolve_body_with(&self, testid_attribute: &str, nth: Option<usize>) -> Option<String> {
         let collect = match self {
             Self::Css(selector) => format!(
-                "{COMPOSED_HELPERS_JS}\nvar selector = {};\nvar all = collectDeepElements(root);\nvar matches = [];\nfor (var i = 0; i < all.length; i++) {{\n  if (all[i].matches(selector)) matches.push(all[i]);\n}}\nvar hiddenFound = false;",
+                "{COMPOSED_HELPERS_JS}
+var selector = {};
+var matches = collectDeepMatches(root, selector);
+var hiddenFound = false;",
                 json_string(selector)
             ),
             Self::Xpath(expression) => format!(

@@ -445,3 +445,49 @@ steps:
         "the screenshot must be a PNG"
     );
 }
+
+/// `:scope` keeps its standard meaning: in a document search it names the
+/// document element, and inside `within` it names the container.
+///
+/// Evaluating each candidate with `matches()` would redefine `:scope` as the
+/// candidate itself, so the document search would match every element and the
+/// scoped child combinator would resolve to nothing.
+#[test]
+fn css_scope_keeps_document_and_container_semantics() {
+    let server = TestServer::start();
+    if chrome_test(&server).is_none() {
+        return;
+    }
+    let dir = TempDir::new("shadow-css-scope");
+    let document_scope = dir.write(
+        "document-scope.yaml",
+        &format!(
+            r##"name: scope names the document element
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.read:
+      css: ":scope"
+"##,
+            server.url("/browser/shadow")
+        ),
+    );
+    run_ok(dir.path(), &document_scope);
+
+    let container_scope = dir.write(
+        "container-scope.yaml",
+        &format!(
+            r##"name: scope names the within container
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.read:
+      css: ":scope > body"
+      within:
+        css: "html"
+"##,
+            server.url("/browser/shadow")
+        ),
+    );
+    run_ok(dir.path(), &container_scope);
+}
