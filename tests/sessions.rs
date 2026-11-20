@@ -347,6 +347,7 @@ fn registry() -> Registry {
                 args_schema: json!({"type": "object"}),
                 validate: |_| Ok(()),
                 check_retry: do_anything::core::registry::disallow_retry,
+                lint_warnings: do_anything::core::registry::no_lint_warnings,
                 run,
             })
             .unwrap_or_else(|error| panic!("`{name}` must register: {error}"));

@@ -573,6 +573,22 @@ steps:
         equals: Welcome back, Alice
 ```
 
+A step that clicked explicit coordinates is exported with the viewport it ran at,
+so the case cannot silently replay at another size, and it is listed in the
+export report's `fragile` array with `"reason": "explicit_coordinates"` and that
+`viewport`:
+
+```yaml
+  # fragile: explicit coordinates recorded at viewport 1280x800; replay this case at the same size
+  - browser.click:
+      at:
+        x: 100
+        y: 50
+        viewport:
+          width: 1280
+          height: 800
+```
+
 Validate and replay it deterministically without interactive refs, then clean up:
 
 ```console
@@ -887,6 +903,33 @@ cases/login.yaml: line 4 column 5: observation `app_log`: `log.fil` is not a reg
 
 A located message also carries the source snippet, with its line breaks escaped
 as `\n` inside the JSON string; the example shows the first line only.
+
+A case that is valid but relies on something fragile is not an error. A step can
+declare a warning for its own arguments — explicit coordinates are the first one,
+see [Coordinates](#coordinates) — and `da lint` reports it while the case still
+passes. Text output writes `file: warning: message` to standard error, the
+standard-output summary counts the warnings, and `--output json` adds a
+`warnings` array beside `errors`:
+
+```json
+{
+  "ok": true,
+  "files": 1,
+  "errors": [],
+  "warnings": [
+    {
+      "file": "cases/editor.yaml",
+      "message": "line 6 column 7: step 2: `browser.click` uses explicit coordinates `at`; ..."
+    }
+  ],
+  "cases": []
+}
+```
+
+A warning never changes the exit code, and a step that fails validation never
+warns: the warning describes arguments that are accepted but fragile. The
+`warnings` key is omitted when there is nothing to warn about, so a report
+without warnings keeps exactly the shape shown above.
 
 `cases` lists every case that parsed, with its classification, so an agent can
 discover the available values without running anything. `project`, `suite` and
@@ -1530,8 +1573,8 @@ running and the user's other tabs are untouched.
 | Step | Arguments | Result |
 | --- | --- | --- |
 | `browser.open` | `url` required; optional `connect`, `profile`, `storage_state`, `testid_attribute` (defaults to `data-testid`), `dialog`; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title`; `dialog` when one opened |
-| `browser.click` | locator; optional `dialog` | `{}`, or the clicked element's `text` when it has one; `dialog` when one opened |
-| `browser.type` | locator; `text` required unless `value` is given; optional `dialog` | `{}`; `dialog` when one opened |
+| `browser.click` | locator, or explicit `at` coordinates; optional `dialog` | `{}`, or the clicked element's `text` when it has one; with `at`, the clicked `x`, `y` and `viewport`; `dialog` when one opened |
+| `browser.type` | locator, or explicit `at` coordinates; `text` required unless `value` is given; optional `dialog` | `{}`; with `at`, the clicked `x`, `y` and `viewport`; `dialog` when one opened |
 | `browser.upload` | locator; `files` required (a list of local paths; `[]` clears the selection); `timeout_ms` defaults to 5000 | `files`, `names` |
 | `browser.press` | `key` required, for example `Enter` or `Tab`; optional `dialog` | `{}`; `dialog` when one opened |
 | `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000; optional `dialog` | `url`; `dialog` when one opened |
@@ -1561,7 +1604,8 @@ Giving zero or more than one locator key, passing `name` without `role`, passing
 a negative or non-integer `nth`, giving an empty `testid_attribute`, or giving
 an invalid `within` locator is an argument error reported by `da lint` before
 anything runs. `browser.wait` keeps its `url_contains` form as an alternative to
-an element locator. Inside [`da session`](#interactive-sessions-da-session), interactive steps also accept `ref: e<N>` targets from the latest snapshot, which `da session export` converts to ordinary stable locators.
+an element locator. `browser.click` and `browser.type` take `at` instead of a
+locator; see [Coordinates](#coordinates). Inside [`da session`](#interactive-sessions-da-session), interactive steps also accept `ref: e<N>` targets from the latest snapshot, which `da session export` converts to ordinary stable locators.
 
 #### Choosing a locator
 
@@ -1576,6 +1620,69 @@ Prefer `testid` and `role` + `name` over `css` or `xpath`:
 - Use `text` for static non-interactive copy, and keep `css` or `xpath` for
   structure that has no test id or accessible role, paired with `within` instead
   of fragile positional chains.
+
+#### Coordinates
+
+Some content has no DOM element and no accessibility node to name: a
+`<canvas>` painting, a WebGL scene, or a map control. For that content only,
+`browser.click` and `browser.type` accept explicit viewport coordinates instead
+of a locator:
+
+```yaml
+- browser.click:
+    at:
+      x: 100
+      y: 50
+      viewport: { width: 1280, height: 800 }
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `at.x`, `at.y` | Position in CSS pixels from the top-left corner of the page viewport. A whole or fractional number that is not negative. |
+| `at.viewport.width`, `at.viewport.height` | The viewport the coordinates were measured at. Optional, but recording it is what makes the step replayable. |
+
+`at` is a locator of its own: it cannot be combined with `css`, `xpath`, `text`,
+`role`, `testid`, `within`, `nth` or `name`, and a step that gives both is refused
+before it runs. `expect` and `save` work on a coordinate step exactly as on any
+other step.
+
+Before the click, the step reads the page's live CSS viewport. When `viewport` is
+recorded and differs from the live size, the step fails with the recorded and the
+live size in the message instead of clicking the wrong place; a different screen
+resolution can therefore never silently hit another target. A coordinate that is
+not smaller than the live viewport's width or height fails the same way, and a
+negative coordinate is refused as an argument error before the browser is
+touched. Then the step dispatches the mouse move, press and release events and
+returns where it clicked and at what size:
+
+```json
+{ "x": 100, "y": 50, "viewport": { "width": 1280, "height": 800 } }
+```
+
+A bare `at: { x, y }` without `viewport` is allowed. It clicks at whatever size
+the page currently has, still refuses a coordinate outside that viewport, and
+reports the viewport it used, so a caller can record it. `browser.type` clicks
+the coordinates first to focus the target and then types `text` (or `value`); it
+does not accept both at once with `at`.
+
+Coordinates are a last resort. A layout change, a different window size, a
+retina scale or a translated page moves the target without changing the case, so
+`da lint` reports every coordinate step and still exits 0. The warning goes to
+standard error, one line per warning, and the standard-output summary counts it:
+
+```text
+$ da lint cases/editor.yaml
+cases/editor.yaml: warning: line 6 column 7: step 2: `browser.click` uses explicit coordinates `at`; coordinates are a last resort for content that has no DOM element or accessibility node (for example `<canvas>`) and they click the wrong place when the layout or viewport changes, so prefer `css`, `xpath`, `text`, `role` or `testid` when one can name the target
+Checked 1 file: 0 errors, 1 warning.
+```
+
+A coordinate step also warns when it records no `at.viewport`, because then a
+different size is not detected. `da session export` therefore writes the
+viewport it observed into every exported coordinate step and lists the step in
+the export report's `fragile` array, so the exported case is replayable at the
+same size. The YAML key `y` is written unquoted and read as written: `da` keeps
+mapping keys as text instead of applying YAML 1.1 boolean inference, so
+`y: 50` is the vertical coordinate, not `true`.
 
 #### Strict unique matching
 

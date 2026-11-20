@@ -66,6 +66,13 @@ pub struct StepRecord {
     pub synthesized_locator: Option<Value>,
     #[serde(default)]
     pub fragile: bool,
+    /// The viewport a step that used explicit coordinates ran at, as
+    /// `{ "width": ..., "height": ... }`.
+    ///
+    /// Export writes it into the step's `at.viewport`, so a replayed case fails
+    /// on a different window size instead of clicking the wrong place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_viewport: Option<Value>,
 }
 
 /// Exclusive non-blocking lock on one session directory.

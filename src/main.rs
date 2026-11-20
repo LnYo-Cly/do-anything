@@ -706,10 +706,12 @@ fn lint(
     } = load_cases(paths, sources, &mut secrets);
     let mut errors = errors;
     errors.extend(runner::preflight(&cases, registry, &mut secrets));
+    let warnings = runner::preflight_warnings(&cases, registry, &mut secrets);
 
     let report = output::LintReport {
         files: files.len(),
         errors,
+        warnings,
         cases: cases.iter().map(output::LintCase::new).collect(),
     };
     let rendered = output::render_lint(&report, format.into(), &secrets);

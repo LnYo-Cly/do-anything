@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use crate::core::assert::AssertionReport;
-use crate::core::case::{CaseError, LoadedCase};
+use crate::core::case::{CaseError, CaseWarning, LoadedCase};
 use crate::core::paths;
 use crate::core::report::{
     CaseReport, CaseStatus, Problem, RunOutcome, StepReport, StepStatus, Summary,
@@ -106,6 +106,11 @@ pub struct LintReport {
     pub files: usize,
     /// Every problem found, across all files.
     pub errors: Vec<CaseError>,
+    /// Every valid case that relies on something fragile.
+    ///
+    /// A warning never changes the verdict: lint still exits 0 for a case that
+    /// only warns.
+    pub warnings: Vec<CaseWarning>,
     /// Every case that parsed, so a reader can discover the classification
     /// values without running anything.
     pub cases: Vec<LintCase>,
@@ -173,21 +178,45 @@ fn text_lint(report: &LintReport, secrets: &Secrets) -> Rendered {
             error.message
         ));
     }
-    stdout.push_str(&format!(
-        "Checked {} {}: {} {}.\n",
-        report.files,
-        noun(report.files, "file", "files"),
-        report.errors.len(),
-        noun(report.errors.len(), "error", "errors"),
-    ));
+    let summary = if report.warnings.is_empty() {
+        format!(
+            "Checked {} {}: {} {}.\n",
+            report.files,
+            noun(report.files, "file", "files"),
+            report.errors.len(),
+            noun(report.errors.len(), "error", "errors"),
+        )
+    } else {
+        format!(
+            "Checked {} {}: {} {}, {} {}.\n",
+            report.files,
+            noun(report.files, "file", "files"),
+            report.errors.len(),
+            noun(report.errors.len(), "error", "errors"),
+            report.warnings.len(),
+            noun(report.warnings.len(), "warning", "warnings"),
+        )
+    };
+    stdout.push_str(&summary);
+    // Warnings leave the process on standard error, leaving standard output as
+    // the result a caller reads. They still name file and location so a reader
+    // can find the step that triggered them.
+    let mut stderr = String::new();
+    for warning in &report.warnings {
+        stderr.push_str(&format!(
+            "{}: warning: {}\n",
+            paths::display(&warning.file),
+            warning.message
+        ));
+    }
     Rendered {
         stdout: secrets.redact(&stdout),
-        stderr: String::new(),
+        stderr: secrets.redact(&stderr),
     }
 }
 
 fn json_lint(report: &LintReport) -> Value {
-    json!({
+    let mut value = json!({
         "ok": report.is_ok(),
         "files": report.files,
         "errors": report
@@ -214,7 +243,27 @@ fn json_lint(report: &LintReport) -> Value {
                 })
             })
             .collect::<Vec<Value>>(),
-    })
+    });
+    // No warnings means no `warnings` key: a case that never warned keeps
+    // exactly the object earlier releases wrote.
+    if !report.warnings.is_empty()
+        && let Some(entries) = value.as_object_mut()
+    {
+        entries.insert(
+            "warnings".to_string(),
+            report
+                .warnings
+                .iter()
+                .map(|warning| {
+                    json!({
+                        "file": paths::display(&warning.file),
+                        "message": warning.message,
+                    })
+                })
+                .collect(),
+        );
+    }
+    value
 }
 
 /// Renders a JSON Schema value for standard output.
@@ -925,6 +974,7 @@ mod tests {
     #[test]
     fn lint_text_puts_one_error_per_line_and_ends_with_a_summary() {
         let report = LintReport {
+            warnings: Vec::new(),
             files: 2,
             errors: vec![
                 CaseError {
@@ -949,8 +999,68 @@ mod tests {
     }
 
     #[test]
+    fn lint_text_prints_warnings_on_stderr_and_counts_them() {
+        let report = LintReport {
+            warnings: vec![crate::core::case::CaseWarning {
+                file: PathBuf::from("coords.yaml"),
+                message: "line 7 column 5: step 2: `browser.click` uses explicit coordinates"
+                    .to_string(),
+            }],
+            files: 1,
+            errors: Vec::new(),
+            cases: Vec::new(),
+        };
+
+        let rendered = render_lint(&report, Format::Text, &Secrets::new());
+
+        assert_eq!(
+            rendered.stdout, "Checked 1 file: 0 errors, 1 warning.\n",
+            "the summary must count a warning that never fails the case"
+        );
+        assert_eq!(
+            rendered.stderr,
+            "coords.yaml: warning: line 7 column 5: step 2: `browser.click` uses explicit coordinates\n"
+        );
+    }
+
+    #[test]
+    fn lint_json_reports_warnings_only_when_there_are_some() {
+        let without = LintReport {
+            files: 1,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            cases: Vec::new(),
+        };
+        let rendered = render_lint(&without, Format::Json, &Secrets::new());
+        let value: Value = serde_json::from_str(&rendered.stdout).expect("stdout must be JSON");
+        assert!(
+            value.get("warnings").is_none(),
+            "a report without warnings must keep the earlier object shape: {value}"
+        );
+
+        let with = LintReport {
+            warnings: vec![crate::core::case::CaseWarning {
+                file: PathBuf::from("coords.yaml"),
+                message: "line 7 column 5: step 2: uses explicit coordinates".to_string(),
+            }],
+            ..without
+        };
+        let rendered = render_lint(&with, Format::Json, &Secrets::new());
+        let value: Value = serde_json::from_str(&rendered.stdout).expect("stdout must be JSON");
+        assert_eq!(
+            value["warnings"],
+            json!([{
+                "file": "coords.yaml",
+                "message": "line 7 column 5: step 2: uses explicit coordinates",
+            }])
+        );
+        assert_eq!(value["ok"], true, "a warning never fails lint");
+    }
+
+    #[test]
     fn lint_text_keeps_the_line_breaks_of_a_parser_message() {
         let report = LintReport {
+            warnings: Vec::new(),
             files: 1,
             errors: vec![CaseError {
                 file: PathBuf::from("broken.yaml"),
@@ -970,6 +1080,7 @@ mod tests {
     #[test]
     fn lint_json_has_ok_files_errors_and_the_case_classification() {
         let report = LintReport {
+            warnings: Vec::new(),
             files: 1,
             errors: vec![CaseError {
                 file: PathBuf::from("broken.yaml"),
@@ -1079,6 +1190,7 @@ mod tests {
     #[test]
     fn a_lint_error_is_redacted_in_text_and_json() {
         let report = LintReport {
+            warnings: Vec::new(),
             files: 1,
             errors: vec![CaseError {
                 file: PathBuf::from("bad.yaml"),

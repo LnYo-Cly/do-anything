@@ -227,6 +227,7 @@ fn set_cookies_step() -> Result<StepDefinition, String> {
         args_schema,
         validate: validate_set_cookies,
         check_retry: disallow_retry,
+        lint_warnings: crate::core::registry::no_lint_warnings,
         run: run_set_cookies,
     })
 }
@@ -235,11 +236,16 @@ fn set_cookies_step() -> Result<StepDefinition, String> {
 fn click_step() -> Result<StepDefinition, String> {
     let mut definition = locator_step::<ClickArgs>(
         STEP_NAMES[1],
-        "Clicks the element the locator names and returns its `text` when it has one.",
+        "Clicks the element the locator names, or explicit `at` coordinates for content that has no element to name, and returns the element's `text` when it has one or the clicked `x`, `y` and `viewport` for coordinates.",
         validate_click,
         run_click,
     )?;
+    apply_at_schema(
+        &mut definition.args_schema,
+        at_branch(&[json!({ "required": ["text"] })]),
+    );
     apply_dialog_schema(&mut definition.args_schema);
+    definition.lint_warnings = coordinate_lint_warnings;
     Ok(definition)
 }
 
@@ -251,7 +257,7 @@ fn click_step() -> Result<StepDefinition, String> {
 fn type_step() -> Result<StepDefinition, String> {
     let mut definition = locator_step::<TypeArgs>(
         STEP_NAMES[2],
-        "Types `text`, or `value` when `text` names the element, into the element the locator names.",
+        "Types `text`, or `value` when `text` names the element, into the element the locator names, or after the focus click `at` coordinates name.",
         validate_type,
         run_type,
     )?;
@@ -264,6 +270,12 @@ fn type_step() -> Result<StepDefinition, String> {
         { "required": ["role"] },
         { "required": ["testid"] }
     ]);
+    // With `at` there is no element for `text` to name, so it is the typing
+    // text; giving both `text` and `value` would silently drop one.
+    let mut coordinates = at_branch(&[json!({ "required": ["text", "value"] })]);
+    coordinates["anyOf"] = json!([{ "required": ["text"] }, { "required": ["value"] }]);
+    apply_at_schema(&mut definition.args_schema, coordinates);
+    definition.lint_warnings = coordinate_lint_warnings;
     Ok(definition)
 }
 
@@ -329,6 +341,7 @@ fn step<T: JsonSchema>(
         args_schema,
         validate,
         check_retry: disallow_retry,
+        lint_warnings: crate::core::registry::no_lint_warnings,
         run,
     })
 }
@@ -632,6 +645,71 @@ fn exactly_one_of(schema: &mut Value, fields: &[&str]) {
     }
 }
 
+/// Adds the `at` coordinate form to a step schema.
+///
+/// Every existing `oneOf` branch refuses `at`, and `at_branch` refuses every
+/// locator and modifier, so a step with `at` and a locator matches no branch.
+fn apply_at_schema(schema: &mut Value, at_branch: Value) {
+    if let Value::Object(entries) = schema {
+        entries.remove("$defs");
+    }
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("at".to_string(), at_schema_value());
+    }
+    let Some(branches) = schema.get_mut("oneOf").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for branch in branches.iter_mut() {
+        if let Value::Object(entries) = branch {
+            entries.insert("not".to_string(), json!({"required": ["at"]}));
+        }
+    }
+    branches.push(at_branch);
+}
+
+/// One `oneOf` branch that accepts `at` alone, plus the extra combinations the
+/// step refuses alongside coordinates.
+fn at_branch(extra_excluded: &[Value]) -> Value {
+    let mut excluded = vec![
+        json!({"required": ["css"]}),
+        json!({"required": ["xpath"]}),
+        json!({"required": ["role"]}),
+        json!({"required": ["testid"]}),
+        json!({"required": ["within"]}),
+        json!({"required": ["nth"]}),
+        json!({"required": ["name"]}),
+    ];
+    excluded.extend(extra_excluded.iter().cloned());
+    json!({
+        "required": ["at"],
+        "not": { "anyOf": excluded },
+    })
+}
+
+/// Self-contained JSON Schema for the optional `at` coordinate argument.
+fn at_schema_value() -> Value {
+    json!({
+        "description": "Explicit viewport coordinates, in CSS pixels, for content that has no element to name, such as a `<canvas>`. `viewport` records the size the coordinates were measured at: when it is given and the live viewport differs, the step fails instead of clicking the wrong place.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["x", "y"],
+        "properties": {
+            "x": { "type": "number", "minimum": 0 },
+            "y": { "type": "number", "minimum": 0 },
+            "viewport": {
+                "description": "Width and height in CSS pixels the coordinates were recorded at.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["width", "height"],
+                "properties": {
+                    "width": { "type": "integer", "minimum": 1 },
+                    "height": { "type": "integer", "minimum": 1 }
+                }
+            }
+        }
+    })
+}
+
 /// Arguments of `browser.open`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -806,6 +884,39 @@ struct WithinArgs {
     nth: Option<u64>,
 }
 
+/// A viewport size a coordinate step was recorded at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ViewportSize {
+    /// Width in CSS pixels.
+    #[schemars(extend("minimum" = 1))]
+    width: u32,
+    /// Height in CSS pixels.
+    #[schemars(extend("minimum" = 1))]
+    height: u32,
+}
+
+/// Explicit viewport coordinates for content that has no DOM node to name, such
+/// as a `<canvas>`, a WebGL scene or a map control.
+///
+/// `viewport` records the viewport the coordinates were measured at. When it is
+/// present the step fails if the live viewport differs, so a different window
+/// size can never silently click the wrong place.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AtArgs {
+    /// Horizontal offset in CSS pixels from the left edge of the viewport.
+    #[schemars(extend("minimum" = 0))]
+    x: f64,
+    /// Vertical offset in CSS pixels from the top edge of the viewport.
+    #[schemars(extend("minimum" = 0))]
+    y: f64,
+    /// Viewport the coordinates were recorded at; the step refuses to run when
+    /// the live viewport differs.
+    #[serde(default)]
+    viewport: Option<ViewportSize>,
+}
+
 /// Arguments of `browser.click`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -835,6 +946,10 @@ struct ClickArgs {
     #[schemars(extend("minimum" = 0))]
     #[serde(default)]
     nth: Option<u64>,
+    /// Explicit viewport coordinates, for content that has no element to name,
+    /// for example a `<canvas>`. Cannot be combined with a locator.
+    #[serde(default)]
+    at: Option<AtArgs>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -877,6 +992,10 @@ struct TypeArgs {
     #[schemars(extend("minimum" = 0))]
     #[serde(default)]
     nth: Option<u64>,
+    /// Explicit viewport coordinates, for content that has no element to name,
+    /// for example a `<canvas>`. Cannot be combined with a locator.
+    #[serde(default)]
+    at: Option<AtArgs>,
     /// How long to wait for the element, in milliseconds. Defaults to 5000.
     #[schemars(extend("minimum" = 1))]
     #[serde(default = "default_timeout_ms")]
@@ -4065,6 +4184,34 @@ impl BrowserSession {
             })
     }
 
+    /// Reads the CSS viewport size explicit coordinates are measured in.
+    fn viewport_size(
+        &mut self,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<(u32, u32), StepError> {
+        let scope = self.scope();
+        let value = page_evaluate(
+            self.connection_mut()?,
+            &scope,
+            "({ width: window.innerWidth, height: window.innerHeight })",
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| {
+            failure.step("could not read the page viewport", timeout_or_execution)
+        })?;
+        let width = viewport_dimension(&value, "width");
+        let height = viewport_dimension(&value, "height");
+        match (width, height) {
+            (Some(width), Some(height)) => Ok((width, height)),
+            _ => Err(StepError::Environment(
+                "the page reported no measurable viewport; wait for the page to finish loading and try again"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// The open connection, or the error a step reports after a close.
     fn connection_mut(&mut self) -> Result<&mut Connection, StepError> {
         self.connection
@@ -6119,6 +6266,9 @@ fn validate_open(raw: &Value) -> Result<(), String> {
 fn validate_click(args: &Value) -> Result<(), String> {
     let args: ClickArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
+    if args.at.is_some() {
+        return check_click_at(&args);
+    }
     let locator = Locator::from_args(
         &args.css,
         &args.xpath,
@@ -6128,6 +6278,76 @@ fn validate_click(args: &Value) -> Result<(), String> {
         &args.testid,
     )?;
     ElementTarget::from_parts(locator, args.within.as_deref(), args.nth).map(|_| ())
+}
+
+/// The `at` checks of `browser.click`, shared by `da lint` and execution.
+fn check_click_at(args: &ClickArgs) -> Result<(), String> {
+    let Some(at) = &args.at else {
+        return Ok(());
+    };
+    check_at(
+        at,
+        &[
+            ("css", args.css.is_some()),
+            ("xpath", args.xpath.is_some()),
+            ("text", args.text.is_some()),
+            ("role", args.role.is_some()),
+            ("testid", args.testid.is_some()),
+            ("name", args.name.is_some()),
+            ("within", args.within.is_some()),
+            ("nth", args.nth.is_some()),
+        ],
+    )
+}
+
+/// Checks one explicit coordinate form.
+///
+/// Coordinates are a locator of their own, so any other locator or element
+/// modifier would name a second target. Both coordinates must be able to
+/// address a pixel inside a positive-sized viewport.
+fn check_at(at: &AtArgs, combined: &[(&str, bool)]) -> Result<(), String> {
+    if let Some((field, _)) = combined.iter().find(|(_, present)| *present) {
+        return Err(format!(
+            "invalid arguments: `at` cannot be combined with `{field}`; give explicit coordinates or a locator, not both"
+        ));
+    }
+    for (name, value) in [("x", at.x), ("y", at.y)] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "invalid arguments: `at.{name}` must be a finite number that is not negative"
+            ));
+        }
+    }
+    if let Some(viewport) = &at.viewport
+        && (viewport.width == 0 || viewport.height == 0)
+    {
+        return Err(
+            "invalid arguments: `at.viewport.width` and `at.viewport.height` must be at least 1"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Warns that explicit coordinates are a fragile way to name a target.
+///
+/// Coordinates are not refused: `<canvas>`, WebGL and map controls have no DOM
+/// node or accessibility node to name, so a coordinate click is the only way in.
+/// Lint still says so, and says how to pin the step to one viewport, because a
+/// coordinate goes stale whenever the layout or the window size changes.
+fn coordinate_lint_warnings(args: &Value) -> Vec<String> {
+    let Some(at) = args.get("at") else {
+        return Vec::new();
+    };
+    let mut warnings = vec![
+        "uses explicit coordinates `at`; coordinates are a last resort for content that has no DOM element or accessibility node (for example `<canvas>`) and they click the wrong place when the layout or viewport changes, so prefer `css`, `xpath`, `text`, `role` or `testid` when one can name the target".to_string(),
+    ];
+    if at.get("viewport").is_none() {
+        warnings.push(
+            "records no `at.viewport`; the step clicks at the live page size, so record the viewport the coordinates were measured at and the step will fail on a different size instead of clicking the wrong place".to_string(),
+        );
+    }
+    warnings
 }
 
 /// The text `browser.type` sends.
@@ -6169,6 +6389,9 @@ fn validate_type(args: &Value) -> Result<(), String> {
     let args: TypeArgs = parse_for_validate(args)?;
     check_timeout(args.timeout_ms)?;
     type_text(&args)?;
+    if args.at.is_some() {
+        return check_type_at(&args);
+    }
     type_target(&args).map(|_| ())
 }
 
@@ -6205,6 +6428,33 @@ fn validate_upload(args: &Value) -> Result<(), String> {
     check_timeout(args.timeout_ms)?;
     upload_target(&args)?;
     check_files(&args.files)
+}
+
+/// The `at` checks of `browser.type`, shared by `da lint` and execution.
+fn check_type_at(args: &TypeArgs) -> Result<(), String> {
+    let Some(at) = &args.at else {
+        return Ok(());
+    };
+    // With `at` there is no element for `text` to name, so both `text` and
+    // `value` would claim to be the typed text.
+    if args.text.is_some() && args.value.is_some() {
+        return Err(
+            "invalid arguments: with `at`, `text` is the text to type, so give `text` or `value`, not both"
+                .to_string(),
+        );
+    }
+    check_at(
+        at,
+        &[
+            ("css", args.css.is_some()),
+            ("xpath", args.xpath.is_some()),
+            ("role", args.role.is_some()),
+            ("testid", args.testid.is_some()),
+            ("name", args.name.is_some()),
+            ("within", args.within.is_some()),
+            ("nth", args.nth.is_some()),
+        ],
+    )
 }
 
 fn validate_press(args: &Value) -> Result<(), String> {
@@ -6645,6 +6895,13 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     }
     let args: ClickArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
+    if let Some(at) = &args.at {
+        check_click_at(&args).map_err(StepError::InvalidArguments)?;
+        let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+        let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
+        let session = session(sessions)?;
+        return click_at(session, at, deadline, &mut dialog);
+    }
     let locator = Locator::from_args(
         &args.css,
         &args.xpath,
@@ -6744,9 +7001,14 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let text = type_text(&args)
         .map_err(StepError::InvalidArguments)?
         .to_string();
-    let target = type_target(&args).map_err(StepError::InvalidArguments)?;
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
+    if let Some(at) = &args.at {
+        check_type_at(&args).map_err(StepError::InvalidArguments)?;
+        let session = session(sessions)?;
+        return type_at(session, at, &text, deadline, &mut dialog);
+    }
+    let target = type_target(&args).map_err(StepError::InvalidArguments)?;
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
     let actionable = session.locate_actionable_target(&target, deadline, &mut dialog)?;
@@ -7014,6 +7276,139 @@ fn follow_label(
             "could not upload to {target_desc}: the element was removed from the page before its files could be set"
         ))),
     }
+}
+
+/// Clicks explicit viewport coordinates after proving they still describe the
+/// page they were measured on.
+fn click_at(
+    session: &mut BrowserSession,
+    at: &AtArgs,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
+    let (width, height) = resolve_coordinates(session, at, deadline, dialog)?;
+    dispatch_pointer_click(session, at, deadline, dialog)?;
+    Ok(attach_dialog(coordinate_result(at, width, height), dialog))
+}
+
+/// Clicks explicit viewport coordinates to focus the target, then types `text`.
+fn type_at(
+    session: &mut BrowserSession,
+    at: &AtArgs,
+    text: &str,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
+    let (width, height) = resolve_coordinates(session, at, deadline, dialog)?;
+    dispatch_pointer_click(session, at, deadline, dialog)?;
+    let target = coordinate_target(at);
+    session.dispatch(
+        &target,
+        "Input.insertText",
+        json!({ "text": text }),
+        "type into",
+        deadline,
+        dialog,
+    )?;
+    Ok(attach_dialog(coordinate_result(at, width, height), dialog))
+}
+
+/// The `at` target as an error message names it.
+fn coordinate_target(at: &AtArgs) -> String {
+    format!("coordinates ({}, {})", at.x, at.y)
+}
+
+/// The JSON result of a coordinate step: where it clicked and at what size.
+fn coordinate_result(at: &AtArgs, width: u32, height: u32) -> Value {
+    json!({
+        "x": coordinate_number(at.x),
+        "y": coordinate_number(at.y),
+        "viewport": { "width": width, "height": height },
+    })
+}
+
+/// The JSON number for one coordinate.
+///
+/// A whole coordinate stays an integer so an `equals: 100` assertion matches the
+/// number the case wrote instead of failing on `100.0`.
+fn coordinate_number(value: f64) -> Value {
+    let whole = value as i64;
+    if value == whole as f64 {
+        json!(whole)
+    } else {
+        serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
+    }
+}
+
+/// One positive viewport dimension from the page's evaluate reply.
+fn viewport_dimension(value: &Value, name: &str) -> Option<u32> {
+    let number = value.get(name)?;
+    let pixels = number
+        .as_u64()
+        .or_else(|| number.as_f64().map(|number| number.max(0.0) as u64))?;
+    u32::try_from(pixels).ok().filter(|pixels| *pixels > 0)
+}
+
+/// Reads the live viewport and refuses coordinates that cannot describe it.
+///
+/// A declared `at.viewport` pins the step to the size it was measured at, so a
+/// different window size fails loudly instead of clicking the wrong place. Every
+/// coordinate must also still fall inside the live viewport.
+fn resolve_coordinates(
+    session: &mut BrowserSession,
+    at: &AtArgs,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(u32, u32), StepError> {
+    let (width, height) = session.viewport_size(deadline, dialog)?;
+    if let Some(declared) = &at.viewport
+        && (declared.width != width || declared.height != height)
+    {
+        return Err(StepError::Execution(format!(
+            "the coordinates were recorded at viewport {}x{}, but the page viewport is {}x{}; record the coordinates at the run's viewport size or open the browser with `width: {}` and `height: {}`",
+            declared.width, declared.height, width, height, declared.width, declared.height
+        )));
+    }
+    if at.x >= f64::from(width) || at.y >= f64::from(height) {
+        return Err(StepError::Execution(format!(
+            "the coordinates ({}, {}) fall outside the {}x{} page viewport; both coordinates must be smaller than the viewport width and height",
+            at.x, at.y, width, height
+        )));
+    }
+    Ok((width, height))
+}
+
+/// Sends the move, press and release events a coordinate click is made of.
+fn dispatch_pointer_click(
+    session: &mut BrowserSession,
+    at: &AtArgs,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(), StepError> {
+    let target = coordinate_target(at);
+    for (event_type, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
+        let params = if event_type == "mouseMoved" {
+            json!({ "type": event_type, "x": at.x, "y": at.y })
+        } else {
+            json!({
+                "type": event_type,
+                "x": at.x,
+                "y": at.y,
+                "button": "left",
+                "buttons": buttons,
+                "clickCount": 1,
+            })
+        };
+        session.dispatch(
+            &target,
+            "Input.dispatchMouseEvent",
+            params,
+            "click",
+            deadline,
+            dialog,
+        )?;
+    }
+    Ok(())
 }
 
 fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -7622,6 +8017,15 @@ mod tests {
             .clone()
     }
 
+    /// Merges the keys of `extra` into the `base` mapping.
+    fn add_fields(base: Value, extra: Value) -> Value {
+        let mut merged = base;
+        if let (Some(entries), Value::Object(extra)) = (merged.as_object_mut(), extra) {
+            entries.extend(extra);
+        }
+        merged
+    }
+
     #[test]
     fn every_browser_step_is_registered_with_a_schema_and_a_description() {
         let registry = registry();
@@ -7677,6 +8081,7 @@ mod tests {
             "browser.screenshot",
             "browser.set_cookies",
             "browser.save_state",
+            "browser.switch_tab",
         ] {
             let def = definition(name);
             for args in [json!({}), within_args.clone()] {
@@ -7766,7 +8171,14 @@ mod tests {
             let branches = definition.args_schema["oneOf"]
                 .as_array()
                 .unwrap_or_else(|| panic!("`{step}` must declare oneOf"));
-            assert_eq!(branches.len(), 5, "`{step}`: {branches:?}");
+            // Five locator forms, plus the `at` coordinate form where a step
+            // supports it.
+            let coordinate_branches = usize::from(matches!(step, "browser.click" | "browser.type"));
+            assert_eq!(
+                branches.len(),
+                5 + coordinate_branches,
+                "`{step}`: {branches:?}"
+            );
             for property in ["css", "xpath", "text", "role", "name", "testid"] {
                 assert_eq!(
                     definition.args_schema["properties"][property]["type"], "string",
@@ -8043,6 +8455,196 @@ mod tests {
     }
 
     #[test]
+    fn coordinates_are_their_own_locator_form_on_click_and_type() {
+        for step in ["browser.click", "browser.type"] {
+            let definition = definition(step);
+            let base = if step == "browser.type" {
+                json!({"at": {"x": 12, "y": 34}, "text": "hello"})
+            } else {
+                json!({"at": {"x": 12, "y": 34}})
+            };
+            assert!(
+                (definition.validate)(&base).is_ok(),
+                "`{step}` must accept bare coordinates: {base}"
+            );
+            assert!(
+                jsonschema::is_valid(&definition.args_schema, &base),
+                "the schema must accept bare coordinates: {base}"
+            );
+            let pinned = if step == "browser.type" {
+                json!({"at": {"x": 12, "y": 34, "viewport": {"width": 800, "height": 600}}, "value": "hello"})
+            } else {
+                json!({"at": {"x": 12, "y": 34, "viewport": {"width": 800, "height": 600}}})
+            };
+            assert!(
+                (definition.validate)(&pinned).is_ok(),
+                "`{step}` must accept a recorded viewport: {pinned}"
+            );
+            assert!(
+                jsonschema::is_valid(&definition.args_schema, &pinned),
+                "the schema must accept a recorded viewport: {pinned}"
+            );
+
+            for (label, extra) in [
+                ("css", json!({"css": "#a"})),
+                ("xpath", json!({"xpath": "//*[@id='a']"})),
+                ("role", json!({"role": "button"})),
+                ("testid", json!({"testid": "a"})),
+                ("within", json!({"within": {"css": "#a"}})),
+                ("nth", json!({"nth": 1})),
+                ("name", json!({"name": "A"})),
+            ] {
+                let combined = add_fields(base.clone(), extra);
+                let error = (definition.validate)(&combined)
+                    .expect_err("a locator must not be combined with coordinates");
+                assert!(
+                    error.contains("cannot be combined"),
+                    "{step}/{label}: {error}"
+                );
+                assert!(
+                    !jsonschema::is_valid(&definition.args_schema, &combined),
+                    "the schema must refuse `at` with {label} on `{step}`: {combined}"
+                );
+            }
+
+            if step == "browser.click" {
+                let combined = add_fields(base.clone(), json!({"text": "Later"}));
+                assert!(
+                    (definition.validate)(&combined).is_err(),
+                    "`browser.click` must refuse `at` with a text locator"
+                );
+                assert!(
+                    !jsonschema::is_valid(&definition.args_schema, &combined),
+                    "the schema must refuse `at` with a text locator: {combined}"
+                );
+            } else {
+                let combined = add_fields(base.clone(), json!({"value": "hello"}));
+                assert!(
+                    (definition.validate)(&combined).is_err(),
+                    "`browser.type` must refuse both `text` and `value` with `at`"
+                );
+                assert!(
+                    !jsonschema::is_valid(&definition.args_schema, &combined),
+                    "the schema must refuse both `text` and `value` with `at`: {combined}"
+                );
+                let value_only = json!({"at": {"x": 1, "y": 2}, "value": "hello"});
+                assert!(
+                    (definition.validate)(&value_only).is_ok(),
+                    "`browser.type` must accept `value` as the typed text with `at`"
+                );
+                assert!(
+                    jsonschema::is_valid(&definition.args_schema, &value_only),
+                    "the schema must accept `value` as the typed text with `at`: {value_only}"
+                );
+            }
+
+            for (label, at) in [
+                ("negative x", json!({"x": -1, "y": 2})),
+                ("negative y", json!({"x": 1, "y": -2})),
+                ("missing x", json!({"y": 2})),
+                (
+                    "zero viewport width",
+                    json!({"x": 1, "y": 2, "viewport": {"width": 0, "height": 600}}),
+                ),
+                (
+                    "zero viewport height",
+                    json!({"x": 1, "y": 2, "viewport": {"width": 800, "height": 0}}),
+                ),
+                ("unknown at field", json!({"x": 1, "y": 2, "z": 3})),
+            ] {
+                let args = if step == "browser.type" {
+                    json!({"at": at, "text": "hello"})
+                } else {
+                    json!({"at": at})
+                };
+                assert!(
+                    (definition.validate)(&args).is_err(),
+                    "`{step}` must refuse {label}: {args}"
+                );
+                assert!(
+                    !jsonschema::is_valid(&definition.args_schema, &args),
+                    "the schema must refuse {label} on `{step}`: {args}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coordinate_steps_warn_about_fragility_and_an_unrecorded_viewport() {
+        for step in ["browser.click", "browser.type"] {
+            let definition = definition(step);
+            let base = if step == "browser.type" {
+                json!({"at": {"x": 12, "y": 34}, "text": "hello"})
+            } else {
+                json!({"at": {"x": 12, "y": 34}})
+            };
+            let warnings = (definition.lint_warnings)(&base);
+            assert_eq!(
+                warnings.len(),
+                2,
+                "`{step}` must warn about coordinates and the missing viewport: {warnings:?}"
+            );
+            assert!(warnings[0].contains("coordinates"), "{warnings:?}");
+            assert!(warnings[0].contains("canvas"), "{warnings:?}");
+            assert!(warnings[1].contains("viewport"), "{warnings:?}");
+
+            let pinned = if step == "browser.type" {
+                json!({"at": {"x": 12, "y": 34, "viewport": {"width": 800, "height": 600}}, "text": "hello"})
+            } else {
+                json!({"at": {"x": 12, "y": 34, "viewport": {"width": 800, "height": 600}}})
+            };
+            let warnings = (definition.lint_warnings)(&pinned);
+            assert_eq!(
+                warnings.len(),
+                1,
+                "a recorded viewport must not warn about a missing one: {warnings:?}"
+            );
+            assert!(warnings[0].contains("coordinates"), "{warnings:?}");
+
+            let locator = if step == "browser.type" {
+                json!({"css": "#name", "text": "hello"})
+            } else {
+                json!({"css": "#name"})
+            };
+            assert!(
+                (definition.lint_warnings)(&locator).is_empty(),
+                "a locator step must not warn about coordinates"
+            );
+        }
+        for step in [
+            "browser.wait",
+            "browser.read",
+            "browser.open",
+            "browser.press",
+        ] {
+            let definition = definition(step);
+            assert!(
+                (definition.lint_warnings)(&json!({})).is_empty(),
+                "`{step}` has no fragile arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn a_coordinate_result_keeps_whole_numbers_and_names_the_viewport() {
+        let at = AtArgs {
+            x: 100.0,
+            y: 12.5,
+            viewport: None,
+        };
+        assert_eq!(coordinate_number(at.x), json!(100));
+        assert_eq!(
+            coordinate_result(&at, 1280, 800),
+            json!({
+                "x": 100,
+                "y": 12.5,
+                "viewport": {"width": 1280, "height": 800},
+            })
+        );
+        assert_eq!(coordinate_target(&at), "coordinates (100, 12.5)");
+    }
+
+    #[test]
     fn timeouts_and_keys_are_checked_by_validate() {
         for step in [
             "browser.click",
@@ -8199,6 +8801,7 @@ mod tests {
             value: None,
             within: None,
             nth: None,
+            at: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             dialog: None,
         };
@@ -8218,6 +8821,7 @@ mod tests {
             value: Some(" typed".to_string()),
             within: None,
             nth: None,
+            at: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             dialog: None,
         };
@@ -8237,6 +8841,7 @@ mod tests {
             value: None,
             within: None,
             nth: None,
+            at: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             dialog: None,
         };
@@ -8324,7 +8929,10 @@ mod tests {
             let branches = def.args_schema["oneOf"]
                 .as_array()
                 .unwrap_or_else(|| panic!("`{step}` must declare oneOf"));
-            let expected_branches = if step == "browser.wait" { 6 } else { 5 };
+            let expected_branches = match step {
+                "browser.wait" | "browser.click" | "browser.type" => 6,
+                _ => 5,
+            };
             assert_eq!(branches.len(), expected_branches, "`{step}`: {branches:?}");
             assert_eq!(def.args_schema["properties"]["testid"]["type"], "string");
             assert_eq!(def.args_schema["properties"]["nth"]["type"], "integer");
