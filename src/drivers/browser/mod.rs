@@ -978,7 +978,7 @@ const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const MASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Shared JavaScript helpers for frame traversal, coordinate transforms, and visibility.
-const FRAME_HELPERS_JS: &str = r#"
+const FRAME_GEOMETRY_HELPERS_JS: &str = r#"
 var isBoxVisible = function (node, win) {
   if (!node || node.nodeType !== 1) return false;
   var view = win || (node.ownerDocument && node.ownerDocument.defaultView) || window;
@@ -1148,6 +1148,56 @@ var frameTransform = function (frame) {
 };
 "#;
 
+/// Composed-tree helpers shared by every script that must see into open shadow
+/// roots.
+///
+/// `collectDeepElements` walks `root` in composed pre-order: it yields each
+/// element, then the elements of the element's open `shadowRoot`, then the
+/// element's light children. That is the order `querySelectorAll` would use if it
+/// pierced roots, so `nth` keeps naming the element a reader sees first.
+///
+/// `composedContains` answers `Node.contains` across shadow boundaries by
+/// climbing through a `ShadowRoot` to its host. A closed root has no accessible
+/// `shadowRoot`, so both helpers stop at the host, which is why the driver
+/// reports closed roots instead of pretending to search them.
+const COMPOSED_HELPERS_JS: &str = r#"
+var collectDeepElements = function (root) {
+  if (!root) return [];
+  var out = [];
+  var walk = function (node) {
+    var kids = node ? node.children : null;
+    if (!kids) return;
+    for (var i = 0; i < kids.length; i++) {
+      var child = kids[i];
+      out.push(child);
+      if (child.shadowRoot) walk(child.shadowRoot);
+      walk(child);
+    }
+  };
+  if (root.shadowRoot) walk(root.shadowRoot);
+  walk(root);
+  return out;
+};
+var composedContains = function (ancestor, node) {
+  if (!ancestor || !node) return false;
+  var cur = node;
+  while (cur) {
+    if (cur === ancestor) return true;
+    if (cur.parentNode) {
+      cur = cur.parentNode;
+      continue;
+    }
+    cur = cur.nodeType === 11 && cur.host ? cur.host : null;
+  }
+  return false;
+};
+"#;
+
+/// Frame traversal, coordinate transforms and visibility checks, plus the
+/// composed-tree helpers.
+static FRAME_HELPERS_JS: LazyLock<String> =
+    LazyLock::new(|| format!("{FRAME_GEOMETRY_HELPERS_JS}\n{COMPOSED_HELPERS_JS}"));
+
 /// JavaScript that covers every visible editable field with an opaque box,
 /// including fields inside accessible same-origin and nested iframes.
 ///
@@ -1157,9 +1207,10 @@ var frameTransform = function (frame) {
 /// each frame document itself. Fails clearly instead of leaving uncovered pixels if
 /// a frame or root element has a CSS transform that cannot be mapped accurately.
 static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
+    let helpers = FRAME_HELPERS_JS.as_str();
     format!(
         r#"(function () {{
-{FRAME_HELPERS_JS}
+{helpers}
   var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
   var masks = [];
   var isFrameset = Boolean(document.body && document.body.tagName === 'FRAMESET');
@@ -1216,10 +1267,10 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
   }};
   var collectDoc = function (doc, ox, oy, sx, sy, clip, blockedReason) {{
     var win = doc.defaultView || window;
-    var fields = doc.querySelectorAll('input, textarea, select, [contenteditable]');
-    for (var i = 0; i < fields.length; i++) {{
-      var el = fields[i];
-      if (el.nodeType !== 1) continue;
+    var all = collectDeepElements(doc);
+    for (var i = 0; i < all.length; i++) {{
+      var el = all[i];
+      if (el.nodeType !== 1 || !el.matches('input, textarea, select, [contenteditable]')) continue;
       var tag = el.tagName;
       var field = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
       if (!field && !el.isContentEditable) continue;
@@ -1250,9 +1301,10 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
         return fail('screenshot mask could not cover transformed field');
       }}
     }}
-    var frames = doc.querySelectorAll('iframe, frame');
+    var frames = collectDeepElements(doc);
     for (var j = 0; j < frames.length; j++) {{
       var frame = frames[j];
+      if (frame.nodeType !== 1 || !frame.matches('iframe, frame')) continue;
       if (!isBoxVisible(frame, win)) continue;
       var childDoc = null;
       try {{
@@ -1303,29 +1355,38 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// JavaScript that removes every mask this module added across the top document
-/// and any accessible same-origin frames.
-const REMOVE_MASKS_SCRIPT: &str = r#"(function () {
+/// and any accessible same-origin frames, including frames inside open shadow
+/// roots.
+static REMOVE_MASKS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"(function () {{
+  {COMPOSED_HELPERS_JS}
   var removed = 0;
-  var cleanDoc = function (doc) {
-    var masks = doc.querySelectorAll('[data-da-screenshot-mask]');
-    for (var i = 0; i < masks.length; i++) {
-      masks[i].remove();
-      removed++;
-    }
-    var frames = doc.querySelectorAll('iframe, frame');
-    for (var j = 0; j < frames.length; j++) {
+  var cleanDoc = function (doc) {{
+    var all = collectDeepElements(doc);
+    for (var i = 0; i < all.length; i++) {{
+      if (all[i].hasAttribute('data-da-screenshot-mask')) {{
+        all[i].remove();
+        removed++;
+      }}
+    }}
+    for (var j = 0; j < all.length; j++) {{
+      var frame = all[j];
+      if (!frame.matches('iframe, frame')) continue;
       var childDoc = null;
-      try {
-        childDoc = frames[j].contentDocument;
-      } catch (e) {
+      try {{
+        childDoc = frame.contentDocument;
+      }} catch (e) {{
         childDoc = null;
-      }
+      }}
       if (childDoc) cleanDoc(childDoc);
-    }
-  };
+    }}
+  }};
   cleanDoc(document);
   return removed;
-})()"#;
+}})()"#
+    )
+});
 
 /// A deterministic way to name one element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1507,10 +1568,14 @@ impl Locator {
     ///
     /// Every user string is passed through `serde_json` so a quote or a
     /// backslash in it can never end the string literal or add code.
+    ///
+    /// `css` and `testid` walk the composed tree, so they reach elements inside
+    /// any number of nested open shadow roots. `xpath` deliberately does not:
+    /// `document.evaluate` cannot see into a shadow root (see `docs/guide.md`).
     fn resolve_body_with(&self, testid_attribute: &str, nth: Option<usize>) -> Option<String> {
         let collect = match self {
             Self::Css(selector) => format!(
-                "var matches = Array.prototype.slice.call(root.querySelectorAll({}));\nvar hiddenFound = false;",
+                "{COMPOSED_HELPERS_JS}\nvar selector = {};\nvar all = collectDeepElements(root);\nvar matches = [];\nfor (var i = 0; i < all.length; i++) {{\n  if (all[i].matches(selector)) matches.push(all[i]);\n}}\nvar hiddenFound = false;",
                 json_string(selector)
             ),
             Self::Xpath(expression) => format!(
@@ -1518,7 +1583,7 @@ impl Locator {
                 json_string(expression)
             ),
             Self::TestId(id) => format!(
-                "var attr = {};\nvar wanted = {};\nvar all = root.getElementsByTagName('*');\nvar matches = [];\nfor (var i = 0; i < all.length; i++) {{\n  if (all[i].getAttribute(attr) === wanted) matches.push(all[i]);\n}}\nvar hiddenFound = false;",
+                "{COMPOSED_HELPERS_JS}\nvar attr = {};\nvar wanted = {};\nvar all = collectDeepElements(root);\nvar matches = [];\nfor (var i = 0; i < all.length; i++) {{\n  if (all[i].getAttribute(attr) === wanted) matches.push(all[i]);\n}}\nvar hiddenFound = false;",
                 json_string(testid_attribute),
                 json_string(id)
             ),
@@ -1538,7 +1603,10 @@ impl Locator {
 }
 
 /// The body of a focus lookup, run with the located element as `el`.
-const FOCUS_BODY: &str = "if (!el || !el.isConnected) return false; el.focus(); return (el.ownerDocument || document).activeElement === el;";
+///
+/// `document.activeElement` reports the outermost shadow host, so the check
+/// descends each open root to find the element that really holds focus.
+const FOCUS_BODY: &str = "if (!el || !el.isConnected) return false; el.focus(); var doc = el.ownerDocument || document; var active = doc.activeElement; while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement; return active === el;";
 
 /// The body of a text read, run with the located element as `el`.
 const TEXT_BODY: &str =
@@ -1546,8 +1614,9 @@ const TEXT_BODY: &str =
 
 /// The body of a visibility read, run with the located element as `el`.
 static VISIBLE_BODY: LazyLock<String> = LazyLock::new(|| {
+    let helpers = FRAME_HELPERS_JS.as_str();
     format!(
-        r#"{FRAME_HELPERS_JS}
+        r#"{helpers}
 if (!el || el.nodeType !== 1 || !el.isConnected) return false;
 var frames = collectEnclosingFrames(el);
 if (!frames || !areEnclosingFramesVisible(frames)) return false;
@@ -1661,13 +1730,18 @@ return matches[wantedNth];
 
 /// JavaScript that collects every innermost visible element inside `root`
 /// whose normalized `innerText` equals `__DA_WANTED__`.
+///
+/// The candidates come from the composed walk, and "innermost" is composed
+/// containment: a host whose `innerText` includes the text of its open shadow
+/// root therefore yields to the element that actually renders it instead of
+/// making the locator look ambiguous.
 const TEXT_COLLECT_TEMPLATE: &str = r#"var wanted = __DA_WANTED__;
 var normalize = function (value) {
   return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
 };
 var rootFrames = collectEnclosingFrames(root);
 var framesVisible = rootFrames !== null && areEnclosingFramesVisible(rootFrames);
-var all = root.querySelectorAll('*');
+var all = collectDeepElements(root);
 var hiddenFound = false;
 var visibleMatches = [];
 for (var i = 0; i < all.length; i++) {
@@ -1682,15 +1756,16 @@ for (var j = 0; j < visibleMatches.length; j++) {
   var candidate = visibleMatches[j];
   var innermost = true;
   for (var k = 0; k < visibleMatches.length; k++) {
-    if (k !== j && candidate.contains(visibleMatches[k])) { innermost = false; break; }
+    if (k !== j && composedContains(candidate, visibleMatches[k])) { innermost = false; break; }
   }
   if (innermost) matches.push(candidate);
 }"#;
 
 /// Builds the text candidate collection snippet for one value.
 fn text_collect_script(text: &str) -> String {
+    let helpers = FRAME_HELPERS_JS.as_str();
     format!(
-        "{FRAME_HELPERS_JS}\n{}",
+        "{helpers}\n{}",
         TEXT_COLLECT_TEMPLATE.replace("__DA_WANTED__", &json_string(text))
     )
 }
@@ -1723,8 +1798,9 @@ impl CandidateInfo {
 /// Inspects an element (`el`) for visibility, disabled state, geometry, and hit-test,
 /// accumulating viewport offsets and checking `elementFromPoint` across enclosing frames.
 static ACTIONABLE_INSPECT_BODY: LazyLock<String> = LazyLock::new(|| {
+    let helpers = FRAME_HELPERS_JS.as_str();
     format!(
-        r#"{FRAME_HELPERS_JS}
+        r#"{helpers}
 var summarizeNode = function (node) {{
   var tag = node.tagName ? node.tagName.toLowerCase() : 'element';
   var id = node.id ? String(node.id) : '';
@@ -1732,6 +1808,23 @@ var summarizeNode = function (node) {{
   var text = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ').trim();
   if (text.length > 240) text = text.slice(0, 240);
   return {{ tag: tag, id: id, text: text }};
+}};
+// `document.elementFromPoint` returns the outermost shadow host at the point.
+// Descending each open root in turn reaches the element that really receives
+// the click; a closed root has no `shadowRoot`, so the host stays the hit.
+var deepHit = function (doc, x, y) {{
+  var hit = doc.elementFromPoint(x, y);
+  while (hit && hit.shadowRoot) {{
+    var deeper = null;
+    try {{
+      deeper = hit.shadowRoot.elementFromPoint(x, y);
+    }} catch (e) {{
+      deeper = null;
+    }}
+    if (!deeper || deeper === hit) break;
+    hit = deeper;
+  }}
+  return hit;
 }};
 if (!el || el.nodeType !== 1 || !el.isConnected) return {{ status: 'not_visible' }};
 var frames = collectEnclosingFrames(el);
@@ -1829,7 +1922,7 @@ var topY = accY;
 var topRect = {{ x: accLeft, y: accTop, width: accW, height: accH }};
 for (var k = 0; k < levelChecks.length; k++) {{
   var check = levelChecks[k];
-  var fHit = check.doc.elementFromPoint(check.x, check.y);
+  var fHit = deepHit(check.doc, check.x, check.y);
   if (fHit !== check.target) {{
     return {{
       status: 'ready_candidate',
@@ -1841,8 +1934,8 @@ for (var k = 0; k < levelChecks.length; k++) {{
     }};
   }}
 }}
-var hit = elDoc.elementFromPoint(lx, ly);
-var hitOk = hit !== null && (hit === el || el.contains(hit));
+var hit = deepHit(elDoc, lx, ly);
+var hitOk = hit !== null && (hit === el || composedContains(el, hit));
 var blocker = !hitOk && hit ? summarizeNode(hit) : null;
 return {{
   status: 'ready_candidate',
@@ -2887,13 +2980,17 @@ impl BrowserSession {
         let target_desc = target.describe_with(&self.testid_attribute);
         let mut last_pending = (target_desc.clone(), PendingReason::Missing);
         loop {
+            // Every terminal return names the same pending reason, including the
+            // timeout that ends the last poll, so a closed shadow root is
+            // explained however the wait happened to expire.
             let poll = match self.resolve_target_once(target, deadline, dialog) {
                 Ok(poll) => poll,
                 Err(LocateError::Timeout) => {
-                    return Err(pending_timeout_error(
+                    return Err(self.pending_error(
                         &last_pending.0,
-                        last_pending.1,
+                        &last_pending.1,
                         deadline,
+                        dialog,
                     ));
                 }
                 Err(LocateError::Step(error)) => return Err(error),
@@ -2906,10 +3003,11 @@ impl BrowserSession {
                         last_pending = (target_desc.clone(), reason);
                     }
                     Err(LocateError::Timeout) => {
-                        return Err(pending_timeout_error(
+                        return Err(self.pending_error(
                             &last_pending.0,
-                            last_pending.1,
+                            &last_pending.1,
                             deadline,
+                            dialog,
                         ));
                     }
                     Err(LocateError::Step(error)) => return Err(error),
@@ -2922,13 +3020,55 @@ impl BrowserSession {
                 }
             }
             if deadline.passed() {
-                return Err(pending_timeout_error(
-                    &last_pending.0,
-                    last_pending.1,
-                    deadline,
-                ));
+                return Err(self.pending_error(&last_pending.0, &last_pending.1, deadline, dialog));
             }
             std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Builds the terminal timeout error, naming a closed shadow root when that
+    /// is why a locator could not reach the element.
+    fn pending_error(
+        &mut self,
+        target_desc: &str,
+        reason: &PendingReason,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> StepError {
+        let error = pending_timeout_error(target_desc, reason.clone(), deadline);
+        if !matches!(reason, PendingReason::Missing | PendingReason::Occluded(_))
+            || !self.page_has_closed_shadow_root(dialog)
+        {
+            return error;
+        }
+        match error {
+            StepError::Execution(message) => {
+                StepError::Execution(format!("{message}{CLOSED_SHADOW_ROOT_HINT}"))
+            }
+            other => other,
+        }
+    }
+
+    /// Whether the page holds a closed shadow root, which only DevTools can see.
+    fn page_has_closed_shadow_root(&mut self, dialog: &mut DialogContext) -> bool {
+        let scope = self.scope();
+        let deadline = Deadline::after(CLOSED_SHADOW_PROBE_TIMEOUT);
+        let Some(connection) = self.connection.as_mut() else {
+            return false;
+        };
+        let document = page_call(
+            connection,
+            &scope,
+            "DOM.getDocument",
+            json!({ "depth": -1, "pierce": true }),
+            deadline,
+            dialog,
+        );
+        match document {
+            Ok(value) => value
+                .get("root")
+                .is_some_and(nodes_include_closed_shadow_root),
+            Err(_) => false,
         }
     }
 
@@ -3305,8 +3445,9 @@ impl BrowserSession {
     }
 
     /// Resolves a `role` query's `within` root into its frame-index path and an
-    /// `objectId` in that frame's own JavaScript world so `this.contains(el)` runs
-    /// in the same context as nodes returned by `DOM.resolveNode`.
+    /// `objectId` in that frame's own JavaScript world so the composed
+    /// containment check runs in the same context as nodes returned by
+    /// `DOM.resolveNode`.
     fn resolve_role_root_context(
         &mut self,
         target_desc: &str,
@@ -3362,7 +3503,9 @@ impl BrowserSession {
     }
 
     /// Checks that an AX node belongs to the top-level document (when unscoped)
-    /// or to the exact frame and DOM subtree of `root_context` (when `within` is set).
+    /// or to the exact frame and composed subtree of `root_context` (when
+    /// `within` is set), so a node inside the container's open shadow root
+    /// counts as inside it.
     fn node_matches_role_root(
         &mut self,
         target_desc: &str,
@@ -3388,12 +3531,15 @@ impl BrowserSession {
                     return Ok(false);
                 }
                 let connection = self.connection_mut().map_err(LocateError::Step)?;
+                let contains_script = format!(
+                    "function (el) {{ {COMPOSED_HELPERS_JS} return Boolean(el) && this !== el && composedContains(this, el); }}"
+                );
                 page_call_function_with_object(
                     connection,
                     &scope,
                     root_id,
                     object_id,
-                    "function (el) { return Boolean(el) && this !== el && this.contains(el); }",
+                    &contains_script,
                     deadline,
                     dialog,
                 )
@@ -3522,7 +3668,7 @@ impl BrowserSession {
         let cleaned = page_evaluate(
             self.connection_mut()?,
             &scope,
-            REMOVE_MASKS_SCRIPT,
+            REMOVE_MASKS_SCRIPT.as_str(),
             Deadline::after(MASK_CLEANUP_TIMEOUT),
             &mut dialog,
         );
@@ -4417,7 +4563,7 @@ enum ResolvePoll {
 }
 
 /// Why one poll did not yield an actionable element yet.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingReason {
     Missing,
     Hidden,
@@ -4517,6 +4663,36 @@ fn pending_timeout_error(
             "{target_desc} was not hit-testable (`elementFromPoint` returned nothing) within {ms} ms"
         )),
     }
+}
+
+/// The sentence a terminal lookup failure adds when the page holds a closed
+/// shadow root, which no page script can look into.
+const CLOSED_SHADOW_ROOT_HINT: &str = "; the page contains a closed shadow root, which `da` cannot pierce: open it with `attachShadow({ mode: 'open' })` or select its host";
+
+/// How long proving a closed shadow root may take on a terminal failure path.
+const CLOSED_SHADOW_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Whether a `DOM.getDocument` node tree holds a closed shadow root.
+///
+/// `pierce: true` reports every shadow root of a host under `shadowRoots` with
+/// its `shadowRootType`, which is the only way to see a closed root: JavaScript
+/// reports `element.shadowRoot === null` for it.
+fn nodes_include_closed_shadow_root(node: &Value) -> bool {
+    if node.get("shadowRootType").and_then(Value::as_str) == Some("closed") {
+        return true;
+    }
+    if ["shadowRoots", "children"]
+        .iter()
+        .filter_map(|key| node.get(*key).and_then(Value::as_array))
+        .flatten()
+        .any(nodes_include_closed_shadow_root)
+    {
+        return true;
+    }
+    ["contentDocument", "templateContent"]
+        .iter()
+        .filter_map(|key| node.get(*key))
+        .any(nodes_include_closed_shadow_root)
 }
 
 /// Builds a step failure that names the target and what was attempted.
@@ -6919,8 +7095,10 @@ mod tests {
             .resolve_body_with(DEFAULT_TESTID_ATTRIBUTE, None)
             .expect("a CSS locator has a page expression");
         assert!(
-            quoted.contains(r#"root.querySelectorAll("a\"b\\c")"#),
-            "a selector must be passed as a JSON string literal: {quoted}"
+            quoted.contains(r#"var selector = "a\"b\\c";"#)
+                && quoted.contains("collectDeepElements(root)"),
+            "a selector must be passed as a JSON string literal and matched over \
+             the composed tree: {quoted}"
         );
 
         let text = Locator::Text("a\"b\\c".to_string())
@@ -9351,6 +9529,16 @@ mod tests {
                             })).expect("serialize missing status")
                         }
                     }),
+                );
+
+                // The terminal timeout names a closed shadow root when the page
+                // has one, so it asks the DOM agent before the attempt fails.
+                let probe = read_cdp_request(&mut socket);
+                assert_eq!(probe["method"], "DOM.getDocument");
+                send_mock_reply(
+                    &mut socket,
+                    &probe["id"],
+                    json!({ "result": { "root": { "nodeId": 1, "nodeType": 9, "nodeName": "#document" } } }),
                 );
 
                 // attempt 3: succeeds

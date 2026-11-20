@@ -437,6 +437,9 @@ fn route(
         (_, "/browser/mask-iframe-inner") => html_response("200 OK", browser_mask_iframe_inner()),
         (_, "/browser/mask-iframe-nested") => html_response("200 OK", browser_mask_iframe_nested()),
         (_, "/browser/probe/shadow") => html_response("200 OK", browser_probe_shadow()),
+        (_, "/browser/shadow") => html_response("200 OK", &browser_shadow(query)),
+        (_, "/browser/shadow-closed") => html_response("200 OK", browser_shadow_closed()),
+        (_, "/browser/shadow-mask") => html_response("200 OK", browser_shadow_mask()),
         (_, "/browser/probe/new-tab") => html_response("200 OK", browser_probe_new_tab()),
         (_, "/browser/probe/new-tab-target") => html_response(
             "200 OK",
@@ -1483,6 +1486,200 @@ btn.onclick = function () { document.getElementById('shadow-status').textContent
 root.appendChild(btn);
 </script>
 </body></html>"#
+}
+
+/// A page whose controls live inside open shadow roots of several depths.
+///
+/// Every control records its own name into the light-DOM `#shadow-status`
+/// paragraph when it is clicked, so one case proves which element `da` actually
+/// reached: a click that lands on a shadow host instead of the control inside it
+/// records nothing.
+///
+/// `?overlay=1` adds a light-DOM overlay above everything, which must still be
+/// reported as occluding a control that lives inside a shadow root.
+fn browser_shadow(query: &str) -> String {
+    let overlay = if query_value(query, "overlay") == "1" {
+        r#"<div id="real-overlay"></div>"#
+    } else {
+        ""
+    };
+    format!(
+        r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>Shadow matrix</title>
+<style>
+  body {{ margin: 0; padding: 8px; font: 16px sans-serif; color: #111; background: #fff; }}
+  button, input, .row, p {{ font: 16px sans-serif; margin: 6px; padding: 6px 10px; min-width: 180px; }}
+  .row {{ display: block; border: 1px solid #333; }}
+  #real-overlay {{ position: fixed; left: 0; top: 0; width: 100%; height: 100%; z-index: 9999; background: #000; opacity: 0.01; }}
+</style></head>
+<body>
+<h1>Shadow matrix</h1>
+<div id="single-host"></div>
+<div id="field-host"></div>
+<div id="text-host"></div>
+<div id="depth-host"></div>
+<div id="nth-host"></div>
+<div id="within-host"></div>
+<div id="frame-host"></div>
+<div id="overlay-host"></div>
+<p id="shadow-status">idle</p>
+<p id="shadow-typed">idle</p>
+{overlay}
+<script>
+function record(name) {{
+  var status = document.getElementById('shadow-status');
+  status.textContent = (status.textContent === 'idle' ? '' : status.textContent + ',') + name;
+}}
+function openRoot(id) {{
+  return document.getElementById(id).attachShadow({{ mode: 'open' }});
+}}
+function makeButton(id, label, name) {{
+  var button = document.createElement('button');
+  button.setAttribute('id', id);
+  button.type = 'button';
+  button.textContent = label;
+  button.addEventListener('click', function () {{ record(name); }});
+  return button;
+}}
+openRoot('single-host').appendChild(makeButton('single-button', 'Single Shadow', 'single'));
+var fieldRoot = openRoot('field-host');
+var field = document.createElement('input');
+field.setAttribute('id', 'shadow-field');
+field.setAttribute('data-testid', 'shadow-field');
+field.type = 'text';
+var note = function () {{ document.getElementById('shadow-typed').textContent = field.value; }};
+field.addEventListener('input', note);
+field.addEventListener('keyup', note);
+fieldRoot.appendChild(field);
+var textRoot = openRoot('text-host');
+var prefix = document.createElement('span');
+prefix.textContent = 'prefix';
+textRoot.appendChild(prefix);
+textRoot.appendChild(makeButton('text-button', 'Composed Text', 'text'));
+var depthRoot = openRoot('depth-host');
+var innerHost = document.createElement('div');
+innerHost.setAttribute('id', 'inner-host');
+depthRoot.appendChild(innerHost);
+var innerRoot = innerHost.attachShadow({{ mode: 'open' }});
+innerRoot.appendChild(makeButton('nested-button', 'Nested Shadow', 'nested'));
+var marker = document.createElement('span');
+marker.setAttribute('data-testid', 'nested-marker');
+marker.textContent = 'nested marker';
+innerRoot.appendChild(marker);
+var nthRoot = openRoot('nth-host');
+for (var i = 0; i < 3; i++) {{
+  var row = document.createElement('div');
+  row.setAttribute('class', 'row');
+  row.setAttribute('id', 'row-' + i);
+  row.textContent = 'row ' + i;
+  row.addEventListener('click', (function (index) {{
+    return function () {{ record('row' + index); }};
+  }})(i));
+  nthRoot.appendChild(row);
+}}
+openRoot('within-host').appendChild(
+  makeButton('within-button', 'Scoped Shadow', 'within')
+);
+var frameRoot = openRoot('frame-host');
+var frame = document.createElement('iframe');
+frame.setAttribute('id', 'shadow-frame');
+frame.setAttribute('src', '/browser/probe/iframe-inner');
+frame.setAttribute('width', '260');
+frame.setAttribute('height', '90');
+frameRoot.appendChild(frame);
+openRoot('overlay-host').appendChild(makeButton('overlay-target', 'Overlay Target', 'overlay'));
+</script>
+</body></html>"##
+    )
+}
+
+/// A page whose only control lives inside a **closed** shadow root.
+///
+/// No page script can look into a closed root (`host.shadowRoot` is `null`), so
+/// `da` has to explain the closed root instead of reporting a plain miss.
+fn browser_shadow_closed() -> &'static str {
+    r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Closed shadow</title></head>
+<body>
+<div id="closed-host"></div>
+<p id="closed-status">idle</p>
+<script>
+var root = document.getElementById('closed-host').attachShadow({ mode: 'closed' });
+var button = document.createElement('button');
+button.setAttribute('id', 'closed-button');
+button.type = 'button';
+button.textContent = 'Closed Shadow';
+button.addEventListener('click', function () {
+  document.getElementById('closed-status').textContent = 'clicked';
+});
+root.appendChild(button);
+</script>
+</body></html>"#
+}
+
+/// A page that records whether the screenshot masks covered editable fields
+/// living inside an open shadow root.
+///
+/// The `MutationObserver` watches the mask elements the driver appends to
+/// `document.documentElement`, the way `browser_mask` does, so the record is
+/// taken while the masks exist and survives their removal.
+fn browser_shadow_mask() -> &'static str {
+    r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>Shadow mask</title>
+<style>
+body{margin:0;font:16px sans-serif;background:#fff}
+#shadow-pw{position:fixed;left:20px;top:80px;width:300px;height:44px;font-size:22px;color:#f00}
+#shadow-note{position:fixed;left:20px;top:150px;width:300px;height:60px;font-size:20px;color:#f00}
+#mask-report{position:fixed;left:20px;top:240px}
+</style></head>
+<body>
+<div id="mask-host"></div>
+<p id="mask-report">not recorded</p>
+<script>
+var root = document.getElementById('mask-host').attachShadow({ mode: 'open' });
+var password = document.createElement('input');
+password.setAttribute('id', 'shadow-pw');
+password.type = 'password';
+password.value = 'shadow-secret';
+root.appendChild(password);
+var note = document.createElement('textarea');
+note.setAttribute('id', 'shadow-note');
+note.textContent = 'shadow note';
+root.appendChild(note);
+function isCovered(el, masks) {
+  var rect = el.getBoundingClientRect();
+  for (var i = 0; i < masks.length; i++) {
+    var mask = masks[i];
+    var box = mask.getBoundingClientRect();
+    var style = window.getComputedStyle(mask);
+    if (style.opacity === '1' &&
+        style.zIndex === '2147483647' &&
+        box.left <= rect.left + 0.5 &&
+        box.top <= rect.top + 0.5 &&
+        box.right >= rect.right - 0.5 &&
+        box.bottom >= rect.bottom - 0.5) {
+      return true;
+    }
+  }
+  return false;
+}
+var observer = new MutationObserver(function (records) {
+  for (var i = 0; i < records.length; i++) {
+    var added = records[i].addedNodes;
+    for (var j = 0; j < added.length; j++) {
+      var node = added[j];
+      if (node.nodeType === 1 && node.hasAttribute('data-da-screenshot-mask')) {
+        var masks = document.querySelectorAll('[data-da-screenshot-mask]');
+        document.getElementById('mask-report').textContent =
+          'shadow-pw=' + isCovered(password, masks) + ',shadow-note=' + isCovered(note, masks);
+        return;
+      }
+    }
+  }
+});
+observer.observe(document.documentElement, { childList: true, subtree: true });
+</script>
+</body></html>"##
 }
 
 fn browser_probe_new_tab() -> &'static str {
