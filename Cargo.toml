@@ -34,6 +34,9 @@ db = [
 ]
 # The `browser.*` steps and the Chrome DevTools Protocol client they need.
 browser = ["dep:schemars", "dep:tungstenite"]
+# The `android.*` steps, which drive a device by spawning `adb`. It is off by
+# default because it is only useful on a machine with an Android device.
+android = ["dep:schemars"]
 # The MCP JSON-RPC 2.0 server.
 mcp = []
 

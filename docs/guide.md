@@ -30,6 +30,7 @@ The complete reference for `da`: installation options, building from source, the
   - [`cli.run`](#clirun)
   - [`db.query`](#dbquery)
   - [Browser steps](#browser-steps)
+  - [Android steps](#android-steps)
   - [`log.file`](#logfile)
 - [Failure bundles](#failure-bundles)
 - [Run records and HTML reports](#run-records-and-html-reports)
@@ -85,7 +86,10 @@ The binary is written to `target/debug/da` (`target\debug\da.exe` on Windows).
 The `http` feature provides the `http.request` step, `cli` provides `cli.run`,
 `log` provides the `log.file` observer, `db` provides `db.query`, `browser`
 provides the `browser.*` steps and `mcp` provides `da mcp`; these six are
-enabled by default. The `browser` feature adds about 0.5 MiB to the release
+enabled by default. The `android` feature provides the [`android.*`
+steps](#android-steps) and is off by default, because it is only useful on a
+machine with an Android device: build it with `cargo build --features android`.
+The `browser` feature adds about 0.5 MiB to the release
 binary and needs a Chrome or Chromium installed on the machine; it never
 downloads a browser. The `mcp` feature adds about 54 KiB to a build with no
 drivers and about 82 KiB to the default build; it has no dependency and no
@@ -110,6 +114,12 @@ The browser tests in `tests/browser.rs` launch the Chrome or Chromium already
 installed on the machine and drive pages served by the same local test server.
 When no browser can be started they print why and skip; set
 `DA_TEST_BROWSER=1` to make that a failure instead, which is what CI does.
+
+The Android tests in `tests/android.rs` need no device for their schema, lint and
+missing-adb checks, and those run on every machine. The tests that drive a
+device through `adb` are gated on `DA_TEST_ANDROID` the same way: with the
+variable unset they print why and skip, and with `DA_TEST_ANDROID=1` a missing
+device fails the suite.
 
 ### Self-test suite
 
@@ -2497,6 +2507,156 @@ socket read times out; whatever a collection did not read stays on the socket
 and is read by the next one, so a busy page delays an observation rather than
 stalling the step that collects it. Only the page this case attached to is
 observed; another tab of the same browser contributes nothing.
+
+### Android steps
+
+The `android.*` steps drive one Android device through the `adb` binary that is
+already installed on the machine. They are provided by the `android` feature and
+never install anything on the device. Two settings reach it:
+
+| Setting | Meaning |
+| --- | --- |
+| `DA_ADB` | The adb binary to run. Defaults to `adb`, looked up on `PATH`. Set it to the adb executable when the platform-tools directory is not on `PATH`. |
+| `DA_ANDROID_SERIAL` | The device to drive when more than one is attached. A step's `serial` argument overrides it for that step. |
+
+```sh
+export DA_ADB="$HOME/Android/Sdk/platform-tools/adb"
+export DA_ANDROID_SERIAL=emulator-5554
+```
+
+Every step spawns `adb`: one command for an action and three for a dump, which
+runs it, reads the file it wrote and removes it again. No device state is kept
+between steps, so there is no session to reattach to either.
+
+#### The dump costs two seconds, so no action reads the tree
+
+Measured on the Android 14 container (`redroid14_x86_64`, 720×1280, density 320):
+`uiautomator dump` takes about **2.0 s per call** and the cost is fixed —
+`--compressed` halves the output to 9.4 KB and changes nothing, and `exec-out`
+without the intermediate file is no faster — while `input tap` takes **24 ms**,
+`screencap -p` about 160 ms and `dumpsys window windows` 23 ms, the last of
+which exposes only window rectangles and no element text.
+
+A driver that dumped before every action would therefore cost two seconds per
+step. This one never does:
+
+- `android.tap`, `android.input_text` and `android.screenshot` are one adb call
+  each and read no UI tree.
+- `android.dump` pays the two seconds once and is the only step that returns
+  text, resource ids, content descriptions and bounds.
+- `android.tap_on` pays them knowingly: one dump, one resolution, one tap.
+
+A case that already knows the pixels from an earlier dump taps the pixels. A
+case that needs semantics — "tap the button whose text is Save" — pays for one
+dump, and `android.dump` is the only Android step that is read-only enough for
+[`retry`](#retrying-read-only-steps), so polling for a screen that is still
+loading is a `retry` on the dump.
+
+#### Steps
+
+| Step | Arguments | Result |
+| --- | --- | --- |
+| `android.launch` | `package` and/or `activity`; optional `serial` | `package`, `component` |
+| `android.tap` | `x`, `y` in pixels; optional `serial` | `x`, `y` |
+| `android.input_text` | `text`; optional `serial` | `characters` |
+| `android.screenshot` | `path`; optional `serial` | `path`, `bytes` |
+| `android.dump` | optional `text` or `resource_id`; optional `serial` | `count`, `nodes`, and `target` when a filter is given |
+| `android.tap_on` | `text` or `resource_id`; optional `serial` | `target`, `center` |
+
+`android.launch` starts `package` with `am start -W -n package/activity` when
+an activity is named. `-W` waits until the launch finishes, so the step after
+the launch sees the screen it produced. `am start` needs a component, so a
+package alone is started through the same `MAIN`/`LAUNCHER` intent with
+`monkey -p`, which resolves the launcher activity on the device; pass `activity`
+when the entry point is not the launcher, or when the next step must wait for
+the first screen. `am start` exits 0 even when it refuses a component, so a
+device answer containing `Error:` fails the step instead of passing it.
+
+`android.tap` taps pixels. Neither it nor any other action reads the tree first.
+
+`android.input_text` types into the field that currently has focus. Spaces
+become `%s`, which is how `input text` carries them, and the text is quoted for
+the device shell, so `$`, `;`, quotes and backslashes reach the field unchanged.
+The step refuses empty text, control characters and `%`: `input text` sends key
+events, so it has no key for a newline or a tab, and it reads `%s` as a space
+with no escape for a literal percent sign. The text is not echoed in the result
+or in an error message; the result is the number of `characters` sent, so a
+password stays out of the report.
+
+`android.screenshot` writes the PNG of the screen. A relative `path` resolves
+against the directory of the case file, the way every other output path in the
+case does, and the device answer is checked for the PNG signature before it is
+written.
+
+`android.dump` runs `uiautomator dump` once, reads the file it wrote in
+`/data/local/tmp` and removes it again, and returns the parsed nodes in document
+order. Each node carries `text`, `resource_id`, `content_desc`, `class`,
+`bounds` (`left`, `top`, `right`, `bottom` in pixels) and `center` (`x`, `y`);
+an attribute the device left empty is `null`. With `text` or `resource_id` the
+step also resolves exactly one node and returns it as `target`, centre included,
+so a case can assert on it or tap it. A filter that names no node, or more than
+one, fails the step: the message gives the node count, or up to five candidates
+with their centres, because tapping the first of two `OK` buttons is how a case
+passes while testing the wrong screen.
+
+`android.tap_on` does what a case would otherwise do in three steps: dump,
+resolve the one `text` or `resource_id`, tap the centre of `bounds`, and return
+the `target` and the `center` it tapped.
+
+```yaml
+name: Search the Settings app
+steps:
+  - android.launch:
+      package: com.android.settings
+  - android.dump:
+      text: Search settings
+    save:
+      search_bar: "$.target.center"
+  - android.tap_on:
+      text: Search settings
+  - android.input_text:
+      text: network
+  - android.screenshot:
+      path: shots/settings-search.png
+```
+
+Two YAML details matter here. A step with no required argument is written as
+`android.dump: {}`, because an empty step value is not a mapping. And the case
+format reads YAML 1.1 scalars, where an unquoted `y`, `Y`, `n`, `N`, `yes`, `no`,
+`on` or `off` is a boolean, so the vertical pixel is written with quotes:
+
+```yaml
+- android.tap:
+    x: 360
+    "y": 640
+```
+
+`da lint` explains that trap when it is hit instead of reporting an unknown
+field called `true`. The same rule applies to values: type the letter `y` as
+`text: "y"`.
+
+#### When there is no device
+
+No step turns a missing device into a skip. Each one fails with the action that
+fixes it:
+
+| Situation | Exit code | Message |
+| --- | --- | --- |
+| adb cannot be started | 4 | `could not run adb: ...` and the setting to fix |
+| no device attached | 4 | `no Android device is attached: connect one over USB or start an emulator, then check \`adb devices\`` |
+| a device is not ready | 4 | `the attached Android device is not ready (\`unauthorized\`): accept the USB debugging prompt ...` |
+| several devices, no serial | 4 | `N Android devices are attached: set \`DA_ANDROID_SERIAL\` ...` |
+| a configured serial matches nothing | 4 | `no attached Android device has the serial in \`DA_ANDROID_SERIAL\` ...` |
+| an invalid argument | 3 | reported by `da lint` before anything runs |
+
+The messages name the serial setting, never the serial itself and never the
+`DA_ADB` path: a report and a failure bundle are shared, and a serial identifies
+one physical device.
+
+The Android tests in `tests/android.rs` follow the browser suite: the schema,
+lint and missing-adb checks run on every machine, and the tests that drive a
+device are gated on `DA_TEST_ANDROID`. With the variable unset they print why
+they skip; with `DA_TEST_ANDROID=1` a missing device fails the suite instead.
 
 ### `log.file`
 
