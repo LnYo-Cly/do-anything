@@ -244,8 +244,13 @@ impl UserBrowser {
     }
 
     /// Waits until the DevTools endpoint answers, so a case can connect.
+    ///
+    /// A loaded CI runner can take far longer than a healthy machine to bind the
+    /// port, and a tab test that starts this browser runs next to other Chrome
+    /// launches, so the window is generous; a real failure still ends here with
+    /// the pid and profile named.
     fn wait_until_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok((200, _)) = http_request(self.port, "GET", "/json/version") {
                 return;
