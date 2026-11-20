@@ -338,6 +338,12 @@ fn valid_arguments(step: &str) -> Value {
         "cli.run" => json!({"command": "da"}),
         "http.request" => json!({"url": "http://127.0.0.1:1/health"}),
         "db.query" => json!({"url": "sqlite:app.db", "sql": "SELECT 1"}),
+        "android.launch" => json!({"package": "com.android.example"}),
+        "android.tap" => json!({"x": 0, "y": 0}),
+        "android.input_text" => json!({"text": "hello"}),
+        "android.screenshot" => json!({"path": "screen.png"}),
+        "android.dump" => json!({}),
+        "android.tap_on" => json!({"text": "OK"}),
         other => panic!("add the valid arguments of `{other}` to this test"),
     }
 }
@@ -943,7 +949,13 @@ fn the_schema_embeds_each_registered_step_with_its_description() {
     );
 }
 
-#[cfg(not(any(feature = "browser", feature = "cli", feature = "db", feature = "http")))]
+#[cfg(not(any(
+    feature = "android",
+    feature = "browser",
+    feature = "cli",
+    feature = "db",
+    feature = "http"
+)))]
 #[test]
 fn the_schema_is_valid_when_no_step_is_registered() {
     let schema = schema();
