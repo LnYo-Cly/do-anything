@@ -3167,11 +3167,11 @@ fn unsupported_capabilities_probe_current_behavior() {
         stderr(&scoped_iframe_out)
     );
 
-    // 2. shadow DOM (css misses; role finds AX node but light-DOM elementFromPoint sees shadow host)
+    // 2. shadow DOM (locators and actionability pierce open shadow roots)
     let shadow_css = dir.write(
         "probe-shadow-css.yaml",
         &format!(
-            "name: probe shadow css\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-shadow\"\n      timeout_ms: 400\n",
+            "name: probe shadow css\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#inside-shadow\"\n  - browser.read:\n      css: \"#shadow-status\"\n    expect:\n      - path: $.text\n        equals: clicked\n",
             server.url("/browser/probe/shadow")
         ),
     );
@@ -3187,22 +3187,16 @@ fn unsupported_capabilities_probe_current_behavior() {
     );
     assert_eq!(
         exit_code(&shadow_css_out),
-        Some(1),
-        "unexpected shadow css probe exit code: stdout={}\nstderr={}",
+        Some(0),
+        "the css locator must pierce an open shadow root: stdout={}\nstderr={}",
         stdout(&shadow_css_out),
         stderr(&shadow_css_out)
-    );
-    let shadow_css_json = json_stdout(&shadow_css_out);
-    let shadow_css_err = case_error(&shadow_css_json);
-    assert!(
-        shadow_css_err.contains("could not find CSS selector `#inside-shadow`"),
-        "unexpected shadow css probe error: {shadow_css_err}"
     );
 
     let shadow_role = dir.write(
         "probe-shadow-role.yaml",
         &format!(
-            "name: probe shadow role\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      role: button\n      name: Inside Shadow\n      timeout_ms: 5000\n",
+            "name: probe shadow role\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      role: button\n      name: Inside Shadow\n  - browser.read:\n      css: \"#shadow-status\"\n    expect:\n      - path: $.text\n        equals: clicked\n",
             server.url("/browser/probe/shadow")
         ),
     );
@@ -3218,16 +3212,10 @@ fn unsupported_capabilities_probe_current_behavior() {
     );
     assert_eq!(
         exit_code(&shadow_role_out),
-        Some(1),
-        "unexpected shadow role probe exit code: stdout={}\nstderr={}",
+        Some(0),
+        "a role click on a shadow child must not report its own host as the blocker: stdout={}\nstderr={}",
         stdout(&shadow_role_out),
         stderr(&shadow_role_out)
-    );
-    let shadow_role_json = json_stdout(&shadow_role_out);
-    let shadow_role_err = case_error(&shadow_role_json);
-    assert!(
-        shadow_role_err.contains("was occluded by <div#shadow-host>"),
-        "unexpected shadow role probe error: {shadow_role_err}"
     );
 
     // 3. new tab (target="_blank" opens a second tab, session stays on original tab)

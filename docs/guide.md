@@ -1539,16 +1539,16 @@ A **locator** takes **exactly one** of the five ways below, plus any modifiers:
 
 | Locator | Meaning |
 | --- | --- |
-| `css: <selector>` | Matches elements with a CSS selector (`querySelectorAll`). |
-| `xpath: <expression>` | Matches elements with an XPath expression (`document.evaluate`). |
-| `text: <text>` | Matches visible text after collapsing runs of whitespace to one space and trimming ends; only the innermost matching visible element counts. |
-| `role: <role>` (optional `name: <name>`) | Matches non-ignored nodes in Chrome's accessibility tree (`Accessibility.queryAXTree`) with that role and exact accessible name. |
-| `testid: <value>` | Matches elements whose test-id attribute equals `<value>`. Defaults to `data-testid`; override per session with `testid_attribute` on `browser.open`. |
+| `css: <selector>` | Matches elements with a CSS selector, including elements inside any number of nested open shadow roots (composed pre-order). |
+| `xpath: <expression>` | Matches elements with an XPath expression (`document.evaluate`). XPath cannot enter a shadow root; see [Shadow DOM](#shadow-dom). |
+| `text: <text>` | Matches visible text after collapsing runs of whitespace to one space and trimming ends; only the innermost matching visible element counts, including elements inside open shadow roots. |
+| `role: <role>` (optional `name: <name>`) | Matches non-ignored nodes in Chrome's accessibility tree (`Accessibility.queryAXTree`) with that role and exact accessible name, including nodes inside shadow roots. |
+| `testid: <value>` | Matches elements whose test-id attribute equals `<value>`, including elements inside any number of nested open shadow roots. Defaults to `data-testid`; override per session with `testid_attribute` on `browser.open`. |
 
 | Modifier | Meaning |
 | --- | --- |
-| `within: <locator>` | Narrows the search to elements inside the unique element matched by this container locator; may be nested. When `within` matches a same-origin `<iframe>` or `<frame>`, the inner locator searches that frame's document (and may nest further). |
-| `nth: <integer>` | Selects the zero-based match (`0`, `1`, …) in document order. Explicit `nth` permits multiple matches and waits until that index exists (failing on timeout if still out of range). |
+| `within: <locator>` | Narrows the search to elements inside the unique element matched by this container locator; may be nested. When `within` matches a same-origin `<iframe>` or `<frame>`, the inner locator searches that frame's document (and may nest further). When it matches a shadow host, the inner locator searches that host's open shadow root. |
+| `nth: <integer>` | Selects the zero-based match (`0`, `1`, …) in document order, composed pre-order when open shadow roots are involved. Explicit `nth` permits multiple matches and waits until that index exists (failing on timeout if still out of range). |
 | `timeout_ms: <ms>` | How long the step polls before timing out (defaults to 5000). |
 
 Giving zero or more than one locator key, passing `name` without `role`, passing
@@ -1606,7 +1606,10 @@ Before clicking or typing, `browser.click` and `browser.type` wait within
 4. **Stable**: viewport position and dimensions are unchanged across two
    consecutive polls (`scrollIntoView` brings offscreen elements in first).
 5. **Unoccluded**: `document.elementFromPoint` at the element's center returns
-   the target element or one of its descendants.
+   the target element or one of its descendants. Each open shadow root at the
+   point is descended in turn, so a target inside a shadow root is compared with
+   the element that really receives the click rather than with its host (see
+   [Shadow DOM](#shadow-dom)).
 
 If `timeout_ms` expires, the error names the check that failed — and when
 occluded, identifies the blocking element (tag, `id`, and snippet). `browser.read`
@@ -1697,18 +1700,73 @@ enters text output, `--output json` or a future shareable report.
 The cover hides editable fields, not ordinary text. A page that writes a secret
 into a heading, a paragraph or an attribute still shows it in the screenshot
 pixels; `dom.html` is redacted, but the PNG is not. The cover also descends into
-accessible same-origin and nested frames (`<iframe>` and `<frame>`), scaling
-masks across axis-aligned frame transforms (`scale(...)`, `translate(...)`,
-`zoom`), and refuses to emit a screenshot when a visible field lies inside an
-unmappable transform (such as rotation, skew, reflection, or 3D transforms),
-whereas cross-origin frames cannot be reached from the main page. Treat both
-kinds of page as unsuitable for screenshots that leave the machine.
+accessible same-origin and nested frames (`<iframe>` and `<frame>`) and into open
+shadow roots, scaling masks across axis-aligned frame transforms
+(`scale(...)`, `translate(...)`, `zoom`), and refuses to emit a screenshot when a
+visible field lies inside an unmappable transform (such as rotation, skew,
+reflection, or 3D transforms), whereas cross-origin frames cannot be reached from
+the main page. Treat both kinds of page as unsuitable for screenshots that leave
+the machine.
 
 `headless`, `width` and `height` only apply when the first `browser.open` creates
 the page. A later `browser.open` that gives a different effective value is a step
 error instead of being silently ignored, so one case cannot change the browser it
 is driving halfway through. `timeout_ms` applies to each navigation, so a later
 `browser.open` may choose a different value.
+
+#### Shadow DOM
+
+`css`, `testid`, `text` and `role` reach elements inside **any number of nested
+open** shadow roots, so a case can drive Web Component internals directly:
+
+```yaml
+- browser.click:
+    css: "#confirm-button"             # an id inside the component's open root
+- browser.click:
+    testid: shadow-field
+- browser.click:
+    text: Pay now
+- browser.click:
+    role: button
+    name: Place order
+    within:
+      css: "#card-widget"              # the component's host element
+```
+
+The search walks the composed tree in pre-order: each element, then the contents
+of its open `shadowRoot`, then its light children. `nth` counts in that same
+order, and `within` accepts a shadow host — `within: { css: "#card-widget" }`
+searches that host's open root — alongside same-origin iframes. A `role` lookup
+already sees shadow content through Chrome's accessibility tree, and `within`
+narrows it to the host's composed subtree.
+
+Actionability applies the same rule. `document.elementFromPoint` reports the
+outermost shadow host at a point, so the hit test descends each open root in turn
+to find the element that really receives the click. A control inside a shadow
+root is therefore no longer reported as "occluded by" its own host, while a real
+overlay above it still is, and an `<iframe>` inside a shadow root is checked in
+the document that contains its host.
+
+`browser.screenshot` masking covers editable fields inside open shadow roots the
+same way it covers fields inside iframes.
+
+**Closed roots cannot be pierced.** A root created with
+`attachShadow({ mode: 'closed' })` is invisible to page scripts
+(`host.shadowRoot` is `null`), so no locator can search it. When a lookup times
+out or a `role` click cannot land, `da` checks the document through the DevTools
+protocol and names the closed root in the error, for example:
+
+```text
+could not find CSS selector `#closed-button` within 400 ms; check the page and the locator; the page contains a closed shadow root, which `da` cannot pierce: open it with `attachShadow({ mode: 'open' })` or select its host
+```
+
+To test such a component, change the root to `open`, or select an element the
+component exposes in the light DOM (its host, a slot, or a `part`).
+
+**`xpath` stays shadow-blind.** `document.evaluate` cannot enter a shadow root,
+so XPath keeps matching only the node's own document tree. Use `css`, `testid`,
+`text` or `role` when a component's internals matter, and treat an XPath
+expression as a main-document-only locator.
 
 #### JavaScript dialogs (`alert`, `confirm`, `prompt`, `beforeunload`)
 
