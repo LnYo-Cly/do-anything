@@ -77,6 +77,10 @@ jobs:
       # The browser tests launch the Chrome that the runner already has. A
       # missing browser must fail the job instead of skipping the tests.
       DA_TEST_BROWSER: "1"
+      # Several cases launch their own browser; with the default thread count a
+      # four-core runner runs four at once and their own 30-second navigation
+      # budgets start failing on code that passes locally.
+      RUST_TEST_THREADS: "2"
     strategy:
       fail-fast: false
       matrix:
