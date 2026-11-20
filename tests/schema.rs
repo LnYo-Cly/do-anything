@@ -333,6 +333,7 @@ fn valid_arguments(step: &str) -> Value {
             json!({"cookies": [{"name": "sid", "value": "abc", "url": "http://127.0.0.1:1/"}]})
         }
         "browser.save_state" => json!({"path": "state.json"}),
+        "browser.switch_tab" => json!({}),
         "cli.run" => json!({"command": "da"}),
         "http.request" => json!({"url": "http://127.0.0.1:1/health"}),
         "db.query" => json!({"url": "sqlite:app.db", "sql": "SELECT 1"}),

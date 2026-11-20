@@ -441,10 +441,17 @@ fn route(
         (_, "/browser/shadow-closed") => html_response("200 OK", browser_shadow_closed()),
         (_, "/browser/shadow-mask") => html_response("200 OK", browser_shadow_mask()),
         (_, "/browser/probe/new-tab") => html_response("200 OK", browser_probe_new_tab()),
-        (_, "/browser/probe/new-tab-target") => html_response(
-            "200 OK",
-            "<!doctype html><html><head><title>New Tab Target</title></head><body><p id=\"new-tab-marker\">Opened</p></body></html>",
-        ),
+        (_, "/browser/probe/new-tab-target") => {
+            html_response("200 OK", browser_probe_new_tab_target())
+        }
+        (_, "/browser/probe/new-tab-window") => {
+            html_response("200 OK", browser_probe_new_tab_window())
+        }
+        (_, "/browser/probe/new-tab-second") => {
+            html_response("200 OK", browser_probe_new_tab_second())
+        }
+        // The fetch a tab opened by a page action issues once it is switched to.
+        (_, "/browser/probe/new-tab-fetch") => json_response("200 OK", r#"{"fetched":true}"#),
         (_, "/browser/probe/dialog") => html_response("200 OK", browser_probe_dialog()),
         (_, "/browser/dialogs") => html_response("200 OK", browser_dialogs()),
         (_, "/browser/dialogs/onload") => html_response("200 OK", browser_dialogs_onload()),
@@ -1687,7 +1694,61 @@ fn browser_probe_new_tab() -> &'static str {
 <html><head><title>Probe New Tab</title></head>
 <body>
 <a id="open-new-tab" href="/browser/probe/new-tab-target" target="_blank">Open Tab</a>
+<a id="open-second-tab" href="/browser/probe/new-tab-second" target="_blank">Open Second Tab</a>
+<button id="open-window" type="button" onclick="window.open('/browser/probe/new-tab-window');">Open Window</button>
+<p id="probe-status">idle</p>
 </body></html>"#
+}
+
+fn browser_probe_new_tab_target() -> &'static str {
+    // The fetch starts half a second after the click, so it finishes during a
+    // *later* step: `browser.network` reports a request in the step that
+    // completed it, and a case that asserts on it must wait for it there.
+    //
+    // The button inside an open shadow root proves that the composed locators
+    // still work on a tab the session switched to.
+    r#"<!doctype html>
+<html><head><title>New Tab Target</title></head>
+<body>
+<p id="new-tab-marker">Opened</p>
+<button id="new-tab-fetch" type="button"
+  onclick="setTimeout(function () {
+    fetch('/browser/probe/new-tab-fetch?case=tab').then(function (r) { return r.text(); }).then(function () {
+      setTimeout(function () {
+        var p = document.createElement('p');
+        p.id = 'new-tab-fetched';
+        p.textContent = 'fetched';
+        document.body.appendChild(p);
+      }, 100);
+    });
+  }, 500);">Fetch</button>
+<p id="new-tab-status">idle</p>
+<div id="new-tab-shadow"></div>
+<p id="new-tab-shadow-status">idle</p>
+<script>
+var shadowRootHandle = document.getElementById('new-tab-shadow').attachShadow({ mode: 'open' });
+var shadowButton = document.createElement('button');
+shadowButton.setAttribute('id', 'new-tab-shadow-button');
+shadowButton.type = 'button';
+shadowButton.textContent = 'Shadow Button';
+shadowButton.addEventListener('click', function () {
+  document.getElementById('new-tab-shadow-status').textContent = 'shadow-clicked';
+});
+shadowRootHandle.appendChild(shadowButton);
+</script>
+</body></html>"#
+}
+
+fn browser_probe_new_tab_window() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>New Tab Window</title></head>
+<body><p id="window-marker">Window</p></body></html>"#
+}
+
+fn browser_probe_new_tab_second() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Second Tab</title></head>
+<body><p id="second-marker">Second</p></body></html>"#
 }
 
 fn browser_probe_dialog() -> &'static str {
