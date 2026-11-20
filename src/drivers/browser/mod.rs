@@ -75,6 +75,12 @@ pub const STEP_NAMES: [&str; 11] = [
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
+
+/// Environment variable that overrides the default navigation budget.
+const NAVIGATION_TIMEOUT_ENV: &str = "DA_BROWSER_NAVIGATION_TIMEOUT_MS";
+
+/// Environment variable that overrides the browser launch budget.
+const LAUNCH_TIMEOUT_ENV: &str = "DA_BROWSER_LAUNCH_TIMEOUT_MS";
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 800;
 /// How long starting the browser and opening its page may take.
@@ -1190,7 +1196,37 @@ fn default_timeout_ms() -> u64 {
 }
 
 fn default_navigation_timeout_ms() -> u64 {
-    DEFAULT_NAVIGATION_TIMEOUT_MS
+    navigation_timeout_default()
+}
+
+/// The navigation budget a case gets when it does not name one.
+///
+/// A contended CI runner can spend longer than the built-in thirty seconds in
+/// `Page.navigate` on a page that loads instantly elsewhere, so the default is
+/// configurable through `DA_BROWSER_NAVIGATION_TIMEOUT_MS`. An unset, malformed
+/// or implausible value falls back to the built-in default instead of failing a
+/// case: the variable is an operator knob, not case content.
+fn launch_timeout() -> Duration {
+    static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+        std::env::var(LAUNCH_TIMEOUT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|value| (1_000..=600_000).contains(value))
+            .map(Duration::from_millis)
+            .unwrap_or(LAUNCH_TIMEOUT)
+    });
+    *TIMEOUT
+}
+
+fn navigation_timeout_default() -> u64 {
+    static TIMEOUT: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var(NAVIGATION_TIMEOUT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|value| (1_000..=600_000).contains(value))
+            .unwrap_or(DEFAULT_NAVIGATION_TIMEOUT_MS)
+    });
+    *TIMEOUT
 }
 
 /// How long all failure evidence of one browser session may take.
@@ -2630,7 +2666,7 @@ impl BrowserSession {
 
     /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
-        let deadline = Deadline::after(LAUNCH_TIMEOUT);
+        let deadline = Deadline::after(launch_timeout());
         let (browser, (connection, page, tabs)) = launch_browser_with_retry(
             deadline,
             MAX_LAUNCH_ATTEMPTS,
@@ -2690,11 +2726,11 @@ impl BrowserSession {
     /// Attaches a page in a browser the user already runs.
     fn connect_to(endpoint: &Endpoint, testid_attribute: Option<&str>) -> Result<Self, String> {
         let websocket_url = endpoint.websocket_url(connect::CONNECT_TIMEOUT)?;
-        let mut connection = Connection::connect(&websocket_url, Deadline::after(LAUNCH_TIMEOUT))
+        let mut connection = Connection::connect(&websocket_url, Deadline::after(launch_timeout()))
             .map_err(|error| {
-            endpoint.explain(format!("could not open the DevTools connection: {error}"))
-        })?;
-        let deadline = Deadline::after(LAUNCH_TIMEOUT);
+                endpoint.explain(format!("could not open the DevTools connection: {error}"))
+            })?;
+        let deadline = Deadline::after(launch_timeout());
         let (page, target_id) = attach(&mut connection, deadline)?;
         let tabs = tabs::Tabs::start(
             &mut connection,
@@ -12370,5 +12406,26 @@ mod tests {
             Some("http://127.0.0.1:8080/app")
         );
         assert_eq!(host_only[0].domain, None);
+    }
+}
+
+#[cfg(test)]
+mod navigation_timeout_tests {
+    /// The value is clamped to a sane range so a typo cannot hang or truncate a case.
+    fn parsed(raw: &str) -> Option<u64> {
+        raw.trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| (1_000..=600_000).contains(value))
+    }
+
+    #[test]
+    fn the_navigation_override_accepts_only_sane_values() {
+        assert_eq!(parsed("90000"), Some(90_000));
+        assert_eq!(parsed(" 1500 "), Some(1_500));
+        assert_eq!(parsed("999"), None, "under one second is a typo");
+        assert_eq!(parsed("600001"), None, "over ten minutes is a typo");
+        assert_eq!(parsed("soon"), None);
+        assert_eq!(parsed(""), None);
     }
 }

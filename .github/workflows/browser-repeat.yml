@@ -33,6 +33,12 @@ jobs:
       # contention. Job level so the --no-run build step receives it too, where
       # it is inert.
       RUST_TEST_THREADS: "2"
+      # A contended runner can spend longer than thirty seconds in
+      # `Page.navigate` on a page that loads instantly elsewhere.
+      DA_BROWSER_NAVIGATION_TIMEOUT_MS: "90000"
+      # Chrome can also take longer to open its debugger port on a
+      # contended runner than the built-in thirty seconds.
+      DA_BROWSER_LAUNCH_TIMEOUT_MS: "90000"
     strategy:
       fail-fast: false
       matrix:
