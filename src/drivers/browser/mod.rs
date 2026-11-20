@@ -59,10 +59,11 @@ use crate::core::session::{Evidence, Session, Sessions};
 pub const SESSION_KIND: &str = "browser";
 
 /// Step names, in the order they are registered.
-pub const STEP_NAMES: [&str; 10] = [
+pub const STEP_NAMES: [&str; 11] = [
     "browser.open",
     "browser.click",
     "browser.type",
+    "browser.upload",
     "browser.press",
     "browser.wait",
     "browser.read",
@@ -89,9 +90,10 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         open_step()?,
         click_step()?,
         type_step()?,
+        upload_step()?,
         press_step()?,
         wait_step(
-            STEP_NAMES[4],
+            STEP_NAMES[5],
             "Waits for the element the locator names, or for the URL to contain `url_contains`, and returns the `url`.",
             validate_wait,
             run_wait,
@@ -112,6 +114,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     })?;
     registry.register_session_validator("browser.click", validate_click_session)?;
     registry.register_session_validator("browser.type", validate_type_session)?;
+    registry.register_session_validator("browser.upload", validate_upload_session)?;
     registry.register_session_validator("browser.wait", validate_wait_session)?;
     registry.register_session_validator("browser.read", validate_read_session)?;
     Ok(())
@@ -149,7 +152,7 @@ fn open_step() -> Result<StepDefinition, String> {
 /// Builds `browser.save_state`, whose `path` names the JSON file to write.
 fn save_state_step() -> Result<StepDefinition, String> {
     let mut definition = step::<SaveStateArgs>(
-        STEP_NAMES[8],
+        STEP_NAMES[9],
         "Saves the browser's cookies and the current origin's `localStorage` to `path` so a later run can load them with `browser.open: { storage_state: ... }`, and returns the `path` and how many items it wrote.",
         validate_save_state,
         run_save_state,
@@ -162,7 +165,7 @@ fn save_state_step() -> Result<StepDefinition, String> {
 /// case, selected by a URL or title fragment or by creation order.
 fn switch_tab_step() -> Result<StepDefinition, String> {
     let mut definition = step::<SwitchTabArgs>(
-        STEP_NAMES[9],
+        STEP_NAMES[10],
         "Switches the session to a tab this case's pages opened, selected by `url_contains`, `title_contains` or `index`, waits up to `timeout_ms` for it to appear and returns its `url` and `title`; every later `browser.*` step, the failure evidence and the network observation then apply to that tab.",
         validate_switch_tab,
         run_switch_tab,
@@ -219,7 +222,7 @@ fn set_cookies_step() -> Result<StepDefinition, String> {
         ]
     });
     Ok(StepDefinition {
-        name: STEP_NAMES[7],
+        name: STEP_NAMES[8],
         description: "Injects cookies and optional `localStorage` entries into the browser session, returning `cookies_set` and `local_storage_set`.",
         args_schema,
         validate: validate_set_cookies,
@@ -264,10 +267,23 @@ fn type_step() -> Result<StepDefinition, String> {
     Ok(definition)
 }
 
+/// Builds `browser.upload`, whose `files` list becomes the input's selection.
+///
+/// An empty `files` list clears the selection, so it stays a valid value and
+/// the schema does not declare a minimum length.
+fn upload_step() -> Result<StepDefinition, String> {
+    locator_step::<UploadArgs>(
+        STEP_NAMES[3],
+        "Sets the files of the `<input type=\"file\">` element the locator names from the `files` paths, which resolve against the case file's directory, and returns the number of `files` set and their `names`; an empty `files` clears the selection.",
+        validate_upload,
+        run_upload,
+    )
+}
+
 /// Builds `browser.press`, with optional `dialog` handling.
 fn press_step() -> Result<StepDefinition, String> {
     let mut definition = step::<PressArgs>(
-        STEP_NAMES[3],
+        STEP_NAMES[4],
         "Presses `key`, such as `Enter` or `Tab`, on the focused element.",
         validate_press,
         run_press,
@@ -279,7 +295,7 @@ fn press_step() -> Result<StepDefinition, String> {
 /// Builds `browser.read`, which is read-only and allows `retry`.
 fn read_step() -> Result<StepDefinition, String> {
     let mut definition = locator_step::<ReadArgs>(
-        STEP_NAMES[5],
+        STEP_NAMES[6],
         "Returns the `text` of the element the locator names, plus its `value` when `attribute` is given.",
         validate_read,
         run_read,
@@ -291,7 +307,7 @@ fn read_step() -> Result<StepDefinition, String> {
 /// Builds `browser.screenshot`, which takes only the output path.
 fn screenshot_step() -> Result<StepDefinition, String> {
     step::<ScreenshotArgs>(
-        STEP_NAMES[6],
+        STEP_NAMES[7],
         "Writes a PNG of the page to `path` after covering every visible editable field, and returns the `path` and the number of `bytes` written.",
         validate_screenshot,
         run_screenshot,
@@ -868,6 +884,48 @@ struct TypeArgs {
     /// How to respond if typing opens a JavaScript dialog.
     #[serde(default)]
     dialog: Option<DialogArg>,
+}
+
+/// Arguments of `browser.upload`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UploadArgs {
+    /// CSS selector of the `<input type="file">` element.
+    #[serde(default)]
+    css: Option<String>,
+    /// XPath expression of the `<input type="file">` element.
+    #[serde(default)]
+    xpath: Option<String>,
+    /// Visible text of the `<input type="file">` element, with whitespace
+    /// normalized.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the `<input type="file">` element, for example
+    /// `button`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
+    /// Test id attribute value of the element.
+    #[serde(default)]
+    testid: Option<String>,
+    /// Local files to set on the input, in order. A relative path resolves
+    /// against the directory that holds the case file; an empty list clears the
+    /// current selection.
+    #[schemars(extend("items" = { "type": "string", "minLength": 1 }))]
+    files: Vec<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
+    /// How long to wait for the element, in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Arguments of `browser.press`.
@@ -1693,6 +1751,79 @@ if (!frames || !areEnclosingFramesVisible(frames)) return false;
 return isBoxVisible(el, null);"#
     )
 });
+
+/// Inspects the element `browser.upload` resolved and reports whether it can
+/// take files: a `<input type="file">` that is present and enabled.
+///
+/// A status object keeps "this is not a file input" and "this file input is
+/// disabled" distinguishable without throwing, so the step can name the element
+/// it actually matched.
+const FILE_INPUT_STATE_BODY: &str = r#"if (!el || el.nodeType !== 1 || !el.isConnected) return { status: 'detached' };
+var tag = el.tagName ? el.tagName.toLowerCase() : '';
+var type = String(el.getAttribute('type') || '').toLowerCase();
+if (tag !== 'input' || type !== 'file') {
+  return { status: 'not_file_input', tag: tag, type: type };
+}
+var disabled = false;
+try {
+  disabled = el.matches(':disabled');
+} catch (e) {
+  disabled = Boolean(el.disabled);
+}
+return { status: 'ok', disabled: disabled, multiple: Boolean(el.multiple) };"#;
+
+/// Reads back the file names the input holds after `DOM.setFileInputFiles`.
+///
+/// The names are the browser's own view of the selection, so the step reports
+/// what the page sees instead of what it asked for.
+const FILE_INPUT_NAMES_BODY: &str = r#"var names = [];
+if (el && el.files) {
+  for (var i = 0; i < el.files.length; i++) names.push(String(el.files[i].name));
+}
+return names;"#;
+
+/// Replaces a matched `<label>` with the control it labels.
+///
+/// A file input is usually hidden behind its label or a styled button, so a
+/// locator that names the visible label — by its `text`, for example — must
+/// upload to the input the label controls. Anything else is returned unchanged.
+const FOLLOW_LABEL_SCRIPT: &str = r#"function () {
+  var el = this;
+  if (!el || el.nodeType !== 1) return null;
+  var tag = el.tagName ? el.tagName.toUpperCase() : '';
+  if (tag === 'LABEL' && el.control) return el.control;
+  return el;
+}"#;
+
+/// Clears the selection of the file input `el`.
+///
+/// `DOM.setFileInputFiles` with an empty list leaves the current files in place
+/// (Chrome treats an empty list as "nothing to do"), so an empty `files` list is
+/// applied in the page instead: assigning `value` empties the `FileList`, and
+/// the `input` and `change` events the browser fires for a new selection are
+/// dispatched so the page sees the clear. An input that held nothing keeps its
+/// handlers quiet.
+const CLEAR_FILE_INPUT_BODY: &str = r#"var hadSelection = Boolean(el && el.files && el.files.length > 0);
+el.value = '';
+if (hadSelection) {
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+return true;"#;
+
+/// The status [`FILE_INPUT_STATE_BODY`] reports.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+struct FileInputState {
+    status: String,
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    multiple: bool,
+}
 
 /// Inspects a matched `within` container (`this`) and returns either the
 /// container element itself, the `contentDocument` of a ready same-origin frame,
@@ -3093,6 +3224,25 @@ impl BrowserSession {
         )
     }
 
+    /// Waits for the target element to exist, match uniquely (or `nth`), without
+    /// requiring it to be painted.
+    ///
+    /// A file input is usually hidden behind a styled label or button, so the
+    /// element the locator names must exist and be usable, not visible.
+    fn locate_target_any_visibility(
+        &mut self,
+        target: &ElementTarget,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<Located, StepError> {
+        self.poll_target(
+            target,
+            deadline,
+            dialog,
+            |_session, _target_desc, object_id, _dialog| Ok(Ok(Located(object_id))),
+        )
+    }
+
     /// Waits for the target element to exist, be visible, enabled, stable across
     /// two consecutive polls, and unoccluded at its click point.
     fn locate_actionable_target(
@@ -3153,6 +3303,18 @@ impl BrowserSession {
                 ))))
             }
         }
+    }
+
+    /// Resolves `ref_id` to a live element and its deterministic locator,
+    /// without requiring the element to be painted.
+    fn locate_ref_any_visibility(
+        &mut self,
+        ref_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<Located, StepError> {
+        let object_id = self.resolve_and_synthesize_ref(ref_id, deadline, dialog)?;
+        Ok(Located(object_id))
     }
 
     /// Resolves `ref_id` to a live element, synthesizes its deterministic locator,
@@ -6010,6 +6172,41 @@ fn validate_type(args: &Value) -> Result<(), String> {
     type_target(&args).map(|_| ())
 }
 
+/// The target locator of `browser.upload`.
+fn upload_target(args: &UploadArgs) -> Result<ElementTarget, String> {
+    let locator = Locator::from_args(
+        &args.css,
+        &args.xpath,
+        &args.text,
+        &args.role,
+        &args.name,
+        &args.testid,
+    )?;
+    ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
+}
+
+/// Checks the `files` list: every entry must name a path.
+///
+/// Whether the path exists is a run-time fact the browser reports, so the
+/// static check only refuses the values no file can ever have.
+fn check_files(files: &[String]) -> Result<(), String> {
+    for (index, file) in files.iter().enumerate() {
+        if file.trim().is_empty() {
+            return Err(format!(
+                "invalid arguments: `files[{index}]` must not be empty; give a file path, or pass `files: []` to clear the input"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_upload(args: &Value) -> Result<(), String> {
+    let args: UploadArgs = parse_for_validate(args)?;
+    check_timeout(args.timeout_ms)?;
+    upload_target(&args)?;
+    check_files(&args.files)
+}
+
 fn validate_press(args: &Value) -> Result<(), String> {
     let args: PressArgs = parse_for_validate(args)?;
     Key::parse(&args.key).map(|_| ())
@@ -6274,6 +6471,16 @@ struct RefReadArgs {
     timeout_ms: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefUploadArgs {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    files: Vec<String>,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
 fn has_ref_field(args: &Value) -> bool {
     args.as_object().is_some_and(|map| map.contains_key("ref"))
 }
@@ -6314,6 +6521,16 @@ fn validate_type_session(args: &Value) -> Result<(), String> {
         return Ok(());
     }
     validate_type(args)
+}
+
+fn validate_upload_session(args: &Value) -> Result<(), String> {
+    if has_ref_field(args) {
+        let parsed: RefUploadArgs = parse_for_validate(args)?;
+        check_ref_id(&parsed.ref_id)?;
+        check_timeout(parsed.timeout_ms)?;
+        return check_files(&parsed.files);
+    }
+    validate_upload(args)
 }
 
 fn validate_wait_session(args: &Value) -> Result<(), String> {
@@ -6568,6 +6785,235 @@ fn type_actionable(
         dialog,
     )?;
     Ok(attach_dialog(json!({}), dialog))
+}
+
+fn run_upload(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    if has_ref_field(args) {
+        if !sessions.is_interactive() {
+            return Err(StepError::InvalidArguments(
+                "invalid arguments: `ref` is only available inside `da session`".to_string(),
+            ));
+        }
+        validate_upload_session(args).map_err(StepError::InvalidArguments)?;
+        let parsed: RefUploadArgs = parse(args)?;
+        let files = resolve_upload_files(&parsed.files, sessions)?;
+        let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+        let mut dialog = DialogContext::fail_fast();
+        let session = session(sessions)?;
+        let target_desc = format!("ref `{}`", parsed.ref_id);
+        let located = session.locate_ref_any_visibility(&parsed.ref_id, deadline, &mut dialog)?;
+        return upload_to_located(
+            session,
+            &target_desc,
+            &located,
+            &files,
+            deadline,
+            &mut dialog,
+        );
+    }
+    validate_upload(args).map_err(StepError::InvalidArguments)?;
+    let args: UploadArgs = parse(args)?;
+    let target = upload_target(&args).map_err(StepError::InvalidArguments)?;
+    let files = resolve_upload_files(&args.files, sessions)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::fail_fast();
+    let session = session(sessions)?;
+    let target_desc = target.describe_with(&session.testid_attribute);
+    let located = session.locate_target_any_visibility(&target, deadline, &mut dialog)?;
+    upload_to_located(
+        session,
+        &target_desc,
+        &located,
+        &files,
+        deadline,
+        &mut dialog,
+    )
+}
+
+/// Resolves and checks the `files` list of `browser.upload`.
+///
+/// A relative path resolves against the directory that holds the case file, the
+/// same rule `browser.screenshot` uses for its output, and every path is checked
+/// on this side first so a missing or unusable file is named in a step error
+/// instead of surfacing as an opaque browser failure.
+fn resolve_upload_files(files: &[String], sessions: &Sessions) -> Result<Vec<PathBuf>, StepError> {
+    let mut resolved = Vec::with_capacity(files.len());
+    for (index, raw) in files.iter().enumerate() {
+        let path = PathBuf::from(raw);
+        let candidate = match sessions.base_directory() {
+            Some(directory) if !path.is_absolute() => directory.join(&path),
+            _ => path,
+        };
+        let absolute = std::path::absolute(&candidate).map_err(|error| {
+            StepError::Execution(format!(
+                "could not upload `files[{index}]` `{raw}`: cannot make it absolute: {error}"
+            ))
+        })?;
+        let metadata = std::fs::metadata(&absolute).map_err(|error| {
+            let detail = if error.kind() == std::io::ErrorKind::NotFound {
+                "does not exist; a relative `files` path resolves against the directory that holds the case file"
+                    .to_string()
+            } else {
+                format!("cannot be read: {error}")
+            };
+            StepError::Execution(format!(
+                "could not upload `files[{index}]` `{raw}`: it {detail} (looked at `{}`)",
+                paths::display(&absolute)
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(StepError::Execution(format!(
+                "could not upload `files[{index}]` `{raw}`: `{}` is not a regular file; `files` must name files, not directories",
+                paths::display(&absolute)
+            )));
+        }
+        resolved.push(absolute);
+    }
+    Ok(resolved)
+}
+
+/// Sets `files` on the resolved element and reports what the page now holds.
+fn upload_to_located(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    located: &Located,
+    files: &[PathBuf],
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
+    let target = follow_label(session, target_desc, located, deadline, dialog)?;
+    let raw = session.run_on(
+        target_desc,
+        &target,
+        FILE_INPUT_STATE_BODY,
+        "inspect",
+        deadline,
+        dialog,
+    )?;
+    let state: FileInputState = serde_json::from_value(raw).map_err(|error| {
+        StepError::Environment(format!(
+            "the browser returned an invalid file input state for {target_desc}: {error}"
+        ))
+    })?;
+    match state.status.as_str() {
+        "ok" => {}
+        "detached" => {
+            return Err(StepError::Execution(format!(
+                "could not upload to {target_desc}: the element was removed from the page before its files could be set"
+            )));
+        }
+        _ => {
+            let matched = match matched_element_label(&state.tag, &state.r#type) {
+                Some(label) => {
+                    format!("the matched element is {label}, not an `<input type=\"file\">`")
+                }
+                None => "the matched element is not an `<input type=\"file\">`".to_string(),
+            };
+            return Err(StepError::Execution(format!(
+                "could not upload to {target_desc}: {matched}; point the locator at the file input"
+            )));
+        }
+    }
+    if state.disabled {
+        return Err(StepError::Execution(format!(
+            "could not upload to {target_desc}: the file input is disabled (its own `disabled` attribute or an enclosing disabled `<fieldset>`), so it cannot take files"
+        )));
+    }
+    if files.len() > 1 && !state.multiple {
+        return Err(StepError::Execution(format!(
+            "could not upload {} files to {target_desc}: the file input has no `multiple` attribute, so it accepts one file; add `multiple` to the input or pass a single path",
+            files.len()
+        )));
+    }
+    if files.is_empty() {
+        session.run_on(
+            target_desc,
+            &target,
+            CLEAR_FILE_INPUT_BODY,
+            "clear the files of",
+            deadline,
+            dialog,
+        )?;
+    } else {
+        let paths: Vec<String> = files.iter().map(|path| paths::display(path)).collect();
+        session.dispatch(
+            target_desc,
+            "DOM.setFileInputFiles",
+            json!({ "objectId": target.0, "files": paths }),
+            "set the files of",
+            deadline,
+            dialog,
+        )?;
+    }
+    let names = session.run_on(
+        target_desc,
+        &target,
+        FILE_INPUT_NAMES_BODY,
+        "read the files of",
+        deadline,
+        dialog,
+    )?;
+    let names: Vec<String> = serde_json::from_value(names).map_err(|error| {
+        StepError::Environment(format!(
+            "the browser returned an invalid file selection for {target_desc}: {error}"
+        ))
+    })?;
+    if names.len() != files.len() {
+        return Err(StepError::Execution(format!(
+            "could not upload {} file(s) to {target_desc}: the browser selected {}; check that the browser can read every file",
+            files.len(),
+            names.len()
+        )));
+    }
+    Ok(json!({ "files": names.len(), "names": names }))
+}
+
+/// Names the element a locator actually matched, for a "not a file input" error.
+fn matched_element_label(tag: &str, input_type: &str) -> Option<String> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    let input_type = input_type.trim();
+    if tag == "input" && !input_type.is_empty() {
+        return Some(format!("`<input type=\"{input_type}\">`"));
+    }
+    Some(format!("`<{tag}>`"))
+}
+
+/// Follows a matched `<label>` to the control it labels.
+///
+/// The label is what a person sees and clicks, and what a `text` locator can
+/// name, so uploads through it must reach the input the label opens.
+fn follow_label(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    located: &Located,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Located, StepError> {
+    let scope = session.scope();
+    let connection = session.connection_mut()?;
+    let remote = page_call_function_remote(
+        connection,
+        &scope,
+        &located.0,
+        FOLLOW_LABEL_SCRIPT,
+        deadline,
+        dialog,
+    )
+    .map_err(|failure| {
+        failure.step(
+            &format!("could not follow the label of {target_desc}"),
+            timeout_or_execution,
+        )
+    })?;
+    match remote {
+        RemoteResult::Object(object_id) => Ok(Located(object_id)),
+        RemoteResult::Value(_) => Err(StepError::Execution(format!(
+            "could not upload to {target_desc}: the element was removed from the page before its files could be set"
+        ))),
+    }
 }
 
 fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -7226,6 +7672,7 @@ mod tests {
             "browser.open",
             "browser.click",
             "browser.type",
+            "browser.upload",
             "browser.press",
             "browser.screenshot",
             "browser.set_cookies",
@@ -7309,7 +7756,12 @@ mod tests {
 
     #[test]
     fn a_locator_is_exactly_one_of_five_forms() {
-        for step in ["browser.click", "browser.type", "browser.read"] {
+        for step in [
+            "browser.click",
+            "browser.type",
+            "browser.upload",
+            "browser.read",
+        ] {
             let definition = definition(step);
             let branches = definition.args_schema["oneOf"]
                 .as_array()
@@ -7322,8 +7774,11 @@ mod tests {
                 );
             }
 
+            let files = json!({"files": ["fixture.txt"]});
             let base = if step == "browser.type" {
                 json!({"css": "#name", "text": "hello"})
+            } else if step == "browser.upload" {
+                json!({"css": "#name", "files": ["fixture.txt"]})
             } else {
                 json!({"css": "#name"})
             };
@@ -7333,6 +7788,8 @@ mod tests {
             );
             let text = if step == "browser.type" {
                 json!({"text": "Later", "value": "hello"})
+            } else if step == "browser.upload" {
+                json!({"text": "Later", "files": ["fixture.txt"]})
             } else {
                 json!({"text": "Later"})
             };
@@ -7342,6 +7799,8 @@ mod tests {
             );
             let role = if step == "browser.type" {
                 json!({"role": "textbox", "name": "Name", "text": "hello"})
+            } else if step == "browser.upload" {
+                json!({"role": "textbox", "name": "Name", "files": ["fixture.txt"]})
             } else {
                 json!({"role": "textbox", "name": "Name"})
             };
@@ -7351,6 +7810,8 @@ mod tests {
             );
             let both = if step == "browser.type" {
                 json!({"css": "#a", "xpath": "//*[@id='a']", "text": "hello"})
+            } else if step == "browser.upload" {
+                json!({"css": "#a", "xpath": "//*[@id='a']", "files": ["fixture.txt"]})
             } else {
                 json!({"css": "#a", "xpath": "//*[@id='a']"})
             };
@@ -7358,6 +7819,8 @@ mod tests {
             assert!(error.contains("cannot both be set"), "{step}: {error}");
             let none = if step == "browser.type" {
                 json!({"text": "hello"})
+            } else if step == "browser.upload" {
+                files.clone()
             } else {
                 json!({})
             };
@@ -7366,12 +7829,171 @@ mod tests {
             assert!(error.contains("one locator"), "{step}: {error}");
             let name = if step == "browser.type" {
                 json!({"name": "Submit", "text": "hello"})
+            } else if step == "browser.upload" {
+                json!({"name": "Submit", "files": ["fixture.txt"]})
             } else {
                 json!({"name": "Submit"})
             };
             let error =
                 (definition.validate)(&name).expect_err("a name without a role must be refused");
             assert!(error.contains("role"), "{step}: {error}");
+        }
+    }
+
+    #[test]
+    fn upload_requires_a_files_list_and_accepts_every_locator() {
+        let definition = definition("browser.upload");
+        assert_eq!(
+            definition.args_schema["required"],
+            json!(["files"]),
+            "`files` is required: {}",
+            definition.args_schema
+        );
+        assert_eq!(
+            definition.args_schema["properties"]["files"]["type"], "array",
+            "`files` is a list: {}",
+            definition.args_schema
+        );
+        assert_eq!(
+            definition.args_schema["properties"]["files"]["items"]["minLength"], 1,
+            "an empty path is refused by the schema: {}",
+            definition.args_schema
+        );
+
+        for locator in [
+            json!({"css": "#file"}),
+            json!({"xpath": "//*[@id='file']"}),
+            json!({"text": "Choose a file"}),
+            json!({"role": "button", "name": "Choose a file"}),
+            json!({"testid": "file"}),
+        ] {
+            let mut args = locator.clone();
+            args["files"] = json!(["fixture.txt"]);
+            assert!(
+                (definition.validate)(&args).is_ok(),
+                "every locator form must be accepted with `files`: {args}"
+            );
+        }
+        assert!(
+            (definition.validate)(&json!({"css": "#file", "files": []})).is_ok(),
+            "an empty `files` list clears the input and is valid"
+        );
+        assert!(
+            (definition.validate)(&json!({
+                "css": "#file",
+                "files": ["a.txt"],
+                "within": {"css": "#form"},
+                "nth": 1,
+                "timeout_ms": 250
+            }))
+            .is_ok(),
+            "the locator modifiers and `timeout_ms` are accepted"
+        );
+
+        let error = (definition.validate)(&json!({"css": "#file"}))
+            .expect_err("a missing `files` list must be refused");
+        assert!(error.contains("files"), "{error}");
+        let error = (definition.validate)(&json!({"css": "#file", "files": [""]}))
+            .expect_err("an empty path must be refused");
+        assert!(error.contains("files[0]"), "{error}");
+        let error =
+            (definition.validate)(&json!({"css": "#file", "files": ["a.txt"], "timeout_ms": 0}))
+                .expect_err("a zero timeout must be refused");
+        assert!(error.contains("timeout_ms"), "{error}");
+        let error = (definition.validate)(&json!({"css": "#file", "files": ["a.txt"], "bogus": 1}))
+            .expect_err("an unknown argument must be refused");
+        assert!(error.contains("bogus"), "{error}");
+    }
+
+    #[test]
+    fn upload_paths_resolve_against_the_case_directory_before_the_browser_runs() {
+        let base = std::env::temp_dir().join(format!("da-upload-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("cases/sub")).expect("the fixture directory must exist");
+        std::fs::write(base.join("cases/fixture.txt"), "hello")
+            .expect("the fixture must be written");
+
+        let mut sessions = Sessions::new();
+        sessions.set_base_directory(base.join("cases"));
+
+        let resolved = resolve_upload_files(&["fixture.txt".to_string()], &sessions)
+            .expect("a relative path must resolve against the case directory");
+        assert_eq!(
+            resolved,
+            vec![
+                std::path::absolute(base.join("cases/fixture.txt"))
+                    .expect("the fixture path must become absolute")
+            ],
+            "a relative path must resolve against the case file's directory"
+        );
+
+        let absolute = std::path::absolute(base.join("cases/fixture.txt"))
+            .expect("the fixture path must become absolute");
+        let resolved = resolve_upload_files(&[paths::display(&absolute)], &sessions)
+            .expect("an absolute path must be used as given");
+        assert_eq!(resolved, vec![absolute], "an absolute path must be kept");
+
+        let error = resolve_upload_files(&["missing.txt".to_string()], &sessions)
+            .expect_err("a missing file must be refused");
+        assert!(
+            step_error_text(error).contains("does not exist"),
+            "a missing file must say so"
+        );
+        let error = resolve_upload_files(&["sub".to_string()], &sessions)
+            .expect_err("a directory must be refused");
+        assert!(
+            step_error_text(error).contains("not a regular file"),
+            "a directory must be named as one"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_matched_element_is_labelled_by_its_tag_and_input_type() {
+        assert_eq!(matched_element_label("div", "").as_deref(), Some("`<div>`"));
+        assert_eq!(
+            matched_element_label("input", "text").as_deref(),
+            Some("`<input type=\"text\">`")
+        );
+        assert_eq!(
+            matched_element_label("input", "").as_deref(),
+            Some("`<input>`")
+        );
+        assert_eq!(matched_element_label("", ""), None);
+    }
+
+    #[test]
+    fn upload_session_accepts_a_ref_and_still_requires_files() {
+        let registry = registry();
+        for args in [
+            json!({"ref": "e1", "files": ["fixture.txt"]}),
+            json!({"ref": "e1", "files": [], "timeout_ms": 250}),
+        ] {
+            assert!(
+                registry
+                    .validate_for_session("browser.upload", &args)
+                    .is_ok(),
+                "a ref upload must be accepted: {args}"
+            );
+        }
+        for (label, args) in [
+            ("empty ref", json!({"ref": "", "files": ["a.txt"]})),
+            ("missing files", json!({"ref": "e1"})),
+            ("empty path", json!({"ref": "e1", "files": [""]})),
+            (
+                "zero timeout",
+                json!({"ref": "e1", "files": ["a.txt"], "timeout_ms": 0}),
+            ),
+            (
+                "ref with a locator",
+                json!({"ref": "e1", "css": "#file", "files": ["a.txt"]}),
+            ),
+        ] {
+            let error = registry
+                .validate_for_session("browser.upload", &args)
+                .expect_err("the session arguments must be refused");
+            assert!(!error.is_empty(), "{label}: {error}");
         }
     }
 
@@ -7425,12 +8047,14 @@ mod tests {
         for step in [
             "browser.click",
             "browser.type",
+            "browser.upload",
             "browser.wait",
             "browser.read",
         ] {
             let definition = definition(step);
             let mut args = match step {
                 "browser.type" => json!({"css": "#a", "text": "x"}),
+                "browser.upload" => json!({"css": "#a", "files": ["a.txt"]}),
                 "browser.wait" => json!({"css": "#a"}),
                 _ => json!({"css": "#a"}),
             };

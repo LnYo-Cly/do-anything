@@ -1157,6 +1157,21 @@ fn every_step_reports_its_argument_errors_in_lint() {
             "one locator",
         ),
         (
+            "upload-no-files.yaml",
+            "  - browser.upload:\n      css: \"#a\"\n",
+            "files",
+        ),
+        (
+            "upload-empty-path.yaml",
+            "  - browser.upload:\n      css: \"#a\"\n      files: [\"\"]\n",
+            "files[0]",
+        ),
+        (
+            "upload-two-locators.yaml",
+            "  - browser.upload:\n      css: \"#a\"\n      testid: b\n      files: [\"a.txt\"]\n",
+            "cannot both be set",
+        ),
+        (
             "wait-zero.yaml",
             "  - browser.wait:\n      css: \"#a\"\n      timeout_ms: 0\n",
             "timeout_ms",
@@ -3323,12 +3338,48 @@ fn unsupported_capabilities_probe_current_behavior() {
         "unexpected dialog probe error: {dialog_err}"
     );
 
-    // 5. file upload (browser.type completes without error, but attaches no file)
+    // 5. file upload (browser.type attaches no file; browser.upload is the step
+    //    that sets one, and the page's change handler proves the event fired)
+    dir.write("sample.txt", "probe upload bytes\n");
     let upload_case = dir.write(
         "probe-upload.yaml",
         &format!(
-            "name: probe file upload\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.type:\n      css: \"#file-upload\"\n      text: \"sample.txt\"\n      timeout_ms: 5000\n  - browser.read:\n      css: \"#file-upload\"\n      attribute: value\n    expect:\n      - path: $.value\n        equals: null\n      - path: $.text\n        equals: \"\"\n",
-            server.url("/browser/probe/upload")
+            r##"name: probe file upload
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.type:
+      css: "#file-upload"
+      text: "sample.txt"
+      timeout_ms: 5000
+  - browser.read:
+      css: "#file-upload"
+      attribute: value
+    expect:
+      - path: $.value
+        equals: null
+      - path: $.text
+        equals: ""
+  - browser.read:
+      css: "#file-upload-events"
+    expect:
+      - path: $.text
+        equals: "idle"
+  - browser.upload:
+      css: "#file-upload"
+      files: ["sample.txt"]
+    expect:
+      - path: $.files
+        equals: 1
+      - path: $.names
+        equals: ["sample.txt"]
+  - browser.read:
+      css: "#file-upload-events"
+    expect:
+      - path: $.text
+        equals: "change:1"
+"##,
+            url = server.url("/browser/probe/upload")
         ),
     );
     let upload_out = run_da_in(
@@ -4077,6 +4128,403 @@ fn a_session_keeps_the_switched_tab_across_commands_and_closes_every_tab_it_open
     assert!(
         after.iter().map(page_id).any(|id| id == user_tab),
         "stopping the session must leave the user tab open: {after:?}"
+    );
+}
+
+/// Runs `steps` (a YAML fragment after `steps:`) against `url` and returns the
+/// run's output.
+fn run_upload_steps(dir: &Path, name: &str, url: &str, steps: &str) -> Output {
+    let case = dir.join(name);
+    fs::write(
+        &case,
+        format!("name: {name}\nsteps:\n  - browser.open:\n      url: \"{url}\"\n{steps}"),
+    )
+    .expect("the upload case file must be written");
+    run_da_in(
+        dir,
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    )
+}
+
+#[test]
+fn upload_sets_single_and_multiple_files_and_clears_with_an_empty_list() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-upload");
+    dir.write("single.txt", "single upload bytes\n");
+    dir.write("first.txt", "first file\n");
+    dir.write("second.txt", "second file\n");
+
+    let output = run_upload_steps(
+        dir.path(),
+        "upload.yaml",
+        &server.url("/browser/upload"),
+        r##"  - browser.upload:
+      css: "#single-file"
+      files: ["single.txt"]
+    expect:
+      - path: $.files
+        equals: 1
+      - path: $.names
+        equals: ["single.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "single-file:1:single.txt"
+  - browser.upload:
+      css: "#multi-file"
+      files: ["first.txt", "second.txt"]
+    expect:
+      - path: $.files
+        equals: 2
+      - path: $.names
+        equals: ["first.txt", "second.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "multi-file:2:first.txt,second.txt"
+  - browser.upload:
+      css: "#multi-file"
+      files: []
+    expect:
+      - path: $.files
+        equals: 0
+      - path: $.names
+        equals: []
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "multi-file:0:"
+"##,
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn upload_reaches_a_hidden_input_with_every_locator_and_modifier() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-upload-locators");
+    dir.write("first.txt", "first file\n");
+    dir.write("second.txt", "second file\n");
+
+    // `text` names the visible label of a `display: none` input, `css` reaches an
+    // input hidden by `opacity: 0` and zero size, `testid` + `within` + `nth`
+    // picks one of two inputs, `xpath` names the other, `role` + `within`
+    // reaches the single file input inside its container, and `css` pierces an
+    // open shadow root to reach the input a component keeps in it.
+    let output = run_upload_steps(
+        dir.path(),
+        "upload-locators.yaml",
+        &server.url("/browser/upload"),
+        r##"  - browser.upload:
+      text: "Choose avatar"
+      files: ["first.txt"]
+    expect:
+      - path: $.names
+        equals: ["first.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "hidden-file:1:first.txt"
+  - browser.upload:
+      css: "#faded-file"
+      files: ["first.txt", "second.txt"]
+    expect:
+      - path: $.names
+        equals: ["first.txt", "second.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "faded-file:2:first.txt,second.txt"
+  - browser.upload:
+      testid: "nested-file"
+      within:
+        css: "#picker"
+      nth: 1
+      files: ["second.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "nested-two:1:second.txt"
+  - browser.upload:
+      xpath: "//*[@id='nested-one']"
+      files: ["first.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "nested-one:1:first.txt"
+  - browser.upload:
+      role: button
+      within:
+        css: "#single-picker"
+      files: ["second.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "single-file:1:second.txt"
+  - browser.upload:
+      css: "#shadow-file"
+      files: ["first.txt"]
+    expect:
+      - path: $.names
+        equals: ["first.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "shadow-file:1:first.txt"
+"##,
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn upload_works_on_the_tab_a_page_action_opened() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-upload-tab");
+    dir.write("first.txt", "first file\n");
+
+    // The click opens a second tab; `browser.switch_tab` moves the session to
+    // it, and the upload must apply to that tab's file input.
+    let output = run_upload_steps(
+        dir.path(),
+        "upload-tab.yaml",
+        &server.url("/browser/upload/tab"),
+        r##"  - browser.click:
+      css: "#open-upload-tab"
+  - browser.switch_tab:
+      url_contains: "/browser/upload/tab-form"
+    expect:
+      - path: $.title
+        equals: "Upload Tab Form"
+  - browser.upload:
+      text: "Tab file"
+      files: ["first.txt"]
+    expect:
+      - path: $.files
+        equals: 1
+      - path: $.names
+        equals: ["first.txt"]
+  - browser.read:
+      css: "#tab-events"
+    expect:
+      - path: $.text
+        equals: "tab-file:1:first.txt"
+"##,
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn upload_reports_a_missing_file_a_directory_and_a_wrong_target() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-upload-errors");
+    dir.write("first.txt", "first file\n");
+    dir.write("second.txt", "second file\n");
+    // A directory that exists, so the step must tell "not a file" from "missing".
+    dir.write("folder/inner.txt", "inner\n");
+
+    let cases = [
+        (
+            "missing-file.yaml",
+            r##"  - browser.upload:
+      css: "#single-file"
+      files: ["nope.txt"]
+"##,
+            "does not exist",
+        ),
+        (
+            "directory.yaml",
+            r##"  - browser.upload:
+      css: "#single-file"
+      files: ["folder"]
+"##,
+            "is not a regular file",
+        ),
+        (
+            "plain-div.yaml",
+            r##"  - browser.upload:
+      css: "#plain-div"
+      files: ["first.txt"]
+"##,
+            "the matched element is `<div>`, not an `<input type=\"file\">`",
+        ),
+        (
+            "text-input.yaml",
+            r##"  - browser.upload:
+      css: "#not-a-file-input"
+      files: ["first.txt"]
+"##,
+            "the matched element is `<input type=\"text\">`",
+        ),
+        (
+            "two-files-one-input.yaml",
+            r##"  - browser.upload:
+      css: "#single-file"
+      files: ["first.txt", "second.txt"]
+"##,
+            "no `multiple` attribute",
+        ),
+        (
+            "disabled.yaml",
+            r##"  - browser.upload:
+      css: "#disabled-file"
+      files: ["first.txt"]
+"##,
+            "is disabled",
+        ),
+        (
+            "disabled-fieldset.yaml",
+            r##"  - browser.upload:
+      css: "#fieldset-file"
+      files: ["first.txt"]
+"##,
+            "is disabled",
+        ),
+    ];
+
+    for (name, steps, fragment) in cases {
+        let output = run_upload_steps(dir.path(), name, &server.url("/browser/upload"), steps);
+        assert_eq!(
+            exit_code(&output),
+            Some(1),
+            "{name} must fail the case: stdout={}\nstderr={}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let value = json_stdout(&output);
+        let message = case_error(&value);
+        assert!(
+            message.contains(fragment),
+            "{name}: the message must contain {fragment:?}, got: {message}"
+        );
+        assert_eq!(
+            value["cases"][0]["error"]["kind"], "execution",
+            "{name}: the error must not be an environment failure: {value}"
+        );
+    }
+}
+
+#[test]
+fn upload_resolves_a_relative_path_against_the_case_file_and_the_form_sends_the_bytes() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-upload-form");
+    // The fixture lives only beside the case file: a run from the parent
+    // directory must still find it, which it can only do by resolving the path
+    // against the case file's directory.
+    let content = "avatar upload bytes \u{2603}\nsecond line\n";
+    dir.write("sub/avatar.txt", content);
+    let case = dir.write(
+        "sub/upload.yaml",
+        &format!(
+            r##"name: upload form
+steps:
+  - browser.open:
+      url: "{url}"
+  - browser.upload:
+      text: "Choose avatar"
+      files: ["avatar.txt"]
+    expect:
+      - path: $.files
+        equals: 1
+      - path: $.names
+        equals: ["avatar.txt"]
+  - browser.read:
+      css: "#file-events"
+    expect:
+      - path: $.text
+        equals: "avatar-file:1:avatar.txt"
+  - browser.click:
+      css: "#send-avatar"
+  - browser.read:
+      css: "#upload-received"
+    expect:
+      - path: $.text
+        equals: "received"
+"##,
+            url = server.url("/browser/upload/form")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let posted = server
+        .requests()
+        .into_iter()
+        .find(|request| request.method == "POST" && request.path() == "/browser/upload/submit")
+        .unwrap_or_else(|| {
+            panic!(
+                "the submitted form must reach the server: {}",
+                server.timing_report()
+            )
+        });
+    assert!(
+        posted.body.contains("name=\"avatar\""),
+        "the form must submit the field the input names: {}",
+        posted.body
+    );
+    assert!(
+        posted.body.contains("filename=\"avatar.txt\""),
+        "the server must see the uploaded file name: {}",
+        posted.body
+    );
+    assert!(
+        posted.body.contains(content),
+        "the server must see the uploaded file's bytes: {:?}",
+        posted.body
     );
 }
 
