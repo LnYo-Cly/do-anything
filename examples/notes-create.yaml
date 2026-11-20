@@ -1,0 +1,63 @@
+name: Create a note and verify the page, the API and the database row
+vars:
+  base: http://127.0.0.1:3845
+  title: Agent proof note
+  body: Written through the accessibility snapshot only.
+  # The example app's PostgreSQL connection, taken from the environment so no
+  # credential lives in this file: export DA_TEST_POSTGRES_URL before linting or
+  # running this case.
+  db_url: ${env:DA_TEST_POSTGRES_URL}
+steps:
+  # --- UI layer: drive the real page -------------------------------
+  - browser.open:
+      url: ${base}
+  - browser.type:
+      name: Title
+      role: textbox
+      text: ${title}
+  - browser.type:
+      name: Content
+      role: textbox
+      text: ${body}
+  # Both Save buttons share the accessible name "Save"; the form is the
+  # unique container. The export produced a structural CSS path here.
+  - browser.click:
+      role: button
+      name: Save
+      within:
+        role: form
+  # Saving starts a request, so wait for the status line instead of reading it.
+  - browser.wait:
+      text: "Saved: ${title}"
+  - browser.read:
+      role: status
+    expect:
+      # `expect` values are literal: `${title}` is not interpolated here.
+      - path: "$.text"
+        equals: "Saved: Agent proof note"
+  # --- HTTP layer: the API serves the same record -------------------
+  - http.request:
+      url: ${base}/api/notes
+    expect:
+      - path: "$.status"
+        equals: 200
+      - path: "$.body.notes[?(@.title == 'Agent proof note')].title"
+        equals: Agent proof note
+      - path: "$.body.notes[?(@.title == 'Agent proof note')].body"
+        equals: Written through the accessibility snapshot only.
+      - path: "$.body.notes[?(@.title == 'Agent proof note')].status"
+        equals: active
+  # --- Database layer: the row really exists -----------------------
+  - db.query:
+      url: ${db_url}
+      sql: SELECT title, body, status FROM notes WHERE title = $1
+      params: ["${title}"]
+    expect:
+      - path: "$.row_count"
+        equals: 1
+      - path: "$.rows[0].title"
+        equals: Agent proof note
+      - path: "$.rows[0].body"
+        equals: Written through the accessibility snapshot only.
+      - path: "$.rows[0].status"
+        equals: active

@@ -1,0 +1,35 @@
+--- a/examples/notes/main.rs
++++ b/examples/notes/main.rs
+@@ -278,18 +278,20 @@
+         if title.is_empty() {
+             return json_response("400 Bad Request", &json!({"error": "title is required"}));
+         }
+-        let mut client = lock(state);
+-        // A title is unique, so saving the same title twice updates that note
+-        // instead of adding a second row: a case can be replayed unchanged.
+-        let sql = format!(
+-            "INSERT INTO notes (title, body) VALUES ($1, $2) \
+-             ON CONFLICT (title) DO UPDATE SET body = EXCLUDED.body, status = 'active' \
+-             RETURNING {NOTE_COLUMNS}"
+-        );
+-        match client.query_one(&sql, &[&title, &body]) {
+-            Ok(row) => json_response("201 Created", &json!({ "note": note_json(&row) })),
+-            Err(error) => database_error(&error),
+-        }
++        // DELIBERATE BUG, prepared for the usage proof: the save path reports
++        // success without writing the row.
++        let _guard = lock(state);
++        json_response(
++            "201 Created",
++            &json!({ "note": {
++                "id": 0,
++                "title": title,
++                "body": body,
++                "status": "active",
++                "pinned": false,
++                "created_at": ""
++            } }),
++        )
+     }
+ 
+     fn pin_note(state: &State, id: i64) -> Result<Option<Value>, postgres::Error> {

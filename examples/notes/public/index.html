@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Team Notes</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; padding: 32px 20px; background: #f6f4ef; color: #22201d; }
+    main { max-width: 760px; margin: 0 auto; display: grid; gap: 20px; }
+    h1 { margin: 0 0 4px; font-size: 1.9rem; }
+    .subtitle { margin: 0; color: #5b564f; font-size: 0.95rem; }
+    .card { background: #fff; border: 1px solid #dbd5ca; border-radius: 8px; padding: 18px 20px; }
+    .card h2 { margin: 0 0 12px; font-size: 1.15rem; }
+    .field { display: grid; gap: 6px; margin-bottom: 12px; }
+    label { font-weight: 600; font-size: 0.9rem; }
+    input[type="text"], textarea {
+      width: 100%; box-sizing: border-box; padding: 8px 10px;
+      border: 1px solid #c8c0b4; border-radius: 6px; font: inherit;
+    }
+    textarea { min-height: 72px; resize: vertical; }
+    button {
+      cursor: pointer; border: 1px solid #2c5282; background: #2c5282; color: #fff;
+      border-radius: 6px; padding: 8px 14px; font: inherit; font-weight: 600;
+    }
+    button.secondary { background: #fff; color: #2c5282; }
+    button.pin-btn { background: #f2efe9; color: #3a3630; border-color: #c8c0b4; padding: 4px 10px; font-size: 0.85rem; }
+    .status { min-height: 1.3em; margin: 10px 0 0; font-size: 0.9rem; color: #276749; }
+    .status.error { color: #9b2c2c; }
+    ul.notes { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+    li.note-item {
+      border: 1px solid #e5dfd5; border-radius: 6px; padding: 12px 14px;
+      display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
+    }
+    .note-title { font-weight: 700; margin: 0 0 4px; }
+    .note-body { margin: 0; color: #4a453f; font-size: 0.92rem; }
+    .note-meta { font-size: 0.8rem; color: #6e675e; margin-top: 4px; }
+    .prefs-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Team Notes</h1>
+      <p class="subtitle">Local notes board backed by an HTTP API and a PostgreSQL table.</p>
+    </header>
+
+    <div class="card">
+      <h2>New Note</h2>
+      <form class="note-form">
+        <div class="field">
+          <label for="note-title">Title</label>
+          <input id="note-title" name="title" type="text" required placeholder="Short summary">
+        </div>
+        <div class="field">
+          <label for="note-body">Content</label>
+          <textarea id="note-body" name="body" placeholder="Write details..."></textarea>
+        </div>
+        <button type="submit">Save</button>
+      </form>
+      <p role="status" class="status" data-testid="form-status"></p>
+    </div>
+
+    <div class="card">
+      <h2>Saved Notes</h2>
+      <ul class="notes" data-testid="notes-list"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Display Preferences</h2>
+      <div class="prefs-row">
+        <label><input type="checkbox" id="compact-mode"> Compact list view</label>
+        <button type="button" class="secondary">Save</button>
+      </div>
+      <p class="subtitle" id="prefs-status"></p>
+    </div>
+  </main>
+
+  <script>
+    const listEl = document.querySelector('[data-testid="notes-list"]');
+    const formEl = document.querySelector('.note-form');
+    const titleEl = document.getElementById('note-title');
+    const bodyEl = document.getElementById('note-body');
+    const statusEl = document.querySelector('[data-testid="form-status"]');
+    const prefsBtn = document.querySelector('.prefs-row button');
+    const compactEl = document.getElementById('compact-mode');
+    const prefsStatusEl = document.getElementById('prefs-status');
+
+    function renderNote(note) {
+      const li = document.createElement('li');
+      li.className = 'note-item';
+
+      const content = document.createElement('div');
+      const title = document.createElement('p');
+      title.className = 'note-title';
+      title.textContent = note.pinned ? `${note.title} [Pinned]` : note.title;
+
+      const body = document.createElement('p');
+      body.className = 'note-body';
+      body.textContent = note.body || '';
+
+      const meta = document.createElement('div');
+      meta.className = 'note-meta';
+      meta.textContent = `status: ${note.status}`;
+
+      content.appendChild(title);
+      content.appendChild(body);
+      content.appendChild(meta);
+
+      const pinBtn = document.createElement('button');
+      pinBtn.type = 'button';
+      pinBtn.className = 'pin-btn';
+      pinBtn.textContent = 'Pin';
+      pinBtn.addEventListener('click', async () => {
+        const res = await fetch(`/api/notes/${note.id}/pin`, { method: 'POST' });
+        if (res.ok) {
+          await loadNotes();
+        }
+      });
+
+      li.appendChild(content);
+      li.appendChild(pinBtn);
+      return li;
+    }
+
+    async function loadNotes() {
+      const res = await fetch('/api/notes');
+      const data = await res.json();
+      listEl.innerHTML = '';
+      for (const note of data.notes) {
+        listEl.appendChild(renderNote(note));
+      }
+    }
+
+    formEl.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      statusEl.className = 'status';
+      statusEl.textContent = '';
+
+      const res = await fetch('/api/notes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ title: titleEl.value, body: bodyEl.value }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        statusEl.className = 'status error';
+        statusEl.textContent = data.error || 'Failed to save note';
+        return;
+      }
+
+      statusEl.textContent = `Saved: ${data.note.title}`;
+      titleEl.value = '';
+      bodyEl.value = '';
+      await loadNotes();
+    });
+
+    prefsBtn.addEventListener('click', () => {
+      prefsStatusEl.textContent = compactEl.checked ? 'Compact view enabled' : 'Standard view enabled';
+    });
+
+    loadNotes();
+  </script>
+</body>
+</html>

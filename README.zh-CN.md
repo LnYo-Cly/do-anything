@@ -150,6 +150,7 @@ HTML 是自包含的，离线可打开。`--shareable` 不嵌入任何截图，`
 | 交互式探测与用例导出 | `da session start \| step \| snapshot \| export \| stop`：跨命令保持会话状态并导出可重放的 YAML 用例 |
 | 宿主没有 shell | `da mcp`：把同一套会话协议以 6 个 MCP 工具暴露在标准输入输出上，参数不合法时直接返回该步骤的 JSON Schema |
 | 机器可读的用例格式 | `da schema`：包含所有已注册步骤的 JSON Schema，编辑器也能直接使用 |
+| Agent 技能文件 | [skills/do-anything/SKILL.md](skills/do-anything/SKILL.md)：供编程 Agent 加载的精简操作指南（探索、导出、重放与读取失败包） |
 
 完整说明见[使用指南](docs/guide.md)：[用例格式](docs/guide.md#case-files)、[输出](docs/guide.md#output)、[失败包](docs/guide.md#failure-bundles)、[用例检查](docs/guide.md#linting)、[Schema](docs/guide.md#schema)、[退出码](docs/guide.md#exit-codes)。使用指南目前只有英文版。
 
