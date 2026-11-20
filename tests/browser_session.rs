@@ -1956,3 +1956,150 @@ fn session_steps_and_export_preserve_within_iframe_while_snapshot_stays_main_fra
     );
     assert_eq!(replay.status.code(), Some(0), "{:?}", replay);
 }
+
+#[test]
+fn session_step_uploads_files_through_a_ref_and_exports_a_replayable_step() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "/upload".to_string(),
+        r##"<!doctype html>
+<html>
+<head><title>Session Upload</title></head>
+<body>
+  <label for="avatar-file">Avatar</label>
+  <input id="avatar-file" name="avatar" type="file">
+  <p id="file-events">idle</p>
+  <script>
+  var avatarNode = document.getElementById('avatar-file');
+  var avatarEvents = document.getElementById('file-events');
+  avatarNode.addEventListener('change', function () {
+    var names = [];
+    for (var i = 0; i < avatarNode.files.length; i++) names.push(avatarNode.files[i].name);
+    avatarEvents.textContent = 'avatar-file:' + avatarNode.files.length + ':' + names.join(',');
+  });
+  </script>
+</body>
+</html>"##
+            .to_string(),
+    );
+    let server = PageServer::start(routes);
+    let dir = TempDir::new("browser-session-upload");
+    // `da session` resolves a relative `files` path against the working
+    // directory, and the exported case is replayed from the same directory.
+    dir.write("avatar.txt", "session avatar bytes\n");
+
+    let id = json_stdout(&run_da_in(dir.path(), &["session", "start"]))["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/upload")),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{:?}", open);
+    let tree = json_stdout(&open)["snapshot"]["tree"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let avatar_ref = find_ref_by_role_and_name(&tree, "button", "Avatar")
+        .unwrap_or_else(|| panic!("the file input must be in the snapshot: {tree:?}"));
+
+    let upload = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.upload",
+            "--arg",
+            &format!("ref={avatar_ref}"),
+            "--arg",
+            "files=[\"avatar.txt\"]",
+        ],
+    );
+    assert_eq!(
+        upload.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&upload.stdout),
+        String::from_utf8_lossy(&upload.stderr)
+    );
+    let upload_json = json_stdout(&upload);
+    assert_eq!(
+        upload_json["step"]["result"]["files"],
+        json!(1),
+        "{upload_json}"
+    );
+    assert_eq!(
+        upload_json["step"]["result"]["names"],
+        json!(["avatar.txt"]),
+        "{upload_json}"
+    );
+
+    // The page's own change handler saw the file, which proves Chrome fired the
+    // events for the CDP file assignment.
+    let read = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.read:\n  css: \"#file-events\"\nexpect:\n  - path: $.text\n    equals: \"avatar-file:1:avatar.txt\"\n",
+    );
+    assert_eq!(read.status.code(), Some(0), "{:?}", read);
+
+    // Export replaces the ref with the synthesized locator and keeps `files`.
+    let exported_path = dir.path().join("avatar-flow.yaml");
+    let export = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "export",
+            &id,
+            "-o",
+            exported_path.to_str().unwrap(),
+            "--name",
+            "Session upload replay",
+        ],
+    );
+    assert_eq!(export.status.code(), Some(0), "{:?}", export);
+    let yaml = fs::read_to_string(&exported_path).expect("read exported YAML");
+    assert!(
+        !yaml.contains("ref:"),
+        "exported YAML must not contain a ref:\n{yaml}"
+    );
+    assert!(
+        yaml.contains("browser.upload") && yaml.contains("avatar.txt"),
+        "exported YAML must keep the upload step and its files:\n{yaml}"
+    );
+
+    let lint = run_da_in(dir.path(), &["lint", exported_path.to_str().unwrap()]);
+    assert_eq!(
+        lint.status.code(),
+        Some(0),
+        "exported YAML failed lint: {}",
+        String::from_utf8_lossy(&lint.stdout)
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{:?}", stop);
+
+    let replay = run_da_in(
+        dir.path(),
+        &["run", exported_path.to_str().unwrap(), "--no-bundle"],
+    );
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "exported YAML failed da run replay: {}",
+        String::from_utf8_lossy(&replay.stdout)
+    );
+}

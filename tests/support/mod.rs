@@ -465,6 +465,14 @@ fn route(
         ),
         (_, "/browser/probe/upload") => html_response("200 OK", browser_probe_upload()),
         (_, "/browser/probe/coords") => html_response("200 OK", browser_probe_coords()),
+        // The file-upload pages: controls for every locator and error, a form
+        // whose submission carries the chosen file's bytes back here, and the
+        // page a submitted form lands on.
+        (_, "/browser/upload") => html_response("200 OK", browser_upload()),
+        (_, "/browser/upload/form") => html_response("200 OK", browser_upload_form()),
+        ("POST", "/browser/upload/submit") => html_response("200 OK", browser_upload_received()),
+        (_, "/browser/upload/tab") => html_response("200 OK", browser_upload_tab()),
+        (_, "/browser/upload/tab-form") => html_response("200 OK", browser_upload_tab_form()),
         (_, "/browser/record") => html_response("200 OK", &browser_record(query)),
         (_, "/browser/second") => html_response("200 OK", &browser_second(query)),
         // Headers and the start of the page arrive, but the document never
@@ -1827,10 +1835,130 @@ fn browser_dialogs_retry() -> &'static str {
 }
 
 fn browser_probe_upload() -> &'static str {
+    // The probe is honest about both halves: typing into a file input attaches
+    // nothing, and `browser.upload` is the step that does attach a file.
     r#"<!doctype html>
 <html><head><title>Probe File Upload</title></head>
 <body>
 <input id="file-upload" type="file">
+<p id="file-upload-events">idle</p>
+<script>
+var probeNode = document.getElementById('file-upload');
+var probeEvents = document.getElementById('file-upload-events');
+probeNode.addEventListener('change', function () {
+  probeEvents.textContent = 'change:' + probeNode.files.length;
+});
+</script>
+</body></html>"#
+}
+
+/// The page whose file inputs cover every locator and every refusal.
+///
+/// `#single-picker` holds exactly one file input, so a `role` locator scoped by
+/// `within` resolves without a name: Chrome's accessibility query matches the
+/// input by role but not by its label-derived name.
+fn browser_upload() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Upload Controls</title></head>
+<body>
+<div id="single-picker">
+  <label for="single-file">Single file</label>
+  <input id="single-file" name="single" type="file">
+</div>
+<label for="hidden-file">Choose avatar</label>
+<input id="hidden-file" name="hidden" type="file" style="display:none">
+<input id="faded-file" name="faded" type="file" multiple style="opacity:0;position:absolute;left:0;top:0;width:0;height:0">
+<input id="multi-file" name="multi" type="file" multiple>
+<div id="picker">
+  <input id="nested-one" name="nested" type="file" data-testid="nested-file">
+  <input id="nested-two" name="nested" type="file" data-testid="nested-file">
+</div>
+<input id="not-a-file-input" name="typed" type="text">
+<div id="plain-div">plain</div>
+<input id="disabled-file" name="disabled" type="file" disabled>
+<fieldset disabled><input id="fieldset-file" name="fieldset" type="file"></fieldset>
+<div id="shadow-host"></div>
+<p id="file-events">idle</p>
+<script>
+var uploadEvents = document.getElementById('file-events');
+var uploadInputs = document.querySelectorAll('input[type="file"]');
+for (var i = 0; i < uploadInputs.length; i++) {
+  uploadInputs[i].addEventListener('change', (function (node) {
+    return function () {
+      var names = [];
+      for (var j = 0; j < node.files.length; j++) names.push(node.files[j].name);
+      uploadEvents.textContent = node.id + ':' + node.files.length + ':' + names.join(',');
+    };
+  })(uploadInputs[i]));
+}
+var uploadShadowRoot = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
+uploadShadowRoot.innerHTML = '<label for="shadow-file">Shadow file</label>' +
+  '<input id="shadow-file" name="shadow" type="file">';
+uploadShadowRoot.getElementById('shadow-file').addEventListener('change', function () {
+  var shadowNames = [];
+  for (var k = 0; k < this.files.length; k++) shadowNames.push(this.files[k].name);
+  uploadEvents.textContent = 'shadow-file:' + this.files.length + ':' + shadowNames.join(',');
+});
+</script>
+</body></html>"#
+}
+
+/// A form that submits the chosen file, so the server receives its bytes.
+fn browser_upload_form() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Upload Form</title></head>
+<body>
+<form id="upload-form" method="post" enctype="multipart/form-data" action="/browser/upload/submit">
+  <label for="avatar-file">Choose avatar</label>
+  <input id="avatar-file" name="avatar" type="file">
+  <button id="send-avatar" type="submit">Send</button>
+</form>
+<p id="file-events">idle</p>
+<script>
+var avatarNode = document.getElementById('avatar-file');
+var avatarEvents = document.getElementById('file-events');
+avatarNode.addEventListener('change', function () {
+  var names = [];
+  for (var i = 0; i < avatarNode.files.length; i++) names.push(avatarNode.files[i].name);
+  avatarEvents.textContent = 'avatar-file:' + avatarNode.files.length + ':' + names.join(',');
+});
+</script>
+</body></html>"#
+}
+
+/// The page a submitted upload form lands on.
+fn browser_upload_received() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Upload Received</title></head><body>
+<p id="upload-received">received</p>
+</body></html>"#
+}
+
+/// A page whose link opens the upload form in a second tab.
+fn browser_upload_tab() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Upload Tab Origin</title></head><body>
+<a id="open-upload-tab" href="/browser/upload/tab-form" target="_blank">Open Upload Tab</a>
+<p id="origin-events">idle</p>
+</body></html>"#
+}
+
+/// The tab `browser_upload_tab` opens: a file input and its change handler.
+fn browser_upload_tab_form() -> &'static str {
+    r#"<!doctype html>
+<html><head><title>Upload Tab Form</title></head><body>
+<label for="tab-file">Tab file</label>
+<input id="tab-file" name="tab" type="file">
+<p id="tab-events">idle</p>
+<script>
+var tabNode = document.getElementById('tab-file');
+var tabEvents = document.getElementById('tab-events');
+tabNode.addEventListener('change', function () {
+  var names = [];
+  for (var i = 0; i < tabNode.files.length; i++) names.push(tabNode.files[i].name);
+  tabEvents.textContent = 'tab-file:' + tabNode.files.length + ':' + names.join(',');
+});
+</script>
 </body></html>"#
 }
 

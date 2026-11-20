@@ -614,13 +614,13 @@ $ da session stop s-1794974416388-44376-0
   Generated hashes/utility tokens and digit-heavy IDs/classes are penalized or
   skipped.
 - **Dialogs**: `da session` steps use the same JavaScript-dialog handling as
-  `da run`. A `ref`-targeted `browser.click`, `browser.type`, `browser.wait` or
-  `browser.read` has no `dialog` argument, so an unexpected `alert`, `confirm`,
-  `prompt` or `beforeunload` is dismissed immediately and fails that step with
-  the dialog type and its redacted message. Take a fresh snapshot and retry
-  after the page settles. Locator-targeted `browser.open`, `browser.click`,
-  `browser.type`, `browser.press` and `browser.wait` steps accept `dialog` in a
-  session exactly as they do in a case file.
+  `da run`. A `ref`-targeted `browser.click`, `browser.type`, `browser.upload`,
+  `browser.wait` or `browser.read` has no `dialog` argument, so an unexpected
+  `alert`, `confirm`, `prompt` or `beforeunload` is dismissed immediately and
+  fails that step with the dialog type and its redacted message. Take a fresh
+  snapshot and retry after the page settles. Locator-targeted `browser.open`,
+  `browser.click`, `browser.type`, `browser.press` and `browser.wait` steps
+  accept `dialog` in a session exactly as they do in a case file.
 - **No `retry` in a session step**: `retry` polling belongs to the case runner
   (`da run` / `da lint`). A `da session step` with a `retry` block is rejected
   as an invalid-input error (exit 3) instead of silently ignoring the policy;
@@ -1224,10 +1224,10 @@ Only read-only steps may declare `retry`:
 
 State-changing steps — `http.request` with `POST`, `PUT`, `PATCH` or `DELETE`
 (or an unresolved variable method), `cli.run`, `browser.open`,
-`browser.click`, `browser.type`, `browser.press`, `browser.screenshot` and
-`browser.switch_tab` — are refused statically by `da lint` and before any step
-runs in `da run` (exit 3). `retry` is a reserved step field name, so no step may
-register under that name.
+`browser.click`, `browser.type`, `browser.upload`, `browser.press`,
+`browser.screenshot` and `browser.switch_tab` — are refused statically by
+`da lint` and before any step runs in `da run` (exit 3). `retry` is a reserved
+step field name, so no step may register under that name.
 
 Each polling iteration runs the step and any declared `observe` observers for
 that attempt, keeping only the last attempt's result and observations:
@@ -1532,6 +1532,7 @@ running and the user's other tabs are untouched.
 | `browser.open` | `url` required; optional `connect`, `profile`, `storage_state`, `testid_attribute` (defaults to `data-testid`), `dialog`; `headless` defaults to `true`; `width` and `height` default to 1280×800; `timeout_ms` defaults to 30000 | `url`, `title`; `dialog` when one opened |
 | `browser.click` | locator; optional `dialog` | `{}`, or the clicked element's `text` when it has one; `dialog` when one opened |
 | `browser.type` | locator; `text` required unless `value` is given; optional `dialog` | `{}`; `dialog` when one opened |
+| `browser.upload` | locator; `files` required (a list of local paths; `[]` clears the selection); `timeout_ms` defaults to 5000 | `files`, `names` |
 | `browser.press` | `key` required, for example `Enter` or `Tab`; optional `dialog` | `{}`; `dialog` when one opened |
 | `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000; optional `dialog` | `url`; `dialog` when one opened |
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
@@ -1618,7 +1619,9 @@ Before clicking or typing, `browser.click` and `browser.type` wait within
 
 If `timeout_ms` expires, the error names the check that failed — and when
 occluded, identifies the blocking element (tag, `id`, and snippet). `browser.read`
-and `browser.wait` only wait for existence and visibility.
+and `browser.wait` only wait for existence and visibility. `browser.upload` waits
+only for existence and an enabled input: a hidden file input is exactly what real
+pages use, so it never waits for the control to be painted.
 
 #### Frames (`iframe` and `frame`)
 
@@ -1796,6 +1799,61 @@ the page. A later `browser.open` that gives a different effective value is a ste
 error instead of being silently ignored, so one case cannot change the browser it
 is driving halfway through. `timeout_ms` applies to each navigation, so a later
 `browser.open` may choose a different value.
+
+#### Uploading files (`browser.upload`)
+
+`browser.upload` sets the files of an `<input type="file">` element through the
+DevTools protocol (`DOM.setFileInputFiles`), so Chrome fires the same `input` and
+`change` events a real file picker would. It returns `files` — how many files the
+input now holds — and `names`, their base names. Only the base names are
+returned, never the local directory, so a report stays portable.
+
+```yaml
+name: Submit an avatar
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/profile
+  - browser.upload:
+      text: Choose avatar
+      files: ["fixtures/avatar.png"]
+  - browser.click:
+      role: button
+      name: Save
+```
+
+- `files` is required. A relative path resolves against the directory that holds
+  the case file (under `da session`, the working directory), the same rule
+  `browser.screenshot` uses for `path`; an absolute path is used as given.
+- `files: []` clears the current selection. The step removes the files itself,
+  because Chrome leaves the old selection in place when an empty list is sent to
+  `DOM.setFileInputFiles`; it then dispatches `input` and `change`, so a page
+  that reacts to a clear sees one. An input that held nothing stays quiet.
+- Every locator works — `css`, `xpath`, `text`, `role` and `testid` — plus
+  `within`, `nth` and `timeout_ms`. The element must exist and be enabled, but it
+  does **not** have to be visible: `display: none`, `opacity: 0`, zero-size and
+  label-associated file inputs all work, because that is how real pages hide the
+  native control.
+- A file input inside an open shadow root is reached by `css`, `xpath` or
+  `testid` like any other shadow element, and the step always applies to the tab
+  the session is on: after `browser.switch_tab`, the upload targets the new tab's
+  input.
+- A locator that matches a `<label>` uploads to the control the label names, so
+  `text: "Choose avatar"` reaches the input it hides. This is the step's only
+  retargeting: every other element that is not an `<input type="file">` is
+  refused.
+- Chrome does not return file inputs for an accessibility query filtered by
+  accessible name, so a `role` locator reaches one by role alone; narrow it with
+  `within` or `nth` when the page has more than one file input.
+- `browser.upload` is not a click: nothing is opened, and the page's submit
+  button still has to be clicked to send the file.
+
+The step fails with a message that names what to change when a path does not
+exist, a path is a directory or another special file, the matched element is not
+an `<input type="file">` (the message names the tag and the input type), the
+input is disabled (its own attribute or an enclosing disabled `<fieldset>`), or
+more than one path is given for an input without the `multiple` attribute. Every
+path is checked by `da` before Chrome is asked, so a missing fixture is reported
+as itself instead of as an opaque browser error.
 
 #### Shadow DOM
 

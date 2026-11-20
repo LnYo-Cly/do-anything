@@ -180,6 +180,10 @@ fn rejects_retry_on_state_changing_browser_steps_and_accepts_read_and_wait() {
         "name: Type\nsteps:\n  - browser.type:\n      css: \"#in\"\n      text: hi\n    retry:\n      until:\n        - path: $.text\n          exists: false\n      timeout_ms: 500\n".to_string(),
     ));
     rejected.push((
+        "browser.upload",
+        "name: Upload\nsteps:\n  - browser.upload:\n      css: \"#file\"\n      files: [\"a.txt\"]\n    retry:\n      until:\n        - path: $.files\n          equals: 1\n      timeout_ms: 500\n".to_string(),
+    ));
+    rejected.push((
         "browser.press",
         "name: Press\nsteps:\n  - browser.press:\n      key: Enter\n    retry:\n      until:\n        - path: $.key\n          equals: Enter\n      timeout_ms: 500\n".to_string(),
     ));

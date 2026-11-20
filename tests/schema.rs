@@ -325,6 +325,7 @@ fn valid_arguments(step: &str) -> Value {
         "browser.open" => json!({"url": "http://127.0.0.1:1/"}),
         "browser.click" => json!({"css": "#name"}),
         "browser.type" => json!({"css": "#name", "text": "hello"}),
+        "browser.upload" => json!({"css": "#name", "files": ["fixture.txt"]}),
         "browser.press" => json!({"key": "Enter"}),
         "browser.wait" => json!({"css": "#name"}),
         "browser.read" => json!({"css": "#name"}),
@@ -1155,6 +1156,81 @@ fn browser_storage_state_schema_match_validate() {
         assert!(
             !validator.is_valid(&instance),
             "browser.save_state ({label}) must fail schema: {instance}"
+        );
+    }
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn browser_upload_schema_match_validate() {
+    let validator = validator(schema());
+
+    let uploads = json!({
+        "name": "Upload an avatar",
+        "steps": [{
+            "browser.upload": {
+                "css": "#avatar",
+                "files": ["fixtures/avatar.png"]
+            }
+        }]
+    });
+    assert!(
+        validator.is_valid(&uploads),
+        "a valid browser.upload must validate: {uploads}"
+    );
+
+    for locator in [
+        json!({"xpath": "//*[@id='avatar']"}),
+        json!({"text": "Choose avatar"}),
+        json!({"role": "button"}),
+        json!({"testid": "avatar"}),
+    ] {
+        let mut instance = uploads.clone();
+        instance["steps"][0]["browser.upload"] = locator.clone();
+        instance["steps"][0]["browser.upload"]["files"] = json!(["fixtures/avatar.png"]);
+        assert!(
+            validator.is_valid(&instance),
+            "every locator form must validate with files: {instance}"
+        );
+    }
+
+    let clearing = json!({
+        "name": "Clear the selection",
+        "steps": [{ "browser.upload": { "css": "#avatar", "files": [] } }]
+    });
+    assert!(
+        validator.is_valid(&clearing),
+        "an empty files list clears the input and must validate: {clearing}"
+    );
+
+    for (label, bad_args) in [
+        ("missing files", json!({"css": "#avatar"})),
+        ("null files", json!({"css": "#avatar", "files": null})),
+        ("empty path", json!({"css": "#avatar", "files": [""]})),
+        (
+            "two locators",
+            json!({"css": "#avatar", "testid": "avatar", "files": ["a.txt"]}),
+        ),
+        (
+            "name without role",
+            json!({"name": "Avatar", "files": ["a.txt"]}),
+        ),
+        (
+            "zero timeout",
+            json!({"css": "#avatar", "files": ["a.txt"], "timeout_ms": 0}),
+        ),
+        (
+            "unknown argument",
+            json!({"css": "#avatar", "files": ["a.txt"], "accept": "*/*"}),
+        ),
+    ] {
+        let instance = json!({
+            "name": "Invalid upload",
+            "steps": [{ "browser.upload": bad_args }]
+        });
+        assert!(
+            !validator.is_valid(&instance),
+            "browser.upload ({label}) must fail schema: {instance}"
         );
     }
 }
