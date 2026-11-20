@@ -30,7 +30,9 @@ use serde_json::{Value, json};
 use self::adb::Adb;
 use self::dump::{Filter, Node, ResolveError};
 use crate::core::paths;
-use crate::core::registry::{Registry, StepDefinition, StepError, allow_retry, disallow_retry};
+use crate::core::registry::{
+    Registry, StepDefinition, StepError, allow_retry, disallow_retry, no_lint_warnings,
+};
 use crate::core::session::Sessions;
 
 /// Step names, in the order they are registered.
@@ -171,6 +173,7 @@ fn step<T: JsonSchema>(
         args_schema,
         validate,
         check_retry: disallow_retry,
+        lint_warnings: no_lint_warnings,
         run,
     })
 }
@@ -567,35 +570,66 @@ fn start_component(adb: &Adb, component: &str, package: Option<&str>) -> Result<
     }))
 }
 
+/// Trims a device message for an error: first non-empty line, bounded length.
+fn excerpt(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(200).collect())
+        .unwrap_or_default()
+}
+
 /// Starts a package's launcher activity.
 ///
-/// `am start` needs a component, so a package without an `activity` is started
-/// with `monkey` and the same `MAIN`/`LAUNCHER` intent, which resolves the entry
-/// point on the device. A case that needs a different entry point passes
-/// `activity` and reaches `am start` directly.
+/// `am start` needs a component, so a package without an `activity` is resolved
+/// on the device with `cmd package resolve-activity` and then started with
+/// `am start -W -n`. Resolution is used instead of `monkey` because `monkey` is
+/// absent from container Android images, where it fails with an unhelpful
+/// argument dump. A case that needs a different entry point passes `activity`
+/// and reaches `am start` directly.
 fn launch_package(adb: &Adb, package: &str) -> Result<Value, StepError> {
     let action = format!("launch package `{package}`");
-    let output = adb.shell(
+    let resolved = adb.shell(
         &[
-            "monkey",
-            "-p",
-            package,
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
             "-c",
             "android.intent.category.LAUNCHER",
-            "1",
+            package,
         ],
-        &action,
+        &format!("resolve the launcher activity of `{package}`"),
     )?;
+    let component = resolved
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| line.contains('/'))
+        .unwrap_or_default()
+        .to_string();
+    if component.is_empty() {
+        let detail = excerpt(&resolved);
+        return Err(StepError::Execution(format!(
+            "could not {action}: the device resolved no launcher activity for it; check the package name, or pass `activity` to name the activity to start{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" (the device said: {detail})")
+            }
+        )));
+    }
+    let output = adb.shell(&["am", "start", "-W", "-n", &component], &action)?;
     if let Some(line) = output
         .lines()
         .map(str::trim)
-        .find(|line| line.contains("aborted") || line.contains("No activities found"))
+        .find(|line| line.contains("Error") || line.contains("does not exist"))
     {
         return Err(StepError::Execution(format!(
-            "could not {action}: the device found no launcher activity for it; check the package name, or pass `activity` to name the activity to start (the device said: {line})"
+            "could not {action}: the device refused to start `{component}` (it said: {line})"
         )));
     }
-    Ok(json!({ "package": package, "component": Value::Null }))
+    Ok(json!({ "package": package, "component": component }))
 }
 
 /// Fails when the device printed an error while the command still exited 0.

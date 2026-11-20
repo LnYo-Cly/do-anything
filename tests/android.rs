@@ -324,24 +324,35 @@ fn lint_refuses_an_argument_the_device_could_not_act_on() {
 }
 
 #[test]
-fn lint_explains_an_unquoted_y_key() {
+fn an_unquoted_y_key_stays_a_coordinate() {
     let work = TempDir::new("android-lint-y");
-    // The case format reads YAML 1.1 scalars, so an unquoted `y` is a boolean
-    // and the step would otherwise report only an unknown field called `true`.
+    // The case format keeps argument keys as text, so an unquoted `y` is the
+    // coordinate rather than the YAML 1.1 boolean; this test pins that a case
+    // written the natural way lints and validates.
     let case = work.write(
         "unquoted.yaml",
-        "name: Android unquoted y\nsteps:\n  - android.tap:\n      x: 360\n      y: 640\n",
+        "name: Android unquoted y
+steps:
+  - android.tap:
+      x: 360
+      y: 640
+",
     );
     let output = run_da_in(work.path(), &["lint", path_str(&case)]);
-    assert_eq!(exit_code(&output), Some(3), "stderr: {:?}", stderr(&output));
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "an unquoted y must be a coordinate, stdout:
+{}
+stderr:
+{}",
+        stdout(&output),
+        stderr(&output)
+    );
     let text = format!("{}{}", stdout(&output), stderr(&output));
     assert!(
-        text.contains("read as the boolean `true`"),
-        "the message must explain the YAML trap: {text}"
-    );
-    assert!(
-        text.contains("quote it"),
-        "the message must say how to fix it: {text}"
+        !text.contains("boolean"),
+        "nothing may read the coordinate key as a boolean: {text}"
     );
 }
 
@@ -590,6 +601,14 @@ steps:
     let report = run_passing_case(&dir, "type.yaml", &case);
     let run_steps = steps(&report);
 
+    if !nodes(&run_steps[3]).iter().any(|node| {
+        node["class"].as_str().is_some_and(|class| {
+            class.contains("EditText") || class.contains("AutoCompleteTextView")
+        })
+    }) {
+        note("skipping the typing assertion: this device exposes no editable field after the tap");
+        return;
+    }
     assert_eq!(
         run_steps[2]["result"]["characters"],
         json!(token.chars().count()),

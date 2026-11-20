@@ -2567,7 +2567,7 @@ loading is a `retry` on the dump.
 an activity is named. `-W` waits until the launch finishes, so the step after
 the launch sees the screen it produced. `am start` needs a component, so a
 package alone is started through the same `MAIN`/`LAUNCHER` intent with
-`monkey -p`, which resolves the launcher activity on the device; pass `activity`
+`cmd package resolve-activity`, which resolves the launcher activity on the device, and then `am start -W -n` on the resolved component; pass `activity`
 when the entry point is not the launcher, or when the next step must wait for
 the first screen. `am start` exits 0 even when it refuses a component, so a
 device answer containing `Error:` fails the step instead of passing it.
@@ -2622,8 +2622,8 @@ steps:
 
 Two YAML details matter here. A step with no required argument is written as
 `android.dump: {}`, because an empty step value is not a mapping. And the case
-format reads YAML 1.1 scalars, where an unquoted `y`, `Y`, `n`, `N`, `yes`, `no`,
-`on` or `off` is a boolean, so the vertical pixel is written with quotes:
+format keeps argument keys as text, so an unquoted `y` is the vertical pixel
+rather than the YAML 1.1 boolean; both spellings are read the same way:
 
 ```yaml
 - android.tap:
@@ -2631,8 +2631,7 @@ format reads YAML 1.1 scalars, where an unquoted `y`, `Y`, `n`, `N`, `yes`, `no`
     "y": 640
 ```
 
-`da lint` explains that trap when it is hit instead of reporting an unknown
-field called `true`. The same rule applies to values: type the letter `y` as
+The same rule applies to values: type the letter `y` as
 `text: "y"`.
 
 #### When there is no device
