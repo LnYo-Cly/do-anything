@@ -78,6 +78,9 @@ const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 
 /// Environment variable that overrides the default navigation budget.
 const NAVIGATION_TIMEOUT_ENV: &str = "DA_BROWSER_NAVIGATION_TIMEOUT_MS";
+
+/// Environment variable that overrides the browser launch budget.
+const LAUNCH_TIMEOUT_ENV: &str = "DA_BROWSER_LAUNCH_TIMEOUT_MS";
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 800;
 /// How long starting the browser and opening its page may take.
@@ -1203,6 +1206,18 @@ fn default_navigation_timeout_ms() -> u64 {
 /// configurable through `DA_BROWSER_NAVIGATION_TIMEOUT_MS`. An unset, malformed
 /// or implausible value falls back to the built-in default instead of failing a
 /// case: the variable is an operator knob, not case content.
+fn launch_timeout() -> Duration {
+    static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+        std::env::var(LAUNCH_TIMEOUT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|value| (1_000..=600_000).contains(value))
+            .map(Duration::from_millis)
+            .unwrap_or(LAUNCH_TIMEOUT)
+    });
+    *TIMEOUT
+}
+
 fn navigation_timeout_default() -> u64 {
     static TIMEOUT: LazyLock<u64> = LazyLock::new(|| {
         std::env::var(NAVIGATION_TIMEOUT_ENV)
@@ -2651,7 +2666,7 @@ impl BrowserSession {
 
     /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
-        let deadline = Deadline::after(LAUNCH_TIMEOUT);
+        let deadline = Deadline::after(launch_timeout());
         let (browser, (connection, page, tabs)) = launch_browser_with_retry(
             deadline,
             MAX_LAUNCH_ATTEMPTS,
@@ -2711,11 +2726,11 @@ impl BrowserSession {
     /// Attaches a page in a browser the user already runs.
     fn connect_to(endpoint: &Endpoint, testid_attribute: Option<&str>) -> Result<Self, String> {
         let websocket_url = endpoint.websocket_url(connect::CONNECT_TIMEOUT)?;
-        let mut connection = Connection::connect(&websocket_url, Deadline::after(LAUNCH_TIMEOUT))
+        let mut connection = Connection::connect(&websocket_url, Deadline::after(launch_timeout()))
             .map_err(|error| {
-            endpoint.explain(format!("could not open the DevTools connection: {error}"))
-        })?;
-        let deadline = Deadline::after(LAUNCH_TIMEOUT);
+                endpoint.explain(format!("could not open the DevTools connection: {error}"))
+            })?;
+        let deadline = Deadline::after(launch_timeout());
         let (page, target_id) = attach(&mut connection, deadline)?;
         let tabs = tabs::Tabs::start(
             &mut connection,
