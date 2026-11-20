@@ -1694,6 +1694,65 @@ same size. The YAML key `y` is written unquoted and read as written: `da` keeps
 mapping keys as text instead of applying YAML 1.1 boolean inference, so
 `y: 50` is the vertical coordinate, not `true`.
 
+#### Coordinates from an outside model
+
+`da` has no model and never interprets the pixels of a page. A caller that
+already has one — its own model or tool — keeps it outside and passes the answer
+in through a coordinate step. The loop has three parts, and only the first and
+the last are steps of the case:
+
+1. `browser.screenshot` writes a PNG of the page to `path`, resolved against the
+   directory that holds the case file, and returns the `path` and the number of
+   `bytes` written.
+2. The caller's own model or tool reads that PNG and computes a point in it.
+3. `browser.click` or `browser.type` acts on that point given as
+   `at: { x, y, viewport }`, with `viewport` recording the size the point was
+   measured at. A coordinate `browser.type` clicks the point to focus it and
+   then types `text`.
+
+Record the viewport with the point. Before acting, the step reads the page's live
+CSS viewport and, when the recorded and the live size differ, fails with both
+sizes in the message instead of clicking whatever now sits at that position.
+`at: { x, y }` without `viewport` still clicks, but then no size is compared and
+`da lint` warns about that as well (see [Coordinates](#coordinates)).
+
+```yaml
+name: Mark the canvas point
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/editor
+  # 1. capture the page; the PNG lands beside the case file
+  - browser.screenshot:
+      path: canvas.png
+  # 2. an outside model or tool reads canvas.png and returns 640, 400
+  # 3. click that point at the size it was measured at
+  - browser.click:
+      at:
+        x: 640
+        y: 400
+        viewport: { width: 1280, height: 800 }
+```
+
+The point is in CSS pixels, the unit `at.x` and `at.y` take. `da` stops at the
+coordinate: it never parses the image it wrote, never checks that a guessed point
+landed on a target, and never retries or adjusts it. A coordinate step acts once,
+at the numbers it was given; the argument rules and the recorded-versus-live
+viewport check above are the only guards. Whether the click hit what the image
+showed is the caller's to assert — with `expect` on the step result, a
+`browser.read`, or another `browser.screenshot` sent back to the model. Because
+the case records the point and not the model, replaying it at the same size
+repeats the same click.
+
+`da lint` accepts the case above and reports the coordinate warning quoted under
+[Coordinates](#coordinates), at the line and column of the step's arguments,
+with `Checked 1 file: 0 errors, 1 warning.` on standard output and exit 0. The
+warning stays when `viewport` is recorded: the recorded size turns a different
+window into a failure instead of a wrong click, but it does not make the point
+follow a layout change, a translated page or a zoom, so a reader of the case
+still has to know that the step is pinned to one window and one layout. It goes
+away only when the target can be named with `css`, `xpath`, `text`, `role` or
+`testid` instead.
+
 #### Strict unique matching
 
 Without `nth`, every locator must match **exactly one** candidate element —
