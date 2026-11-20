@@ -3218,7 +3218,8 @@ fn unsupported_capabilities_probe_current_behavior() {
         stderr(&shadow_role_out)
     );
 
-    // 3. new tab (target="_blank" opens a second tab, session stays on original tab)
+    // 3. new tab (target="_blank" opens a second tab; the session stays on the
+    //    original tab until `browser.switch_tab` names the new one)
     let new_tab_case = dir.write(
         "probe-new-tab.yaml",
         &format!(
@@ -3247,7 +3248,34 @@ fn unsupported_capabilities_probe_current_behavior() {
     let new_tab_err = case_error(&new_tab_json);
     assert!(
         new_tab_err.contains("could not find CSS selector `#new-tab-marker`"),
-        "unexpected new-tab probe error: {new_tab_err}"
+        "a click that opens a tab must not move the session by itself: {new_tab_err}"
+    );
+
+    // The same page after an explicit switch: the tab the click opened is the
+    // one every later step then drives.
+    let switched_case = dir.write(
+        "probe-new-tab-switched.yaml",
+        &format!(
+            "name: probe new tab switched\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.click:\n      css: \"#open-new-tab\"\n  - browser.switch_tab:\n      url_contains: \"/browser/probe/new-tab-target\"\n  - browser.read:\n      css: \"#new-tab-marker\"\n    expect:\n      - path: $.text\n        equals: \"Opened\"\n",
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+    let switched_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&switched_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&switched_out),
+        Some(0),
+        "switching to the opened tab must reach its content: stdout={}\nstderr={}",
+        stdout(&switched_out),
+        stderr(&switched_out)
     );
 
     // 4. dialog (window.alert fails fast with dialog type and message instead of waiting for timeout)
@@ -3348,6 +3376,702 @@ fn unsupported_capabilities_probe_current_behavior() {
     assert!(
         coords_err.contains("unknown field `x`"),
         "unexpected coords probe error: {coords_err}"
+    );
+}
+
+#[test]
+fn switch_tab_selects_a_tab_by_url_and_switches_back_by_title() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-switch-tab-select");
+    let case = dir.write(
+        "switch-select.yaml",
+        &format!(
+            r##"name: switch by url and back by title
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#open-new-tab"
+  - browser.switch_tab:
+      url_contains: "/browser/probe/new-tab-target"
+    expect:
+      - path: $.url
+        contains: "/browser/probe/new-tab-target"
+      - path: $.title
+        equals: "New Tab Target"
+  - browser.read:
+      css: "#new-tab-marker"
+    expect:
+      - path: $.text
+        equals: "Opened"
+  - browser.switch_tab:
+      title_contains: "Probe New Tab"
+    expect:
+      - path: $.title
+        equals: "Probe New Tab"
+  - browser.read:
+      css: "#open-new-tab"
+    expect:
+      - path: $.text
+        equals: "Open Tab"
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn switch_tab_selects_the_most_recently_opened_tab_and_by_index() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-switch-tab-order");
+    let case = dir.write(
+        "switch-order.yaml",
+        &format!(
+            r##"name: switch by creation order
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#open-new-tab"
+  - browser.click:
+      css: "#open-second-tab"
+  - browser.switch_tab:
+      timeout_ms: 5000
+    expect:
+      - path: $.title
+        equals: "Second Tab"
+  - browser.read:
+      css: "#second-marker"
+    expect:
+      - path: $.text
+        equals: "Second"
+  - browser.switch_tab:
+      index: 1
+    expect:
+      - path: $.title
+        equals: "New Tab Target"
+  - browser.switch_tab:
+      index: 0
+    expect:
+      - path: $.title
+        equals: "Probe New Tab"
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn switch_tab_times_out_with_the_tabs_it_could_see() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-switch-tab-timeout");
+    let nothing_opened = dir.write(
+        "switch-no-tab.yaml",
+        &format!(
+            r##"name: switch with no tab opened
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.switch_tab:
+      timeout_ms: 400
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+    let no_match = dir.write(
+        "switch-no-match.yaml",
+        &format!(
+            r##"name: switch with no match
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.switch_tab:
+      url_contains: "/browser/probe/absent"
+      timeout_ms: 400
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+    let no_position = dir.write(
+        "switch-no-position.yaml",
+        &format!(
+            r##"name: switch with no position
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.switch_tab:
+      index: 4
+      timeout_ms: 400
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+
+    let mut messages = Vec::new();
+    for case in [&nothing_opened, &no_match, &no_position] {
+        let output = run_da_in(
+            dir.path(),
+            &["--output", "json", "run", path_str(case), "--no-bundle"],
+        );
+        assert_eq!(
+            exit_code(&output),
+            Some(1),
+            "stdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let value = json_stdout(&output);
+        messages.push(case_error(&value).to_string());
+    }
+
+    assert!(
+        messages[0].contains("no tab was opened by this case's pages within 400 ms"),
+        "the message must say that nothing opened a tab: {}",
+        messages[0]
+    );
+    assert!(
+        messages[0].contains("tabs: 0: "),
+        "the message must list the tabs the case owns: {}",
+        messages[0]
+    );
+    assert!(
+        messages[1]
+            .contains("no tab matched a URL containing `/browser/probe/absent` within 400 ms"),
+        "the message must name the URL filter: {}",
+        messages[1]
+    );
+    assert!(
+        messages[2].contains("no tab matched position 4 within 400 ms"),
+        "the message must name the position: {}",
+        messages[2]
+    );
+}
+
+#[test]
+fn switch_tab_reports_more_than_one_matching_tab() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-switch-tab-ambiguous");
+    let case = dir.write(
+        "switch-ambiguous.yaml",
+        &format!(
+            r##"name: switch with two matches
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#open-new-tab"
+  - browser.switch_tab:
+      url_contains: "/browser/probe/new-tab-target"
+  - browser.switch_tab:
+      url_contains: "/browser/probe/new-tab"
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let message = case_error(&value);
+    assert!(
+        message.contains("`browser.switch_tab` matched 2 tabs"),
+        "the message must count the matches: {message}"
+    );
+    assert!(
+        message.contains("candidates: 0:") && message.contains("1:"),
+        "the message must list both candidates: {message}"
+    );
+}
+
+#[test]
+fn switch_tab_applies_read_write_screenshot_and_network_to_the_new_tab() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-switch-tab-work");
+    let fetch_url = server.url("/browser/probe/new-tab-fetch?case=tab");
+    let case = dir.write(
+        "switch-work.yaml",
+        &format!(
+            r##"name: work on the opened tab
+observe:
+  net:
+    browser.network: {{}}
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#open-new-tab"
+  - browser.switch_tab:
+      url_contains: "/browser/probe/new-tab-target"
+    expect:
+      - path: $.title
+        equals: "New Tab Target"
+  - browser.click:
+      css: "#new-tab-fetch"
+  - browser.wait:
+      css: "#new-tab-fetched"
+      timeout_ms: 10000
+    expect:
+      - path: "$.observed.net.requests[?(@.url == '{fetch_url}')].status"
+        equals: 200
+  - browser.read:
+      css: "#new-tab-marker"
+    expect:
+      - path: $.text
+        equals: "Opened"
+  - browser.click:
+      css: "#new-tab-shadow-button"
+    expect:
+      - path: $.text
+        equals: "Shadow Button"
+  - browser.read:
+      css: "#new-tab-shadow-status"
+    expect:
+      - path: $.text
+        equals: "shadow-clicked"
+  - browser.screenshot:
+      path: "new-tab.png"
+    expect:
+      - path: $.bytes
+        exists: true
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let png = fs::read(dir.path().join("new-tab.png"))
+        .expect("the screenshot of the switched tab must be written");
+    assert!(
+        is_png(&png),
+        "the screenshot must be a PNG: {:?}",
+        &png[..png.len().min(8)]
+    );
+}
+
+#[test]
+fn failure_evidence_after_a_switch_is_the_new_tabs_document() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-switch-tab-evidence");
+    let case = dir.write(
+        "switch-evidence.yaml",
+        &format!(
+            r##"name: evidence of the opened tab
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.click:
+      css: "#open-new-tab"
+  - browser.switch_tab:
+      url_contains: "/browser/probe/new-tab-target"
+  - browser.read:
+      css: "#absent-marker"
+      timeout_ms: 300
+"##,
+            server.url("/browser/probe/new-tab")
+        ),
+    );
+    let bundles = dir.path().join("failures");
+
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let value = json_stdout(&output);
+    let bundle = PathBuf::from(
+        value["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must name its bundle"),
+    );
+    let dom = fs::read_to_string(bundle.join("browser/dom.html"))
+        .expect("the bundle must hold the DOM snapshot");
+    assert!(
+        dom.contains("id=\"new-tab-marker\""),
+        "the DOM evidence must be the tab the case switched to: {dom}"
+    );
+    assert!(
+        !dom.contains("id=\"open-new-tab\""),
+        "the DOM evidence must not be the tab the case left: {dom}"
+    );
+    let png = fs::read(bundle.join("browser/screenshot.png"))
+        .expect("the bundle must hold the screenshot of the switched tab");
+    assert!(is_png(&png));
+}
+
+#[test]
+fn connect_switch_tab_closes_the_tabs_the_case_opened_and_keeps_the_users_tab() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let mut browser = UserBrowser::start();
+    let user_tab = browser.open_tab(&server.url("/browser/form?case=user-tab"));
+    let before = wait_for_pages(&browser, 2);
+    let initial_ids: Vec<String> = before
+        .iter()
+        .map(|page| page_id(page).to_string())
+        .collect();
+
+    let dir = TempDir::new("browser-switch-tab-connect");
+    let case = dir.write(
+        "switch-connect.yaml",
+        &format!(
+            r##"name: switch tabs in the connected browser
+steps:
+  - browser.open:
+      connect: "{}"
+      url: "{}"
+  - browser.click:
+      css: "#open-new-tab"
+  - browser.switch_tab:
+      url_contains: "/browser/probe/new-tab-target"
+    expect:
+      - path: $.title
+        equals: "New Tab Target"
+  - browser.read:
+      css: "#new-tab-marker"
+    expect:
+      - path: $.text
+        equals: "Opened"
+"##,
+            browser.connect_url(),
+            server.url("/browser/probe/new-tab?case=connect-tab")
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}\n{}",
+        stdout(&output),
+        stderr(&output),
+        server.timing_report()
+    );
+
+    assert!(
+        browser
+            .child
+            .try_wait()
+            .expect("the test must watch the browser process")
+            .is_none(),
+        "connect mode must not end the user's browser"
+    );
+
+    // The user's own tab matches the filter, but no tab of this case was opened
+    // by it: the step must not adopt it.
+    let forbidden = dir.write(
+        "switch-user-tab.yaml",
+        &format!(
+            r##"name: never switch to the user tab
+steps:
+  - browser.open:
+      connect: "{}"
+      url: "{}"
+  - browser.switch_tab:
+      url_contains: "case=user-tab"
+      timeout_ms: 400
+"##,
+            browser.connect_url(),
+            server.url("/browser/probe/new-tab?case=forbidden-tab")
+        ),
+    );
+    let forbidden_output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&forbidden),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&forbidden_output),
+        Some(1),
+        "a tab the case does not own must not be selectable: stdout={}\nstderr={}",
+        stdout(&forbidden_output),
+        stderr(&forbidden_output)
+    );
+    let forbidden_json = json_stdout(&forbidden_output);
+    let forbidden_error = case_error(&forbidden_json);
+    assert!(
+        forbidden_error.contains("no tab matched a URL containing `case=user-tab` within 400 ms"),
+        "the step must report that no tab of the case matched: {forbidden_error}"
+    );
+    assert!(
+        !forbidden_error.contains("Browser form"),
+        "the user's tab must not appear among the case's tabs: {forbidden_error}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = browser.page_tabs();
+    while after.len() > before.len() {
+        assert!(
+            Instant::now() < deadline,
+            "the case left a tab it opened open: {after:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+        after = browser.page_tabs();
+    }
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the case must close the tab it opened and the tab its page opened: {after:?}"
+    );
+    let after_ids: Vec<&str> = after.iter().map(page_id).collect();
+    for id in &initial_ids {
+        assert!(
+            after_ids.contains(&id.as_str()),
+            "the case must leave the tab {id} it found open: {after:?}"
+        );
+    }
+    assert!(
+        after_ids.contains(&user_tab.as_str()),
+        "the case must leave the user tab open: {after:?}"
+    );
+    assert!(
+        after.iter().all(|page| !page["url"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("case=connect-tab")),
+        "the case's own tab must be closed: {after:?}"
+    );
+}
+
+#[test]
+fn a_session_keeps_the_switched_tab_across_commands_and_closes_every_tab_it_opened() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let mut browser = UserBrowser::start();
+    let user_tab = browser.open_tab(&server.url("/browser/form?case=session-user"));
+    let before = wait_for_pages(&browser, 2);
+
+    let dir = TempDir::new("browser-session-switch-tab");
+    let started = json_stdout(&run_da_in(
+        dir.path(),
+        &["--output", "json", "session", "start"],
+    ));
+    let id = started["session_id"]
+        .as_str()
+        .expect("session start must name the session")
+        .to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("connect={}", browser.connect_url()),
+            "--arg",
+            &format!(
+                "url={}",
+                server.url("/browser/probe/new-tab?case=session-tab")
+            ),
+        ],
+    );
+    assert_eq!(
+        exit_code(&open),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&open),
+        stderr(&open)
+    );
+
+    let click = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &id,
+            "browser.click",
+            "--arg",
+            "css=#open-new-tab",
+        ],
+    );
+    assert_eq!(
+        exit_code(&click),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&click),
+        stderr(&click)
+    );
+
+    // A later command reattaches the session; it must still see the tab the
+    // click opened and switch to it there.
+    let switch = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &id,
+            "browser.switch_tab",
+            "--arg",
+            "url_contains=/browser/probe/new-tab-target",
+        ],
+    );
+    assert_eq!(
+        exit_code(&switch),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&switch),
+        stderr(&switch)
+    );
+    let switch_json = json_stdout(&switch);
+    assert_eq!(
+        switch_json["snapshot"]["title"], "New Tab Target",
+        "the session snapshot must be the tab the step switched to: {switch_json}"
+    );
+
+    let read = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &id,
+            "browser.read",
+            "--arg",
+            "css=#new-tab-marker",
+        ],
+    );
+    assert_eq!(
+        exit_code(&read),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&read),
+        stderr(&read)
+    );
+    assert_eq!(
+        json_stdout(&read)["step"]["result"]["text"],
+        "Opened",
+        "a later command must read the switched tab"
+    );
+
+    let stop = run_da_in(dir.path(), &["--output", "json", "session", "stop", &id]);
+    assert_eq!(
+        exit_code(&stop),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&stop),
+        stderr(&stop)
+    );
+
+    assert!(
+        browser
+            .child
+            .try_wait()
+            .expect("the test must watch the browser process")
+            .is_none(),
+        "stopping a connected session must not end the user's browser"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = browser.page_tabs();
+    while after.len() > before.len() {
+        assert!(
+            Instant::now() < deadline,
+            "the session left a tab it opened open: {after:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+        after = browser.page_tabs();
+    }
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "stopping the session must close the tab it opened and the tab its page opened: {after:?}"
+    );
+    assert!(
+        after.iter().map(page_id).any(|id| id == user_tab),
+        "stopping the session must leave the user tab open: {after:?}"
     );
 }
 
@@ -3465,7 +4189,11 @@ fn session_creation_recovers_from_target_crash_and_reports_diagnostics_when_all_
         while let Some(cmd) = read_mock_cdp(&mut socket) {
             let method = cmd["method"].as_str().unwrap_or_default();
             let result = match method {
-                "Page.enable" | "Runtime.enable" | "Network.enable" | "Page.navigate" => json!({}),
+                "Page.enable"
+                | "Runtime.enable"
+                | "Network.enable"
+                | "Page.navigate"
+                | "Target.setDiscoverTargets" => json!({}),
                 "Runtime.evaluate" => {
                     let expr = cmd["params"]["expression"].as_str().unwrap_or_default();
                     if expr == "location.href" {
@@ -3624,7 +4352,11 @@ fn session_creation_recovers_from_silent_attach_to_target_hang() {
         while let Some(cmd) = read_mock_cdp(&mut socket) {
             let method = cmd["method"].as_str().unwrap_or_default();
             let result = match method {
-                "Page.enable" | "Runtime.enable" | "Network.enable" | "Page.navigate" => json!({}),
+                "Page.enable"
+                | "Runtime.enable"
+                | "Network.enable"
+                | "Page.navigate"
+                | "Target.setDiscoverTargets" => json!({}),
                 "Runtime.evaluate" => {
                     let expr = cmd["params"]["expression"].as_str().unwrap_or_default();
                     if expr == "location.href" {
@@ -3760,7 +4492,10 @@ fn connect_navigate_aborts_on_target_death_and_reports_diagnostics() {
                     &mut socket,
                     &json!({ "id": cmd["id"], "result": { "sessionId": "s-nav-1" } }),
                 ),
-                "Page.enable" | "Runtime.enable" | "Network.enable" => {
+                "Page.enable"
+                | "Runtime.enable"
+                | "Network.enable"
+                | "Target.setDiscoverTargets" => {
                     send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
                 }
                 "Page.navigate" => {
@@ -3845,7 +4580,10 @@ fn connect_navigate_aborts_on_target_death_and_reports_diagnostics() {
                     &mut socket,
                     &json!({ "id": cmd["id"], "result": { "sessionId": "s-nav-2" } }),
                 ),
-                "Page.enable" | "Runtime.enable" | "Network.enable" => {
+                "Page.enable"
+                | "Runtime.enable"
+                | "Network.enable"
+                | "Target.setDiscoverTargets" => {
                     send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
                 }
                 "Page.navigate" => {}
@@ -3913,7 +4651,10 @@ fn connect_click_aborts_on_target_death_and_reports_diagnostics() {
                     &mut socket,
                     &json!({ "id": cmd["id"], "result": { "sessionId": "s-click-1" } }),
                 ),
-                "Page.enable" | "Runtime.enable" | "Network.enable" => {
+                "Page.enable"
+                | "Runtime.enable"
+                | "Network.enable"
+                | "Target.setDiscoverTargets" => {
                     send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
                 }
                 // No `loaderId`: a same-document navigation, so the session

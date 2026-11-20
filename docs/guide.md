@@ -1224,10 +1224,10 @@ Only read-only steps may declare `retry`:
 
 State-changing steps — `http.request` with `POST`, `PUT`, `PATCH` or `DELETE`
 (or an unresolved variable method), `cli.run`, `browser.open`,
-`browser.click`, `browser.type`, `browser.press` and `browser.screenshot` —
-are refused statically by `da lint` and before any step runs in `da run`
-(exit 3). `retry` is a reserved step field name, so no step may register under
-that name.
+`browser.click`, `browser.type`, `browser.press`, `browser.screenshot` and
+`browser.switch_tab` — are refused statically by `da lint` and before any step
+runs in `da run` (exit 3). `retry` is a reserved step field name, so no step may
+register under that name.
 
 Each polling iteration runs the step and any declared `observe` observers for
 that attempt, keeping only the last attempt's result and observations:
@@ -1516,12 +1516,16 @@ The `browser.*` steps drive one page in a Chrome or Chromium that is already
 installed. They are provided by the `browser` feature and never download a
 browser. A case has one page: the first `browser.open` creates it, every later
 step of the same case uses it, and a second `browser.open` navigates that same
-page instead of opening another one.
+page instead of opening another one. A page action such as a link with
+`target="_blank"` or a `window.open` call opens another tab; the session keeps
+driving the tab it was on until [`browser.switch_tab`](#tabs-opened-by-a-page-action)
+selects the new one.
 
 By default the case starts its own browser. With `connect`, it instead drives a
 browser the user already runs with a debug port, so the user's logged-in state is
-available. The case opens a new tab there and closes only that tab when it ends;
-the user's browser keeps running and the user's other tabs are untouched.
+available. The case opens a new tab there and closes only the tabs it opened —
+that tab and the tabs its pages opened — when it ends; the user's browser keeps
+running and the user's other tabs are untouched.
 
 | Step | Arguments | Result |
 | --- | --- | --- |
@@ -1534,6 +1538,7 @@ the user's browser keeps running and the user's other tabs are untouched.
 | `browser.screenshot` | `path` required | `path`, `bytes` |
 | `browser.set_cookies` | `cookies` (non-empty array of `{ name, value, url \| domain, path?, http_only?, secure?, same_site? }`) and/or `local_storage` (non-empty `<origin> \| current` → `{ key: value }` map); at least one of the two | `cookies_set`, `local_storage_set` |
 | `browser.save_state` | `path` required | `path`, `cookies`, `local_storage` (counts only) |
+| `browser.switch_tab` | `url_contains`, `title_contains` or `index` (optional; defaults to the tab a page action opened most recently); `timeout_ms` defaults to 5000 | `url`, `title` |
 
 A **locator** takes **exactly one** of the five ways below, plus any modifiers:
 
@@ -1650,6 +1655,84 @@ fail immediately as an execution error (exit 1) without waiting out
 Inside [`da session`](#interactive-sessions-da-session), `snapshot` and `ref`
 targets stay scoped to the main document (showing frames as `Iframe` nodes),
 while explicit `within` locators work in `da session step` and export verbatim.
+
+#### Tabs opened by a page action
+
+Clicking a link with `target="_blank"`, or a control whose handler calls
+`window.open`, opens a second tab. The session stays on the tab it was driving —
+an advertisement, a download page or a sign-in popup therefore cannot move the
+case by itself — and `browser.switch_tab` selects the new tab explicitly:
+
+```yaml
+name: Follow a link that opens a new tab
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/orders
+  - browser.click:
+      css: "#new-order"
+  - browser.switch_tab:
+      url_contains: "/orders/new"
+    expect:
+      - path: $.title
+        equals: New order
+  - browser.type:
+      css: "#customer"
+      text: Ada
+  - browser.screenshot:
+      path: new-order.png
+```
+
+`browser.switch_tab` takes:
+
+| Argument | Meaning |
+| --- | --- |
+| `url_contains: <text>` | Keep the tabs whose URL contains `<text>`. |
+| `title_contains: <text>` | Keep the tabs whose title contains `<text>`. |
+| `index: <integer>` | Select the tab at this zero-based position in the order the case created its tabs (`0` is the tab `browser.open` opened). |
+| `timeout_ms: <ms>` | How long to wait for a matching tab (defaults to 5000). |
+
+The filters combine (a tab must satisfy all of them), and, like a locator, a
+filtered switch must match **exactly one** tab: a second match fails immediately
+as an execution error whose message lists the candidates with their positions.
+Without any filter the step selects the tab a page action opened **most
+recently**; it never falls back to the tab the case already drives, so a case
+that opened nothing keeps waiting and then fails. A tab that is not there yet is
+waited for: the step polls until `timeout_ms` expires and then fails with the
+configured filters and every tab the case owns, for example:
+
+```text
+no tab matched a URL containing `/browser/probe/absent` within 400 ms (tabs: 0: "http://127.0.0.1:8080/orders" "Orders")
+```
+
+After the switch, every later `browser.*` step drives the new tab: `read`,
+`click`, `type`, `press`, `wait`, `screenshot`, `browser.open`, and the network
+requests `browser.network` reports. The failure bundle (`screenshot.png` and
+`dom.html`) is collected from the tab the case was on, because that is the tab
+whose failure the case is reporting. The previous tab stays open, so a second
+`browser.switch_tab` can select it again, by `title_contains`, `url_contains` or
+`index`.
+
+**Which tabs a case can select.** A case owns exactly two kinds of tabs: the tab
+`browser.open` created for it, and every tab a page of this case opened (Chrome
+reports those with an `openerId` inside the set). Only those are enumerated,
+switched to and closed. With `connect`, that rule is what keeps the user's
+browser safe: a tab the user already had open was not opened by the case, so it
+is never adopted, never selected by `browser.switch_tab`, and never closed —
+even when it matches `url_contains` or `title_contains`. A tab of another browser
+context is not adopted either.
+
+When the case ends — passed, failed, errored or stopped early — `da` closes every
+tab in the set, including a tab that was opened after the last step ran. A case
+that starts its own browser closes the browser, as before. With `connect`, only
+those tabs are closed and the user's browser keeps running. A `da session` keeps
+the same set in its saved handle, so `browser.switch_tab` in one `session step`
+command stays in effect for the next command, and `da session stop` closes every
+tab the session opened.
+
+The step is not `retry`-able: it changes the tab the session drives. It cannot
+reach a page target this case does not own, so a tab the user drags into the same
+browser, or a popup opened by a page outside this case, is out of reach by
+design.
 
 `browser.type` keeps its original `text` argument as the text to type. Because
 `text` is also a locator, the two meanings are separated by `value`: when `value`

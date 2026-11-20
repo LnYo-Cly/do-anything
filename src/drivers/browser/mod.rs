@@ -7,7 +7,12 @@
 //!
 //! A case either starts its own browser or, with `connect`, drives a browser the
 //! user already runs with a debug port. The connected browser is never closed:
-//! only the tab this case opened is.
+//! only the tabs this case opened and the tabs its pages opened are.
+//!
+//! A page action such as `<a target="_blank">` or `window.open` opens a tab the
+//! session does not follow by itself; `browser.switch_tab` moves the session to
+//! one of them. [`tabs`] keeps the set of tabs this case owns, which is also the
+//! set teardown closes.
 //!
 //! Locators are deterministic on purpose: a CSS selector, an XPath expression,
 //! visible text or an accessibility role and name, never a coordinate or a
@@ -25,6 +30,7 @@ mod launch;
 mod network;
 mod snapshot;
 mod synthesis;
+mod tabs;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -53,7 +59,7 @@ use crate::core::session::{Evidence, Session, Sessions};
 pub const SESSION_KIND: &str = "browser";
 
 /// Step names, in the order they are registered.
-pub const STEP_NAMES: [&str; 9] = [
+pub const STEP_NAMES: [&str; 10] = [
     "browser.open",
     "browser.click",
     "browser.type",
@@ -63,6 +69,7 @@ pub const STEP_NAMES: [&str; 9] = [
     "browser.screenshot",
     "browser.set_cookies",
     "browser.save_state",
+    "browser.switch_tab",
 ];
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -93,6 +100,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         screenshot_step()?,
         set_cookies_step()?,
         save_state_step()?,
+        switch_tab_step()?,
     ] {
         registry.register(definition)?;
     }
@@ -147,6 +155,20 @@ fn save_state_step() -> Result<StepDefinition, String> {
         run_save_state,
     )?;
     string_property(&mut definition.args_schema, "path");
+    Ok(definition)
+}
+
+/// Builds `browser.switch_tab`, which moves the session to another tab of the
+/// case, selected by a URL or title fragment or by creation order.
+fn switch_tab_step() -> Result<StepDefinition, String> {
+    let mut definition = step::<SwitchTabArgs>(
+        STEP_NAMES[9],
+        "Switches the session to a tab this case's pages opened, selected by `url_contains`, `title_contains` or `index`, waits up to `timeout_ms` for it to appear and returns its `url` and `title`; every later `browser.*` step, the failure evidence and the network observation then apply to that tab.",
+        validate_switch_tab,
+        run_switch_tab,
+    )?;
+    string_property(&mut definition.args_schema, "url_contains");
+    string_property(&mut definition.args_schema, "title_contains");
     Ok(definition)
 }
 
@@ -948,6 +970,30 @@ struct ReadArgs {
     #[schemars(extend("minLength" = 1))]
     #[serde(default)]
     attribute: Option<String>,
+}
+
+/// Arguments of `browser.switch_tab`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SwitchTabArgs {
+    /// Text the URL of the tab must contain.
+    #[schemars(extend("minLength" = 1))]
+    #[serde(default)]
+    url_contains: Option<String>,
+    /// Text the title of the tab must contain.
+    #[schemars(extend("minLength" = 1))]
+    #[serde(default)]
+    title_contains: Option<String>,
+    /// Zero-based position of the tab in the order this case created its tabs;
+    /// `0` is the tab `browser.open` opened. Defaults to the tab a page action
+    /// opened most recently.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    index: Option<usize>,
+    /// How long to wait for a matching tab, in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
 }
 
 fn default_headless() -> bool {
@@ -2273,8 +2319,8 @@ struct BrowserSession {
     /// written. `Drop` only matters on the fallback path.
     connection: Option<Connection>,
     origin: Option<Origin>,
-    /// The CDP target id attached for this session's page.
-    target_id: String,
+    /// Every tab this case owns, and the one the session drives now.
+    tabs: tabs::Tabs,
     /// The target session every page command is sent with.
     page: String,
     /// The requests this page reported, bounded and merged by request id.
@@ -2335,7 +2381,7 @@ impl BrowserSession {
     /// Starts the browser described by `browser.open` and attaches its page.
     fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
         let deadline = Deadline::after(LAUNCH_TIMEOUT);
-        let (browser, (connection, page, target_id)) = launch_browser_with_retry(
+        let (browser, (connection, page, tabs)) = launch_browser_with_retry(
             deadline,
             MAX_LAUNCH_ATTEMPTS,
             |attempt_deadline| {
@@ -2354,7 +2400,12 @@ impl BrowserSession {
                         format!("could not connect to the browser it started: {error}; set `DA_CHROME` to the Chrome or Chromium executable")
                     })?;
                 let (page, target_id) = attach(&mut connection, attempt_deadline)?;
-                Ok((connection, page, target_id))
+                let tabs = tabs::Tabs::start(
+                    &mut connection,
+                    &target_id,
+                    attempt_deadline.capped(TAB_QUERY_TIMEOUT),
+                )?;
+                Ok((connection, page, tabs))
             },
             Launched::abort,
         )?;
@@ -2365,7 +2416,7 @@ impl BrowserSession {
         Ok(Self {
             connection: Some(connection),
             origin: Some(Origin::Launched(Box::new(browser))),
-            target_id,
+            tabs,
             page,
             network,
             port,
@@ -2393,13 +2444,19 @@ impl BrowserSession {
             .map_err(|error| {
             endpoint.explain(format!("could not open the DevTools connection: {error}"))
         })?;
-        let (page, target_id) = attach(&mut connection, Deadline::after(LAUNCH_TIMEOUT))?;
+        let deadline = Deadline::after(LAUNCH_TIMEOUT);
+        let (page, target_id) = attach(&mut connection, deadline)?;
+        let tabs = tabs::Tabs::start(
+            &mut connection,
+            &target_id,
+            deadline.capped(TAB_QUERY_TIMEOUT),
+        )?;
         let network = network::NetworkState::new(&page);
 
         Ok(Self {
             connection: Some(connection),
             origin: Some(Origin::Connected),
-            target_id,
+            tabs,
             page,
             network,
             port: endpoint.port(),
@@ -2448,12 +2505,12 @@ impl BrowserSession {
                 ValidatedHandle::Connected {
                     port,
                     websocket_url,
-                    target_id,
+                    ..
                 } => (
                     Origin::Connected,
                     port,
                     websocket_url.to_string(),
-                    target_id.to_string(),
+                    parsed.target_id.clone(),
                     None,
                 ),
             };
@@ -2461,14 +2518,22 @@ impl BrowserSession {
         let mut connection = Connection::connect(&websocket_url, deadline).map_err(|error| {
             format!("browser session is no longer reachable at `{websocket_url}`: {error}")
         })?;
-        let page =
-            attach_existing_target(&mut connection, &target_id, deadline, ATTACH_ENABLE_TIMEOUT)
-                .map_err(|failure| failure.message)?;
+        let page = attach_existing_target(
+            &mut connection,
+            &target_id,
+            "could not attach to the page this session drives",
+            deadline,
+            ATTACH_ENABLE_TIMEOUT,
+        )
+        .map_err(|failure| failure.message)?;
+        let mut tabs = tabs::Tabs::restored(&target_id, &parsed.tabs);
+        tabs.enable_discovery(&mut connection, deadline)?;
+        tabs.refresh(&mut connection, deadline)?;
         let network = network::NetworkState::new(&page);
         Ok(Self {
             connection: Some(connection),
             origin: Some(origin),
-            target_id,
+            tabs,
             page,
             network,
             port,
@@ -2596,6 +2661,10 @@ impl BrowserSession {
         // Network events that arrive before a navigation still belong to a
         // request of this page, so they are merged before the rest is cleared.
         self.absorb_network();
+        // Every tab a page action opened before this navigation keeps its place
+        // in the case's tab set; the events that reported it must not be
+        // cleared with the page events of the page being left.
+        self.absorb_targets();
         let connection = self.connection_mut()?;
         // Events from the about:blank page must not be mistaken for this
         // navigation's load event, while any terminal target/session event or
@@ -2657,7 +2726,204 @@ impl BrowserSession {
         if let Some(origin) = loaded_origin {
             self.cleanup_pending_local_storage_scripts(&origin, deadline, dialog);
         }
+        // The page is what `browser.switch_tab` reports for this tab and what a
+        // `url_contains` or `title_contains` filter matches, so it is recorded
+        // without waiting for the browser to report the same change again.
+        let current_target = self.tabs.current().to_string();
+        self.tabs.set_current(&current_target, &current, &title);
         Ok((current, title))
+    }
+
+    /// Merges the target events already received into the case's tab set.
+    fn absorb_targets(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
+            self.tabs.absorb(connection);
+        }
+    }
+
+    /// Switches the session to the tab `selector` names and returns its `url`
+    /// and `title`.
+    fn switch_tab(
+        &mut self,
+        selector: &tabs::Selector,
+        deadline: Deadline,
+    ) -> Result<Value, StepError> {
+        let index = self.await_tab(selector, deadline)?;
+        let (url, title) = self.activate_tab(index, deadline)?;
+        Ok(json!({ "url": url, "title": title }))
+    }
+
+    /// Waits inside `deadline` for a tab the selector names.
+    ///
+    /// The browser's target list is read at least once and then every
+    /// [`TAB_REFRESH_ROUNDS`] rounds, because a title often changes without an
+    /// event that says so; between reads the target events Chrome already sent
+    /// are merged, which is what keeps the creation order.
+    fn await_tab(
+        &mut self,
+        selector: &tabs::Selector,
+        deadline: Deadline,
+    ) -> Result<usize, StepError> {
+        let mut round: u32 = 0;
+        loop {
+            if let Some(connection) = self.connection.as_mut() {
+                self.tabs.absorb(connection);
+            }
+            if round.is_multiple_of(TAB_REFRESH_ROUNDS) && !deadline.passed() {
+                let refresh = match self.connection.as_mut() {
+                    Some(connection) => self
+                        .tabs
+                        .refresh(connection, deadline.capped(TAB_QUERY_TIMEOUT)),
+                    None => return Err(Self::no_connection_error()),
+                };
+                if let Err(message) = refresh {
+                    if deadline.passed() {
+                        return Err(StepError::Execution(
+                            self.tabs.timeout_message(selector, deadline.timeout_ms()),
+                        ));
+                    }
+                    return Err(StepError::Environment(message));
+                }
+            }
+            round += 1;
+            match self.tabs.select(selector) {
+                tabs::Selection::Tab(index) => return Ok(index),
+                tabs::Selection::Ambiguous(candidates) => {
+                    return Err(StepError::Execution(
+                        self.tabs.ambiguous_message(selector, &candidates),
+                    ));
+                }
+                tabs::Selection::None => {}
+            }
+            if deadline.passed() {
+                return Err(StepError::Execution(
+                    self.tabs.timeout_message(selector, deadline.timeout_ms()),
+                ));
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Attaches the tab at `index`, waits for its document and makes it the
+    /// session's page.
+    fn activate_tab(
+        &mut self,
+        index: usize,
+        deadline: Deadline,
+    ) -> Result<(String, String), StepError> {
+        let target_id = self
+            .tabs
+            .target(index)
+            .ok_or_else(|| {
+                StepError::Execution(format!(
+                    "the tab at position {index} is no longer open; run `browser.switch_tab` again"
+                ))
+            })?
+            .to_string();
+        // Switching to the tab the session already drives changes nothing; it
+        // must not detach and re-attach the same page.
+        if target_id == self.tabs.current() {
+            return Ok(self.tabs.info(index).unwrap_or_default());
+        }
+        let connection = self.connection_mut()?;
+        let page = attach_existing_target(
+            connection,
+            &target_id,
+            &format!("could not switch to the tab `{target_id}`"),
+            deadline.capped(TAB_QUERY_TIMEOUT),
+            ATTACH_ENABLE_TIMEOUT,
+        )
+        .map_err(|failure| StepError::Execution(failure.message))?;
+        let tracked = self.tabs.info(index).unwrap_or_default();
+        let (url, title) = self.read_ready_tab(&target_id, &page, tracked, deadline);
+        let previous = std::mem::replace(&mut self.page, page);
+        self.tabs.set_current(&target_id, &url, &title);
+        // The observer of the tab being left keeps nothing: `browser.network`
+        // reports the requests of the tab the session now drives.
+        self.network = network::NetworkState::new(&self.page);
+        // A snapshot `ref` names an element of the document being left, and a
+        // preload script was registered on the page session being left.
+        self.refs = snapshot::RefStore::default();
+        self.pending_local_storage_scripts.clear();
+        self.step_metadata = None;
+        if let Some(connection) = self.connection.as_mut() {
+            // The previous session would otherwise keep reporting network and
+            // page events of a tab no step looks at, filling the message queue.
+            let _ = connection.call(
+                "Target.detachFromTarget",
+                json!({ "sessionId": previous }),
+                None,
+                deadline.capped(TAB_DETACH_TIMEOUT),
+            );
+            // `Target.detachedFromTarget` for a tab this session left is stale
+            // news; reading it now keeps it from aborting a later attach.
+            let _ = connection.poll_messages();
+            self.tabs.absorb(connection);
+        }
+        Ok((url, title))
+    }
+
+    /// Reads the URL and title of a freshly attached tab once its document is
+    /// the tab's own, not the blank document it was created with.
+    ///
+    /// The returned page may still be loading when `deadline` runs out; the
+    /// switch itself succeeded, and a later `browser.wait` or `browser.read`
+    /// waits for content. What must not be returned is the `about:blank`
+    /// document of a tab whose navigation only just started.
+    fn read_ready_tab(
+        &mut self,
+        target_id: &str,
+        page: &str,
+        tracked: (String, String),
+        deadline: Deadline,
+    ) -> (String, String) {
+        let scope = PageScope {
+            target_id: target_id.to_string(),
+            session_id: page.to_string(),
+        };
+        let script = "[document.readyState, location.href, document.title]";
+        let blank_expected = self.tabs.is_blank(target_id);
+        let mut last = tracked.clone();
+        loop {
+            let mut dialog = DialogContext::fail_fast();
+            let read = match self.connection.as_mut() {
+                Some(connection) => {
+                    page_evaluate(connection, &scope, script, deadline, &mut dialog)
+                }
+                None => return last,
+            };
+            match read {
+                Ok(Value::Array(values)) => {
+                    let ready = values.first().and_then(Value::as_str).unwrap_or("complete");
+                    let url = values
+                        .get(1)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let title = values
+                        .get(2)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    last = (url.clone(), title.clone());
+                    if ready != "loading"
+                        && (url != "about:blank" || blank_expected || deadline.passed())
+                    {
+                        return last;
+                    }
+                }
+                // A navigation that commits while the session is attached
+                // destroys the document the read addressed; the next read sees
+                // the new one. A page that died is reported by the next step.
+                Ok(_) => return last,
+                Err(_) if deadline.passed() => return last,
+                Err(_) => {}
+            }
+            if deadline.passed() {
+                return last;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
 
     fn cleanup_pending_local_storage_scripts(
@@ -3639,17 +3905,22 @@ impl BrowserSession {
 
     /// The open connection, or the error a step reports after a close.
     fn connection_mut(&mut self) -> Result<&mut Connection, StepError> {
-        self.connection.as_mut().ok_or_else(|| {
-            StepError::Execution(
-                "the browser session is already closed; run `browser.open` again".to_string(),
-            )
-        })
+        self.connection
+            .as_mut()
+            .ok_or_else(Self::no_connection_error)
+    }
+
+    /// The error a step reports once the session's browser is gone.
+    fn no_connection_error() -> StepError {
+        StepError::Execution(
+            "the browser session is already closed; run `browser.open` again".to_string(),
+        )
     }
 
     /// The target and session every page-session wait watches.
     fn scope(&self) -> PageScope {
         PageScope {
-            target_id: self.target_id.clone(),
+            target_id: self.tabs.current().to_string(),
             session_id: self.page.clone(),
         }
     }
@@ -3747,6 +4018,18 @@ const MAX_ATTACH_ATTEMPTS: usize = 3;
 const ATTACH_ENABLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long `attach` waits for `Target.closeTarget` when cleaning up a failed fresh tab.
 const ATTACH_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Longest one `Target.getTargets` or `Target.setDiscoverTargets` may take.
+///
+/// They only list or subscribe; a browser that cannot answer them in this
+/// budget is failing, and the wait for a tab must not spend its whole budget
+/// on one listing.
+const TAB_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long detaching the previous tab's page session may take.
+const TAB_DETACH_TIMEOUT: Duration = Duration::from_secs(1);
+/// How many polling rounds pass before `browser.switch_tab` re-reads the
+/// browser's target list, so a title that never arrives as an event is still
+/// seen.
+const TAB_REFRESH_ROUNDS: u32 = 5;
 
 /// Which phase of `attach` failed, used to classify whether target recreation can help.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3928,20 +4211,31 @@ fn attach_once(
             target_destroyed: false,
         })?
         .to_string();
-    let page = attach_existing_target(connection, &target_id, deadline, enable_timeout)?;
+    let page = attach_existing_target(
+        connection,
+        &target_id,
+        "could not attach to the page the browser opened",
+        deadline,
+        enable_timeout,
+    )?;
     Ok((page, target_id))
 }
 
+/// Attaches `target_id` and enables the domains every page step needs.
+///
+/// `action` starts the messages of a failed attach, so the error names what the
+/// step was doing.
 fn attach_existing_target(
     connection: &mut Connection,
     target_id: &str,
+    action: &str,
     deadline: Deadline,
     enable_timeout: Duration,
 ) -> Result<String, AttachAttemptFailure> {
     let attached = attach_call(
         connection,
         AttachStep::AttachToTarget,
-        "could not attach to the page the browser opened",
+        action,
         "Target.attachToTarget",
         json!({ "targetId": target_id, "flatten": true }),
         AttachScope {
@@ -4839,6 +5133,39 @@ struct DetachedBrowserHandle {
     refs: snapshot::RefStore,
     #[serde(default)]
     pending_local_storage_scripts: Vec<(String, String)>,
+    /// Every tab this case owns, in creation order; the first entry is the tab
+    /// `browser.open` opened. A handle written before tabs were tracked lists
+    /// only `target_id`.
+    #[serde(default)]
+    tabs: Vec<String>,
+}
+
+/// The tabs a handle lists, as one entry per owned target.
+///
+/// The current target must be one of them: a handle that names it out of the
+/// set would detach a session whose tab teardown never closes.
+fn managed_tabs(parsed: &DetachedBrowserHandle) -> Result<Vec<&str>, String> {
+    if parsed.tabs.is_empty() {
+        return Ok(vec![parsed.target_id.as_str()]);
+    }
+    if parsed.tabs.len() > tabs::MAX_TABS {
+        return Err(format!(
+            "browser session handle lists {} tabs; at most {} are managed",
+            parsed.tabs.len(),
+            tabs::MAX_TABS
+        ));
+    }
+    for target_id in &parsed.tabs {
+        if target_id.trim().is_empty() {
+            return Err("browser session handle has an empty `tabs` entry".to_string());
+        }
+    }
+    if !parsed.tabs.iter().any(|id| id == &parsed.target_id) {
+        return Err(
+            "browser session handle `target_id` is not one of its managed `tabs`".to_string(),
+        );
+    }
+    Ok(parsed.tabs.iter().map(String::as_str).collect())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4854,7 +5181,8 @@ enum ValidatedHandle<'a> {
     Connected {
         port: u16,
         websocket_url: &'a str,
-        target_id: &'a str,
+        /// Every tab the case owns, so teardown closes exactly those.
+        target_ids: Vec<&'a str>,
     },
 }
 
@@ -4891,6 +5219,10 @@ fn validate_detached_handle<'a>(
                 launch::validate_owned_profile_in(profile, temp_root)?;
             }
             validate_launched_ws_url(&parsed.websocket_url, parsed.port)?;
+            // The tab list is checked for both modes: a launched handle also
+            // drives tabs through `da session`, even though stopping it closes
+            // the whole browser.
+            managed_tabs(parsed)?;
             Ok(ValidatedHandle::Launched {
                 pid,
                 profile,
@@ -4922,7 +5254,7 @@ fn validate_detached_handle<'a>(
             Ok(ValidatedHandle::Connected {
                 port: parsed.port,
                 websocket_url: &parsed.websocket_url,
-                target_id: &parsed.target_id,
+                target_ids: managed_tabs(parsed)?,
             })
         }
         other => Err(format!("unknown browser session mode `{other}`")),
@@ -5013,11 +5345,13 @@ where
         ValidatedHandle::Connected {
             port,
             websocket_url,
-            target_id,
+            target_ids,
         } => {
             on_record_close(port);
             let mut errors = Vec::new();
-            close_target(websocket_url, target_id, &mut errors);
+            for target_id in target_ids {
+                close_target(websocket_url, target_id, &mut errors);
+            }
             if errors.is_empty() {
                 Ok(())
             } else {
@@ -5102,6 +5436,13 @@ fn close_and_dispose_detached_with<P, V, CB, D>(
 
 impl Session for BrowserSession {
     fn detach(&mut self) -> Result<Option<Value>, String> {
+        // A tab a page action opened after the last step is still reported by
+        // the browser; it must be in the handle, or the next command neither
+        // switches to it nor closes it.
+        if let Some(connection) = self.connection.as_mut() {
+            let _ = connection.poll_messages();
+            self.tabs.absorb(connection);
+        }
         let _ = self.connection.take();
         let (mode, pid, profile, profile_name, port, websocket_url) = match self.origin.take() {
             Some(Origin::Launched(browser)) => {
@@ -5141,7 +5482,7 @@ impl Session for BrowserSession {
         let handle = DetachedBrowserHandle {
             mode,
             websocket_url,
-            target_id: self.target_id.clone(),
+            target_id: self.tabs.current().to_string(),
             port,
             pid,
             profile,
@@ -5153,6 +5494,7 @@ impl Session for BrowserSession {
             testid_attribute: self.testid_attribute.clone(),
             refs: self.refs.clone(),
             pending_local_storage_scripts: self.pending_local_storage_scripts.clone(),
+            tabs: self.tabs.ids(),
         };
         serde_json::to_value(handle)
             .map(Some)
@@ -5333,9 +5675,15 @@ impl Session for BrowserSession {
                 }
             }
             Some(Origin::Connected) => {
-                // Only this case's tab is ours. `Browser.close` is never sent:
-                // the browser belongs to the user and must keep running.
-                send_target_close(&mut connection, &self.target_id, &mut errors);
+                // Only the tabs this case owns are ours: the one `browser.open`
+                // created and the ones its pages opened. `Browser.close` is
+                // never sent: the browser belongs to the user, whose own tabs
+                // are not in the set and must keep running.
+                let _ = connection.poll_messages();
+                self.tabs.absorb(&mut connection);
+                for target_id in self.tabs.ids() {
+                    send_target_close(&mut connection, &target_id, &mut errors);
+                }
                 drop(connection);
             }
             None => drop(connection),
@@ -5870,6 +6218,25 @@ fn validate_save_state(args: &Value) -> Result<(), String> {
         return Err(
             "invalid arguments: `path` must name the storage-state file to write".to_string(),
         );
+    }
+    Ok(())
+}
+
+fn validate_switch_tab(args: &Value) -> Result<(), String> {
+    let parsed: SwitchTabArgs = parse_for_validate(args)?;
+    check_timeout(parsed.timeout_ms)?;
+    for (field, value) in [
+        ("url_contains", &parsed.url_contains),
+        ("title_contains", &parsed.title_contains),
+    ] {
+        if let Some(text) = value
+            && text.is_empty()
+        {
+            return Err(format!(
+                "invalid arguments: `{field}` must not be empty; give the text the tab's {} contains",
+                field.trim_end_matches("_contains")
+            ));
+        }
     }
     Ok(())
 }
@@ -6774,6 +7141,19 @@ fn run_save_state(args: &Value, sessions: &mut Sessions) -> Result<Value, StepEr
         "cookies": cookies,
         "local_storage": local_storage,
     }))
+}
+
+fn run_switch_tab(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let args: SwitchTabArgs = parse(args)?;
+    check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
+    let selector = tabs::Selector {
+        url_contains: args.url_contains,
+        title_contains: args.title_contains,
+        index: args.index,
+    };
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let session = session(sessions)?;
+    session.switch_tab(&selector, deadline)
 }
 
 #[cfg(test)]
@@ -8540,7 +8920,7 @@ mod tests {
         BrowserSession {
             connection: Some(connection),
             origin: Some(Origin::Connected),
-            target_id: target_id.to_string(),
+            tabs: tabs::Tabs::attached(target_id),
             page: session_id.to_string(),
             network: network::NetworkState::new(session_id),
             port: 9222,
@@ -9249,6 +9629,11 @@ mod tests {
             send_mock_reply(socket, &cmd["id"], json!({}));
         }
 
+        // `browser.open` starts tracking the tabs a page action opens.
+        let discover = read_cdp_request(socket);
+        assert_eq!(discover["method"], "Target.setDiscoverTargets");
+        send_mock_reply(socket, &discover["id"], json!({}));
+
         let nav = read_cdp_request(socket);
         assert_eq!(nav["method"], "Page.navigate");
         on_navigate(socket);
@@ -9941,6 +10326,7 @@ mod tests {
             testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
             refs: snapshot::RefStore::default(),
             pending_local_storage_scripts: Vec::new(),
+            tabs: Vec::new(),
         };
 
         assert!(matches!(
@@ -10011,6 +10397,7 @@ mod tests {
             testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
             refs: snapshot::RefStore::default(),
             pending_local_storage_scripts: Vec::new(),
+            tabs: Vec::new(),
         };
 
         assert!(matches!(
@@ -10222,6 +10609,33 @@ mod tests {
                     ))
                     .expect("send domain reply");
             }
+            // A reattached session resumes tracking the tabs this case owns and
+            // reads their current URL and title.
+            let discover = read_cdp_request(&mut socket1);
+            assert_eq!(discover["method"], "Target.setDiscoverTargets");
+            socket1
+                .send(tungstenite::Message::text(
+                    json!({ "id": discover["id"], "result": {} }).to_string(),
+                ))
+                .expect("send discover reply");
+            let targets = read_cdp_request(&mut socket1);
+            assert_eq!(targets["method"], "Target.getTargets");
+            socket1
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": targets["id"],
+                        "result": {
+                            "targetInfos": [{
+                                "targetId": "tab-connected",
+                                "type": "page",
+                                "url": "http://127.0.0.1/app",
+                                "title": "App"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("send targets reply");
             while socket1.read().is_ok() {}
 
             // Connection 2: BrowserSession::dispose_handle
