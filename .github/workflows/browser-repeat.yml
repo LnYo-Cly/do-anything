@@ -27,6 +27,12 @@ jobs:
     timeout-minutes: 60
     env:
       DA_TEST_BROWSER: "1"
+      # Several browser tests each start their own Chrome, so libtest's default
+      # one thread per core puts several browsers on a four-core runner at once
+      # and Page.navigate misses its 30 s budget. Two threads bound that
+      # contention. Job level so the --no-run build step receives it too, where
+      # it is inert.
+      RUST_TEST_THREADS: "2"
     strategy:
       fail-fast: false
       matrix:
@@ -58,16 +64,19 @@ jobs:
             duration=$2
             tmp_dir="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"
             tmp_dir="${tmp_dir%/}"
-            if [ "${RUNNER_OS:-}" = "Windows" ]; then
-              procs=$(tasklist //FO CSV //NH | grep -c -i -E 'chrome|chromium' || true)
-            else
-              procs=$(ps -A -o comm= | grep -c -i -E 'chrome|chromium' || true)
-            fi
+            case "$(uname -s)" in
+              MINGW* | MSYS* | CYGWIN*)
+                chrome_procs=$(tasklist //FO CSV //NH 2>/dev/null | grep -c -i -E 'chrome|chromium' || true)
+                ;;
+              *)
+                chrome_procs=$(ps -A -o comm= 2>/dev/null | grep -c -i -E 'chrome|chromium' || true)
+                ;;
+            esac
             profiles=0
             for d in "$tmp_dir"/da-chrome-profile*; do
               [ -d "$d" ] && profiles=$((profiles + 1))
             done
-            echo "DIAG: iter=$iter, duration=${duration}s, procs=$procs, profiles=$profiles"
+            echo "DIAG: iter=$iter duration=${duration}s threads=${RUST_TEST_THREADS:-unset} chrome_procs=$chrome_procs left_profiles=$profiles"
           }
 
           print_diag 0 0
