@@ -133,14 +133,38 @@ fn wait_for_marker(marker: &Path, started: Instant, limit: Duration) -> Duration
     started.elapsed()
 }
 
+/// Runs a program, waiting out a transient "text file busy".
+///
+/// Linux refuses to execute a file that any process still has open for writing,
+/// and a test writes its fake adb moments before running it, so the first exec
+/// can lose a race with the write it just finished. The condition clears within
+/// milliseconds; anything else is a real failure.
+fn run_settled(command: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let mut delay = Duration::from_millis(10);
+    for attempt in 0..40 {
+        match command.status() {
+            Ok(status) => return Ok(status),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 39 =>
+            {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop returns on the last attempt")
+}
+
 /// Times one positive-control run of a fake adb, including its descendant.
 fn calibrate_fake_adb(adb: &str, marker: &Path) -> Duration {
     let started = Instant::now();
-    let status = Command::new(adb)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("the fake adb must run outside da as well");
+    let status = run_settled(
+        Command::new(adb)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("the fake adb must run outside da as well");
     assert!(
         status.success(),
         "the fake adb must finish when nothing kills it: {status}"
