@@ -27,7 +27,23 @@ fn da() -> &'static str {
     env!("CARGO_BIN_EXE_da")
 }
 
+/// Removes the device variables an operator may have exported.
+///
+/// A test that brings its own adb and its own device list must not inherit the
+/// serial, the adb path or the device gate from the shell that runs the suite,
+/// or the same test passes on CI and fails on a machine that drives a device.
+fn without_device_env(command: &mut Command) -> &mut Command {
+    command
+        .env_remove("DA_ADB")
+        .env_remove("DA_ANDROID_SERIAL")
+        .env_remove("DA_TEST_ANDROID")
+}
+
 /// Runs the binary with `dir` as its working directory.
+///
+/// Device tests rely on the operator's `DA_ANDROID_SERIAL` and `DA_ADB`, so this
+/// helper inherits the environment; a test that brings its own adb uses
+/// [`run_da_with_env`], which clears those variables first.
 fn run_da_in(dir: &Path, args: &[&str]) -> Output {
     Command::new(da())
         .current_dir(dir)
@@ -40,6 +56,7 @@ fn run_da_in(dir: &Path, args: &[&str]) -> Output {
 fn run_da_with_env(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Output {
     let mut command = Command::new(da());
     command.current_dir(dir).args(args);
+    without_device_env(&mut command);
     for (name, value) in envs {
         command.env(name, value);
     }
