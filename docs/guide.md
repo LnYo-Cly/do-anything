@@ -2627,12 +2627,12 @@ loading is a `retry` on the dump.
 
 | Step | Arguments | Result |
 | --- | --- | --- |
-| `android.launch` | `package` and/or `activity`; optional `serial` | `package`, `component` |
-| `android.tap` | `x`, `y` in pixels; optional `serial` | `x`, `y` |
-| `android.input_text` | `text`; optional `serial` | `characters` |
-| `android.screenshot` | `path`; optional `serial` | `path`, `bytes` |
-| `android.dump` | optional `text` or `resource_id`; optional `serial` | `count`, `nodes`, and `target` when a filter is given |
-| `android.tap_on` | `text` or `resource_id`; optional `serial` | `target`, `center` |
+| `android.launch` | `package` and/or `activity`; optional `serial`, `timeout_ms` | `package`, `component` |
+| `android.tap` | `x`, `y` in pixels; optional `serial`, `timeout_ms` | `x`, `y` |
+| `android.input_text` | `text`; optional `serial`, `timeout_ms` | `characters` |
+| `android.screenshot` | `path`; optional `serial`, `timeout_ms` | `path`, `bytes` |
+| `android.dump` | optional `text` or `resource_id`; optional `serial`, `timeout_ms` | `count`, `nodes`, and `target` when a filter is given |
+| `android.tap_on` | `text` or `resource_id`; optional `serial`, `timeout_ms` | `target`, `center` |
 
 `android.launch` starts `package` with `am start -W -n package/activity` when
 an activity is named. `-W` waits until the launch finishes, so the step after
@@ -2651,8 +2651,9 @@ the device shell, so `$`, `;`, quotes and backslashes reach the field unchanged.
 The step refuses empty text, control characters and `%`: `input text` sends key
 events, so it has no key for a newline or a tab, and it reads `%s` as a space
 with no escape for a literal percent sign. The text is not echoed in the result
-or in an error message; the result is the number of `characters` sent, so a
-password stays out of the report.
+or in an error message, including a timeout: that error names the command as
+`adb shell input text <redacted>`. The result is the number of `characters` sent,
+so a password stays out of the report.
 
 `android.screenshot` writes the PNG of the screen. A relative `path` resolves
 against the directory of the case file, the way every other output path in the
@@ -2705,6 +2706,72 @@ rather than the YAML 1.1 boolean; both spellings are read the same way:
 The same rule applies to values: type the letter `y` as
 `text: "y"`.
 
+#### Every step has a deadline
+
+A device that stops answering holds an adb command open for as long as nobody
+kills it: a dropped transport, a `uiautomator dump` that never returns or a
+wedged input method all leave the step waiting until CI or the operator ends the
+run. Every `android.*` step therefore accepts `timeout_ms`, the deadline of one
+adb command:
+
+| Field | Meaning |
+| --- | --- |
+| `timeout_ms` | Deadline of one adb command, in milliseconds. Defaults to `30000`. `0` and values above `600000` (ten minutes) are refused by `da lint`: a command that cannot start and a deadline that outlives the run both rescue nothing. |
+
+On the measured container a dump costs about 2.0 s and a tap 24 ms, so thirty
+seconds leaves ample room for a slow image while still failing fast on a device
+that is gone. A step that runs more than one command — a dump runs three — gives
+each of them the same deadline: the deadline bounds one adb call, not the case.
+
+When the deadline passes the adb process tree is killed and reaped — its own
+process group on Unix, its process tree on Windows — and both output pipes are
+drained within one bounded one-second grace period, so a descendant holding a
+pipe cannot keep the run waiting. The step fails with exit code 5:
+
+```text
+`android.dump` did not finish within its 30000 ms deadline: the adb command `adb shell uiautomator dump /data/local/tmp/da-dump-4231-0.xml` was killed after 30012 ms; raise `timeout_ms` if the device is only slow, or check that the device answers `adb devices`
+```
+
+The message names the step, the deadline, the time that passed and the command it
+ran, and never the adb path, the serial or the text typed by
+`android.input_text`, for the same reason the other messages do not. What the
+command printed before it was killed is kept in the message too: a device that
+dropped its transport says so there, while a device that is merely slow prints
+nothing and only needs a larger `timeout_ms`.
+
+#### A failed step records what the device showed
+
+When a step fails and the device still answers, the step writes two files into
+the case directory — the directory a relative `android.screenshot` path resolves
+against — and names both in the error:
+
+| File | Content |
+| --- | --- |
+| `android-failure-<pid>-<n>-<step>.png` | The screen as a PNG, captured the way `android.screenshot` captures it. |
+| `android-failure-<pid>-<n>-<step>.xml` | The `uiautomator dump` document, so the tree can be read, parsed or diffed as XML. |
+
+The two files of one failure share their name; the process id and the counter in
+it keep two failures of one run — a `retry` on the dump, or two cases on the
+same device — from overwriting each other's evidence. The error reads like this,
+after whatever reason the step itself gave:
+
+```text
+no node with text `Save` in the current UI tree (37 nodes); check the value, or run `android.dump` without a filter to see the tree; the device still answered, so the failure was recorded in the case directory: screenshot `cases/shop/android-failure-4231-0-android.dump.png` (28416 bytes) and UI tree `cases/shop/android-failure-4231-0-android.dump.xml` (9124 bytes)
+```
+
+The screenshot is the screen as it is: unlike `browser.screenshot`, nothing is
+masked, so a case that types a secret into a field and then fails leaves that
+field in the evidence.
+
+A command that times out is not asked for evidence at all: it already spent its
+deadline against a transport that did not answer, and its partial output and
+deadline error are the record. For an execution failure, the screenshot is also
+the question whether the device is still there, and when it does not come back as
+a PNG the step fails with the output adb printed — no evidence files, and no
+second full deadline spent. The two evidence commands use `min` of the step's
+deadline and ten seconds each. An invalid argument never reached the device and
+records nothing either.
+
 #### When there is no device
 
 No step turns a missing device into a skip. Each one fails with the action that
@@ -2717,16 +2784,23 @@ fixes it:
 | a device is not ready | 4 | `the attached Android device is not ready (\`unauthorized\`): accept the USB debugging prompt ...` |
 | several devices, no serial | 4 | `N Android devices are attached: set \`DA_ANDROID_SERIAL\` ...` |
 | a configured serial matches nothing | 4 | `no attached Android device has the serial in \`DA_ANDROID_SERIAL\` ...` |
+| a command outlived `timeout_ms` | 5 | `` `android.tap` did not finish within its 30000 ms deadline: the adb command `adb shell input tap 10 20` was killed after ... `` |
 | an invalid argument | 3 | reported by `da lint` before anything runs |
 
 The messages name the serial setting, never the serial itself and never the
 `DA_ADB` path: a report and a failure bundle are shared, and a serial identifies
-one physical device.
+one physical device. When adb printed something before it gave up, the message
+keeps it after the advice, so a device that left the bus mid-run is not reported
+as one that was never attached.
 
 The Android tests in `tests/android.rs` follow the browser suite: the schema,
-lint and missing-adb checks run on every machine, and the tests that drive a
-device are gated on `DA_TEST_ANDROID`. With the variable unset they print why
-they skip; with `DA_TEST_ANDROID=1` a missing device fails the suite instead.
+lint, missing-adb and deadline checks run on every machine — the deadline and
+no-evidence tests point `DA_ADB` at a script that waits or fails instead of
+answering, so the kill path is proven without a device — and the tests that drive
+a device are gated on `DA_TEST_ANDROID`, including the one that forces a failure
+and asserts the screenshot and the UI tree it wrote. With the variable unset
+those tests print why they skip; with `DA_TEST_ANDROID=1` a missing device fails
+the suite instead.
 
 ### `log.file`
 
