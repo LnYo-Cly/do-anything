@@ -15,18 +15,22 @@
 //! `uiautomator dump` that never returns or a wedged input method all leave adb
 //! waiting without an answer, and none of them ends on its own, so without a
 //! deadline the run hangs until CI or the operator kills it. When the deadline
-//! passes the `adb` process is killed and the command fails with the step, the
-//! deadline, the time that passed and the command it ran. Killing adb is safe:
-//! it keeps no state between calls, so the next call starts from the device as
-//! it is.
+//! passes the `adb` process tree is killed and reaped, so a descendant holding
+//! an output pipe cannot keep the run waiting, and the command fails with the
+//! step, the deadline, the time that passed and the command it ran. The command
+//! line keeps that identity without typed input: `android.input_text` shows
+//! `<redacted>` instead of the text it sent. Killing adb is safe: it keeps no
+//! state between calls, so the next call starts from the device as it is.
 //!
 //! A test replaces the binary with a script through `DA_ADB`, so the deadline
 //! and the kill are proven without a device; `tests/android.rs` does that.
 
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -62,11 +66,12 @@ pub(crate) const MAX_TIMEOUT_MS: u64 = 600_000;
 /// which is nothing against a deadline measured in seconds.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// How long the output pipes may stay open after the command ended or died.
+/// One shared grace period for both output pipes after the command ended or died.
 ///
 /// A process the command started keeps the write end of a pipe open after adb
-/// itself is gone. Waiting for it without a bound would hang `da`, so the output
-/// read so far is what a killed command reports.
+/// itself is gone. Both readers are polled against this one deadline, not waited
+/// for one after the other, so a descendant cannot add two full waits to one
+/// timeout. The output read so far is what a killed command reports.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The message for a run with no device attached: it names the next action.
@@ -150,6 +155,14 @@ impl Adb {
     /// The command line, with the serial when one is configured.
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
+        // A Unix child gets its own process group, so killing the group at a
+        // deadline also kills every descendant that inherited its pipes. The
+        // group id is the child's pid; Windows uses its process tree instead.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         if let Some(serial) = &self.serial {
             command.arg("-s").arg(serial);
         }
@@ -241,7 +254,14 @@ impl Adb {
     }
 
     /// The command line as a message shows it: `adb`, the arguments, no serial.
+    ///
+    /// `input text` is shown without its argument: adb's shell escaping changes
+    /// spaces and apostrophes after `Secrets::redact` has recorded the value, so
+    /// the escaped text could otherwise survive every later redaction pass.
     fn command_line(&self, argv: &[&str]) -> String {
+        if argv.starts_with(&["shell", "input", "text"]) {
+            return String::from("adb shell input text <redacted>");
+        }
         let mut line = String::from("adb");
         for argument in argv {
             line.push(' ');
@@ -345,21 +365,112 @@ impl Adb {
     }
 }
 
-/// Everything the two readers collected, each waited for at most
-/// [`DRAIN_TIMEOUT`].
+/// Everything the two readers collected within one shared [`DRAIN_TIMEOUT`].
+///
+/// Both pipes are polled against the same deadline. Waiting for stdout and then
+/// for stderr would let one stuck descendant add two full grace periods to a
+/// command that already missed its deadline.
 fn drain(stdout: Option<PipeReader>, stderr: Option<PipeReader>) -> (Vec<u8>, Vec<u8>) {
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    let mut readers = [stdout, stderr];
+    loop {
+        let mut waiting = false;
+        for reader in readers.iter_mut().flatten() {
+            if reader.closed {
+                continue;
+            }
+            match reader.done.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => reader.closed = true,
+                Err(TryRecvError::Empty) => waiting = true,
+            }
+        }
+        if !waiting {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(POLL_INTERVAL));
+    }
+
+    let [stdout, stderr] = readers;
     (
         stdout.map(PipeReader::finish).unwrap_or_default(),
         stderr.map(PipeReader::finish).unwrap_or_default(),
     )
 }
 
-/// Kills one command's process and reaps it.
+/// Kills one command's process tree and reaps the direct child.
 ///
 /// An unreaped child stays a zombie on Unix and holds its handle on Windows, so
-/// the wait is part of the kill. Both calls are best effort: a process that
-/// already exited fails the kill and still needs to be reaped.
+/// the wait is part of the kill. The tree is killed first: a descendant that
+/// inherited an output pipe must not survive the direct child and keep a reader
+/// blocked. Both calls are best effort: a process that already exited fails the
+/// kill and still needs to be reaped.
 fn kill(child: &mut Child) {
+    kill_tree(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Kills every process of one adb command, not just the direct child.
+///
+/// On Unix the child was spawned with its own process group, whose id is its pid;
+/// `/bin/kill -KILL -<pid>` reaches every descendant that inherited its pipes.
+/// On Windows `taskkill /T` walks the process tree of that pid. The helper itself
+/// is bounded, so a wedged kill utility cannot replace the deadline it enforces.
+fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("/bin/kill");
+        command.arg("-KILL").arg(format!("-{pid}"));
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let pid = pid.to_string();
+        let program = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .map(|root| root.join("System32").join("taskkill.exe"))
+            .unwrap_or_else(|| PathBuf::from("taskkill.exe"));
+        let mut command = Command::new(program);
+        command.args(["/PID", pid.as_str(), "/T", "/F"]);
+        command
+    };
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        bounded_kill_helper(command);
+    }
+}
+
+/// Runs a tree-kill helper without letting the helper outlive the deadline.
+fn bounded_kill_helper(mut command: Command) {
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(POLL_INTERVAL));
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -375,6 +486,8 @@ struct PipeReader {
     buffer: Arc<Mutex<Vec<u8>>>,
     done: Receiver<()>,
     handle: Option<JoinHandle<()>>,
+    /// Whether [`drain`] saw this reader's pipe close within the shared grace period.
+    closed: bool,
 }
 
 impl PipeReader {
@@ -403,13 +516,15 @@ impl PipeReader {
             buffer,
             done,
             handle: Some(handle),
+            closed: false,
         }
     }
 
-    /// Waits for the pipe to close, then returns everything that was read.
+    /// Joins a reader whose pipe closed, then returns everything that was read.
     fn finish(mut self) -> Vec<u8> {
-        let closed = self.done.recv_timeout(DRAIN_TIMEOUT).is_ok();
-        if closed && let Some(handle) = self.handle.take() {
+        if self.closed
+            && let Some(handle) = self.handle.take()
+        {
             let _ = handle.join();
         }
         // A reader that is still blocked stays detached with its pipe. It owns
@@ -779,6 +894,27 @@ mod tests {
         assert!(
             !message.contains("emulator-5554"),
             "the serial must not leak: {message}"
+        );
+    }
+
+    #[test]
+    fn a_deadline_does_not_echo_the_text_of_input_text() {
+        let deadlined = adb("adb", None, false);
+        let argv = ["shell", "input", "text", r"'hunter%stwo'\''o%sclock'"];
+
+        let StepError::Timeout(message) =
+            deadlined.deadline_error(&argv, Duration::from_millis(30_005), b"", b"")
+        else {
+            panic!("a missed deadline is a timeout");
+        };
+
+        assert!(
+            message.contains("`adb shell input text <redacted>`"),
+            "the command identity must remain without the typed text: {message}"
+        );
+        assert!(
+            !message.contains("hunter") && !message.contains("%s") && !message.contains("'\\''"),
+            "no escaped fragment of the typed text belongs in an error: {message}"
         );
     }
 

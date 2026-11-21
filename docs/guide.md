@@ -2651,8 +2651,9 @@ the device shell, so `$`, `;`, quotes and backslashes reach the field unchanged.
 The step refuses empty text, control characters and `%`: `input text` sends key
 events, so it has no key for a newline or a tab, and it reads `%s` as a space
 with no escape for a literal percent sign. The text is not echoed in the result
-or in an error message; the result is the number of `characters` sent, so a
-password stays out of the report.
+or in an error message, including a timeout: that error names the command as
+`adb shell input text <redacted>`. The result is the number of `characters` sent,
+so a password stays out of the report.
 
 `android.screenshot` writes the PNG of the screen. A relative `path` resolves
 against the directory of the case file, the way every other output path in the
@@ -2722,18 +2723,21 @@ seconds leaves ample room for a slow image while still failing fast on a device
 that is gone. A step that runs more than one command — a dump runs three — gives
 each of them the same deadline: the deadline bounds one adb call, not the case.
 
-When the deadline passes the adb process is killed, so the run keeps no child
-behind, and the step fails with exit code 5:
+When the deadline passes the adb process tree is killed and reaped — its own
+process group on Unix, its process tree on Windows — and both output pipes are
+drained within one bounded one-second grace period, so a descendant holding a
+pipe cannot keep the run waiting. The step fails with exit code 5:
 
 ```text
 `android.dump` did not finish within its 30000 ms deadline: the adb command `adb shell uiautomator dump /data/local/tmp/da-dump-4231-0.xml` was killed after 30012 ms; raise `timeout_ms` if the device is only slow, or check that the device answers `adb devices`
 ```
 
 The message names the step, the deadline, the time that passed and the command it
-ran, and never the adb path or the serial, for the same reason the other messages
-do not. What the command printed before it was killed is kept in the message
-too: a device that dropped its transport says so there, while a device that is
-merely slow prints nothing and only needs a larger `timeout_ms`.
+ran, and never the adb path, the serial or the text typed by
+`android.input_text`, for the same reason the other messages do not. What the
+command printed before it was killed is kept in the message too: a device that
+dropped its transport says so there, while a device that is merely slow prints
+nothing and only needs a larger `timeout_ms`.
 
 #### A failed step records what the device showed
 
@@ -2759,10 +2763,13 @@ The screenshot is the screen as it is: unlike `browser.screenshot`, nothing is
 masked, so a case that types a secret into a field and then fails leaves that
 field in the evidence.
 
-A device that does not answer is not asked twice. The screenshot is also the
-question whether the device is still there, and when it does not come back as a
-PNG the step fails with the output adb printed — no evidence files, and no
-second full deadline spent. An invalid argument never reached the device and
+A command that times out is not asked for evidence at all: it already spent its
+deadline against a transport that did not answer, and its partial output and
+deadline error are the record. For an execution failure, the screenshot is also
+the question whether the device is still there, and when it does not come back as
+a PNG the step fails with the output adb printed — no evidence files, and no
+second full deadline spent. The two evidence commands use `min` of the step's
+deadline and ten seconds each. An invalid argument never reached the device and
 records nothing either.
 
 #### When there is no device

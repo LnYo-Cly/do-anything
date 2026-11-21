@@ -26,8 +26,9 @@
 //! showed: a screenshot and the current UI tree, written into the case directory
 //! and named in the error. A failure without those files costs a debugging cycle
 //! — the report says a tap found no node, and nothing says which screen the tap
-//! was on — while a device that does not answer at all is not asked twice: the
-//! step fails at once, with what adb printed.
+//! was on — while a device that does not answer at all, or a command that spent
+//! its whole deadline, is not asked again: the step fails at once with what adb
+//! printed.
 
 mod adb;
 mod dump;
@@ -857,10 +858,11 @@ fn run_tap_on(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
     })
 }
 
-/// Runs one step's device work, recording evidence when it fails.
+/// Runs one step's device work, recording evidence for an execution failure.
 ///
-/// This wrapper is the one place every step reports through, so a step cannot
-/// fail without asking whether the device still had something to show.
+/// This wrapper is the one place every step reports through. A timeout has
+/// already spent its deadline against an unresponsive transport, so it is
+/// returned directly instead of asking adb for evidence.
 fn with_evidence<T>(
     adb: &Adb,
     step: &'static str,
@@ -1048,26 +1050,29 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StepError> {
     })
 }
 
-/// Adds the screenshot and the UI tree to a failed step's error.
+/// Adds the screenshot and the UI tree to a step's execution failure.
 ///
 /// Both files go into the case directory — the directory a relative
 /// `android.screenshot` path resolves against — and the error names them, so a
 /// terminal, a report and a failure bundle all say what the device displayed
-/// when the step failed. The screenshot is taken first and is also the question
-/// whether the device still answers: when it does not come back as a PNG the
-/// device is gone, nothing is written, and the step fails with the output adb
-/// already printed instead of spending a second deadline on a tree that will
-/// not come either.
+/// when the step failed. A timeout returns before any evidence command: the
+/// transport that just missed a deadline is not asked to answer another one.
+/// Otherwise the screenshot is taken first and is also the question whether the
+/// device still answers: when it does not come back as a PNG the device is gone,
+/// nothing is written, and the step fails with the output adb already printed
+/// instead of spending a second deadline on a tree that will not come either.
 fn record_evidence(
     adb: &Adb,
     step: &'static str,
     sessions: &Sessions,
     error: StepError,
 ) -> StepError {
-    // An invalid argument never reached the device, and an environment failure
-    // says the device could not be reached at all: there is nothing to record,
-    // and a second command would hang for the same reason the first one did.
-    if !matches!(error, StepError::Execution(_) | StepError::Timeout(_)) {
+    // An invalid argument never reached the device; an environment failure says
+    // the device could not be reached; and a timeout says the command did not
+    // answer within its deadline. None can justify another device call: against
+    // a dead transport it would spend a second deadline for evidence that is
+    // not there. Only an execution failure may still ask for the screen.
+    if !matches!(error, StepError::Execution(_)) {
         return error;
     }
     let evidence = adb.bounded_by(EVIDENCE_TIMEOUT);
@@ -1105,7 +1110,6 @@ fn record_evidence(
     );
     match error {
         StepError::Execution(message) => StepError::Execution(format!("{message}; {note}")),
-        StepError::Timeout(message) => StepError::Timeout(format!("{message}; {note}")),
         other => other,
     }
 }
