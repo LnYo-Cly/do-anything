@@ -116,6 +116,36 @@ da report evidence/            # writes evidence/report.html
 da report .da/failures/<run>   # or a single failure run
 ```
 
+## On a phone
+
+`android.*` drives one Android device over `adb`, in a build that enables the
+`android` feature:
+
+```sh
+cargo install --path . --features android   # or: cargo build --features android
+export DA_ADB=/path/to/adb                  # default: adb on PATH
+export DA_ANDROID_SERIAL=emulator-5554      # needed when several devices answer
+```
+
+The steps are `android.launch` (a `package` and/or an `activity`),
+`android.tap` (`x`, `y`), `android.input_text` (`text`), `android.screenshot`,
+`android.dump` (the UI tree, optionally filtered by `text` or `resource_id`) and
+`android.tap_on`, which reads the tree once and taps the node it found. Reading
+the tree costs about two seconds on a real device and does not get cheaper with
+compression, so only `dump` and `tap_on` do it: prefer `tap` with coordinates a
+previous `dump` gave you when a case taps several times in a row. Every step
+takes `timeout_ms` (default 30000) and a step that fails while the device still
+answers writes a screenshot and the tree beside the case file.
+
+```yaml
+name: Battery setting
+steps:
+  - android.launch: { package: com.android.settings }
+  - android.dump: { text: Battery }
+  - android.tap_on: { text: Battery }
+  - android.input_text: { text: "50" }
+```
+
 ## Guardrails
 
 - **No secrets in cases.** Write `${env:NAME}` for a token, password or
