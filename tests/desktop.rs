@@ -1272,3 +1272,278 @@ steps:
         "desktop.attach must never terminate the attached external process"
     );
 }
+
+#[cfg(windows)]
+fn is_windows_pid_alive(pid: u32) -> bool {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let tasklist = system_root.join("System32").join("tasklist.exe");
+    let output = Command::new(if tasklist.is_file() {
+        tasklist
+    } else {
+        PathBuf::from("tasklist")
+    })
+    .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+    .stdin(Stdio::null())
+    .output()
+    .expect("run tasklist");
+    let pid_text = pid.to_string();
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('"') {
+            return false;
+        }
+        let mut fields = trimmed.split("\",\"");
+        let _image = fields.next();
+        fields
+            .next()
+            .is_some_and(|f| f.trim_matches('"') == pid_text)
+    })
+}
+
+#[cfg(windows)]
+#[test]
+fn desktop_session_stop_kills_owned_pid_and_refuses_recycled_or_tampered_pid() {
+    let _guard = desktop_test_guard();
+    let dir = TempDir::new("desktop-pid-reuse");
+    let exe = compile_fixture(dir.path());
+
+    // 1. Normal `da session stop` terminates an owned launched GUI process cleanly.
+    let title1 = format!("DA Owned Stop {}", std::process::id());
+    let s1 = json_stdout(&run_da(
+        dir.path(),
+        &["session", "start", "--output", "json"],
+        &[],
+    ));
+    let id1 = s1["session_id"].as_str().expect("session_id").to_string();
+    let launch1 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id1,
+            "desktop.launch",
+            "--output",
+            "json",
+            "--with",
+            &json!({
+                "command": exe,
+                "args": ["--title", title1],
+                "window_title_contains": title1,
+                "timeout_ms": 15000
+            })
+            .to_string(),
+        ],
+        &[],
+    ));
+    assert!(launch1["ok"].as_bool().unwrap_or(false), "{launch1}");
+    let owned_pid1 = launch1["step"]["result"]["pid"].as_u64().expect("pid") as u32;
+    assert!(is_windows_pid_alive(owned_pid1));
+
+    let state1_path = dir
+        .path()
+        .join(".da")
+        .join("sessions")
+        .join(&id1)
+        .join("state.json");
+    let state1: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state1_path).expect("read state1"))
+            .expect("parse state1");
+    assert!(
+        state1["handles"]["desktop"]["process_start_filetime"]
+            .as_i64()
+            .is_some_and(|ticks| ticks > 0),
+        "persisted owned desktop handle must record positive process_start_filetime: {state1}"
+    );
+
+    let stop1 = json_stdout(&run_da(
+        dir.path(),
+        &["session", "stop", &id1, "--output", "json"],
+        &[],
+    ));
+    assert!(stop1["ok"].as_bool().unwrap_or(false), "{stop1}");
+    assert!(
+        !is_windows_pid_alive(owned_pid1),
+        "normal `da session stop` must terminate owned launched desktop process PID {owned_pid1}"
+    );
+
+    // Spawn an unrelated background process to stand in for a recycled PID holder.
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let ping_bin = system_root.join("System32").join("PING.EXE");
+    let victim_child = Command::new(if ping_bin.is_file() {
+        ping_bin
+    } else {
+        PathBuf::from("ping")
+    })
+    .args(["-n", "60", "127.0.0.1"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("spawn unrelated dummy process");
+    let victim_pid = victim_child.id();
+    let mut victim_guard = ProcessGuard(Some(victim_child));
+
+    // 2. Simulate PID reuse: launch owned GUI app, let it exit, then point `state.json`
+    // `pid` at `victim_pid` while keeping the original `process_start_filetime`.
+    let title2 = format!("DA Recycled PID {}", std::process::id());
+    let s2 = json_stdout(&run_da(
+        dir.path(),
+        &["session", "start", "--output", "json"],
+        &[],
+    ));
+    let id2 = s2["session_id"].as_str().expect("session_id").to_string();
+    let launch2 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id2,
+            "desktop.launch",
+            "--output",
+            "json",
+            "--with",
+            &json!({
+                "command": exe,
+                "args": ["--title", title2],
+                "window_title_contains": title2,
+                "timeout_ms": 15000
+            })
+            .to_string(),
+        ],
+        &[],
+    ));
+    assert!(launch2["ok"].as_bool().unwrap_or(false), "{launch2}");
+
+    // Close the owned fixture cleanly via its Close button so only the simulated recycled PID remains.
+    let close_click = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id2,
+            "desktop.click",
+            "--output",
+            "json",
+            "--with",
+            &json!({"automation_id": "closeBtn"}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(
+        close_click["ok"].as_bool().unwrap_or(false),
+        "{close_click}"
+    );
+
+    let state2_path = dir
+        .path()
+        .join(".da")
+        .join("sessions")
+        .join(&id2)
+        .join("state.json");
+    let mut state2: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state2_path).expect("read state2"))
+            .expect("parse state2");
+    state2["handles"]["desktop"]["pid"] = json!(victim_pid);
+    std::fs::write(
+        &state2_path,
+        serde_json::to_string_pretty(&state2).expect("serialize state2"),
+    )
+    .expect("write simulated recycled-pid state2");
+
+    // Verify reattach (`session snapshot`) also refuses the recycled PID cleanly without touching `victim_pid`.
+    let reattach_attempt = run_da(
+        dir.path(),
+        &["session", "snapshot", &id2, "--output", "json"],
+        &[],
+    );
+    assert!(
+        !reattach_attempt.status.success(),
+        "reattach must reject a recycled PID whose StartTime differs"
+    );
+    assert!(
+        victim_guard
+            .0
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none(),
+        "reattach check must not disturb unrelated process"
+    );
+
+    // `da session stop` treats the mismatched StartTime as original process already exited -> succeeds without killing `victim_pid`!
+    let stop2 = json_stdout(&run_da(
+        dir.path(),
+        &["session", "stop", &id2, "--output", "json"],
+        &[],
+    ));
+    assert!(stop2["ok"].as_bool().unwrap_or(false), "{stop2}");
+    assert!(
+        victim_guard
+            .0
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none(),
+        "`da session stop` must NEVER kill an unrelated process holding a recycled PID"
+    );
+
+    // 3. Fail-closed tamper check: `owned_launch: true` with missing `process_start_filetime`
+    // refuses termination with an error and leaves `victim_pid` untouched.
+    let s3 = json_stdout(&run_da(
+        dir.path(),
+        &["session", "start", "--output", "json"],
+        &[],
+    ));
+    let id3 = s3["session_id"].as_str().expect("session_id").to_string();
+    let state3_path = dir
+        .path()
+        .join(".da")
+        .join("sessions")
+        .join(&id3)
+        .join("state.json");
+    let mut state3: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state3_path).expect("read state3"))
+            .expect("parse state3");
+    state3["handles"]["desktop"] = json!({
+        "pid": victim_pid,
+        "hwnd": 123456,
+        "owned_launch": true
+    });
+    std::fs::write(
+        &state3_path,
+        serde_json::to_string_pretty(&state3).expect("serialize state3"),
+    )
+    .expect("write tampered state3");
+
+    let stop3 = run_da(
+        dir.path(),
+        &["session", "stop", &id3, "--output", "json"],
+        &[],
+    );
+    assert!(
+        !stop3.status.success(),
+        "tampered owned handle missing process_start_filetime must fail closed: {}",
+        stdout_str(&stop3)
+    );
+    let stop3_json = json_stdout(&stop3);
+    assert!(
+        stop3_json.to_string().contains("process_start_filetime"),
+        "expected missing process_start_filetime diagnostic: {stop3_json}"
+    );
+    assert!(
+        victim_guard
+            .0
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none(),
+        "fail-closed stop must NEVER kill an unrelated process when identity metadata is missing"
+    );
+}

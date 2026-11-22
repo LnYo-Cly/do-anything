@@ -196,6 +196,11 @@ struct PersistedHandle {
     pid: u32,
     hwnd: isize,
     owned_launch: bool,
+    /// Kernel creation timestamp in 100ns UTC `FILETIME` ticks (`StartTime.ToFileTimeUtc()`).
+    /// Required (`Some(> 0)`) when `owned_launch` is `true` so `reattach`, `close`, and
+    /// `dispose_handle` never interact with or terminate an unrelated process after PID reuse.
+    #[serde(default)]
+    process_start_filetime: Option<i64>,
     #[serde(default)]
     local_only_reason: Option<String>,
     #[serde(default)]
@@ -255,6 +260,7 @@ pub struct DesktopBackend {
     pid: u32,
     hwnd: isize,
     owned_launch: bool,
+    process_start_filetime: Option<i64>,
     local_only_reason: Option<String>,
     title: String,
     refs: BTreeMap<String, StoredRef>,
@@ -280,8 +286,8 @@ impl DesktopBackend {
             }
         });
 
-        let (mut child, pid) = if interactive {
-            let pid = spawn_detached_via_powershell(
+        let (mut child, pid, process_start_filetime) = if interactive {
+            let (pid, start_filetime) = spawn_detached_via_powershell(
                 &command_path,
                 &args.args,
                 resolved_cwd.as_deref(),
@@ -293,7 +299,7 @@ impl DesktopBackend {
                     args.command
                 ))
             })?;
-            (None, pid)
+            (None, pid, Some(start_filetime))
         } else {
             let spawned = spawn_direct(
                 &command_path,
@@ -303,7 +309,7 @@ impl DesktopBackend {
                 &args.command,
             )?;
             let pid = spawned.id();
-            (Some(spawned), pid)
+            (Some(spawned), pid, None)
         };
 
         let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
@@ -345,6 +351,7 @@ impl DesktopBackend {
                         pid: win.pid,
                         hwnd: win.hwnd,
                         owned_launch: true,
+                        process_start_filetime,
                         local_only_reason: None,
                         title: win.title,
                         refs: BTreeMap::new(),
@@ -354,13 +361,13 @@ impl DesktopBackend {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    terminate_pid_or_child(child.as_mut(), pid);
+                    terminate_pid_or_child(child.as_mut(), pid, process_start_filetime);
                     return Err(err);
                 }
             }
 
             if Instant::now() >= deadline {
-                terminate_pid_or_child(child.as_mut(), pid);
+                terminate_pid_or_child(child.as_mut(), pid, process_start_filetime);
                 return Err(StepError::Timeout(format!(
                     "timed out after {}ms waiting for main window of `{}` (PID {pid})",
                     args.timeout_ms, args.command
@@ -409,6 +416,7 @@ impl DesktopBackend {
                     pid: win.pid,
                     hwnd: win.hwnd,
                     owned_launch: false,
+                    process_start_filetime: None,
                     local_only_reason: Some(reason),
                     title: win.title,
                     refs: BTreeMap::new(),
@@ -431,6 +439,33 @@ impl DesktopBackend {
     pub fn reattach(handle: &Value) -> Result<Self, String> {
         let parsed: PersistedHandle = serde_json::from_value(handle.clone())
             .map_err(|err| format!("invalid persisted desktop session handle: {err}"))?;
+        if parsed.pid == 0 {
+            return Err(
+                "invalid persisted desktop session handle: `pid` must be non-zero".to_string(),
+            );
+        }
+        if parsed.owned_launch {
+            let expected_ticks =
+                validate_owned_start_filetime(parsed.pid, parsed.process_start_filetime)?;
+            let mut probe = probe_windows_process_identity;
+            let mut sleep = thread::sleep;
+            match settle_process_identity_with(parsed.pid, expected_ticks, &mut probe, &mut sleep) {
+                ProcessIdentityMatch::Matches => {}
+                ProcessIdentityMatch::NotRunning | ProcessIdentityMatch::Reused => {
+                    return Err(format!(
+                        "desktop window closed: target process (PID {}) is no longer active",
+                        parsed.pid
+                    ));
+                }
+                ProcessIdentityMatch::Unknown => {
+                    return Err(format!(
+                        "could not verify process identity for owned desktop session PID {}",
+                        parsed.pid
+                    ));
+                }
+            }
+        }
+
         let worker = MtaWorker::new()?;
 
         let pid = parsed.pid;
@@ -448,6 +483,7 @@ impl DesktopBackend {
             pid,
             hwnd,
             owned_launch: parsed.owned_launch,
+            process_start_filetime: parsed.process_start_filetime,
             local_only_reason: parsed.local_only_reason,
             title: parsed.title,
             refs: parsed.refs,
@@ -455,12 +491,12 @@ impl DesktopBackend {
         })
     }
 
-    /// Disposes a persisted desktop handle, terminating only owned launched processes.
+    /// Disposes a persisted desktop handle, terminating only verified owned launched processes.
     pub fn dispose_handle(handle: &Value) -> Result<(), String> {
         let parsed: PersistedHandle = serde_json::from_value(handle.clone())
             .map_err(|err| format!("invalid persisted desktop session handle: {err}"))?;
         if parsed.owned_launch {
-            kill_pid_tree(parsed.pid)?;
+            terminate_owned_detached_pid(parsed.pid, parsed.process_start_filetime)?;
         }
         Ok(())
     }
@@ -470,10 +506,24 @@ impl DesktopBackend {
     }
 
     pub fn detach(&mut self) -> Result<Option<Value>, String> {
+        let mut owned_launch = self.owned_launch;
+        if owned_launch && self.process_start_filetime.is_none() {
+            if let Some(child) = &mut self.child
+                && child.try_wait().map_err(|e| e.to_string())?.is_some()
+            {
+                owned_launch = false;
+                self.owned_launch = false;
+            } else {
+                // `self.child` (if present) still holds an open Win32 process HANDLE here,
+                // so `self.pid` cannot be recycled before its creation FILETIME is read.
+                self.process_start_filetime = Some(query_exact_process_start_filetime(self.pid)?);
+            }
+        }
         let handle = PersistedHandle {
             pid: self.pid,
             hwnd: self.hwnd,
-            owned_launch: self.owned_launch,
+            owned_launch,
+            process_start_filetime: self.process_start_filetime,
             local_only_reason: self.local_only_reason.clone(),
             title: self.title.clone(),
             refs: self.refs.clone(),
@@ -488,11 +538,10 @@ impl DesktopBackend {
 
     pub fn close(&mut self) -> Result<(), String> {
         if self.owned_launch {
-            if let Some(child) = &mut self.child {
-                terminate_child(child, self.pid)?;
-                self.child = None;
+            if let Some(mut child) = self.child.take() {
+                terminate_owned_child(&mut child, self.pid)?;
             } else {
-                kill_pid_tree(self.pid)?;
+                terminate_owned_detached_pid(self.pid, self.process_start_filetime)?;
             }
         }
         Ok(())
@@ -1227,7 +1276,7 @@ impl Drop for DesktopBackend {
         if self.owned_launch
             && let Some(child) = &mut self.child
         {
-            let _ = terminate_child(child, self.pid);
+            let _ = terminate_owned_child(child, self.pid);
         }
     }
 }
@@ -2150,7 +2199,7 @@ fn spawn_detached_via_powershell(
     args: &[String],
     cwd: Option<&Path>,
     env: &BTreeMap<String, String>,
-) -> Result<u32, String> {
+) -> Result<(u32, i64), String> {
     let arg_line = args
         .iter()
         .map(|arg| quote_windows_arg(arg))
@@ -2158,6 +2207,7 @@ fn spawn_detached_via_powershell(
         .join(" ");
 
     let script = concat!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
         "$exe = $env:DA_DESKTOP_LAUNCH_EXE; ",
         "$argStr = $env:DA_DESKTOP_LAUNCH_ARGS; ",
         "$cwd = $env:DA_DESKTOP_LAUNCH_CWD; ",
@@ -2166,7 +2216,7 @@ fn spawn_detached_via_powershell(
         "if ($argStr) { $sp.ArgumentList = $argStr }; ",
         "if ($cwd) { $sp.WorkingDirectory = $cwd }; ",
         "$p = Start-Process @sp; ",
-        "[Console]::Out.Write($p.Id)"
+        "[Console]::Out.Write(([string]$p.Id) + ':' + [string]$p.StartTime.ToFileTimeUtc())"
     );
 
     let ps = windows_system_tool(
@@ -2204,11 +2254,34 @@ fn spawn_detached_via_powershell(
             stderr
         });
     }
-    let pid_text = String::from_utf8_lossy(&output.stdout);
-    pid_text
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_detached_launch_output(&stdout)
+}
+
+fn parse_detached_launch_output(raw: &str) -> Result<(u32, i64), String> {
+    let trimmed = raw.trim();
+    let Some((pid_part, ticks_part)) = trimmed.split_once(':') else {
+        return Err(format!(
+            "invalid PID/StartTime payload from Start-Process `{trimmed}`"
+        ));
+    };
+    let pid = pid_part
         .trim()
         .parse::<u32>()
-        .map_err(|e| format!("invalid PID from Start-Process `{pid_text}`: {e}"))
+        .map_err(|e| format!("invalid PID from Start-Process `{trimmed}`: {e}"))?;
+    if pid == 0 {
+        return Err("Start-Process returned invalid PID 0".to_string());
+    }
+    let start_filetime = ticks_part
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| format!("invalid StartTime FILETIME from Start-Process `{trimmed}`: {e}"))?;
+    if start_filetime <= 0 {
+        return Err(format!(
+            "Start-Process returned non-positive StartTime FILETIME `{start_filetime}`"
+        ));
+    }
+    Ok((pid, start_filetime))
 }
 
 fn quote_windows_arg(arg: &str) -> String {
@@ -2236,11 +2309,15 @@ fn quote_windows_arg(arg: &str) -> String {
     out
 }
 
-fn terminate_pid_or_child(child: Option<&mut Child>, pid: u32) {
+fn terminate_pid_or_child(
+    child: Option<&mut Child>,
+    pid: u32,
+    expected_start_filetime: Option<i64>,
+) {
     if let Some(c) = child {
-        let _ = terminate_child(c, pid);
+        let _ = terminate_owned_child(c, pid);
     } else {
-        let _ = kill_pid_tree(pid);
+        let _ = terminate_owned_detached_pid(pid, expected_start_filetime);
     }
 }
 
@@ -2288,48 +2365,324 @@ fn pid_executable_map() -> HashMap<u32, String> {
     map
 }
 
-fn is_pid_running(pid: u32) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessIdentityMatch {
+    /// Live process has the exact recorded creation FILETIME (`100ns` UTC ticks).
+    Matches,
+    /// No process with `pid` is currently running.
+    NotRunning,
+    /// A live process holds `pid`, but its creation FILETIME differs (PID reused).
+    Reused,
+    /// Probe could not determine whether `pid` matches (fail-closed).
+    Unknown,
+}
+
+const IDENTITY_PROBE_ATTEMPTS: usize = 3;
+const IDENTITY_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const TASKKILL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn parse_tasklist_pid_exists(stdout: &str, pid: u32) -> bool {
+    let pid_text = pid.to_string();
+    stdout.lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('"') {
+            return false;
+        }
+        let mut fields = trimmed.split("\",\"");
+        let _image = fields.next();
+        fields
+            .next()
+            .is_some_and(|field| field.trim_matches('"') == pid_text)
+    })
+}
+
+fn windows_pid_exists(pid: u32) -> Option<bool> {
     let tasklist = windows_system_tool(&["tasklist.exe"], "tasklist");
-    let Ok(output) = Command::new(tasklist)
+    let output = Command::new(tasklist)
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(parse_tasklist_pid_exists(&text, pid))
+}
+
+fn is_pid_running(pid: u32) -> bool {
+    windows_pid_exists(pid).unwrap_or(false)
+}
+
+fn parse_process_identity_probe(
+    stdout: &str,
+    expected_start_filetime: i64,
+) -> ProcessIdentityMatch {
+    let trimmed = stdout.trim();
+    if expected_start_filetime <= 0 {
+        return ProcessIdentityMatch::Unknown;
+    }
+    if trimmed == "ABSENT" {
+        return ProcessIdentityMatch::NotRunning;
+    }
+    if let Some(rest) = trimmed.strip_prefix("EXACT:") {
+        let Ok(ticks) = rest.trim().parse::<i64>() else {
+            return ProcessIdentityMatch::Unknown;
+        };
+        if ticks <= 0 {
+            return ProcessIdentityMatch::Unknown;
+        }
+        return if ticks == expected_start_filetime {
+            ProcessIdentityMatch::Matches
+        } else {
+            ProcessIdentityMatch::Reused
+        };
+    }
+    if let Some(rest) = trimmed.strip_prefix("CIM:") {
+        let Ok(ticks) = rest.trim().parse::<i64>() else {
+            return ProcessIdentityMatch::Unknown;
+        };
+        if ticks <= 0 {
+            return ProcessIdentityMatch::Unknown;
+        }
+        // WMI CreationDate has 1-microsecond (10 FILETIME-tick) precision. When
+        // Get-Process.StartTime was unreadable (for example, PID recycled by an
+        // elevated or system process), a >= 10-tick difference proves PID reuse;
+        // otherwise stay fail-closed (`Unknown`) and never issue taskkill.
+        return if expected_start_filetime.abs_diff(ticks) >= 10 {
+            ProcessIdentityMatch::Reused
+        } else {
+            ProcessIdentityMatch::Unknown
+        };
+    }
+    ProcessIdentityMatch::Unknown
+}
+
+fn probe_windows_process_identity(pid: u32, expected_start_filetime: i64) -> ProcessIdentityMatch {
+    let ps = windows_system_tool(
+        &["WindowsPowerShell", "v1.0", "powershell.exe"],
+        "powershell.exe",
+    );
+    let script = format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+         $p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+         if ($null -eq $p) {{ [Console]::Out.Write('ABSENT'); exit 0 }} \
+         $st = $null; \
+         try {{ $st = $p.StartTime }} catch {{ $st = $null }} \
+         if ($null -ne $st) {{ [Console]::Out.Write('EXACT:' + [string]$st.ToFileTimeUtc()); exit 0 }} \
+         if ($null -eq (Get-Process -Id {pid} -ErrorAction SilentlyContinue)) {{ [Console]::Out.Write('ABSENT'); exit 0 }} \
+         $cim = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}' -ErrorAction SilentlyContinue; \
+         if ($null -eq $cim) {{ \
+             if ($null -eq (Get-Process -Id {pid} -ErrorAction SilentlyContinue)) {{ [Console]::Out.Write('ABSENT') }} \
+             else {{ [Console]::Out.Write('UNKNOWN') }} \
+         }} elseif ($null -ne $cim.CreationDate) {{ \
+             [Console]::Out.Write('CIM:' + [string]$cim.CreationDate.ToFileTimeUtc()) \
+         }} else {{ \
+             [Console]::Out.Write('UNKNOWN') \
+         }}"
+    );
+    let Ok(output) = Command::new(ps)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output()
     else {
-        return false;
+        return ProcessIdentityMatch::Unknown;
     };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let needle = format!("\"{pid}\"");
-    text.lines().any(|line| line.contains(&needle))
+    if !output.status.success() {
+        return ProcessIdentityMatch::Unknown;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_process_identity_probe(&stdout, expected_start_filetime)
 }
 
-fn terminate_child(child: &mut Child, pid: u32) -> Result<(), String> {
-    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-        return Ok(());
+fn query_exact_process_start_filetime(pid: u32) -> Result<i64, String> {
+    let ps = windows_system_tool(
+        &["WindowsPowerShell", "v1.0", "powershell.exe"],
+        "powershell.exe",
+    );
+    let script = format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+         $p = Get-Process -Id {pid} -ErrorAction Stop; \
+         [Console]::Out.Write([string]$p.StartTime.ToFileTimeUtc())"
+    );
+    let output = Command::new(ps)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|err| format!("failed to query StartTime for PID {pid}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not query StartTime for PID {pid} (PowerShell exited with {})",
+            output.status
+        ));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    if is_pid_running(pid) {
-        let _ = kill_pid_tree(pid);
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let ticks = raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|err| format!("invalid StartTime `{}` for PID {pid}: {err}", raw.trim()))?;
+    if ticks <= 0 {
+        return Err(format!("non-positive StartTime `{ticks}` for PID {pid}"));
     }
-    Ok(())
+    Ok(ticks)
 }
 
-fn kill_pid_tree(pid: u32) -> Result<(), String> {
-    if !is_pid_running(pid) {
-        return Ok(());
+fn validate_owned_start_filetime(
+    pid: u32,
+    process_start_filetime: Option<i64>,
+) -> Result<i64, String> {
+    if pid == 0 {
+        return Err("cannot verify or terminate owned desktop PID 0: invalid PID".to_string());
     }
+    process_start_filetime.filter(|&ticks| ticks > 0).ok_or_else(|| {
+        format!(
+            "cannot verify or terminate owned desktop PID {pid}: session handle is missing valid `process_start_filetime`"
+        )
+    })
+}
+
+fn settle_process_identity_with<P, S>(
+    pid: u32,
+    expected_start_filetime: i64,
+    probe: &mut P,
+    sleep: &mut S,
+) -> ProcessIdentityMatch
+where
+    P: FnMut(u32, i64) -> ProcessIdentityMatch,
+    S: FnMut(Duration),
+{
+    let mut last = ProcessIdentityMatch::Unknown;
+    for attempt in 0..IDENTITY_PROBE_ATTEMPTS {
+        last = probe(pid, expected_start_filetime);
+        if last != ProcessIdentityMatch::Unknown {
+            return last;
+        }
+        if attempt + 1 < IDENTITY_PROBE_ATTEMPTS {
+            sleep(IDENTITY_PROBE_INTERVAL);
+        }
+    }
+    last
+}
+
+fn run_windows_taskkill(args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
     let taskkill = windows_system_tool(&["taskkill.exe"], "taskkill");
-    let status = Command::new(taskkill)
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+    Command::new(taskkill)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|err| format!("failed to run taskkill for PID {pid}: {err}"))?;
-    if !status.success() && is_pid_running(pid) {
-        return Err(format!("taskkill failed for PID {pid} ({status})"));
+}
+
+fn terminate_owned_child(child: &mut Child, pid: u32) -> Result<(), String> {
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(());
     }
-    Ok(())
+    // `child` holds an open Win32 process HANDLE until dropped, preventing the
+    // kernel from recycling `pid` while `taskkill` terminates its process tree.
+    let _ = run_windows_taskkill(&["/PID", &pid.to_string(), "/T", "/F"]);
+    let _ = child.kill();
+    child
+        .wait()
+        .map(|_| ())
+        .map_err(|err| format!("failed waiting for owned desktop child PID {pid}: {err}"))
+}
+
+fn terminate_owned_detached_pid(
+    pid: u32,
+    expected_start_filetime: Option<i64>,
+) -> Result<(), String> {
+    terminate_owned_detached_pid_with_ops(
+        pid,
+        expected_start_filetime,
+        TASKKILL_WAIT_TIMEOUT,
+        windows_pid_exists,
+        probe_windows_process_identity,
+        run_windows_taskkill,
+        thread::sleep,
+    )
+}
+
+// Injects OS process probes and `taskkill` so unit tests can exercise PID-reuse and fail-closed paths deterministically.
+#[allow(clippy::too_many_arguments)]
+fn terminate_owned_detached_pid_with_ops<E, P, K, S>(
+    pid: u32,
+    expected_start_filetime: Option<i64>,
+    wait_timeout: Duration,
+    mut pid_exists: E,
+    mut probe_identity: P,
+    mut run_taskkill: K,
+    mut sleep: S,
+) -> Result<(), String>
+where
+    E: FnMut(u32) -> Option<bool>,
+    P: FnMut(u32, i64) -> ProcessIdentityMatch,
+    K: FnMut(&[&str]) -> std::io::Result<std::process::ExitStatus>,
+    S: FnMut(Duration),
+{
+    let expected_ticks = validate_owned_start_filetime(pid, expected_start_filetime)?;
+
+    if pid_exists(pid) == Some(false) {
+        return Ok(());
+    }
+
+    match settle_process_identity_with(pid, expected_ticks, &mut probe_identity, &mut sleep) {
+        ProcessIdentityMatch::NotRunning | ProcessIdentityMatch::Reused => return Ok(()),
+        ProcessIdentityMatch::Unknown => {
+            if pid_exists(pid) == Some(false) {
+                return Ok(());
+            }
+            return Err(format!(
+                "could not verify process identity for owned desktop PID {pid} before termination"
+            ));
+        }
+        ProcessIdentityMatch::Matches => {}
+    }
+
+    let pid_str = pid.to_string();
+    let status = run_taskkill(&["/PID", &pid_str, "/T", "/F"])
+        .map_err(|err| format!("failed to run taskkill for owned desktop PID {pid}: {err}"))?;
+
+    let deadline = Instant::now() + wait_timeout;
+    loop {
+        match pid_exists(pid) {
+            Some(false) => return Ok(()),
+            Some(true) | None if Instant::now() < deadline => {
+                sleep(POLL_INTERVAL);
+            }
+            Some(true) => {
+                return match settle_process_identity_with(
+                    pid,
+                    expected_ticks,
+                    &mut probe_identity,
+                    &mut sleep,
+                ) {
+                    ProcessIdentityMatch::NotRunning | ProcessIdentityMatch::Reused => Ok(()),
+                    ProcessIdentityMatch::Unknown => Err(format!(
+                        "could not verify whether owned desktop PID {pid} exited after taskkill ({status})"
+                    )),
+                    ProcessIdentityMatch::Matches => Err(format!(
+                        "taskkill failed to terminate owned desktop PID {pid} ({status})"
+                    )),
+                };
+            }
+            None => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "taskkill failed for owned desktop PID {pid} ({status})"
+                    ))
+                };
+            }
+        }
+    }
 }
 
 fn click_button_name(button: ClickButton) -> &'static str {
@@ -2392,5 +2745,261 @@ fn control_type_to_role(ct: ControlType) -> Option<DesktopRole> {
         ControlType::Separator => Some(DesktopRole::Separator),
         ControlType::SemanticZoom => Some(DesktopRole::SemanticZoom),
         ControlType::AppBar => Some(DesktopRole::AppBar),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn exit_status(code: u32) -> std::process::ExitStatus {
+        let cmd = windows_system_tool(&["cmd.exe"], "cmd.exe");
+        Command::new(cmd)
+            .args(["/C", &format!("exit {code}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("cmd exit status")
+    }
+
+    #[test]
+    fn parse_detached_launch_output_validates_pid_and_filetime() {
+        assert_eq!(
+            parse_detached_launch_output("  14280:134083940123456789 \r\n").unwrap(),
+            (14280, 134_083_940_123_456_789)
+        );
+        for invalid in [
+            "",
+            "14280",
+            "0:134083940123456789",
+            "14280:0",
+            "14280:-9",
+            "abc:134083940123456789",
+            "14280:notanumber",
+        ] {
+            assert!(
+                parse_detached_launch_output(invalid).is_err(),
+                "expected `{invalid}` to fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tasklist_pid_exists_matches_only_pid_column() {
+        let csv = "\"notepad.exe\",\"4200\",\"Console\",\"1\",\"12,480 K\"\r\n";
+        assert!(parse_tasklist_pid_exists(csv, 4200));
+        assert!(
+            !parse_tasklist_pid_exists(csv, 1),
+            "session number column `1` must not match PID 1"
+        );
+        assert!(!parse_tasklist_pid_exists(
+            "INFO: No tasks are running which match the specified criteria.\r\n",
+            4200
+        ));
+    }
+
+    #[test]
+    fn parse_process_identity_probe_handles_exact_cim_absent_and_unknown() {
+        let expected = 134_000_000_000_000_005_i64;
+        assert_eq!(
+            parse_process_identity_probe("ABSENT\r\n", expected),
+            ProcessIdentityMatch::NotRunning
+        );
+        assert_eq!(
+            parse_process_identity_probe("EXACT:134000000000000005", expected),
+            ProcessIdentityMatch::Matches
+        );
+        assert_eq!(
+            parse_process_identity_probe("EXACT:134000000000000006", expected),
+            ProcessIdentityMatch::Reused
+        );
+        // >= 10 ticks difference on CIM fallback proves a different process holds the PID.
+        assert_eq!(
+            parse_process_identity_probe("CIM:134000000000000100", expected),
+            ProcessIdentityMatch::Reused
+        );
+        // < 10 ticks difference on CIM fallback cannot prove identity; stay fail-closed.
+        assert_eq!(
+            parse_process_identity_probe("CIM:134000000000000000", expected),
+            ProcessIdentityMatch::Unknown
+        );
+        assert_eq!(
+            parse_process_identity_probe("UNKNOWN", expected),
+            ProcessIdentityMatch::Unknown
+        );
+        assert_eq!(
+            parse_process_identity_probe("", expected),
+            ProcessIdentityMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn dispose_handle_and_validator_fail_closed_when_owned_identity_missing() {
+        let kill_calls = Cell::new(0usize);
+        for (pid, ticks) in [
+            (0, Some(100)),
+            (4242, None),
+            (4242, Some(0)),
+            (4242, Some(-1)),
+        ] {
+            let res = terminate_owned_detached_pid_with_ops(
+                pid,
+                ticks,
+                Duration::from_millis(50),
+                |_| Some(true),
+                |_, _| ProcessIdentityMatch::Matches,
+                |_| {
+                    kill_calls.set(kill_calls.get() + 1);
+                    unreachable!("taskkill must never run when identity metadata is invalid");
+                },
+                |_| {},
+            );
+            assert!(
+                res.is_err(),
+                "expected fail-closed error for ({pid}, {ticks:?})"
+            );
+        }
+        assert_eq!(kill_calls.get(), 0);
+
+        let missing_ticks = json!({
+            "pid": 4242,
+            "hwnd": 1001,
+            "owned_launch": true
+        });
+        assert!(DesktopBackend::dispose_handle(&missing_ticks).is_err());
+
+        let attached_unowned = json!({
+            "pid": 4242,
+            "hwnd": 1001,
+            "owned_launch": false
+        });
+        assert!(DesktopBackend::dispose_handle(&attached_unowned).is_ok());
+    }
+
+    #[test]
+    fn terminate_owned_detached_pid_never_kills_reused_or_unverified_process() {
+        // 1. Recycled PID (`Reused`) is treated as already exited without calling taskkill.
+        let reused_res = terminate_owned_detached_pid_with_ops(
+            5150,
+            Some(999_000),
+            Duration::from_millis(50),
+            |_| Some(true),
+            |_, _| ProcessIdentityMatch::Reused,
+            |_| panic!("taskkill must never be called on a recycled PID"),
+            |_| {},
+        );
+        assert!(reused_res.is_ok());
+
+        // 2. Transient `Unknown` followed by `Reused` settles without calling taskkill.
+        let attempts = Cell::new(0usize);
+        let settled_res = terminate_owned_detached_pid_with_ops(
+            5150,
+            Some(999_000),
+            Duration::from_millis(50),
+            |_| Some(true),
+            |_, _| {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                if n == 0 {
+                    ProcessIdentityMatch::Unknown
+                } else {
+                    ProcessIdentityMatch::Reused
+                }
+            },
+            |_| panic!("taskkill must never be called after settling to Reused"),
+            |_| {},
+        );
+        assert!(settled_res.is_ok());
+        assert_eq!(attempts.get(), 2);
+
+        // 3. Persistent `Unknown` while PID exists fails closed without calling taskkill.
+        let probe_count = Cell::new(0usize);
+        let unknown_res = terminate_owned_detached_pid_with_ops(
+            5150,
+            Some(999_000),
+            Duration::from_millis(50),
+            |_| Some(true),
+            |_, _| {
+                probe_count.set(probe_count.get() + 1);
+                ProcessIdentityMatch::Unknown
+            },
+            |_| panic!("taskkill must never be called when identity is Unknown"),
+            |_| {},
+        );
+        assert!(unknown_res.is_err());
+        assert_eq!(probe_count.get(), IDENTITY_PROBE_ATTEMPTS);
+
+        // 4. Fast `pid_exists == Some(false)` exits immediately without probing or killing.
+        let exited_res = terminate_owned_detached_pid_with_ops(
+            5150,
+            Some(999_000),
+            Duration::from_millis(50),
+            |_| Some(false),
+            |_, _| panic!("probe should not run when tasklist already reports PID absent"),
+            |_| panic!("taskkill should not run when PID is absent"),
+            |_| {},
+        );
+        assert!(exited_res.is_ok());
+    }
+
+    #[test]
+    fn terminate_owned_detached_pid_kills_verified_match_and_handles_post_kill_reuse() {
+        let ok_status = exit_status(0);
+        let killed = Cell::new(false);
+        let res = terminate_owned_detached_pid_with_ops(
+            7777,
+            Some(123_456_789),
+            Duration::from_millis(50),
+            |_| Some(!killed.get()),
+            |_, _| ProcessIdentityMatch::Matches,
+            |args| {
+                assert_eq!(args, ["/PID", "7777", "/T", "/F"]);
+                killed.set(true);
+                Ok(ok_status)
+            },
+            |_| {},
+        );
+        assert!(res.is_ok());
+        assert!(killed.get());
+
+        // Non-zero taskkill exit where Windows recycled the PID before post-kill poll finishes.
+        let err_status = exit_status(128);
+        let call_idx = Cell::new(0usize);
+        let recycled_after_kill = terminate_owned_detached_pid_with_ops(
+            8888,
+            Some(123_456_789),
+            Duration::ZERO,
+            |_| Some(true),
+            |_, _| {
+                let c = call_idx.get();
+                call_idx.set(c + 1);
+                if c == 0 {
+                    ProcessIdentityMatch::Matches
+                } else {
+                    ProcessIdentityMatch::Reused
+                }
+            },
+            |_| Ok(err_status),
+            |_| {},
+        );
+        assert!(recycled_after_kill.is_ok());
+    }
+
+    #[test]
+    fn live_process_start_filetime_matches_self_and_detects_mismatch() {
+        let self_pid = std::process::id();
+        let ticks = query_exact_process_start_filetime(self_pid)
+            .expect("current test process StartTime must be readable");
+        assert!(ticks > 0);
+        assert_eq!(
+            probe_windows_process_identity(self_pid, ticks),
+            ProcessIdentityMatch::Matches
+        );
+        assert_eq!(
+            probe_windows_process_identity(self_pid, ticks + 1),
+            ProcessIdentityMatch::Reused
+        );
     }
 }

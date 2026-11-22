@@ -2878,7 +2878,9 @@ keyboard actions.
   `local_only: true`, because pre-existing local window state can contain
   unmanaged data.
 - **Sessions & export (`da session`)**: `desktop` sessions detach and reattach
-  across CLI/MCP calls by persisted `pid`, `hwnd`, and `owned_launch`.
+  across CLI/MCP calls by persisted `pid`, `hwnd`, `owned_launch`, and kernel
+  `process_start_filetime` (verified before reattaching or terminating an owned
+  process so Windows PID reuse never touches an unrelated process).
   `da session snapshot` assigns bounded `e1`, `e2`, … refs; `da session export`
   synthesizes deterministic locators (and reverse-looks up `ElementFromPoint`
   when `at:` hit a named interactive control), skips bare `desktop.read` steps
