@@ -500,7 +500,7 @@ fn handle_export(
         Ok(records) => records,
         Err(message) => return error_response(ExitCode::Environment, "environment", message),
     };
-    let result = match export::export_session(&state.id, &records, options) {
+    let result = match export::export_session(&state.id, &state.observe, &records, options) {
         Ok(result) => result,
         Err(message) => return error_response(ExitCode::InvalidCase, "invalid_input", message),
     };

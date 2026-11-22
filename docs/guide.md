@@ -577,7 +577,9 @@ Syntax errors exit 2 (`usage`); unknown observer names, invalid observer
 arguments, or unresolved `${env:NAME}` secrets fail with exit 3 before creating
 any session directory. Observer arguments are resolved with `${env:NAME}`
 references (not step-saved `${var}` variables). Attached observers expose
-`$.observed.<name>` in each step result before `expect` and `save` run.
+`$.observed.<name>` in each step result before `expect` and `save` run, and `da
+session export` writes the declared `observe:` block (preserving unexpanded
+`${env:NAME}` references) into the exported YAML case.
 
 Each entry in `.da/sessions/<id>/steps.jsonl` records:
 

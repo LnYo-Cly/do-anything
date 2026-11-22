@@ -2366,10 +2366,17 @@ fn session_export_preserves_saved_var_in_set_cookies_and_refuses_inline_secrets(
         .expect("session_id")
         .to_string();
 
-    let login_step = format!(
-        "http.request:\n  method: POST\n  url: \"{base}/login\"\n  json:\n    user: \"alice\"\nsave:\n  tok: $.body.token\n"
+    let open_step = format!("browser.open:\n  url: \"{base}/health\"\n");
+    let s0 = run_da_stdin(dir.path(), &["session", "step", &id], &open_step);
+    assert_eq!(
+        s0.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&s0.stdout)
     );
-    let s1 = run_da_stdin(dir.path(), &["session", "step", &id], &login_step);
+
+    let read_step = "browser.read:\n  css: \"body\"\nsave:\n  tok: $.text\n";
+    let s1 = run_da_stdin(dir.path(), &["session", "step", &id], read_step);
     assert_eq!(
         s1.status.code(),
         Some(0),
@@ -2396,9 +2403,9 @@ fn session_export_preserves_saved_var_in_set_cookies_and_refuses_inline_secrets(
         .join(&id)
         .join("steps.jsonl");
     let jsonl = fs::read_to_string(&steps_path).expect("steps.jsonl");
-    let line2: Value =
-        serde_json::from_str(jsonl.lines().nth(1).expect("second record")).expect("record json");
-    assert_eq!(line2["raw_args"]["cookies"][0]["value"], "${tok}");
+    let line3: Value =
+        serde_json::from_str(jsonl.lines().nth(2).expect("third record")).expect("record json");
+    assert_eq!(line3["raw_args"]["cookies"][0]["value"], "${tok}");
 
     let exported_path = dir.path().join("exported.yaml");
     let export = run_da_in(
@@ -2430,15 +2437,11 @@ fn session_export_preserves_saved_var_in_set_cookies_and_refuses_inline_secrets(
     let stop = run_da_in(dir.path(), &["session", "stop", &id]);
     assert_eq!(stop.status.code(), Some(0), "{:?}", stop);
 
-    let trace_dir = dir.path().join("trace-bundle");
     let replay = run_da_in(
         dir.path(),
         &[
             "run",
             exported_path.to_str().expect("utf8 path"),
-            "--record",
-            trace_dir.to_str().expect("utf8 path"),
-            "--trace-steps",
             "--no-bundle",
         ],
     );
@@ -2449,6 +2452,27 @@ fn session_export_preserves_saved_var_in_set_cookies_and_refuses_inline_secrets(
         String::from_utf8_lossy(&replay.stdout),
         String::from_utf8_lossy(&replay.stderr)
     );
+
+    // Pre-open browser.set_cookies under --trace-steps must skip step_evidence cleanly without error files.
+    let preopen_case = dir.write(
+        "preopen.yaml",
+        &format!(
+            "name: Preopen cookie\nvars:\n  tok: \"preopen-val\"\nsteps:\n  - browser.set_cookies:\n      cookies:\n        - name: sid\n          value: \"${{tok}}\"\n          url: \"{base}/\"\n"
+        ),
+    );
+    let trace_dir = dir.path().join("trace-bundle");
+    let preopen_run = run_da_in(
+        dir.path(),
+        &[
+            "run",
+            preopen_case.to_str().expect("utf8 path"),
+            "--record",
+            trace_dir.to_str().expect("utf8 path"),
+            "--trace-steps",
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(preopen_run.status.code(), Some(0));
     assert!(
         !trace_dir.join("trace/steps/1").exists(),
         "pre-open browser.set_cookies must not write a noisy error trace group"

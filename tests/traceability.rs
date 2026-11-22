@@ -530,8 +530,54 @@ expect:
     let state_json = fs::read_to_string(session_dir.join("state.json")).expect("read state.json");
     assert_no_secret_leaks(&state_json, SECRET, "state.json");
 
+    // Export the observer-backed session and verify `da lint` + `da run` replay its `observe:` block,
+    // `expect: $.observed.*`, and `save: $.observed.*` end-to-end.
+    let exported_path = dir.path().join("observed-exported.yaml");
+    let export = run_da_in(
+        dir.path(),
+        &["session", "export", &id, "-o", path_str(&exported_path)],
+    );
+    assert_eq!(
+        export.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&export.stdout)
+    );
+    let exported_yaml = fs::read_to_string(&exported_path).expect("read exported yaml");
+    assert!(
+        exported_yaml.contains("observe:\n  app_log:\n    log.file:\n"),
+        "expected top-level observe block in exported YAML:\n{exported_yaml}"
+    );
+    assert_no_secret_leaks(&exported_yaml, SECRET, "exported yaml");
+
     let stop = run_da_in(dir.path(), &["session", "stop", &id]);
     assert_eq!(stop.status.code(), Some(0));
+
+    let lint = run_da_with_env(
+        dir.path(),
+        &["lint", path_str(&exported_path)],
+        &[(ENV_NAME, SECRET)],
+    );
+    assert_eq!(
+        lint.status.code(),
+        Some(0),
+        "lint failed: {}",
+        String::from_utf8_lossy(&lint.stderr)
+    );
+
+    fs::write(&log_path, "").expect("reset log before replay");
+    let replay = run_da_with_env(
+        dir.path(),
+        &["run", path_str(&exported_path), "--no-bundle"],
+        &[(ENV_NAME, SECRET)],
+    );
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "exported observer case replay failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
 }
 
 #[allow(dead_code)]
