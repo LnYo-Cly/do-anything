@@ -15,10 +15,14 @@ pub mod cli;
 pub mod db;
 #[cfg(feature = "desktop")]
 pub mod desktop;
+#[cfg(feature = "fs")]
+pub mod fs;
 #[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "log")]
 pub mod log;
+#[cfg(feature = "proc")]
+pub mod proc;
 
 /// Registers every driver enabled at build time.
 pub fn register(registry: &mut Registry) -> Result<(), String> {
@@ -46,13 +50,18 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     {
         http::register(registry)?;
     }
+    #[cfg(feature = "proc")]
+    {
+        proc::register(registry)?;
+    }
     #[cfg(not(any(
         feature = "android",
         feature = "browser",
         feature = "cli",
         feature = "db",
         feature = "desktop",
-        feature = "http"
+        feature = "http",
+        feature = "proc"
     )))]
     {
         let _ = registry;
@@ -62,11 +71,15 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
 
 /// Registers every observer enabled at build time.
 pub fn register_observers(registry: &mut Registry) -> Result<(), String> {
+    #[cfg(feature = "fs")]
+    {
+        fs::register(registry)?;
+    }
     #[cfg(feature = "log")]
     {
         log::register(registry)?;
     }
-    #[cfg(not(feature = "log"))]
+    #[cfg(not(any(feature = "fs", feature = "log")))]
     {
         let _ = registry;
     }

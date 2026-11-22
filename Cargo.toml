@@ -17,13 +17,17 @@ name = "da"
 path = "src/main.rs"
 
 [features]
-default = ["http", "cli", "log", "db", "browser", "mcp", "plugin"]
+default = ["http", "cli", "log", "db", "browser", "mcp", "plugin", "proc", "fs"]
 # The `http.request` step and the HTTP client it needs.
 http = ["dep:schemars", "dep:ureq"]
 # The `cli.run` step and the child-process timeout it needs.
 cli = ["dep:schemars", "dep:wait-timeout"]
 # The `log.file` observer and the argument schema it needs.
 log = ["dep:schemars"]
+# The `fs.watch` observer and the argument schema it needs.
+fs = ["dep:schemars"]
+# The `proc.*` steps for long-lived process sessions.
+proc = ["dep:schemars"]
 # The `db.query` step and the two database clients it needs.
 db = [
     "dep:schemars",

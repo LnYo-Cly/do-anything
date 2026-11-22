@@ -30,11 +30,13 @@ The complete reference for `da`: installation options, building from source, the
   - [Cleanup with `finally`](#cleanup-with-finally)
   - [`http.request`](#httprequest)
   - [`cli.run`](#clirun)
+  - [Process sessions (`proc.*`)](#process-sessions-proc)
   - [`db.query`](#dbquery)
   - [Browser steps](#browser-steps)
   - [Android steps](#android-steps)
   - [Desktop steps](#desktop-steps)
   - [`log.file`](#logfile)
+  - [`fs.watch`](#fswatch)
 - [Failure bundles](#failure-bundles)
 - [Run records and HTML reports](#run-records-and-html-reports)
 - [RSI verification loop](#rsi-verification-loop)
@@ -88,10 +90,11 @@ cargo build
 
 The binary is written to `target/debug/da` (`target\debug\da.exe` on Windows).
 The `http` feature provides the `http.request` step, `cli` provides `cli.run`,
-`log` provides the `log.file` observer, `db` provides `db.query`, `browser`
-provides the `browser.*` steps, `mcp` provides `da mcp`, and `plugin` provides
-the [external plugin host](#external-plugins); these seven are enabled by
-default. The `android` feature provides the [`android.*`
+`proc` provides the `proc.*` process-session steps, `log` provides the
+`log.file` observer, `fs` provides the `fs.watch` observer, `db` provides
+`db.query`, `browser` provides the `browser.*` steps, `mcp` provides `da mcp`,
+and `plugin` provides the [external plugin host](#external-plugins); these nine
+are enabled by default. The `android` feature provides the [`android.*`
 steps](#android-steps) and is off by default, because it is only useful on a
 machine with an Android device: build it with `cargo build --features android`.
 The `desktop` feature provides the [`desktop.*` steps](#desktop-steps) and is
@@ -303,9 +306,10 @@ unreachable service is never a failed assertion.
 
 An interface that answers `201` has not necessarily done what it promised. An
 **observer** reads another layer while a step runs — a log file, the requests a
-page sends, or a database later — so a case can assert on the evidence the step
-left behind. The built-in observers are `log.file` for a file and, with the
-`browser` feature, `browser.network` for the page's requests ([Observing the
+page sends, a directory tree, or a database later — so a case can assert on the
+evidence the step left behind. The built-in observers are `log.file` for a file,
+`fs.watch` for a directory snapshot diff, and, with the `browser` feature,
+`browser.network` for the page's requests ([Observing the
 network](#observing-the-network)).
 
 `observe:` is optional. It is a mapping: the key is the name you choose for the
@@ -1850,6 +1854,116 @@ and the step is a timeout (exit 5). Both pipes are read on their own threads, so
 a program that writes more than a pipe buffer cannot deadlock the run; after the
 program ends `da` waits at most one second for the pipes to close, so a process
 the program left behind cannot hang it.
+
+### Process sessions (`proc.*`)
+
+`cli.run` blocks until a command exits. When a case needs to keep a local server
+or an interactive CLI/REPL alive across multiple steps, use `proc.start`,
+`proc.send`, `proc.wait_output` and `proc.stop`. All four share one per-case
+session and support multiple named processes in the same case (`name` defaults
+to `"default"`).
+
+#### `proc.start`
+
+Starts a long-lived background process directly without a shell and optionally
+waits until `ready_pattern` appears on standard output or standard error.
+
+| Argument | Meaning |
+| --- | --- |
+| `name` | Logical process name within the case. Defaults to `"default"`. Must start with an ASCII letter or digit and use only ASCII letters, digits, `.`, `_` and `-`. |
+| `command` | Program name or path. Required. Resolved the same way as `cli.run`. |
+| `args` | List of arguments, one per entry. No shell is involved. |
+| `cwd` | Working directory of the program. Defaults to the working directory of `da`. |
+| `env` | Environment variables added to the inherited environment, replacing names already set. |
+| `ready_pattern` | Optional non-empty substring to wait for in stdout or stderr before continuing. |
+| `ready_timeout_ms` | Maximum wait for `ready_pattern` in milliseconds. Defaults to `30000`. |
+
+Returns `{ "name", "pid", "ready", "stdout", "stderr" }`. Starting a process
+with a `name` that is already running is an execution error (exit 1). If the
+process exits before emitting `ready_pattern`, `proc.start` fails immediately
+with an execution error (exit 1); if `ready_timeout_ms` expires, `proc.start`
+kills the process tree and fails with a timeout (exit 5), keeping any captured
+logs for failure bundles.
+
+#### `proc.send`
+
+Writes UTF-8 text verbatim to a running process's standard input and optionally
+closes stdin.
+
+| Argument | Meaning |
+| --- | --- |
+| `name` | Logical process name. Defaults to `"default"`. |
+| `input` | Text written verbatim to stdin (no implicit newline is added). |
+| `eof` | Close stdin after writing `input` (or immediately when `input` is omitted). Defaults to `false`. |
+
+At least one of `input` or `eof: true` must be provided. Returns
+`{ "name", "bytes_written", "eof" }`.
+
+#### `proc.wait_output`
+
+Waits for a non-empty `pattern` substring in unconsumed output emitted after the
+previous match cursor on that process.
+
+| Argument | Meaning |
+| --- | --- |
+| `name` | Logical process name. Defaults to `"default"`. |
+| `pattern` | Non-empty substring to match. Required. |
+| `stream` | Which stream to search: `both` (default), `stdout`, or `stderr`. |
+| `timeout_ms` | Maximum wait in milliseconds. Defaults to `30000`. |
+
+Returns `{ "name", "matched", "stream", "stdout", "stderr" }`, advancing the
+matched stream's cursor past the match so repeated prompts or lines across
+subsequent steps match only new output. If the process exits before emitting
+`pattern`, the step fails fast with an execution error (exit 1).
+
+#### `proc.stop`
+
+Stops a running process and its entire process tree (`SIGTERM` then `SIGKILL` on
+its Unix process group; `taskkill /T /F` on Windows), reaps the child, and drains
+its pipes.
+
+| Argument | Meaning |
+| --- | --- |
+| `name` | Logical process name. Defaults to `"default"`. |
+| `timeout_ms` | Teardown budget in milliseconds. Defaults to `5000`. |
+
+Returns `{ "name", "was_running", "exit_code", "stdout", "stderr" }`. Calling
+`proc.stop` on a process that already exited or was already stopped succeeds with
+`was_running: false`.
+
+```yaml
+name: Start server and query health endpoint
+vars:
+  port: "18080"
+steps:
+  - proc.start:
+      name: api
+      command: python3
+      args: ["-m", "http.server", "${port}"]
+      ready_pattern: "Serving HTTP"
+      ready_timeout_ms: 5000
+  - http.request:
+      url: http://127.0.0.1:${port}/
+    expect:
+      - path: $.status
+        equals: 200
+  - proc.stop:
+      name: api
+```
+
+- **Zero orphan process trees:** `proc` spawns each process in its own Unix
+  process group (`process_group(0)`) and uses `taskkill /PID <pid> /T /F` on
+  Windows. When a case ends — whether it passed, failed, errored, or timed out
+  — `da` kills every still-running process tree even if `proc.stop` was never
+  called.
+- **Bounded non-blocking pipe draining:** background threads drain stdout and
+  stderr continuously into 1 MiB sliding buffers per stream so a chatty process
+  never blocks on a full OS pipe.
+- **Redacted failure evidence:** when a case fails or `--record` is enabled, the
+  session attaches `proc/stdout.log` and `proc/stderr.log` (or
+  `proc/<name>-stdout.log` and `proc/<name>-stderr.log` when named or when
+  multiple processes ran in the case), automatically redacted with `${env:NAME}`
+  secrets.
 
 ### `db.query`
 
@@ -3505,6 +3619,58 @@ steps:
   one of the same length or longer cannot be told apart from an append, and a
   file that is rewritten between two steps is read from its recorded length.
 
+### `fs.watch`
+
+Reports files created, modified, and deleted inside a directory while each step
+ran.
+
+| Argument | Meaning |
+| --- | --- |
+| `path` | Directory path to watch. Required. |
+| `recursive` | Walk subdirectories recursively. Defaults to `true`. |
+| `max_entries` | Maximum number of directory entries allowed per snapshot. Defaults to `1000`. |
+| `hash` | Compute SHA-256 content digests instead of metadata-only (`len` + `mtime`) comparisons. Defaults to `false`. |
+
+The result under `$.observed.<alias>` is `{ "created": [...], "modified": [...], "deleted": [...] }`,
+where each array holds sorted, normalized `/`-separated relative paths:
+
+```yaml
+name: Build produces output artifacts
+vars:
+  out_dir: build-out
+observe:
+  artifacts:
+    fs.watch:
+      path: ${out_dir}
+      recursive: true
+      max_entries: 500
+      hash: true
+steps:
+  - cli.run:
+      command: ./build.sh
+      args: ["${out_dir}"]
+    expect:
+      - path: $.exit_code
+        equals: 0
+      - path: $.observed.artifacts.created
+        contains: "bundle.js"
+      - path: $.observed.artifacts.deleted
+        equals: []
+```
+
+- **Strictly read-only:** `fs.watch` never creates, modifies, or deletes files.
+  A directory that does not exist when the step starts is treated as empty; if
+  the step creates it and writes files inside it, those files appear in
+  `created`. A path that exists and is not a directory is an environment error
+  (exit 4).
+- **Bounded & symlink-safe:** directory symlinks are never followed into cycles,
+  and exceeding `max_entries` fails the step with an environment error (exit 4)
+  naming the observer and cap.
+- **Metadata vs content digest:** with `hash: false`, modifications compare
+  `(len, mtime)` without reading file contents; set `hash: true` to compute
+  read-only SHA-256 digests when a tool rewrites files with the same size and
+  timestamp.
+
 ## Failure bundles
 
 Terminal output is truncated and gone after the run, so every case that does not
@@ -3522,6 +3688,9 @@ pass also leaves a directory that an agent can read afterwards:
     │   ├── desktop/                   present only when a desktop session had evidence
     │   │   ├── screenshot.png         the window, with Edit/IsPassword controls blacked out
     │   │   └── uia-tree.json          serialized UIA tree, text-redacted
+    │   ├── proc/                      present when `proc.*` started processes
+    │   │   ├── stdout.log             redacted stdout (or `<name>-stdout.log`)
+    │   │   └── stderr.log             redacted stderr (or `<name>-stderr.log`)
     │   └── meta.json                  written last
     └── 1-login-returns-a-token/
         └── (the same files; a case without a browser session has no browser/)
