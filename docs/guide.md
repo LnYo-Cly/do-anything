@@ -31,6 +31,7 @@ The complete reference for `da`: installation options, building from source, the
   - [`db.query`](#dbquery)
   - [Browser steps](#browser-steps)
   - [Android steps](#android-steps)
+  - [Desktop steps](#desktop-steps)
   - [`log.file`](#logfile)
 - [Failure bundles](#failure-bundles)
 - [Run records and HTML reports](#run-records-and-html-reports)
@@ -89,6 +90,9 @@ provides the `browser.*` steps and `mcp` provides `da mcp`; these six are
 enabled by default. The `android` feature provides the [`android.*`
 steps](#android-steps) and is off by default, because it is only useful on a
 machine with an Android device: build it with `cargo build --features android`.
+The `desktop` feature provides the [`desktop.*` steps](#desktop-steps) and is
+also off by default, because it drives a local graphical desktop session: build
+it with `cargo build --features desktop`.
 The `browser` feature adds about 0.5 MiB to the release
 binary and needs a Chrome or Chromium installed on the machine; it never
 downloads a browser. The `mcp` feature adds about 54 KiB to a build with no
@@ -120,6 +124,13 @@ missing-adb checks, and those run on every machine. The tests that drive a
 device through `adb` are gated on `DA_TEST_ANDROID` the same way: with the
 variable unset they print why and skip, and with `DA_TEST_ANDROID=1` a missing
 device fails the suite.
+
+The desktop tests in `tests/desktop.rs` run when `--features desktop` is
+enabled (`cargo test --features desktop --test desktop`). Schema, lint, and
+non-Windows `#88` stub checks run everywhere; on Windows the suite compiles a
+temporary WinForms fixture with `csc.exe` and exercises `da session` snapshots,
+exports, input-masked failure screenshots, `at:` coordinate pinning, and
+closed-window error classification.
 
 ### Self-test suite
 
@@ -2828,6 +2839,109 @@ and asserts the screenshot and the UI tree it wrote. With the variable unset
 those tests print why they skip; with `DA_TEST_ANDROID=1` a missing device fails
 the suite instead.
 
+### Desktop steps
+
+The `desktop.*` steps drive native desktop GUI applications through an
+accessibility tree rather than pixel guessing. They are provided by the
+opt-in `desktop` cargo feature (`cargo build --features desktop`): Tier 1
+implements Windows UI Automation (`#84`), while macOS and Linux backends are
+tracked in `#88` (on non-Windows builds, `desktop.*` steps compile cleanly and
+return an environment error referencing `#88`).
+
+An in-process `COINIT_MULTITHREADED` worker thread executes bulk-cached UI
+Automation tree walks (`UICacheRequest`) and simulates input under an exclusive
+host-level desktop lock so concurrent `da` runs never interleave mouse or
+keyboard actions.
+
+#### Steps
+
+| Step | Arguments | Result |
+| --- | --- | --- |
+| `desktop.launch` | `command`, optional `args`, `cwd`, `env`, `window_title_contains`, `timeout_ms` (default `30000`) | `pid`, `hwnd`, `title`, `window`, `viewport`, `owned` |
+| `desktop.attach` | At least one of `pid`, `executable`, `title_contains`; optional `timeout_ms` (default `10000`) | `pid`, `hwnd`, `title`, `window`, `viewport`, `owned`, `local_only` |
+| `desktop.click` | Locator (or `ref` in `da session`) or `at: { x, y, window? }`; optional `button` (`left`, `right`, `double`), `timeout_ms` | `clicked`, `button`, `role`/`name`/`automation_id` or `at`, `window` |
+| `desktop.type` | Locator (or `ref` in `da session`) or `at`, plus `text` (or `value` when `text` locates the control); optional `timeout_ms` | `typed_chars`, `role`, `window` |
+| `desktop.press` | `key` or chord (for example `Enter`, `Tab`, `Ctrl+S`, `Ctrl+Shift+P`); optional `timeout_ms` | `pressed` |
+| `desktop.wait` | Locator (or `ref` in `da session`), optional `state` (`present`, `gone`, `enabled`, `visible`), `timeout_ms` | `matched`, `state`, `elapsed_ms`, `element` |
+| `desktop.read` | Locator (or `ref` in `da session`), optional `timeout_ms` | `role`, `name`, `value` (`null` when `is_password`), `automation_id`, `class_name`, `bounds`, `enabled`, `is_password` |
+| `desktop.screenshot` | `path`; optional `mask_inputs` (default `true`), `timeout_ms` | `path`, `width`, `height`, `masked_inputs`, `masked_count` |
+
+- **Locators**: match controls by `automation_id`, `role` (`Button`, `Edit`,
+  `Text`, `CheckBox`, `ComboBox`, `MenuItem`, `Pane`, `Window`, …), exact
+  `name`, case-insensitive `text` substring, `class_name`, container scope
+  `within`, and 0-based `nth`. Volatile WinForms `HWND`-derived
+  `AutomationId` values (`AutomationId == NativeWindowHandle`) are filtered out
+  automatically during snapshots and locator synthesis so exported cases stay
+  portable across runs.
+- **`desktop.attach` is `local_only`**: attaching to an already-running
+  desktop window never kills that process on close and marks the run
+  `local_only: true`, because pre-existing local window state can contain
+  unmanaged data.
+- **Sessions & export (`da session`)**: `desktop` sessions detach and reattach
+  across CLI/MCP calls by persisted `pid`, `hwnd`, and `owned_launch`.
+  `da session snapshot` assigns bounded `e1`, `e2`, … refs; `da session export`
+  synthesizes deterministic locators (and reverse-looks up `ElementFromPoint`
+  when `at:` hit a named interactive control), skips bare `desktop.read` steps
+  without `expect` or `save` unless `--include-reads` is passed, disambiguates
+  `text` vs `value` on `desktop.type`, and pins `at.window` on remaining
+  coordinate clicks.
+- **Failure evidence & input masking**: on failure, the session captures
+  `desktop/screenshot.png` (painting every `Edit` and `IsPassword` control's
+  `BoundingRectangle` solid black by default) and `Secrets`-redacted
+  `desktop/uia-tree.json` (never exposing password values).
+
+```yaml
+name: Native desktop login flow
+steps:
+  - desktop.launch:
+      command: build/DemoApp.exe
+      window_title_contains: Sign In
+  - desktop.type:
+      automation_id: usernameBox
+      text: alice
+  - desktop.type:
+      automation_id: passwordBox
+      text: "${env:DEMO_PASS}"
+  - desktop.click:
+      role: Button
+      name: Submit
+  - desktop.wait:
+      automation_id: statusLabel
+      text: Welcome
+```
+
+#### UIPI, elevation, and custom-drawn surfaces
+
+- **UIPI and closed windows**: Windows User Interface Privilege Isolation
+  (UIPI) blocks a standard medium-integrity `da` process from driving an
+  elevated Administrator window (`E_ACCESSDENIED`, `0x80070005`). Because UIA
+  also briefly returns `0x80070005` while tearing down a window that just
+  exited, `da` checks child exit status and `element_from_handle` / process
+  liveness before reporting a UIPI elevation mismatch — closed windows fail fast
+  with `"desktop window closed"` instead of a misleading elevation error.
+- **Canvas & custom-drawn widgets (`at:`)**: controls painted directly with
+  GDI, Direct2D, or `DrawingContext` expose no child UIA nodes. Use
+  window-relative `at: { x, y, window: { width, height } }` as an explicit
+  escape hatch; `da lint` warns on `at` coordinates (and warns again when
+  `at.window` is omitted), and `desktop.click` fails if the live window size
+  differs from `at.window`.
+- **Electron and WebView2 apps (`--remote-debugging-port`)**: Electron and
+  WebView2 desktop apps render a Chromium DOM inside a native frame. Prefer
+  launching them with `--remote-debugging-port=9222` (or setting
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`) and
+  attaching `browser.open` (`connect:`) for full DOM locators, network
+  observation, and deterministic assertions:
+
+```yaml
+name: Electron app via CDP bridge
+steps:
+  - browser.open:
+      connect: http://127.0.0.1:9222
+      url: app://index.html
+  - browser.click:
+      testid: save-btn
+```
+
 ### `log.file`
 
 Reports the text a log file gained while the step ran.
@@ -2888,9 +3002,12 @@ pass also leaves a directory that an agent can read afterwards:
     ├── 0-wrong-exit-code/
     │   ├── case.yaml                  copy of the case file
     │   ├── report.json                the case as `--output json` shows it
-    │   ├── browser/                   present only when a session had evidence
+    │   ├── browser/                   present only when a browser session had evidence
     │   │   ├── screenshot.png         the page, with editable fields covered
     │   │   └── dom.html               serialized page HTML, text-redacted
+    │   ├── desktop/                   present only when a desktop session had evidence
+    │   │   ├── screenshot.png         the window, with Edit/IsPassword controls blacked out
+    │   │   └── uia-tree.json          serialized UIA tree, text-redacted
     │   └── meta.json                  written last
     └── 1-login-returns-a-token/
         └── (the same files; a case without a browser session has no browser/)

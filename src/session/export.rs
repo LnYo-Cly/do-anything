@@ -10,7 +10,7 @@ use crate::session::store::{StepRecord, StoredObservation};
 pub struct ExportOptions {
     /// Case name written into `name:`. Defaults to a name derived from the session id.
     pub case_name: Option<String>,
-    /// Include `browser.read` steps that have neither `expect` nor `save`.
+    /// Include `browser.read` and `desktop.read` steps that have neither `expect` nor `save`.
     pub include_reads: bool,
 }
 
@@ -54,7 +54,7 @@ pub fn export_session(
             continue;
         }
         if !options.include_reads
-            && record.action == "browser.read"
+            && matches!(record.action.as_str(), "browser.read" | "desktop.read")
             && record.expect.is_empty()
             && record.save.is_empty()
         {
@@ -75,8 +75,8 @@ pub fn export_session(
 
         let args = materialize_args(record)?;
         let exported_index = exported.len() + 1;
-        let viewport = coordinates_viewport(&args);
-        if record.fragile || viewport.is_some() {
+        let coord_bounds = coordinates_bounds(&record.action, &args);
+        if record.fragile || coord_bounds.is_some() {
             let mut entry = json!({
                 "step_index": record.index,
                 "exported_index": exported_index,
@@ -84,10 +84,10 @@ pub fn export_session(
                 "ref": record.used_ref,
                 "locator": record.synthesized_locator,
             });
-            match &viewport {
-                Some(viewport) => {
+            match &coord_bounds {
+                Some((field, bounds)) => {
                     entry["reason"] = json!("explicit_coordinates");
-                    entry["viewport"] = viewport.clone();
+                    entry[*field] = bounds.clone();
                 }
                 None => entry["reason"] = json!("synthesized_locator"),
             }
@@ -124,16 +124,21 @@ pub fn export_session(
     yaml.push_str("steps:\n");
 
     for (record, args) in &exported {
-        if let Some(viewport) = coordinates_viewport(args) {
-            let width = viewport.get("width").and_then(Value::as_u64).unwrap_or(0);
-            let height = viewport.get("height").and_then(Value::as_u64).unwrap_or(0);
+        if let Some((field, bounds)) = coordinates_bounds(&record.action, args) {
+            let width = bounds.get("width").and_then(Value::as_u64).unwrap_or(0);
+            let height = bounds.get("height").and_then(Value::as_u64).unwrap_or(0);
             yaml.push_str(&format!(
-                "  # fragile: explicit coordinates recorded at viewport {width}x{height}; replay this case at the same size\n"
+                "  # fragile: explicit coordinates recorded at {field} {width}x{height}; replay this case at the same size\n"
             ));
         } else if record.fragile {
             let ref_label = record.used_ref.as_deref().unwrap_or("target");
+            let fallback_kind = if record.action.starts_with("desktop.") {
+                "UIA"
+            } else {
+                "CSS"
+            };
             yaml.push_str(&format!(
-                "  # fragile: structural CSS path fallback for ref `{ref_label}`\n"
+                "  # fragile: structural {fallback_kind} path fallback for ref `{ref_label}`\n"
             ));
         }
         yaml.push_str(&format!("  - {}:", record.action));
@@ -203,27 +208,39 @@ fn materialize_args(record: &StepRecord) -> Result<Value, String> {
     Ok(args)
 }
 
-/// The `at.viewport` a coordinate step exports, if the step uses coordinates.
-fn coordinates_viewport(args: &Value) -> Option<Value> {
-    args.get("at")?.get("viewport").cloned()
+/// Name of the recorded bounds field inside `at` (`window` for desktop, `viewport` for browser).
+fn coordinate_bounds_field(action: &str) -> &'static str {
+    if action.starts_with("desktop.") {
+        "window"
+    } else {
+        "viewport"
+    }
 }
 
-/// Adds the recorded viewport to a bare `at`, so the exported case refuses to
-/// replay at a different size instead of clicking the wrong place.
+/// The `at.viewport` or `at.window` size a coordinate step exports, if present.
+fn coordinates_bounds(action: &str, args: &Value) -> Option<(&'static str, Value)> {
+    let field = coordinate_bounds_field(action);
+    let bounds = args.get("at")?.get(field)?.clone();
+    Some((field, bounds))
+}
+
+/// Adds the recorded viewport or window size to a bare `at`, so the exported
+/// case refuses to replay at a different size instead of clicking the wrong place.
 fn pin_coordinate_viewport(record: &StepRecord, args: &mut Value) -> Result<(), String> {
+    let field = coordinate_bounds_field(&record.action);
     let Some(at) = args.get_mut("at").and_then(Value::as_object_mut) else {
         return Ok(());
     };
-    if at.get("viewport").is_some() {
+    if at.get(field).is_some() {
         return Ok(());
     }
-    let viewport = record.observed_viewport.clone().ok_or_else(|| {
+    let bounds = record.observed_viewport.clone().ok_or_else(|| {
         format!(
-            "step {} (`{}`) uses `at` coordinates but recorded no viewport, so the exported case could not replay at the same size",
+            "step {} (`{}`) uses `at` coordinates but recorded no {field} size, so the exported case could not replay at the same size",
             record.index, record.action
         )
     })?;
-    at.insert("viewport".to_string(), viewport);
+    at.insert(field.to_string(), bounds);
     Ok(())
 }
 
@@ -245,8 +262,9 @@ fn synthesized_locator_args(record: &StepRecord) -> Result<Value, String> {
         ));
     };
     base.remove("ref");
+    base.remove("at");
 
-    if record.action == "browser.type" {
+    if matches!(record.action.as_str(), "browser.type" | "desktop.type") {
         let typed = base.remove("value").or_else(|| base.remove("text"));
         let mut merged = Map::new();
         for (k, v) in loc_map {

@@ -71,6 +71,10 @@ jobs:
         run: cargo clippy --all-targets --no-default-features --features browser -- -D warnings
       - name: Clippy (android feature)
         run: cargo clippy --all-targets --no-default-features --features android -- -D warnings
+      - name: Clippy (desktop feature)
+        run: cargo clippy --all-targets --no-default-features --features desktop -- -D warnings
+      - name: Clippy (default features with desktop)
+        run: cargo clippy --features desktop --all-targets -- -D warnings
 
   browser:
     name: Browser tests (${{ matrix.os }})
@@ -135,6 +139,11 @@ jobs:
         run: cargo test --no-default-features --features browser ${{ steps.targets.outputs.args }}
       - name: Test (android feature)
         run: cargo test --no-default-features --features android ${{ steps.targets.outputs.args }}
+      - name: Test (desktop feature)
+        run: cargo test --no-default-features --features desktop ${{ steps.targets.outputs.args }} -- --test-threads=1
+      - name: Test (desktop on Windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --features desktop --test desktop -- --test-threads=1
       - name: Doctests
         run: cargo test --doc
 
