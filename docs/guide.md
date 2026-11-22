@@ -676,13 +676,26 @@ $ da session stop s-1794974416388-44376-0
   `# fragile:` in the YAML and listed in the export JSON's `fragile` array.
   Generated hashes/utility tokens and digit-heavy IDs/classes are penalized or
   skipped.
+- **Structured, Compilable Computer Use**: instead of screenshot-and-pixel guessing
+  loops, explore the page with `da session` (or `da mcp`) using the structured
+  accessibility snapshot and `ref`s across `browser.click`, `browser.type`,
+  `browser.scroll`, `browser.hover`, `browser.drag`, `browser.set_clipboard`, and
+  `browser.read_clipboard`; export deterministic YAML with `da session export`
+  (compiling `ref`s into 7-tier locators and pinning any `at` coordinates to the
+  observed `viewport`); then run `da lint` and `da run` for repeatable multi-layer
+  replay. All interactions stay target-scoped over CDP (never moving the host OS
+  cursor or touching unrelated windows), and any `${env:NAME}` secret written to
+  the browser clipboard is automatically redacted across CLI, JSON, session logs,
+  and failure bundles.
 - **Dialogs**: `da session` steps use the same JavaScript-dialog handling as
   `da run`. A `ref`-targeted `browser.click`, `browser.type`, `browser.upload`,
-  `browser.wait` or `browser.read` has no `dialog` argument, so an unexpected
-  `alert`, `confirm`, `prompt` or `beforeunload` is dismissed immediately and
-  fails that step with the dialog type and its redacted message. Take a fresh
-  snapshot and retry after the page settles. Locator-targeted `browser.open`,
-  `browser.click`, `browser.type`, `browser.press` and `browser.wait` steps
+  `browser.wait`, `browser.read`, `browser.scroll`, `browser.hover`, or
+  `browser.drag` (when `from.ref` or `to.ref` is used) has no `dialog` argument,
+  so an unexpected `alert`, `confirm`, `prompt` or `beforeunload` is dismissed
+  immediately and fails that step with the dialog type and its redacted message.
+  Take a fresh snapshot and retry after the page settles. Locator-targeted
+  `browser.open`, `browser.click`, `browser.type`, `browser.press`,
+  `browser.wait`, `browser.scroll`, `browser.hover` and `browser.drag` steps
   accept `dialog` in a session exactly as they do in a case file.
 - **No `retry` in a session step**: `retry` polling belongs to the case runner
   (`da run` / `da lint`). A `da session step` with a `retry` block is rejected
@@ -1310,14 +1323,17 @@ Only read-only steps may declare `retry`:
 - `http.request` with exact uppercase `method` `GET` or `HEAD` (including when `method` is omitted, which defaults to `GET`)
 - `db.query`
 - `browser.read`
+- `browser.read_clipboard`
 - `browser.wait`
 
 State-changing steps — `http.request` with `POST`, `PUT`, `PATCH` or `DELETE`
 (or an unresolved variable method), `cli.run`, `browser.open`,
 `browser.click`, `browser.type`, `browser.upload`, `browser.press`,
-`browser.screenshot` and `browser.switch_tab` — are refused statically by
-`da lint` and before any step runs in `da run` (exit 3). `retry` is a reserved
-step field name, so no step may register under that name.
+`browser.scroll`, `browser.hover`, `browser.drag`, `browser.set_clipboard`,
+`browser.set_cookies`, `browser.save_state`, `browser.screenshot` and
+`browser.switch_tab` — are refused statically by `da lint` and before any step
+runs in `da run` (exit 3). `retry` is a reserved step field name, so no step may
+register under that name.
 
 Each polling iteration runs the step and any declared `observe` observers for
 that attempt, keeping only the last attempt's result and observations:
@@ -1626,6 +1642,11 @@ running and the user's other tabs are untouched.
 | `browser.press` | `key` required, for example `Enter` or `Tab`; optional `dialog` | `{}`; `dialog` when one opened |
 | `browser.wait` | locator, or `url_contains`; `timeout_ms` defaults to 5000; optional `dialog` | `url`; `dialog` when one opened |
 | `browser.read` | locator; optional `attribute` | `text`; with `attribute`, also `value` (`null` when the attribute is absent) |
+| `browser.scroll` | viewport `delta_x`/`delta_y`, `at` coordinates + `delta_x`/`delta_y`, locator + `delta_x`/`delta_y`, or locator (with optional `into_view: true`); optional `timeout_ms`, `dialog` | `scrolled` (`true`), `scroll_x`, `scroll_y`; `into_view`, `scroll_left`/`scroll_top`, or `x`/`y`/`viewport` when applicable; `dialog` when one opened |
+| `browser.hover` | locator, or explicit `at` coordinates; optional `timeout_ms`, `dialog` | `hovered` (`true`), optional `text`; with `at`, `x`, `y` and `viewport`; `dialog` when one opened |
+| `browser.drag` | `from` and `to` (each a locator, or explicit `at` coordinates); optional `timeout_ms`, `dialog` | `dragged` (`true`), `from: { x, y }`, `to: { x, y }`; `viewport` when an endpoint uses `at`; `dialog` when one opened |
+| `browser.set_clipboard` | `text` required (supports `${env:NAME}` secrets); optional `timeout_ms` | `characters` (character count only; never echoes `text`) |
+| `browser.read_clipboard` | optional `timeout_ms`; safe with `retry` | `text` (redacted with `***` when matching `${env:NAME}`) |
 | `browser.screenshot` | `path` required | `path`, `bytes` |
 | `browser.set_cookies` | `cookies` (non-empty array of `{ name, value, url \| domain, path?, http_only?, secure?, same_site? }`) and/or `local_storage` (non-empty `<origin> \| current` → `{ key: value }` map); at least one of the two | `cookies_set`, `local_storage_set` |
 | `browser.save_state` | `path` required | `path`, `cookies`, `local_storage` (counts only) |
@@ -1651,8 +1672,11 @@ Giving zero or more than one locator key, passing `name` without `role`, passing
 a negative or non-integer `nth`, giving an empty `testid_attribute`, or giving
 an invalid `within` locator is an argument error reported by `da lint` before
 anything runs. `browser.wait` keeps its `url_contains` form as an alternative to
-an element locator. `browser.click` and `browser.type` take `at` instead of a
-locator; see [Coordinates](#coordinates). Inside [`da session`](#interactive-sessions-da-session), interactive steps also accept `ref: e<N>` targets from the latest snapshot, which `da session export` converts to ordinary stable locators.
+an element locator. `browser.click`, `browser.type`, `browser.scroll`,
+`browser.hover` and `browser.drag` endpoints take `at` instead of a locator; see
+[Coordinates](#coordinates). Inside [`da session`](#interactive-sessions-da-session),
+interactive steps also accept `ref: e<N>` targets from the latest snapshot,
+which `da session export` converts to ordinary stable locators.
 
 #### Choosing a locator
 
@@ -1672,8 +1696,9 @@ Prefer `testid` and `role` + `name` over `css` or `xpath`:
 
 Some content has no DOM element and no accessibility node to name: a
 `<canvas>` painting, a WebGL scene, or a map control. For that content only,
-`browser.click` and `browser.type` accept explicit viewport coordinates instead
-of a locator:
+`browser.click`, `browser.type`, `browser.scroll`, `browser.hover` and
+`browser.drag` endpoints (`from` / `to`) accept explicit viewport coordinates
+instead of a locator:
 
 ```yaml
 - browser.click:
@@ -1742,10 +1767,10 @@ the last are steps of the case:
    directory that holds the case file, and returns the `path` and the number of
    `bytes` written.
 2. The caller's own model or tool reads that PNG and computes a point in it.
-3. `browser.click` or `browser.type` acts on that point given as
-   `at: { x, y, viewport }`, with `viewport` recording the size the point was
-   measured at. A coordinate `browser.type` clicks the point to focus it and
-   then types `text`.
+3. `browser.click`, `browser.type`, `browser.scroll`, `browser.hover` or
+   `browser.drag` acts on that point given as `at: { x, y, viewport }`, with
+   `viewport` recording the size the point was measured at. A coordinate
+   `browser.type` clicks the point to focus it and then types `text`.
 
 Record the viewport with the point. Before acting, the step reads the page's live
 CSS viewport and, when the recorded and the live size differ, fails with both
@@ -1814,7 +1839,8 @@ with `within` or pick an explicit zero-based `nth`.
 
 #### Actionability checks
 
-Before clicking or typing, `browser.click` and `browser.type` wait within
+Before clicking, typing, hovering or dragging, `browser.click`, `browser.type`,
+`browser.hover` and locator endpoints of `browser.drag` wait within
 `timeout_ms` for all five checks in order:
 
 1. **Exists**: unique match (or valid `nth` index).
@@ -1921,7 +1947,8 @@ no tab matched a URL containing `/browser/probe/absent` within 400 ms (tabs: 0: 
 ```
 
 After the switch, every later `browser.*` step drives the new tab: `read`,
-`click`, `type`, `press`, `wait`, `screenshot`, `browser.open`, and the network
+`click`, `type`, `press`, `scroll`, `hover`, `drag`, `set_clipboard`,
+`read_clipboard`, `wait`, `screenshot`, `browser.open`, and the network
 requests `browser.network` reports. The failure bundle (`screenshot.png` and
 `dom.html`) is collected from the tab the case was on, because that is the tab
 whose failure the case is reporting. The previous tab stays open, so a second
@@ -1969,13 +1996,17 @@ equivalent except for how the element is found:
 its title. Its own `timeout_ms` bounds how long the page may take to finish
 loading; exceeding it is a timeout (exit 5).
 
-Every wait a browser step makes on the page — navigation, the load event, the
-locator and actionability polls, `Input.*`, `browser.wait`, the screenshot and
-the evidence snapshot — ends at once as an environment error (exit 4) when Chrome
-reports that the page's target crashed or detached, and the message names the
-event. A tab that dies while loading is therefore not reported as a slow page.
-Without such an event the wait still ends at `timeout_ms` with the same exit code
-as before, and the timeout message says that no target/session event arrived.
+Every wait and interaction a browser step makes on the page — navigation, the
+load event, the locator and actionability polls, `Input.*`, `browser.scroll`,
+`browser.hover`, `browser.drag`, `browser.set_clipboard`,
+`browser.read_clipboard`, `browser.wait`, the screenshot and the evidence
+snapshot — ends at once as an environment error (exit 4) when Chrome reports
+that the page's target crashed or detached, or when the owned tab is already
+closed, and the message names the event or tab. A tab that dies while loading
+is therefore not reported as a slow page, and steps stay strictly target-scoped
+over CDP without moving the host OS cursor or touching unowned windows. Without
+such an event the wait still ends at `timeout_ms` with the same exit code as
+before, and the timeout message says that no target/session event arrived.
 
 `browser.press` accepts `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, the four
 arrow keys, `Home`, `End`, `PageUp`, `PageDown`, `Space`, or one printable
@@ -2012,6 +2043,74 @@ the page. A later `browser.open` that gives a different effective value is a ste
 error instead of being silently ignored, so one case cannot change the browser it
 is driving halfway through. `timeout_ms` applies to each navigation, so a later
 `browser.open` may choose a different value.
+
+#### Scrolling, hovering, dragging, and scoped clipboard
+
+All four Computer Use primitives run strictly inside the owned CDP page target —
+they never move the host OS cursor, hijack unrelated desktop windows, or read/write
+arbitrary `Runtime.evaluate` strings.
+
+- **`browser.scroll`** scrolls the viewport (`delta_x` / `delta_y`), dispatches
+  a CDP wheel event at `at` coordinates (`at` + `delta_x` / `delta_y`), scrolls a
+  uniquely matched scrollable container (`locator` + `delta_x` / `delta_y`), or
+  scrolls a matched element (and its enclosing same-origin frames) into view
+  (`locator` with `into_view: true` or omitted deltas). In `da session`, `ref`
+  targets compile into verified deterministic locators on `da session export`.
+- **`browser.hover`** waits for full actionability on a uniquely matched element
+  (or validates live viewport bounds on `at`), dispatches a CDP pointer move to
+  its center, and triggers CSS `:hover`, `mouseover`, and `mouseenter` events.
+  Returns `{ "hovered": true }` plus optional `text` (or `x`, `y`, `viewport`
+  for `at`).
+- **`browser.drag`** resolves `from` and `to` (each a locator, a session `ref`,
+  or explicit `at` coordinates), re-verifies `from` if scrolling `to` shifted the
+  page, and drives a stepped CDP pointer drag with `Input.setInterceptDrags` and
+  `Input.dispatchDragEvent` (`dragEnter`, `dragOver`, `drop`), handling both
+  pointer-event controls and HTML5 `draggable` elements across main documents,
+  open shadow DOM, and same-origin `<iframe>`s. Using `at` on either endpoint
+  emits a `da lint` warning and pins `viewport` during `da session export`.
+- **`browser.set_clipboard` and `browser.read_clipboard`** read and write text
+  in the browser-scoped clipboard via `navigator.clipboard` (granting
+  `clipboardReadWrite` / `clipboardSanitizedWrite` on the page origin and
+  enabling focus emulation on that page target). Both steps require a secure
+  context (`http://127.0.0.1`, `http://localhost`, `https://`, or `file://`) and
+  fail clearly on `about:blank`.
+  - `browser.set_clipboard` accepts `text` (including `${env:NAME}` secrets),
+    returns only `{ "characters": N }` without echoing the text, and cannot use
+    `retry`.
+  - `browser.read_clipboard` returns `{ "text": ... }` and is safe to pair with
+    `retry`. Any value read from `${env:NAME}` is redacted as `***` across text
+    output, `--output json`, `steps.jsonl`, `state.json`, and failure bundles.
+  - **External browser (`connect`) boundary:** clipboard values preexisting on
+    an externally connected user browser (`browser.open: { connect: ... }`) before
+    `da` starts did not come from `${env:NAME}`. Just like preexisting cookies
+    or storage in a connected browser, `da` never read those values from the
+    environment and cannot redact them; connected runs mark their evidence
+    `local_only`.
+
+```yaml
+name: Hover, drag, scroll, and copy with secret redaction
+steps:
+  - browser.open:
+      url: http://127.0.0.1:8080/board
+  - browser.hover:
+      role: button
+      name: Card menu
+  - browser.drag:
+      from: { testid: task-1 }
+      to: { testid: done-column }
+  - browser.scroll:
+      testid: audit-log
+      delta_y: 240
+  - browser.set_clipboard:
+      text: "${env:API_TOKEN}"
+  - browser.read_clipboard: {}
+    retry:
+      until:
+        - path: $.text
+          exists: true
+      timeout_ms: 2000
+      interval_ms: 50
+```
 
 #### Uploading files (`browser.upload`)
 
@@ -2133,7 +2232,8 @@ dialog `type` and its `message` (redacted like any other step output when it
 contains a `${env:...}` secret).
 
 To handle an expected dialog instead, set `dialog` on `browser.open`,
-`browser.click`, `browser.type`, `browser.press` or `browser.wait`:
+`browser.click`, `browser.type`, `browser.press`, `browser.wait`,
+`browser.scroll`, `browser.hover` or `browser.drag`:
 
 - `dialog: accept` or `dialog: dismiss` — accepts or cancels the dialog.
 - `dialog: { action: accept, prompt_text: "..." }` or
@@ -2433,8 +2533,12 @@ output like any other secret (see [Secrets](#secrets)).
 ##### Evidence from a profile or a connected browser
 
 A browser started with `profile` or reached with `connect` may show pages that
-were signed in outside `da`, so `da` cannot know every secret its evidence could
-contain. Such a case marks its evidence `local_only`: failure bundles write
+were signed in outside `da` (and a `connect` browser may already hold preexisting
+clipboard contents created before `da` started), so `da` cannot know every
+secret its evidence could contain. Preexisting clipboard values on a connected
+user browser did not come from `${env:NAME}` and therefore are not redacted by
+`Secrets` (the same boundary as preexisting cookies and storage). Such a case
+marks its evidence `local_only`: failure bundles write
 `"local_only": true` with a `"local_only_reason"`, text output prints a
 `local-only:` line, and `--output json` adds `local_only` and
 `local_only_reason`. A browser `da` starts in a temporary directory has none of

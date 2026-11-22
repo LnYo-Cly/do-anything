@@ -81,6 +81,13 @@ pub struct DialogWatch<'a> {
     pub opened: &'a mut Option<OpenedDialog>,
 }
 
+/// Evaluation flags passed to `Runtime.evaluate`.
+#[derive(Clone, Copy)]
+struct EvalOptions {
+    await_promise: bool,
+    user_gesture: bool,
+}
+
 /// The instant one step must finish by.
 #[derive(Clone, Copy, Debug)]
 pub struct Deadline {
@@ -425,12 +432,65 @@ impl Connection {
     where
         F: FnMut(&Value) -> bool,
     {
+        self.evaluate_with_options(
+            session_id,
+            expression,
+            EvalOptions {
+                await_promise: false,
+                user_gesture: false,
+            },
+            deadline,
+            should_abort,
+            dialog,
+        )
+    }
+
+    /// Evaluates an async JavaScript expression (`awaitPromise: true`), optionally marking
+    /// the call as a user gesture (`userGesture`) for clipboard / permissioned APIs.
+    pub fn evaluate_async<F>(
+        &mut self,
+        session_id: &str,
+        expression: &str,
+        user_gesture: bool,
+        deadline: Deadline,
+        should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        self.evaluate_with_options(
+            session_id,
+            expression,
+            EvalOptions {
+                await_promise: true,
+                user_gesture,
+            },
+            deadline,
+            should_abort,
+            dialog,
+        )
+    }
+
+    fn evaluate_with_options<F>(
+        &mut self,
+        session_id: &str,
+        expression: &str,
+        options: EvalOptions,
+        deadline: Deadline,
+        should_abort: F,
+        dialog: Option<DialogWatch<'_>>,
+    ) -> Result<Value, CdpError>
+    where
+        F: FnMut(&Value) -> bool,
+    {
         let reply = self.call_until_with_dialog(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
                 "returnByValue": true,
-                "awaitPromise": false,
+                "awaitPromise": options.await_promise,
+                "userGesture": options.user_gesture,
             }),
             Some(session_id),
             deadline,
@@ -666,6 +726,19 @@ impl Connection {
         for message in messages {
             self.queued.push(message);
         }
+    }
+
+    /// Removes and returns the first queued event whose `method` matches `method`.
+    pub fn take_queued_method(&mut self, method: &str) -> Option<Value> {
+        self.queued.take(method)
+    }
+
+    /// Whether any currently queued event matches `predicate` without removing it.
+    pub fn has_queued_matching<F>(&self, predicate: F) -> bool
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        self.queued.any(predicate)
     }
 
     /// How many messages the queue discarded to stay within its bound.

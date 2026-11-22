@@ -352,6 +352,11 @@ fn valid_arguments(step: &str) -> Value {
         }
         "browser.save_state" => json!({"path": "state.json"}),
         "browser.switch_tab" => json!({}),
+        "browser.scroll" => json!({"css": "#list", "delta_y": 200}),
+        "browser.hover" => json!({"css": "#name"}),
+        "browser.drag" => json!({"from": {"css": "#source"}, "to": {"css": "#target"}}),
+        "browser.set_clipboard" => json!({"text": "hello"}),
+        "browser.read_clipboard" => json!({}),
         "cli.run" => json!({"command": "da"}),
         "http.request" => json!({"url": "http://127.0.0.1:1/health"}),
         "db.query" => json!({"url": "sqlite:app.db", "sql": "SELECT 1"}),
@@ -1355,6 +1360,183 @@ fn desktop_steps_schema_accepts_valid_cases_and_rejects_unknown_fields() {
             "desktop schema ({label}) must reject invalid step: {invalid}"
         );
     }
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn browser_computer_use_schemas_match_validate() {
+    let validator = validator(schema());
+    let registry = built_in_registry();
+
+    let check_step = |step: &str, valid: Vec<Value>, invalid: Vec<(&str, Value)>| {
+        let def = registry
+            .get(step)
+            .unwrap_or_else(|| panic!("`{step}` must be registered"));
+        for args in valid {
+            let instance = json!({
+                "name": format!("Valid {step}"),
+                "steps": [{ step: args.clone() }]
+            });
+            assert!(
+                validator.is_valid(&instance),
+                "`{step}` schema must accept {args}"
+            );
+            assert!(
+                (def.validate)(&args).is_ok(),
+                "`{step}` validate must accept {args}"
+            );
+        }
+        for (label, args) in invalid {
+            let instance = json!({
+                "name": format!("Invalid {step}: {label}"),
+                "steps": [{ step: args.clone() }]
+            });
+            assert!(
+                !validator.is_valid(&instance),
+                "`{step}` schema must reject ({label}): {args}"
+            );
+            assert!(
+                (def.validate)(&args).is_err(),
+                "`{step}` validate must reject ({label}): {args}"
+            );
+        }
+    };
+
+    check_step(
+        "browser.scroll",
+        vec![
+            json!({"delta_y": 200}),
+            json!({"delta_x": -120, "delta_y": 40}),
+            json!({"css": "#list", "delta_y": 150}),
+            json!({"testid": "footer"}),
+            json!({"testid": "footer", "into_view": true}),
+            json!({"role": "region", "name": "Feed", "delta_y": 200, "dialog": "accept"}),
+            json!({"at": {"x": 10, "y": 20}, "delta_y": 100}),
+            json!({"at": {"x": 10, "y": 20, "viewport": {"width": 800, "height": 600}}, "delta_x": -50}),
+        ],
+        vec![
+            ("empty object", json!({})),
+            ("into_view without locator", json!({"into_view": true})),
+            ("into_view false", json!({"css": "#a", "into_view": false})),
+            (
+                "delta with into_view",
+                json!({"css": "#a", "delta_y": 100, "into_view": true}),
+            ),
+            ("at without delta", json!({"at": {"x": 10, "y": 20}})),
+            (
+                "at with locator",
+                json!({"at": {"x": 10, "y": 20}, "css": "#a", "delta_y": 100}),
+            ),
+            (
+                "within without locator",
+                json!({"within": {"css": "#box"}, "delta_y": 100}),
+            ),
+            ("name without role", json!({"name": "Btn", "delta_y": 100})),
+            ("zero timeout", json!({"delta_y": 100, "timeout_ms": 0})),
+            ("null delta_y", json!({"delta_y": null})),
+            ("unknown field", json!({"delta_y": 100, "extra": true})),
+            ("ref in case", json!({"ref": "e1", "delta_y": 100})),
+        ],
+    );
+
+    check_step(
+        "browser.hover",
+        vec![
+            json!({"css": "#menu"}),
+            json!({"xpath": "//button"}),
+            json!({"text": "More"}),
+            json!({"role": "button", "name": "More"}),
+            json!({"testid": "menu"}),
+            json!({"at": {"x": 10, "y": 20}}),
+            json!({"at": {"x": 10, "y": 20, "viewport": {"width": 800, "height": 600}}, "dialog": "dismiss"}),
+        ],
+        vec![
+            ("empty object", json!({})),
+            ("two locators", json!({"css": "#a", "testid": "b"})),
+            (
+                "at with locator",
+                json!({"css": "#a", "at": {"x": 10, "y": 20}}),
+            ),
+            ("name without role", json!({"name": "More"})),
+            ("negative at x", json!({"at": {"x": -1, "y": 0}})),
+            ("zero timeout", json!({"css": "#a", "timeout_ms": 0})),
+            ("null css", json!({"css": null})),
+            ("ref in case", json!({"ref": "e1"})),
+        ],
+    );
+
+    check_step(
+        "browser.drag",
+        vec![
+            json!({"from": {"css": "#a"}, "to": {"testid": "b"}}),
+            json!({
+                "from": {"role": "button", "name": "Card"},
+                "to": {"css": ".col", "within": {"testid": "board"}, "nth": 1}
+            }),
+            json!({
+                "from": {"at": {"x": 10, "y": 20}},
+                "to": {"at": {"x": 200, "y": 300, "viewport": {"width": 1280, "height": 800}}},
+                "dialog": "accept"
+            }),
+            json!({"from": {"testid": "item"}, "to": {"at": {"x": 300, "y": 150}}}),
+        ],
+        vec![
+            ("empty object", json!({})),
+            ("missing to", json!({"from": {"css": "#a"}})),
+            ("missing from", json!({"to": {"css": "#b"}})),
+            ("empty from", json!({"from": {}, "to": {"css": "#b"}})),
+            (
+                "two locators in from",
+                json!({"from": {"css": "#a", "testid": "a"}, "to": {"css": "#b"}}),
+            ),
+            (
+                "at and locator in from",
+                json!({"from": {"css": "#a", "at": {"x": 1, "y": 2}}, "to": {"css": "#b"}}),
+            ),
+            (
+                "name without role",
+                json!({"from": {"name": "Item"}, "to": {"css": "#b"}}),
+            ),
+            (
+                "negative coord",
+                json!({"from": {"at": {"x": -1, "y": 2}}, "to": {"css": "#b"}}),
+            ),
+            (
+                "zero timeout",
+                json!({"from": {"css": "#a"}, "to": {"css": "#b"}, "timeout_ms": 0}),
+            ),
+            (
+                "ref in case",
+                json!({"from": {"ref": "e1"}, "to": {"ref": "e2"}}),
+            ),
+        ],
+    );
+
+    check_step(
+        "browser.set_clipboard",
+        vec![
+            json!({"text": "hello"}),
+            json!({"text": ""}),
+            json!({"text": "secret", "timeout_ms": 1000}),
+        ],
+        vec![
+            ("empty object", json!({})),
+            ("null text", json!({"text": null})),
+            ("non-string text", json!({"text": 123})),
+            ("zero timeout", json!({"text": "hi", "timeout_ms": 0})),
+            ("unknown field", json!({"text": "hi", "extra": true})),
+        ],
+    );
+
+    check_step(
+        "browser.read_clipboard",
+        vec![json!({}), json!({"timeout_ms": 1000})],
+        vec![
+            ("zero timeout", json!({"timeout_ms": 0})),
+            ("null timeout", json!({"timeout_ms": null})),
+            ("unknown field", json!({"extra": true})),
+        ],
+    );
 }
 
 /// Every file directly inside `dir` with the given extension, sorted by path.

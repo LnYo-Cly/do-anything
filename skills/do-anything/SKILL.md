@@ -42,22 +42,49 @@ between commands and prints JSON by default.
    - Address elements by `ref` from the snapshot of the **previous** command; a
      ref from an older snapshot is refused. When a snapshot says
      `truncated: true`, expand a subtree with `da session snapshot <id> --ref e7`.
+   - Use the structured browser Computer Use primitives directly with `ref`s or
+     locators: `browser.click`, `browser.type`, `browser.scroll` (`delta_x`/`delta_y`
+     on viewport or container `ref`, or `into_view: true`), `browser.hover`,
+     `browser.drag` (`from` and `to` `ref`s or locators), `browser.set_clipboard`,
+     and `browser.read_clipboard`. All interactions stay strictly scoped to the
+     owned CDP tab — never move the host OS cursor or touch unrelated windows.
    - `browser.read` returns an element's text. After an action that starts a
      request, `browser.wait` for a locator or for `url_contains`: reading does
      not wait for text to change.
    - To assert or save in the same command, pass a whole step on stdin:
      `da session step <id> -f -` with `browser.read: { testid: status }`, an
      `expect:` list and/or `save: { name: $.text }`.
-   - The snapshot is the first tool. `browser.screenshot --arg path=shot.png` is
-     for what the tree cannot express (canvas, overlapping layout), not a
-     default; there is no coordinate-based clicking.
+   - The snapshot is the first tool. `browser.screenshot --arg path=shot.png` and
+     explicit `at: { x, y, viewport }` coordinates (supported on `browser.click`,
+     `browser.type`, `browser.scroll`, `browser.hover`, and `browser.drag`
+     endpoints) are a last resort for `<canvas>` or WebGL surfaces that have no
+     accessibility node; `da lint` warns on every `at` step, and `da session
+     export` pins the observed `viewport` automatically.
 3. `da session export <id> -o cases/flow.yaml --name "Create a note"` writes a
-   deterministic case; transient refs become locators verified against the live
-   page. `da session stop <id>` closes the session (`da session list` shows open
-   sessions; idle ones are reaped after 30 minutes).
+   deterministic case; transient refs (including both endpoints of
+   `browser.drag` and `browser.scroll`/`browser.hover` targets) compile into
+   verified locators against the live page. `da session stop <id>` closes the
+   session (`da session list` shows open sessions; idle ones are reaped after
+   30 minutes).
 4. Edit the exported YAML to add the other layers, then `da lint cases/flow.yaml`
    and `da run cases/flow.yaml`. That is the replay: it must pass with no session
    and no `ref` left in the file.
+
+### Structured, Compilable Computer Use loop
+
+Prefer the 3-step structured loop (`da session` or `da mcp`) over raw
+screenshot-and-pixel loops:
+
+1. **Explore with snapshots (`ref`s):** drive clicks, typing, scrolling, hovering,
+   drag-and-drop, and clipboard flows using accessibility `ref`s — zero pixels
+   guessed, zero unrelated host windows touched. If the owned tab is closed
+   externally, steps fail fast with exit code `4` (`Environment`).
+2. **Compile to YAML (`da session export`):** `ref`s synthesize into `testid`,
+   `role`+`name`, `text`, or CSS locators (structural paths are marked
+   `# fragile:`), and `${env:NAME}` secrets stay parameterized.
+3. **Lint and replay (`da lint` + `da run`):** validate schemas, secret wiring,
+   and retryability (`browser.read_clipboard` allows `retry`; mutating steps
+   do not), then replay deterministically across UI, API, and database layers.
 
 ## One case, three layers
 
@@ -148,10 +175,14 @@ steps:
 
 ## Guardrails
 
-- **No secrets in cases.** Write `${env:NAME}` for a token, password or
-  connection string; `da` reads it at run time and replaces the value with `***`
-  in text output, `--output json` and every bundle file. A literal value in a
-  case, a vars file or `--var` is not redacted.
+- **No secrets in cases.** Write `${env:NAME}` for a token, password,
+  clipboard secret or connection string; `da` reads it at run time and
+  replaces the value with `***` in text output, `--output json`, session logs,
+  and every bundle file (`browser.set_clipboard` returns only `characters`). A
+  literal value in a case, a vars file or `--var` is not redacted, and
+  clipboard values preexisting on an externally connected browser (`connect`)
+  before `da` starts did not come from `${env:NAME}` and stay local-only
+  (same boundary as `connect` cookies/storage).
 - **Lint before run**, and never weaken `src/` or a test to make a case pass.
 - **Bundles and reports are evidence, not publishing material.** They hold page
   text and step arguments; a report embeds screenshots unless you pass

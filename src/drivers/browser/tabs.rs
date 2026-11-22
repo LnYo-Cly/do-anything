@@ -174,6 +174,13 @@ impl Tabs {
         &self.current
     }
 
+    /// Whether the tab the session currently drives is still alive.
+    pub(super) fn is_current_alive(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.target_id == self.current && tab.alive)
+    }
+
     /// Every target id this case owns, in creation order.
     pub(super) fn ids(&self) -> Vec<String> {
         self.tabs.iter().map(|tab| tab.target_id.clone()).collect()

@@ -8375,3 +8375,1101 @@ finally:
     assert!(!html.contains(SECRET), "secret leaked into report.html");
     assert!(html.contains("data:image/png;base64,"));
 }
+
+struct CuServer {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl CuServer {
+    fn start(routes: Vec<(&str, &str)>) -> Self {
+        let listener = support::bind_browser_safe_listener();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = std::sync::Arc::clone(&stop);
+        let owned_routes: Vec<(String, String)> = routes
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let mut buf = [0_u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let target = req
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let path = target.split('?').next().unwrap_or(target);
+                        let (status, body) = owned_routes
+                            .iter()
+                            .find(|(p, _)| p == path)
+                            .map(|(_, html)| ("200 OK", html.as_str()))
+                            .unwrap_or((
+                                "404 Not Found",
+                                "<!doctype html><html><body>not found</body></html>",
+                            ));
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+}
+
+impl Drop for CuServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[test]
+fn computer_use_lint_and_retry_policies_enforce_contracts() {
+    let dir = TempDir::new("browser-cu-lint");
+    let invalid = [
+        ("scroll-empty.yaml", "  - browser.scroll: {}\n", "delta"),
+        (
+            "scroll-at-with-locator.yaml",
+            "  - browser.scroll:\n      css: \"#box\"\n      at: { x: 10, y: 10 }\n      delta_y: 50\n",
+            "at",
+        ),
+        (
+            "scroll-into-view-without-target.yaml",
+            "  - browser.scroll:\n      into_view: true\n",
+            "into_view",
+        ),
+        (
+            "hover-neither.yaml",
+            "  - browser.hover: {}\n",
+            "one locator",
+        ),
+        (
+            "hover-at-with-css.yaml",
+            "  - browser.hover:\n      css: \"#btn\"\n      at: { x: 10, y: 20 }\n",
+            "at",
+        ),
+        (
+            "drag-missing-to.yaml",
+            "  - browser.drag:\n      from: { css: \"#a\" }\n",
+            "to",
+        ),
+        (
+            "drag-bad-from.yaml",
+            "  - browser.drag:\n      from: { css: \"#a\", text: \"b\" }\n      to: { css: \"#c\" }\n",
+            "cannot both be set",
+        ),
+        (
+            "set-clipboard-missing-text.yaml",
+            "  - browser.set_clipboard: {}\n",
+            "text",
+        ),
+        (
+            "read-clipboard-extra-arg.yaml",
+            "  - browser.read_clipboard:\n      bogus: true\n",
+            "bogus",
+        ),
+        (
+            "scroll-retry-disallowed.yaml",
+            "  - browser.scroll:\n      delta_y: 100\n    retry:\n      until:\n        - path: $.scrolled\n          equals: true\n      timeout_ms: 500\n      interval_ms: 50\n",
+            "retry",
+        ),
+        (
+            "hover-retry-disallowed.yaml",
+            "  - browser.hover:\n      css: \"#menu\"\n    retry:\n      until:\n        - path: $.hovered\n          equals: true\n      timeout_ms: 500\n      interval_ms: 50\n",
+            "retry",
+        ),
+        (
+            "drag-retry-disallowed.yaml",
+            "  - browser.drag:\n      from: { css: \"#a\" }\n      to: { css: \"#b\" }\n    retry:\n      until:\n        - path: $.dragged\n          equals: true\n      timeout_ms: 500\n      interval_ms: 50\n",
+            "retry",
+        ),
+        (
+            "set-clipboard-retry-disallowed.yaml",
+            "  - browser.set_clipboard:\n      text: \"hi\"\n    retry:\n      until:\n        - path: $.characters\n          equals: 2\n      timeout_ms: 500\n      interval_ms: 50\n",
+            "retry",
+        ),
+    ];
+
+    for (name, step_yaml, expected_fragment) in invalid {
+        let case = dir.write(
+            name,
+            &format!(
+                "name: {name}\nsteps:\n  - browser.open:\n      url: \"http://127.0.0.1:1/\"\n{step_yaml}"
+            ),
+        );
+        let out = run_da_in(dir.path(), &["lint", path_str(&case)]);
+        assert_ne!(
+            exit_code(&out),
+            Some(0),
+            "{name} must fail lint\nstdout={}\nstderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+        let combined = format!("{}\n{}", stdout(&out), stderr(&out)).to_lowercase();
+        assert!(
+            combined.contains(&expected_fragment.to_lowercase()),
+            "{name} error must mention `{expected_fragment}`, got:\n{combined}"
+        );
+    }
+
+    // Bare `at` coordinates emit warnings for scroll, hover, and drag.
+    let warn_case = dir.write(
+        "cu-bare-at-warnings.yaml",
+        r##"name: cu bare at warnings
+steps:
+  - browser.open:
+      url: "http://127.0.0.1:1/"
+  - browser.scroll:
+      at: { x: 10, y: 20 }
+      delta_y: 50
+  - browser.hover:
+      at: { x: 10, y: 20 }
+  - browser.drag:
+      from: { at: { x: 10, y: 20 } }
+      to: { at: { x: 80, y: 20 } }
+  - browser.read_clipboard: {}
+    retry:
+      until:
+        - path: $.text
+          equals: "ready"
+      timeout_ms: 1000
+      interval_ms: 50
+"##,
+    );
+    let warn_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "lint", path_str(&warn_case)],
+    );
+    assert_eq!(
+        exit_code(&warn_out),
+        Some(0),
+        "valid bare-at & retry read_clipboard must pass lint: stdout={}\nstderr={}",
+        stdout(&warn_out),
+        stderr(&warn_out)
+    );
+    let warn_json = json_stdout(&warn_out);
+    let warnings = warn_json["warnings"]
+        .as_array()
+        .expect("lint JSON must report warnings");
+    assert!(
+        warnings.len() >= 4,
+        "scroll, hover, drag.from, drag.to bare `at` should warn: {warn_json}"
+    );
+}
+
+#[test]
+fn browser_scroll_handles_viewport_container_into_view_and_coordinates() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![(
+        "/scroll",
+        r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; font-family: sans-serif; height: 2600px; }
+  #scroll-box {
+    margin: 20px; width: 220px; height: 100px; overflow: auto;
+    border: 1px solid #444;
+  }
+  #scroll-box-inner { height: 600px; padding-top: 300px; }
+  #wheel-box {
+    position: fixed; left: 20px; top: 200px; width: 160px; height: 80px;
+    overflow: auto; border: 1px solid #06c;
+  }
+  #wheel-inner { height: 500px; }
+  #far-btn {
+    position: absolute; left: 320px; top: 1700px; width: 140px; height: 40px;
+  }
+  #probe-state { position: fixed; top: 40px; right: 10px; }
+  #status { position: fixed; top: 10px; right: 10px; }
+</style></head>
+<body>
+  <div id="scroll-box"><div id="scroll-box-inner"><span id="inner-mark">inner</span></div></div>
+  <div id="wheel-box"><div id="wheel-inner">wheel</div></div>
+  <div id="wheel-box2" style="position:fixed;left:220px;top:200px;width:160px;height:80px;overflow:auto;border:1px solid #096;"><div id="wheel-inner2" style="height:500px;">wheel2</div></div>
+  <button id="far-btn" onclick="document.getElementById('status').textContent = 'clicked:' + Math.round(window.scrollY)">Far Button</button>
+  <button id="probe-state" onclick="
+    const r = document.getElementById('far-btn').getBoundingClientRect();
+    const ok = window.scrollY >= 200
+      && document.getElementById('scroll-box').scrollTop >= 100
+      && document.getElementById('wheel-box').scrollTop >= 60
+      && document.getElementById('wheel-box2').scrollTop >= 40;
+    document.getElementById('status').textContent =
+      (ok ? 'ok' : 'bad') + ':visible=' + (r.top >= 0 && r.bottom <= window.innerHeight);
+  ">Probe</button>
+  <div id="status">init</div>
+</body>
+</html>"##,
+    )]);
+
+    let dir = TempDir::new("browser-scroll-e2e");
+    let case = dir.write(
+        "scroll.yaml",
+        &format!(
+            r##"name: scroll all modes
+steps:
+  - browser.open:
+      url: "{}"
+      width: 1280
+      height: 720
+  - browser.scroll:
+      delta_y: 240
+  - browser.scroll:
+      css: "#scroll-box"
+      delta_y: 120
+  - browser.scroll:
+      at: {{ x: 100, y: 240 }}
+      delta_y: 100
+  - browser.scroll:
+      css: "#wheel-inner2"
+      delta_y: 80
+  - browser.click:
+      css: "#probe-state"
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        equals: "ok:visible=false"
+  - browser.scroll:
+      css: "#far-btn"
+      into_view: true
+  - browser.click:
+      css: "#probe-state"
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        contains: "visible=true"
+  - browser.click:
+      css: "#far-btn"
+  - browser.read:
+      css: "#status"
+    expect:
+      - path: $.text
+        contains: "clicked:"
+"##,
+            cu.url("/scroll")
+        ),
+    );
+
+    let out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&out),
+        Some(0),
+        "scroll case must pass: stdout={}\nstderr={}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let j = json_stdout(&out);
+    let vp = &j["cases"][0]["steps"][3]["result"]["viewport"];
+    let vw = vp["width"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("coordinate scroll must report viewport width: {j}"));
+    let vh = vp["height"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("coordinate scroll must report viewport height: {j}"));
+    assert!(vw > 0 && vh > 0, "got viewport {vw}x{vh}");
+
+    // Mismatched pinned viewport on scroll `at:` fails loudly instead of scrolling blindly.
+    let mismatch_w = vw + 1;
+    let bad_vp = dir.write(
+        "scroll-bad-vp.yaml",
+        &format!(
+            r##"name: scroll viewport mismatch
+steps:
+  - browser.open:
+      url: "{}"
+      width: 1280
+      height: 720
+  - browser.scroll:
+      at:
+        x: 100
+        y: 240
+        viewport: {{ width: {mismatch_w}, height: {vh} }}
+      delta_y: 80
+"##,
+            cu.url("/scroll")
+        ),
+    );
+    let bad_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&bad_vp), "--no-bundle"],
+    );
+    assert_eq!(exit_code(&bad_out), Some(1), "{:?}", stdout(&bad_out));
+    assert!(
+        stdout(&bad_out).contains("viewport"),
+        "viewport mismatch error must explain size mismatch: {}",
+        stdout(&bad_out)
+    );
+}
+
+#[test]
+fn browser_hover_triggers_css_hover_mouse_events_and_coordinates() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![(
+        "/hover",
+        r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; font-family: sans-serif; }
+  #menu { position: relative; display: inline-block; padding: 12px 20px; background: #eee; margin: 20px; }
+  #submenu { display: none; position: absolute; left: 0; top: 100%; background: #cce; padding: 8px; }
+  #menu:hover #submenu { display: block; }
+  #coord-pad { position: fixed; left: 40px; top: 200px; width: 120px; height: 50px; background: #efe; }
+  #covered-wrap { position: relative; width: 120px; height: 40px; margin: 20px; }
+  #covered-btn, #cover { position: absolute; inset: 0; }
+  #cover { background: rgba(255,0,0,0.4); z-index: 2; }
+</style></head>
+<body>
+  <div id="menu">Menu
+    <button id="submenu" onclick="document.getElementById('out').textContent='sub-clicked'">Sub Item</button>
+  </div>
+  <div id="coord-pad" onmouseenter="document.getElementById('coord-out').textContent='coord-entered'">Pad</div>
+  <div id="covered-wrap">
+    <button id="covered-btn">Covered</button>
+    <div id="cover">Blocker</div>
+  </div>
+  <div id="log"></div>
+  <div id="out">none</div>
+  <div id="coord-out">none</div>
+  <script>
+    const m = document.getElementById('menu');
+    const l = document.getElementById('log');
+    for (const ev of ['mouseover', 'mouseenter']) {
+      m.addEventListener(ev, () => { l.textContent += ev + ';'; });
+    }
+  </script>
+</body>
+</html>"##,
+    )]);
+
+    let dir = TempDir::new("browser-hover-e2e");
+    let bare_case = dir.write(
+        "hover-bare.yaml",
+        &format!(
+            r##"name: hover bare coords
+steps:
+  - browser.open:
+      url: "{}"
+      width: 1280
+      height: 720
+  - browser.hover:
+      at:
+        x: 100
+        y: 225
+  - browser.read:
+      css: "#coord-out"
+    expect:
+      - path: $.text
+        equals: "coord-entered"
+"##,
+            cu.url("/hover")
+        ),
+    );
+    let bare_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&bare_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&bare_out),
+        Some(0),
+        "stdout={}\nstderr={}",
+        stdout(&bare_out),
+        stderr(&bare_out)
+    );
+    let bare_json = json_stdout(&bare_out);
+    let vw = bare_json["cases"][0]["steps"][1]["result"]["viewport"]["width"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("hover must report viewport width: {bare_json}"));
+    let vh = bare_json["cases"][0]["steps"][1]["result"]["viewport"]["height"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("hover must report viewport height: {bare_json}"));
+
+    let ok_case = dir.write(
+        "hover.yaml",
+        &format!(
+            r##"name: hover tests
+steps:
+  - browser.open:
+      url: "{}"
+      width: 1280
+      height: 720
+  - browser.hover:
+      css: "#menu"
+  - browser.click:
+      css: "#submenu"
+  - browser.read:
+      css: "#out"
+    expect:
+      - path: $.text
+        equals: "sub-clicked"
+  - browser.read:
+      css: "#log"
+    expect:
+      - path: $.text
+        contains: "mouseover;"
+      - path: $.text
+        contains: "mouseenter;"
+  - browser.hover:
+      at:
+        x: 100
+        y: 225
+        viewport: {{ width: {vw}, height: {vh} }}
+  - browser.read:
+      css: "#coord-out"
+    expect:
+      - path: $.text
+        equals: "coord-entered"
+"##,
+            cu.url("/hover")
+        ),
+    );
+
+    let ok_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&ok_case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&ok_out),
+        Some(0),
+        "stdout={}\nstderr={}",
+        stdout(&ok_out),
+        stderr(&ok_out)
+    );
+
+    let occluded_case = dir.write(
+        "hover-occluded.yaml",
+        &format!(
+            r##"name: hover occluded
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.hover:
+      css: "#covered-btn"
+      timeout_ms: 400
+"##,
+            cu.url("/hover")
+        ),
+    );
+    let occ_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&occluded_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&occ_out), Some(1), "{}", stdout(&occ_out));
+    let msg = stdout(&occ_out).to_lowercase();
+    assert!(
+        msg.contains("covered") || msg.contains("cover") || msg.contains("actionable"),
+        "occluded hover error must explain blocker: {}",
+        stdout(&occ_out)
+    );
+}
+
+#[test]
+fn browser_drag_handles_html5_dnd_pointer_drag_iframe_and_shadow_dom() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![
+        (
+            "/drag",
+            r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; font-family: sans-serif; }
+  .row { display: flex; gap: 40px; padding: 16px; }
+  .box { width: 120px; height: 50px; border: 1px solid #333; display: flex; align-items: center; justify-content: center; }
+  #knob { width: 80px; height: 32px; background: #06c; color: #fff; user-select: none; }
+  #track { width: 200px; height: 32px; background: #eee; margin-left: 16px; }
+  #shadow-host { position: fixed; left: 40px; top: 340px; width: 320px; height: 60px; }
+  #drag-frame { width: 360px; height: 110px; border: 1px solid #666; margin: 12px 16px; }
+  #far-src { position: absolute; left: 40px; top: 1350px; }
+  #far-dst { position: absolute; left: 260px; top: 1350px; }
+</style></head>
+<body>
+  <div class="row">
+    <div id="src-a" class="box" draggable="true">Card A</div>
+    <div id="dst-a" class="box">Drop A</div>
+    <div id="src-b" class="box" draggable="true">Card B</div>
+    <div id="dst-b" class="box">Drop B</div>
+  </div>
+  <div id="track"><div id="knob">Knob</div></div>
+  <iframe id="drag-frame" src="/drag-frame"></iframe>
+  <div id="shadow-host"></div>
+  <div id="far-src" class="box" draggable="true">Far Src</div>
+  <div id="far-dst" class="box">Far Dst</div>
+  <div id="dnd-log"></div>
+  <div id="ptr-log"></div>
+  <div id="shadow-log">none</div>
+  <div id="far-log"></div>
+  <script>
+    function wireDnd(srcId, dstId, outEl, prefix) {
+      const s = document.getElementById(srcId);
+      const d = document.getElementById(dstId);
+      s.addEventListener('dragstart', e => {
+        e.dataTransfer.setData('text/plain', prefix + '-payload');
+        outEl.textContent += prefix + ':start>';
+      });
+      s.addEventListener('dragend', () => { outEl.textContent += prefix + ':end;'; });
+      d.addEventListener('dragenter', e => { e.preventDefault(); outEl.textContent += prefix + ':enter>'; });
+      d.addEventListener('dragover', e => { e.preventDefault(); });
+      d.addEventListener('drop', e => {
+        e.preventDefault();
+        outEl.textContent += prefix + ':drop(' + e.dataTransfer.getData('text/plain') + ')>';
+      });
+    }
+    const dndLog = document.getElementById('dnd-log');
+    wireDnd('src-a', 'dst-a', dndLog, 'A');
+    wireDnd('src-b', 'dst-b', dndLog, 'B');
+    wireDnd('far-src', 'far-dst', document.getElementById('far-log'), 'FAR');
+
+    const knob = document.getElementById('knob');
+    const ptrLog = document.getElementById('ptr-log');
+    let dragging = false, startX = 0, movedDx = 0;
+    knob.addEventListener('pointerdown', e => { dragging = true; startX = e.clientX; ptrLog.textContent = 'down'; });
+    window.addEventListener('pointermove', e => { if (dragging) movedDx = Math.round(e.clientX - startX); });
+    window.addEventListener('pointerup', e => { if (dragging) { dragging = false; ptrLog.textContent = movedDx > 80 ? 'moved:ok' : 'moved:short:' + movedDx; } });
+
+    const root = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
+    root.innerHTML = `<div style="display:flex;justify-content:space-between;width:300px;height:50px">
+      <div id="s-src" draggable="true" style="width:90px;height:50px;background:#ccc">S-Src</div>
+      <div id="s-dst" style="width:90px;height:50px;background:#cec">S-Dst</div>
+    </div>`;
+    root.getElementById('s-src').addEventListener('dragstart', e => e.dataTransfer.setData('text/plain', 'shadow-ok'));
+    root.getElementById('s-dst').addEventListener('dragover', e => e.preventDefault());
+    root.getElementById('s-dst').addEventListener('drop', e => {
+      e.preventDefault();
+      document.getElementById('shadow-log').textContent = e.dataTransfer.getData('text/plain');
+    });
+  </script>
+</body>
+</html>"##,
+        ),
+        (
+            "/drag-frame",
+            r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; display: flex; gap: 30px; padding: 12px; }
+  .fbox { width: 100px; height: 50px; border: 1px solid #333; }
+</style></head>
+<body>
+  <div id="f-src" class="fbox" draggable="true">F-Src</div>
+  <div id="f-dst" class="fbox">F-Dst</div>
+  <div id="f-out">none</div>
+  <script>
+    const fs = document.getElementById('f-src');
+    const fd = document.getElementById('f-dst');
+    fs.addEventListener('dragstart', e => e.dataTransfer.setData('text/plain', 'iframe-payload'));
+    fd.addEventListener('dragover', e => e.preventDefault());
+    fd.addEventListener('drop', e => {
+      e.preventDefault();
+      document.getElementById('f-out').textContent = e.dataTransfer.getData('text/plain');
+    });
+  </script>
+</body>
+</html>"##,
+        ),
+    ]);
+
+    let dir = TempDir::new("browser-drag-e2e");
+    let probe_case = dir.write(
+        "drag-probe.yaml",
+        &format!(
+            r##"name: drag probe viewport
+steps:
+  - browser.open:
+      url: "{}"
+      width: 1280
+      height: 720
+  - browser.hover:
+      at: {{ x: 10, y: 10 }}
+"##,
+            cu.url("/drag")
+        ),
+    );
+    let probe_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&probe_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&probe_out), Some(0), "{}", stdout(&probe_out));
+    let probe_json = json_stdout(&probe_out);
+    let vw = probe_json["cases"][0]["steps"][1]["result"]["viewport"]["width"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("probe must report viewport width: {probe_json}"));
+    let vh = probe_json["cases"][0]["steps"][1]["result"]["viewport"]["height"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("probe must report viewport height: {probe_json}"));
+
+    let case = dir.write(
+        "drag.yaml",
+        &format!(
+            r##"name: drag all modes
+steps:
+  - browser.open:
+      url: "{}"
+      width: 1280
+      height: 720
+  - browser.drag:
+      from: {{ css: "#src-a" }}
+      to: {{ css: "#dst-a" }}
+  - browser.drag:
+      from: {{ css: "#knob" }}
+      to: {{ at: {{ x: 180, y: 98, viewport: {{ width: {vw}, height: {vh} }} }} }}
+  - browser.drag:
+      from: {{ css: "#src-b" }}
+      to: {{ css: "#dst-b" }}
+  - browser.drag:
+      from: {{ at: {{ x: 85, y: 365, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ at: {{ x: 295, y: 365, viewport: {{ width: {vw}, height: {vh} }} }} }}
+  - browser.drag:
+      from: {{ css: "#f-src", within: {{ css: "#drag-frame" }} }}
+      to: {{ css: "#f-dst", within: {{ css: "#drag-frame" }} }}
+  - browser.drag:
+      from: {{ css: "#far-src" }}
+      to: {{ css: "#far-dst" }}
+  - browser.read:
+      css: "#dnd-log"
+    expect:
+      - path: $.text
+        equals: "A:start>A:enter>A:drop(A-payload)>A:end;B:start>B:enter>B:drop(B-payload)>B:end;"
+  - browser.read:
+      css: "#ptr-log"
+    expect:
+      - path: $.text
+        equals: "moved:ok"
+  - browser.read:
+      css: "#shadow-log"
+    expect:
+      - path: $.text
+        equals: "shadow-ok"
+  - browser.read:
+      css: "#f-out"
+      within: {{ css: "#drag-frame" }}
+    expect:
+      - path: $.text
+        equals: "iframe-payload"
+  - browser.read:
+      css: "#far-log"
+    expect:
+      - path: $.text
+        equals: "FAR:start>FAR:enter>FAR:drop(FAR-payload)>FAR:end;"
+"##,
+            cu.url("/drag")
+        ),
+    );
+
+    let out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&out),
+        Some(0),
+        "drag case must pass: stdout={}\nstderr={}",
+        stdout(&out),
+        stderr(&out)
+    );
+
+    let mismatch_w = vw + 1;
+    let bad_drag = dir.write(
+        "drag-bad-vp.yaml",
+        &format!(
+            r##"name: drag viewport mismatch
+steps:
+  - browser.open:
+      url: "{}"
+      width: 1280
+      height: 720
+  - browser.drag:
+      from: {{ css: "#knob" }}
+      to: {{ at: {{ x: 180, y: 98, viewport: {{ width: {mismatch_w}, height: {vh} }} }} }}
+"##,
+            cu.url("/drag")
+        ),
+    );
+    let bad_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&bad_drag),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&bad_out), Some(1), "{}", stdout(&bad_out));
+    assert!(
+        stdout(&bad_out).contains("viewport"),
+        "drag viewport mismatch must report viewport mismatch: {}",
+        stdout(&bad_out)
+    );
+}
+
+#[test]
+fn browser_clipboard_writes_reads_pastes_isolates_and_redacts_secrets() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![(
+        "/clip",
+        r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+  <input id="paste-box" type="text" placeholder="paste here">
+  <button id="paste-btn" onclick="navigator.clipboard.readText().then(t => { const box = document.getElementById('paste-box'); box.value = t; box.setAttribute('data-value', t); document.getElementById('paste-done').textContent = 'pasted:' + t; })">Paste</button>
+  <div id="paste-done">none</div>
+  <button id="async-write" onclick="setTimeout(() => navigator.clipboard.writeText('async-clip-ok'), 180)">Async Write</button>
+  <button id="measure-clip" onclick="navigator.clipboard.readText().then(t => document.getElementById('clip-len').textContent = String(t.length))">Measure</button>
+  <div id="clip-len">0</div>
+</body>
+</html>"##,
+    )]);
+
+    let dir = TempDir::new("browser-clipboard-e2e");
+
+    // 1. Write clipboard -> read into page -> async page write -> retry read_clipboard.
+    let happy = dir.write(
+        "clip-happy.yaml",
+        &format!(
+            r##"name: clipboard happy path
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.set_clipboard:
+      text: "hello-clipboard"
+    expect:
+      - path: $.characters
+        equals: 15
+  - browser.read_clipboard: {{}}
+    expect:
+      - path: $.text
+        equals: "hello-clipboard"
+  - browser.click:
+      css: "#paste-btn"
+  - browser.wait:
+      text: "pasted:hello-clipboard"
+  - browser.read:
+      css: "#paste-box"
+      attribute: "data-value"
+    expect:
+      - path: $.value
+        equals: "hello-clipboard"
+  - browser.click:
+      css: "#async-write"
+  - browser.read_clipboard: {{}}
+    retry:
+      until:
+        - path: $.text
+          equals: "async-clip-ok"
+      timeout_ms: 2500
+      interval_ms: 50
+"##,
+            cu.url("/clip")
+        ),
+    );
+    let happy_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&happy), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&happy_out),
+        Some(0),
+        "stdout={}\nstderr={}",
+        stdout(&happy_out),
+        stderr(&happy_out)
+    );
+    let happy_json = json_stdout(&happy_out);
+    assert!(
+        happy_json["cases"][0]["steps"][1]["result"]
+            .get("text")
+            .is_none(),
+        "set_clipboard must never echo text in result: {happy_json}"
+    );
+
+    // 2. A fresh browser instance is isolated from previous run's clipboard.
+    let iso = dir.write(
+        "clip-isolated.yaml",
+        &format!(
+            r##"name: clipboard isolated
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.read_clipboard: {{}}
+    expect:
+      - path: $.text
+        equals: ""
+"##,
+            cu.url("/clip")
+        ),
+    );
+    let iso_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&iso), "--no-bundle"],
+    );
+    assert_eq!(
+        exit_code(&iso_out),
+        Some(0),
+        "fresh browser clipboard must start empty: stdout={}\nstderr={}",
+        stdout(&iso_out),
+        stderr(&iso_out)
+    );
+
+    // 3. `${env:...}` secret stays real inside browser, but is redacted everywhere in output and failure bundles.
+    let secret = "super-clip-secret-987654";
+    let secret_case = dir.write(
+        "clip-secret.yaml",
+        &format!(
+            r##"name: clipboard secret redaction
+steps:
+  - browser.open:
+      url: "{}"
+  - browser.set_clipboard:
+      text: "${{env:DA_TEST_CLIP_SECRET}}"
+  - browser.click:
+      css: "#measure-clip"
+  - browser.read:
+      css: "#clip-len"
+    retry:
+      until:
+        - path: $.text
+          equals: "24"
+      timeout_ms: 2500
+      interval_ms: 50
+  - browser.read_clipboard: {{}}
+    expect:
+      - path: $.text
+        equals: "force-failure-to-inspect-bundle"
+"##,
+            cu.url("/clip")
+        ),
+    );
+    let bundles = dir.path().join("clip-bundles");
+    let sec_out = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&secret_case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_TEST_CLIP_SECRET", secret.to_string())],
+    );
+    assert_eq!(exit_code(&sec_out), Some(1), "{}", stdout(&sec_out));
+    assert!(
+        !stdout(&sec_out).contains(secret) && !stderr(&sec_out).contains(secret),
+        "raw clipboard env secret leaked to stdout/stderr!\nstdout={}\nstderr={}",
+        stdout(&sec_out),
+        stderr(&sec_out)
+    );
+    let sec_json = json_stdout(&sec_out);
+    assert_eq!(
+        sec_json["cases"][0]["steps"][4]["result"]["text"],
+        json!("***"),
+        "read_clipboard result must redact secret: {sec_json}"
+    );
+    let bundle = PathBuf::from(sec_json["cases"][0]["bundle"].as_str().expect("bundle"));
+    for (path, text) in bundle_texts(&bundle) {
+        assert!(
+            !text.contains(secret),
+            "raw clipboard env secret leaked in bundle {}:\n{text}",
+            path.display()
+        );
+    }
+
+    // 4. Non-secure context fails clearly instead of hanging.
+    let insecure = dir.write(
+        "clip-insecure.yaml",
+        r##"name: clipboard insecure context error
+steps:
+  - browser.open:
+      url: "data:text/html,<!doctype html><html><body>insecure</body></html>"
+  - browser.read_clipboard: {}
+"##,
+    );
+    let insec_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&insecure),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&insec_out), Some(1), "{}", stdout(&insec_out));
+    assert!(
+        stdout(&insec_out).to_lowercase().contains("clipboard"),
+        "{}",
+        stdout(&insec_out)
+    );
+}
+
+#[test]
+fn computer_use_mock_closed_tab_fails_fast_as_environment_error() {
+    let dir = TempDir::new("browser-cu-dead-tab");
+    for (name, step_yaml, needs_node_query) in [
+        ("scroll", "  - browser.scroll:\n      delta_y: 100\n", false),
+        ("hover", "  - browser.hover:\n      css: \"#btn\"\n", true),
+        (
+            "drag",
+            "  - browser.drag:\n      from: { css: \"#a\" }\n      to: { css: \"#b\" }\n",
+            true,
+        ),
+        (
+            "set_clipboard",
+            "  - browser.set_clipboard:\n      text: \"abc\"\n",
+            false,
+        ),
+        ("read_clipboard", "  - browser.read_clipboard: {}\n", false),
+    ] {
+        let (port, handle) = spawn_mock_devtools(move |mut socket| {
+            let mut returned_first_eval = false;
+            while let Some(cmd) = read_mock_cdp(&mut socket) {
+                let method = cmd["method"].as_str().unwrap_or_default();
+                match method {
+                    "Target.createTarget" => send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "targetId": "t-cu-1" } }),
+                    ),
+                    "Target.attachToTarget" => send_mock_cdp(
+                        &mut socket,
+                        &json!({ "id": cmd["id"], "result": { "sessionId": "s-cu-1" } }),
+                    ),
+                    "Page.enable"
+                    | "Runtime.enable"
+                    | "Network.enable"
+                    | "Target.setDiscoverTargets"
+                    | "Page.setLifecycleEventsEnabled"
+                    | "Emulation.setDeviceMetricsOverride"
+                    | "Browser.grantPermissions"
+                    | "Emulation.setFocusEmulationEnabled" => {
+                        send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
+                    }
+                    "Page.navigate" => {
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({ "id": cmd["id"], "result": { "frameId": "f1", "loaderId": "l1" } }),
+                        );
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({ "method": "Page.loadEventFired", "sessionId": "s-cu-1", "params": { "timestamp": 1.0 } }),
+                        );
+                    }
+                    "Runtime.evaluate" if !returned_first_eval && needs_node_query => {
+                        returned_first_eval = true;
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({
+                                "id": cmd["id"],
+                                "error": { "code": -32001, "message": "Session with given id not found." }
+                            }),
+                        );
+                    }
+                    "Runtime.evaluate" | "DOM.getDocument" => {
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({
+                                "id": cmd["id"],
+                                "error": { "code": -32001, "message": "Session with given id not found." }
+                            }),
+                        );
+                    }
+                    "Target.closeTarget" => {
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({ "id": cmd["id"], "result": { "success": true } }),
+                        );
+                        break;
+                    }
+                    _ => {
+                        send_mock_cdp(
+                            &mut socket,
+                            &json!({
+                                "id": cmd["id"],
+                                "error": { "code": -32001, "message": "Session with given id not found." }
+                            }),
+                        );
+                    }
+                }
+            }
+        });
+
+        let case = dir.write(
+            &format!("dead-{name}.yaml"),
+            &format!(
+                "name: dead tab {name}\nsteps:\n  - browser.open:\n      connect: \"http://127.0.0.1:{port}\"\n      url: \"http://127.0.0.1/cu\"\n{step_yaml}"
+            ),
+        );
+        let out = run_da_in(
+            dir.path(),
+            &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        );
+        handle.join().expect("mock server join");
+        assert_eq!(
+            exit_code(&out),
+            Some(4),
+            "closed tab during {name} must return exit code 4 (Environment): stdout={}\nstderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+    }
+}
