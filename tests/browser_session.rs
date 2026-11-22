@@ -2350,3 +2350,139 @@ fn da_session_start_observe_browser_network_collects_requests_across_steps() {
     let stop = run_da_in(dir.path(), &["session", "stop", &id]);
     assert_eq!(stop.status.code(), Some(0), "{:?}", stop);
 }
+
+#[test]
+fn session_export_preserves_saved_var_in_set_cookies_and_refuses_inline_secrets() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+
+    let server = support::TestServer::start();
+    let dir = TempDir::new("browser-session-cookie-export");
+    let base = server.url("");
+
+    let id = json_stdout(&run_da_in(dir.path(), &["session", "start"]))["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let login_step = format!(
+        "http.request:\n  method: POST\n  url: \"{base}/login\"\n  json:\n    user: \"alice\"\nsave:\n  tok: $.body.token\n"
+    );
+    let s1 = run_da_stdin(dir.path(), &["session", "step", &id], &login_step);
+    assert_eq!(
+        s1.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&s1.stdout)
+    );
+
+    let cookie_step = format!(
+        "browser.set_cookies:\n  cookies:\n    - name: sid\n      value: \"${{tok}}\"\n      url: \"{base}/\"\n"
+    );
+    let s2 = run_da_stdin(dir.path(), &["session", "step", &id], &cookie_step);
+    assert_eq!(
+        s2.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&s2.stdout)
+    );
+    let s2_json = json_stdout(&s2);
+    assert_eq!(s2_json["step"]["args"]["cookies"][0]["value"], "***");
+
+    let steps_path = dir
+        .path()
+        .join(".da/sessions")
+        .join(&id)
+        .join("steps.jsonl");
+    let jsonl = fs::read_to_string(&steps_path).expect("steps.jsonl");
+    let line2: Value =
+        serde_json::from_str(jsonl.lines().nth(1).expect("second record")).expect("record json");
+    assert_eq!(line2["raw_args"]["cookies"][0]["value"], "${tok}");
+
+    let exported_path = dir.path().join("exported.yaml");
+    let export = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "export",
+            &id,
+            "-o",
+            exported_path.to_str().expect("utf8 path"),
+        ],
+    );
+    assert_eq!(
+        export.status.code(),
+        Some(0),
+        "export failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&export.stdout),
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let export_json = json_stdout(&export);
+    assert_eq!(export_json["skipped_steps"], json!([]));
+    let yaml = export_json["yaml"].as_str().expect("exported yaml");
+    assert!(
+        yaml.contains("${tok}"),
+        "expected ${{tok}} in yaml:\n{yaml}"
+    );
+    assert!(!yaml.contains("***"), "unexpected *** in yaml:\n{yaml}");
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{:?}", stop);
+
+    let trace_dir = dir.path().join("trace-bundle");
+    let replay = run_da_in(
+        dir.path(),
+        &[
+            "run",
+            exported_path.to_str().expect("utf8 path"),
+            "--record",
+            trace_dir.to_str().expect("utf8 path"),
+            "--trace-steps",
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "replay failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        !trace_dir.join("trace/steps/1").exists(),
+        "pre-open browser.set_cookies must not write a noisy error trace group"
+    );
+
+    // Inline literal cookie value is redacted in steps.jsonl and refused on export.
+    let id2 = json_stdout(&run_da_in(dir.path(), &["session", "start"]))["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let inline_cookie = format!(
+        "browser.set_cookies:\n  cookies:\n    - name: sid\n      value: \"inline-s3cr3t-cookie\"\n      url: \"{base}/\"\n"
+    );
+    let inline_step = run_da_stdin(dir.path(), &["session", "step", &id2], &inline_cookie);
+    assert_eq!(inline_step.status.code(), Some(0));
+    let jsonl2 = fs::read_to_string(
+        dir.path()
+            .join(".da/sessions")
+            .join(&id2)
+            .join("steps.jsonl"),
+    )
+    .expect("steps.jsonl");
+    assert!(!jsonl2.contains("inline-s3cr3t-cookie"));
+    let inline_export = run_da_in(dir.path(), &["session", "export", &id2]);
+    assert_ne!(
+        inline_export.status.code(),
+        Some(0),
+        "inline redacted secret must fail export"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&inline_export.stdout),
+        String::from_utf8_lossy(&inline_export.stderr)
+    );
+    assert!(combined.contains("browser.set_cookies"), "{combined}");
+    let _ = run_da_in(dir.path(), &["session", "stop", &id2]);
+}

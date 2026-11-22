@@ -91,7 +91,7 @@ pub struct SessionDefinition {
 }
 
 type ValidateFn = fn(&Value) -> Result<(), String>;
-type ArgRedactorFn = fn(&Value) -> Value;
+type ArgRedactorFn = fn(&Value, bool) -> Value;
 
 /// The steps, observers and detachable sessions available to the runner.
 #[derive(Default)]
@@ -212,12 +212,13 @@ impl Registry {
         (definition.validate)(args)
     }
 
-    /// Registers a step-specific argument redactor called before resolved step
-    /// arguments enter reports, terminals, bundles, or session logs.
+    /// Registers a step-specific argument redactor called before step arguments
+    /// enter reports, terminals, bundles (`preserve_placeholders = false`), or
+    /// unexpanded session templates (`preserve_placeholders = true`).
     pub fn register_arg_redactor(
         &mut self,
         step_name: &'static str,
-        redact: fn(&Value) -> Value,
+        redact: fn(&Value, bool) -> Value,
     ) -> Result<(), String> {
         if !self.steps.contains_key(step_name) {
             return Err(format!(
@@ -228,11 +229,22 @@ impl Registry {
         Ok(())
     }
 
-    /// Returns a scrubbed copy of `args` for `step_name` using any registered
-    /// argument redactor, or clones `args` unchanged when none is registered.
+    /// Returns a scrubbed copy of resolved `args` for `step_name` using any
+    /// registered argument redactor, or clones `args` unchanged when none is
+    /// registered.
     pub fn redact_step_args(&self, step_name: &str, args: &Value) -> Value {
         match self.arg_redactors.get(step_name) {
-            Some(redact) => redact(args),
+            Some(redact) => redact(args, false),
+            None => args.clone(),
+        }
+    }
+
+    /// Returns a scrubbed copy of unexpanded template `args` for `step_name`,
+    /// preserving whole-string `${env:NAME}` and `${var}` placeholders for
+    /// deterministic session export while masking inline sensitive values.
+    pub fn redact_template_args(&self, step_name: &str, args: &Value) -> Value {
+        match self.arg_redactors.get(step_name) {
+            Some(redact) => redact(args, true),
             None => args.clone(),
         }
     }

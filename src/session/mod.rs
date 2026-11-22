@@ -819,10 +819,13 @@ fn build_step_record(
         .and(report.result.as_ref())
         .and_then(|result| result.get("viewport"))
         .cloned();
+    let raw_args = registry.redact_template_args(&step.action, &step.args);
+    let redacted_args = raw_args != step.args;
     StepRecord {
         index,
         action: step.action.clone(),
-        raw_args: registry.redact_step_args(&step.action, &step.args),
+        raw_args,
+        redacted_args,
         expect,
         save,
         optional: step.optional,

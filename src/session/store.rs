@@ -65,6 +65,10 @@ pub struct StepRecord {
     pub index: usize,
     pub action: String,
     pub raw_args: Value,
+    /// Set when an inline sensitive value in `raw_args` was masked to `***`
+    /// before persisting to `steps.jsonl`, making `raw_args` non-replayable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted_args: bool,
     #[serde(default)]
     pub expect: Vec<StoredExpectation>,
     #[serde(default)]
@@ -538,6 +542,7 @@ mod tests {
             index: 1,
             action: "http.request".to_string(),
             raw_args: serde_json::json!({ "header": "${env:TOKEN}" }),
+            redacted_args: false,
             expect: Vec::new(),
             save: BTreeMap::new(),
             optional: false,

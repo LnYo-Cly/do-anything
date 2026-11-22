@@ -575,14 +575,15 @@ da session start --observe 'app_log=log.file:{"path":"app.log"}'
 
 Syntax errors exit 2 (`usage`); unknown observer names, invalid observer
 arguments, or unresolved `${env:NAME}` secrets fail with exit 3 before creating
-any session directory. Attached observers expose `$.observed.<name>` in each
-step result before `expect` and `save` run.
+any session directory. Observer arguments are resolved with `${env:NAME}`
+references (not step-saved `${var}` variables). Attached observers expose
+`$.observed.<name>` in each step result before `expect` and `save` run.
 
 Each entry in `.da/sessions/<id>/steps.jsonl` records:
 
 - `started_at_ms`: Unix epoch milliseconds when the step started;
 - `duration_ms`: execution duration in milliseconds;
-- `result`: the redacted step result JSON (or `null` when absent), while `raw_args` continues to preserve unexpanded `${env:NAME}` references.
+- `result`: the redacted step result JSON (or `null` when absent), while `raw_args` preserves unexpanded `${env:NAME}` and `${var}` placeholders (and masks inline sensitive literals such as raw cookie values to `***`, which `da session export` refuses to emit silently).
 
 ```yaml
 name: Login flow

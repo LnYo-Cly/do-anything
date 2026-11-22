@@ -5900,6 +5900,9 @@ impl Session for BrowserSession {
     }
 
     fn step_evidence(&mut self) -> Result<Vec<Evidence>, String> {
+        if self.connection.is_none() {
+            return Ok(Vec::new());
+        }
         self.evidence()
     }
 
@@ -7699,22 +7702,41 @@ fn read_located(
     Ok(result)
 }
 
-fn is_env_placeholder(value: &str) -> bool {
-    value.starts_with("${env:") && value.ends_with('}') && !value[6..value.len() - 1].contains('}')
+fn is_template_placeholder(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    if inner.is_empty() || inner.contains(['{', '}']) {
+        return false;
+    }
+    match inner.strip_prefix("env:") {
+        Some(env_name) => {
+            let mut chars = env_name.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        }
+        None => true,
+    }
 }
 
-fn mask_sensitive_value(slot: &mut Value) {
+fn mask_sensitive_value(slot: &mut Value, preserve_placeholders: bool) {
     match slot {
-        Value::String(s) if !is_env_placeholder(s) => *slot = Value::String("***".to_string()),
-        Value::String(_) => {}
+        Value::String(s) if preserve_placeholders && is_template_placeholder(s) => {}
         _ => *slot = Value::String("***".to_string()),
     }
 }
 
-/// Replaces cookie values and `local_storage` values in `browser.set_cookies`
-/// arguments before they enter step reports, HTML reports, or session logs,
-/// while preserving `${env:NAME}` placeholders for deterministic session export.
-fn redact_set_cookies_args(args: &Value) -> Value {
+/// Replaces concrete cookie values and `local_storage` values in
+/// `browser.set_cookies` arguments before they enter step reports, HTML
+/// reports, or session logs. When `preserve_placeholders` is true (unexpanded
+/// session `raw_args`), whole-string `${env:NAME}` and `${var}` placeholders
+/// stay intact for deterministic `da session export`.
+fn redact_set_cookies_args(args: &Value, preserve_placeholders: bool) -> Value {
     let mut redacted = args.clone();
     let Some(root) = redacted.as_object_mut() else {
         return redacted;
@@ -7724,7 +7746,7 @@ fn redact_set_cookies_args(args: &Value) -> Value {
             if let Some(obj) = cookie.as_object_mut()
                 && let Some(val) = obj.get_mut("value")
             {
-                mask_sensitive_value(val);
+                mask_sensitive_value(val, preserve_placeholders);
             }
         }
     }
@@ -7732,7 +7754,7 @@ fn redact_set_cookies_args(args: &Value) -> Value {
         for entries in origins.values_mut() {
             if let Some(map) = entries.as_object_mut() {
                 for val in map.values_mut() {
-                    mask_sensitive_value(val);
+                    mask_sensitive_value(val, preserve_placeholders);
                 }
             }
         }
@@ -12452,21 +12474,30 @@ mod tests {
     }
 
     #[test]
-    fn redact_set_cookies_args_masks_values_and_keeps_env_placeholders() {
-        let scrubbed = redact_set_cookies_args(&json!({
+    fn redact_set_cookies_args_masks_values_and_keeps_env_and_var_placeholders() {
+        let input = json!({
             "cookies": [
                 { "name": "sid", "value": "s3cr3t-session", "url": "http://127.0.0.1/" },
-                { "name": "env_ck", "value": "${env:MY_COOKIE}", "url": "http://127.0.0.1/" }
+                { "name": "env_ck", "value": "${env:MY_COOKIE}", "url": "http://127.0.0.1/" },
+                { "name": "var_ck", "value": "${tok}", "url": "http://127.0.0.1/" },
+                { "name": "mixed_ck", "value": "Bearer ${tok}", "url": "http://127.0.0.1/" }
             ],
             "local_storage": {
-                "http://127.0.0.1": { "auth_token": "s3cr3t-token", "env_tok": "${env:TOK}" },
+                "http://127.0.0.1": {
+                    "auth_token": "s3cr3t-token",
+                    "env_tok": "${env:TOK}",
+                    "var_tok": "${saved_tok}"
+                },
                 "current": { "k": "inline-val" }
             }
-        }));
+        });
+        let scrubbed = redact_set_cookies_args(&input, true);
         assert_eq!(scrubbed["cookies"][0]["name"], "sid");
         assert_eq!(scrubbed["cookies"][0]["value"], "***");
         assert_eq!(scrubbed["cookies"][0]["url"], "http://127.0.0.1/");
         assert_eq!(scrubbed["cookies"][1]["value"], "${env:MY_COOKIE}");
+        assert_eq!(scrubbed["cookies"][2]["value"], "${tok}");
+        assert_eq!(scrubbed["cookies"][3]["value"], "***");
         assert_eq!(
             scrubbed["local_storage"]["http://127.0.0.1"]["auth_token"],
             "***"
@@ -12475,7 +12506,23 @@ mod tests {
             scrubbed["local_storage"]["http://127.0.0.1"]["env_tok"],
             "${env:TOK}"
         );
+        assert_eq!(
+            scrubbed["local_storage"]["http://127.0.0.1"]["var_tok"],
+            "${saved_tok}"
+        );
         assert_eq!(scrubbed["local_storage"]["current"]["k"], "***");
+
+        let resolved_scrubbed = redact_set_cookies_args(&input, false);
+        assert_eq!(resolved_scrubbed["cookies"][1]["value"], "***");
+        assert_eq!(resolved_scrubbed["cookies"][2]["value"], "***");
+        assert_eq!(
+            resolved_scrubbed["local_storage"]["http://127.0.0.1"]["env_tok"],
+            "***"
+        );
+        assert_eq!(
+            resolved_scrubbed["local_storage"]["http://127.0.0.1"]["var_tok"],
+            "***"
+        );
     }
 }
 
