@@ -85,11 +85,16 @@ pub fn resolve_ref_object_id(
         deadline,
         dialog,
     )
-    .map_err(|failure| match failure.error() {
-        super::cdp::CdpError::Method { .. } => StepError::Execution(format!(
-            "ref `{ref_id}` is stale because the element is no longer on the page; run `da session snapshot` to get current element refs"
-        )),
-        _ => failure.environment(&format!("could not resolve ref `{ref_id}`")),
+    .map_err(|failure| {
+        if failure.is_death() {
+            return failure.environment(&format!("could not resolve ref `{ref_id}`"));
+        }
+        match failure.error() {
+            super::cdp::CdpError::Method { .. } => StepError::Execution(format!(
+                "ref `{ref_id}` is stale because the element is no longer on the page; run `da session snapshot` to get current element refs"
+            )),
+            _ => failure.environment(&format!("could not resolve ref `{ref_id}`")),
+        }
     })?;
 
     let object_id = resolved

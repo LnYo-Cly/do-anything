@@ -42,9 +42,8 @@ pub fn export_session(
     let mut fragile = Vec::new();
 
     for record in records {
-        let exportable_skipped = record.optional
-            && record.status == "skipped"
-            && (record.used_ref.is_none() || record.synthesized_locator.is_some());
+        let exportable_skipped =
+            record.optional && record.status == "skipped" && !has_unresolved_refs(record);
         if record.status != "passed" && !exportable_skipped {
             skipped_steps.push(json!({
                 "index": record.index,
@@ -82,7 +81,7 @@ pub fn export_session(
                 "exported_index": exported_index,
                 "action": record.action,
                 "ref": record.used_ref,
-                "locator": record.synthesized_locator,
+                "locator": fragile_locator_payload(record),
             });
             match &coord_bounds {
                 Some((field, bounds)) => {
@@ -196,10 +195,49 @@ pub fn export_session(
     })
 }
 
+/// Returns whether a skipped optional step left any `ref` without a synthesized locator.
+fn has_unresolved_refs(record: &StepRecord) -> bool {
+    if record.action == "browser.drag" {
+        let synth = record.synthesized_locator.as_ref();
+        for side in ["from", "to"] {
+            if record
+                .raw_args
+                .get(side)
+                .and_then(|endpoint| endpoint.get("ref"))
+                .is_some()
+                && synth.and_then(|map| map.get(side)).is_none()
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    record.used_ref.is_some() && record.synthesized_locator.is_none()
+}
+
+/// Strips internal `from_ref`/`to_ref`/`*_fragile` metadata keys from `fragile` export entries.
+fn fragile_locator_payload(record: &StepRecord) -> Value {
+    if record.action == "browser.drag"
+        && let Some(Value::Object(map)) = &record.synthesized_locator
+    {
+        let mut clean = Map::new();
+        for key in ["from", "to"] {
+            if let Some(val) = map.get(key) {
+                clean.insert(key.to_string(), val.clone());
+            }
+        }
+        return Value::Object(clean);
+    }
+    record.synthesized_locator.clone().unwrap_or(Value::Null)
+}
+
 /// Replaces `ref` with the synthesized deterministic locator while preserving
 /// original `${env:...}` and `${var}` placeholders, and records the viewport a
 /// coordinate step ran at.
 fn materialize_args(record: &StepRecord) -> Result<Value, String> {
+    if record.action == "browser.drag" {
+        return materialize_drag_args(record);
+    }
     let mut args = match &record.synthesized_locator {
         Some(_) => synthesized_locator_args(record)?,
         None => record.raw_args.clone(),
@@ -220,21 +258,102 @@ fn coordinate_bounds_field(action: &str) -> &'static str {
 /// The `at.viewport` or `at.window` size a coordinate step exports, if present.
 fn coordinates_bounds(action: &str, args: &Value) -> Option<(&'static str, Value)> {
     let field = coordinate_bounds_field(action);
-    let bounds = args.get("at")?.get(field)?.clone();
+    let bounds = args
+        .get("at")
+        .and_then(|at| at.get(field))
+        .or_else(|| {
+            args.get("from")
+                .and_then(|endpoint| endpoint.get("at"))
+                .and_then(|at| at.get(field))
+        })
+        .or_else(|| {
+            args.get("to")
+                .and_then(|endpoint| endpoint.get("at"))
+                .and_then(|at| at.get(field))
+        })?
+        .clone();
     Some((field, bounds))
 }
 
-/// Adds the recorded viewport or window size to a bare `at`, so the exported
-/// case refuses to replay at a different size instead of clicking the wrong place.
-fn pin_coordinate_viewport(record: &StepRecord, args: &mut Value) -> Result<(), String> {
+/// Merges synthesized locator keys with remaining step/endpoint arguments without
+/// overwriting locator fields.
+fn merge_locator_fields(
+    loc_map: &Map<String, Value>,
+    extra: Map<String, Value>,
+) -> Map<String, Value> {
+    let mut merged = Map::new();
+    for (k, v) in loc_map {
+        merged.insert(k.clone(), v.clone());
+    }
+    for (k, v) in extra {
+        merged.entry(k).or_insert(v);
+    }
+    merged
+}
+
+/// Materializes both `from` and `to` endpoints of `browser.drag` (synthesized refs and pinned `at.viewport`).
+fn materialize_drag_args(record: &StepRecord) -> Result<Value, String> {
+    let Value::Object(mut base) = record.raw_args.clone() else {
+        return Err(format!(
+            "step {} (`{}`) arguments must be a mapping",
+            record.index, record.action
+        ));
+    };
+    let synth = record
+        .synthesized_locator
+        .as_ref()
+        .and_then(Value::as_object);
+    let observed_viewport = record
+        .observed_viewport
+        .as_ref()
+        .or_else(|| synth.and_then(|map| map.get("viewport")));
+
+    for side in ["from", "to"] {
+        let Some(mut endpoint) = base.remove(side) else {
+            return Err(format!(
+                "step {} (`{}`) is missing `{side}` endpoint",
+                record.index, record.action
+            ));
+        };
+        let Value::Object(mut ep_map) = endpoint.clone() else {
+            return Err(format!(
+                "step {} (`{}`) endpoint `{side}` must be a mapping",
+                record.index, record.action
+            ));
+        };
+        if ep_map.remove("ref").is_some() {
+            let Some(loc_map) = synth
+                .and_then(|map| map.get(side))
+                .and_then(Value::as_object)
+            else {
+                return Err(format!(
+                    "step {} (`{}`) uses `{side}.ref` without a synthesized locator",
+                    record.index, record.action
+                ));
+            };
+            endpoint = Value::Object(merge_locator_fields(loc_map, ep_map));
+        }
+        pin_endpoint_at_viewport(record, &mut endpoint, observed_viewport)?;
+        base.insert(side.to_string(), endpoint);
+    }
+
+    Ok(Value::Object(base))
+}
+
+/// Pins an unpinned `at` block inside `container` to `observed` viewport or window dimensions.
+fn pin_endpoint_at_viewport(
+    record: &StepRecord,
+    container: &mut Value,
+    observed: Option<&Value>,
+) -> Result<(), String> {
     let field = coordinate_bounds_field(&record.action);
-    let Some(at) = args.get_mut("at").and_then(Value::as_object_mut) else {
+    let Some(at) = container.get_mut("at").and_then(Value::as_object_mut) else {
         return Ok(());
     };
     if at.get(field).is_some() {
         return Ok(());
     }
-    let bounds = record.observed_viewport.clone().ok_or_else(|| {
+    let bounds = observed.cloned().ok_or_else(|| {
         format!(
             "step {} (`{}`) uses `at` coordinates but recorded no {field} size, so the exported case could not replay at the same size",
             record.index, record.action
@@ -242,6 +361,12 @@ fn pin_coordinate_viewport(record: &StepRecord, args: &mut Value) -> Result<(), 
     })?;
     at.insert(field.to_string(), bounds);
     Ok(())
+}
+
+/// Adds the recorded viewport to a bare `at`, so the exported case refuses to
+/// replay at a different size instead of clicking the wrong place.
+fn pin_coordinate_viewport(record: &StepRecord, args: &mut Value) -> Result<(), String> {
+    pin_endpoint_at_viewport(record, args, record.observed_viewport.as_ref())
 }
 
 /// Replaces `ref` with the synthesized deterministic locator.
@@ -283,14 +408,7 @@ fn synthesized_locator_args(record: &StepRecord) -> Result<Value, String> {
         return Ok(Value::Object(merged));
     }
 
-    let mut merged = Map::new();
-    for (k, v) in loc_map {
-        merged.insert(k.clone(), v.clone());
-    }
-    for (k, v) in base {
-        merged.entry(k).or_insert(v);
-    }
-    Ok(Value::Object(merged))
+    Ok(Value::Object(merge_locator_fields(loc_map, base)))
 }
 
 fn format_inline_or_block(value: &Value, indent: usize) -> String {
@@ -527,6 +645,10 @@ mod tests {
         }
     }
 
+    fn base_record(index: usize, action: &str, raw_args: Value) -> StepRecord {
+        sample_record(index, action, raw_args, false)
+    }
+
     #[test]
     fn export_preserves_saved_variable_placeholders_in_set_cookies() {
         let mut cli_step = sample_record(
@@ -627,6 +749,139 @@ mod tests {
             exported.yaml.contains("observe:\n  app_log:\n    log.file:\n      path: \"${env:APP_LOG_PATH}\"\n  net:\n    browser.network: {}\n"),
             "unexpected exported YAML:\n{}",
             exported.yaml
+        );
+    }
+
+    #[test]
+    fn export_drag_materializes_both_endpoints_pins_viewport_and_cleans_fragile() {
+        let mut mixed_drag = base_record(
+            2,
+            "browser.drag",
+            json!({
+                "from": { "at": { "x": 40, "y": 60 } },
+                "to": { "ref": "e9" }
+            }),
+        );
+        mixed_drag.used_ref = Some("e9".to_string());
+        mixed_drag.fragile = true;
+        mixed_drag.observed_viewport = Some(json!({ "width": 1280, "height": 720 }));
+        mixed_drag.synthesized_locator = Some(json!({
+            "to": { "css": "#col > div:nth-of-type(2)" },
+            "to_ref": "e9",
+            "to_fragile": true,
+            "viewport": { "width": 1280, "height": 720 }
+        }));
+
+        let mut two_ref_drag = base_record(
+            3,
+            "browser.drag",
+            json!({
+                "from": { "ref": "e1" },
+                "to": { "ref": "e2" }
+            }),
+        );
+        two_ref_drag.used_ref = Some("e1/e2".to_string());
+        two_ref_drag.fragile = false;
+        two_ref_drag.synthesized_locator = Some(json!({
+            "from": { "testid": "card-a" },
+            "from_ref": "e1",
+            "from_fragile": false,
+            "to": { "testid": "drop-b" },
+            "to_ref": "e2",
+            "to_fragile": false
+        }));
+
+        let read_clip = base_record(4, "browser.read_clipboard", json!({}));
+
+        let records = vec![
+            base_record(1, "browser.open", json!({ "url": "http://127.0.0.1/" })),
+            mixed_drag,
+            two_ref_drag,
+            read_clip,
+        ];
+
+        let result = export_session(
+            "drag-test",
+            &[],
+            &records,
+            &ExportOptions {
+                case_name: Some("Drag export".to_string()),
+                include_reads: false,
+            },
+        )
+        .expect("export must succeed");
+
+        assert_eq!(result.exported_steps, 4);
+        assert!(
+            !result.yaml.contains("ref:"),
+            "exported YAML must not contain raw ref:\n{}",
+            result.yaml
+        );
+        assert!(
+            !result.yaml.contains("to_ref")
+                && !result.yaml.contains("from_ref")
+                && !result.yaml.contains("to_fragile")
+                && !result.yaml.contains("from_fragile"),
+            "internal metadata helper keys must not leak into YAML:\n{}",
+            result.yaml
+        );
+        assert!(
+            result.yaml.contains("width: 1280") && result.yaml.contains("height: 720"),
+            "explicit drag endpoint coordinates must pin observed viewport:\n{}",
+            result.yaml
+        );
+        assert!(
+            result.yaml.contains("testid: card-a") && result.yaml.contains("testid: drop-b"),
+            "both drag refs must materialize into synthesized locators:\n{}",
+            result.yaml
+        );
+        assert!(
+            result.yaml.contains("  - browser.read_clipboard: {}\n"),
+            "empty read_clipboard args must render cleanly:\n{}",
+            result.yaml
+        );
+        assert_eq!(result.fragile.len(), 1, "{:?}", result.fragile);
+        let fragile_loc = &result.fragile[0]["locator"];
+        assert!(
+            fragile_loc.get("from_fragile").is_none()
+                && fragile_loc.get("to_fragile").is_none()
+                && fragile_loc.get("from_ref").is_none()
+                && fragile_loc.get("to_ref").is_none(),
+            "fragile metadata must strip internal helper keys: {fragile_loc}"
+        );
+    }
+
+    #[test]
+    fn export_omits_optional_skipped_drag_with_any_unresolved_ref() {
+        let mut partial_failed_drag = base_record(
+            2,
+            "browser.drag",
+            json!({
+                "from": { "ref": "e1" },
+                "to": { "ref": "e99" }
+            }),
+        );
+        partial_failed_drag.optional = true;
+        partial_failed_drag.status = "skipped".to_string();
+        partial_failed_drag.used_ref = Some("e1/e99".to_string());
+        partial_failed_drag.synthesized_locator = Some(json!({
+            "from": { "testid": "card-a" },
+            "from_ref": "e1",
+            "from_fragile": false
+        }));
+
+        let records = vec![
+            base_record(1, "browser.open", json!({ "url": "http://127.0.0.1/" })),
+            partial_failed_drag,
+        ];
+
+        let result = export_session("drag-optional", &[], &records, &ExportOptions::default())
+            .expect("export must succeed");
+        assert_eq!(result.exported_steps, 1);
+        assert!(
+            !result.yaml.contains("browser.drag") && !result.yaml.contains("ref:"),
+            "optional skipped drag with unresolved `to.ref` must be omitted:\n{}",
+            result.yaml
         );
     }
 }
