@@ -336,13 +336,32 @@ impl StreamBuffer {
         String::from_utf8_lossy(&slice[start..]).into_owned()
     }
 
+    #[cfg(test)]
     fn find_and_advance(&mut self, needle: &[u8]) -> Option<String> {
-        let start = self.cursor.saturating_sub(self.base_offset) as usize;
+        let mut scanned_up_to = 0;
+        self.find_and_advance_from(needle, &mut scanned_up_to)
+    }
+
+    fn find_and_advance_from(&mut self, needle: &[u8], scanned_up_to: &mut u64) -> Option<String> {
+        if needle.is_empty() {
+            return None;
+        }
+        let overlap = needle.len().saturating_sub(1) as u64;
+        let search_abs = (*scanned_up_to)
+            .saturating_sub(overlap)
+            .max(self.cursor)
+            .max(self.base_offset);
+        let unconsumed_start = self.cursor.saturating_sub(self.base_offset) as usize;
+        let search_start = search_abs.saturating_sub(self.base_offset) as usize;
         let slice = self.bytes.make_contiguous();
-        let unconsumed = &slice[start..];
-        let pos = find_subslice(unconsumed, needle)?;
-        let text = String::from_utf8_lossy(unconsumed).into_owned();
-        self.cursor = self.base_offset + (start + pos + needle.len()) as u64;
+        *scanned_up_to = self.total_bytes;
+        if search_start >= slice.len() {
+            return None;
+        }
+        let rel_pos = find_subslice(&slice[search_start..], needle)?;
+        let match_end = search_start + rel_pos + needle.len();
+        let text = String::from_utf8_lossy(&slice[unconsumed_start..]).into_owned();
+        self.cursor = self.base_offset + match_end as u64;
         Some(text)
     }
 
@@ -559,6 +578,8 @@ impl ManagedProcess {
         let needle = pattern.as_bytes();
         let deadline = Instant::now() + timeout;
         let mut exited_at: Option<Instant> = None;
+        let mut stdout_scanned: u64 = 0;
+        let mut stderr_scanned: u64 = 0;
 
         loop {
             let (pipes_closed, found) = {
@@ -567,35 +588,37 @@ impl ManagedProcess {
                 })?;
 
                 let found = match stream {
-                    OutputStream::Stdout => {
-                        guard
-                            .stdout
-                            .find_and_advance(needle)
-                            .map(|stdout| WaitMatch {
-                                matched_stream: StreamKind::Stdout,
-                                stdout,
-                                stderr: String::new(),
-                            })
-                    }
-                    OutputStream::Stderr => {
-                        guard
-                            .stderr
-                            .find_and_advance(needle)
-                            .map(|stderr| WaitMatch {
-                                matched_stream: StreamKind::Stderr,
-                                stdout: String::new(),
-                                stderr,
-                            })
-                    }
+                    OutputStream::Stdout => guard
+                        .stdout
+                        .find_and_advance_from(needle, &mut stdout_scanned)
+                        .map(|stdout| WaitMatch {
+                            matched_stream: StreamKind::Stdout,
+                            stdout,
+                            stderr: String::new(),
+                        }),
+                    OutputStream::Stderr => guard
+                        .stderr
+                        .find_and_advance_from(needle, &mut stderr_scanned)
+                        .map(|stderr| WaitMatch {
+                            matched_stream: StreamKind::Stderr,
+                            stdout: String::new(),
+                            stderr,
+                        }),
                     OutputStream::Both => {
-                        if let Some(stdout) = guard.stdout.find_and_advance(needle) {
+                        if let Some(stdout) = guard
+                            .stdout
+                            .find_and_advance_from(needle, &mut stdout_scanned)
+                        {
                             let stderr = guard.stderr.unconsumed_text();
                             Some(WaitMatch {
                                 matched_stream: StreamKind::Stdout,
                                 stdout,
                                 stderr,
                             })
-                        } else if let Some(stderr) = guard.stderr.find_and_advance(needle) {
+                        } else if let Some(stderr) = guard
+                            .stderr
+                            .find_and_advance_from(needle, &mut stderr_scanned)
+                        {
                             let stdout = guard.stdout.unconsumed_text();
                             Some(WaitMatch {
                                 matched_stream: StreamKind::Stderr,
@@ -1059,12 +1082,11 @@ fn terminate_unix_process_group(
     pid: u32,
     timeout: Duration,
 ) -> Result<(), String> {
-    let pgid = format!("-{pid}");
     let already_exited = exit_status.is_some()
         || matches!(child.try_wait(), Ok(Some(status)) if { *exit_status = Some(status); true });
 
     if !already_exited {
-        let _ = run_unix_kill(&["-TERM", &pgid]);
+        let _ = signal_unix_process_group("TERM", pid);
         let grace_deadline = Instant::now() + timeout.min(GRACEFUL_TERM_CAP);
         while Instant::now() < grace_deadline {
             if let Ok(Some(status)) = child.try_wait() {
@@ -1077,7 +1099,7 @@ fn terminate_unix_process_group(
 
     // Send SIGKILL to the whole process group even if the leader already exited,
     // because grandchildren in that process group can outlive their parent.
-    let _ = run_unix_kill(&["-KILL", &pgid]);
+    let _ = signal_unix_process_group("KILL", pid);
     if exit_status.is_none() {
         let _ = child.kill();
         *exit_status = child
@@ -1086,36 +1108,151 @@ fn terminate_unix_process_group(
             .map_err(|error| format!("could not wait for process exit: {error}"))?;
     }
 
-    // Leader is now reaped; confirm no member remains in process group `pid`.
+    // Leader is now reaped; confirm no non-zombie member remains in process group `pid`.
     let wait_deadline = Instant::now() + timeout.min(KILL_HELPER_TIMEOUT);
-    while unix_process_group_alive(&pgid) {
+    while unix_process_group_alive(pid) {
         if Instant::now() >= wait_deadline {
             return Err("process group survived SIGKILL".to_string());
         }
-        let _ = run_unix_kill(&["-KILL", &pgid]);
+        let _ = signal_unix_process_group("KILL", pid);
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn run_unix_kill(args: &[&str]) -> std::io::Result<ExitStatus> {
-    let bin = if std::path::Path::new("/bin/kill").is_file() {
-        "/bin/kill"
-    } else {
-        "kill"
-    };
-    Command::new(bin)
-        .args(args)
+fn signal_unix_process_group(signal: &str, pgid: u32) -> std::io::Result<ExitStatus> {
+    // First signal the process group atomically (`--` prevents dash/procps
+    // from parsing `-<pgid>` as signal option flags), then also signal any
+    // discovered live member PIDs as positive integers so no shell/kill
+    // variant can miss surviving grandchildren.
+    let pid_str = pgid.to_string();
+    let group_status = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "kill -s \"$1\" -- -\"$2\" 2>/dev/null || /bin/kill -s \"$1\" -- -\"$2\" 2>/dev/null",
+            "sh",
+            signal,
+            &pid_str,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status();
+
+    let members = collect_unix_pgid_members(pgid);
+    if !members.is_empty() {
+        let member_args: Vec<String> = members.into_iter().map(|m| m.to_string()).collect();
+        let bin = if std::path::Path::new("/bin/kill").is_file() {
+            "/bin/kill"
+        } else {
+            "kill"
+        };
+        let _ = Command::new(bin)
+            .arg("-s")
+            .arg(signal)
+            .args(&member_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    group_status
+}
+
+#[cfg(any(unix, test))]
+fn parse_proc_stat_pgrp_and_state(stat_text: &str) -> Option<(u32, char)> {
+    let (_, rest) = stat_text.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse::<u32>().ok()?;
+    Some((pgrp, state))
+}
+
+#[cfg(any(unix, test))]
+fn is_dead_or_zombie_state(state: char) -> bool {
+    matches!(state, 'Z' | 'X' | 'x')
+}
+
+#[cfg(any(unix, test))]
+fn ps_output_pgid_members(stdout: &str, target_pgid: u32, self_pid: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for line in stdout.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(pgid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(stat) = fields.next() else {
+            continue;
+        };
+        if pid != 0
+            && pid != self_pid
+            && pgid == target_pgid
+            && !stat.chars().next().is_some_and(is_dead_or_zombie_state)
+        {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 #[cfg(unix)]
-fn unix_process_group_alive(pgid: &str) -> bool {
-    run_unix_kill(&["-0", pgid]).is_ok_and(|status| status.success())
+fn collect_unix_pgid_members(target_pgid: u32) -> Vec<u32> {
+    let self_pid = std::process::id();
+    let proc_root = std::path::Path::new("/proc");
+    if proc_root.is_dir()
+        && let Ok(entries) = std::fs::read_dir(proc_root)
+    {
+        let mut pids = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == 0 || pid == self_pid {
+                continue;
+            }
+            if let Ok(stat) = std::fs::read_to_string(entry.path().join("stat"))
+                && let Some((pgrp, state)) = parse_proc_stat_pgrp_and_state(&stat)
+                && pgrp == target_pgid
+                && !is_dead_or_zombie_state(state)
+            {
+                pids.push(pid);
+            }
+        }
+        return pids;
+    }
+
+    let Ok(output) = Command::new("ps")
+        .args(["-ww", "-A", "-o", "pid=,pgid=,stat="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    ps_output_pgid_members(
+        &String::from_utf8_lossy(&output.stdout),
+        target_pgid,
+        self_pid,
+    )
+}
+
+#[cfg(unix)]
+fn unix_process_group_alive(target_pgid: u32) -> bool {
+    !collect_unix_pgid_members(target_pgid).is_empty()
 }
 
 #[cfg(windows)]
@@ -1284,5 +1421,20 @@ mod tests {
             buf.find_and_advance(b"SPLIT_READY").as_deref(),
             Some("SPLIT_READY_OK")
         );
+    }
+
+    #[test]
+    fn unix_pgrp_parsers_ignore_zombie_members_and_handle_paren_comm() {
+        assert_eq!(
+            parse_proc_stat_pgrp_and_state("6624 (my ) helper) S 1 6624 6624 0 -1"),
+            Some((6624, 'S'))
+        );
+        let (_, zstate) =
+            parse_proc_stat_pgrp_and_state("6625 (defunct) Z 1 6624 6624 0 -1").unwrap();
+        assert!(is_dead_or_zombie_state(zstate));
+
+        let ps_out = "  6625  6624 Z+\n  7001  7000 S\n";
+        assert!(ps_output_pgid_members(ps_out, 6624, 9999).is_empty());
+        assert_eq!(ps_output_pgid_members(ps_out, 7000, 9999), vec![7001]);
     }
 }
