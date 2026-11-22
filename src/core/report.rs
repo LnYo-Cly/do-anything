@@ -1,5 +1,6 @@
 //! Result types shared by the runner, the event bus and the renderer.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -102,8 +103,12 @@ pub struct StepReport {
     pub status: StepStatus,
     /// How long the step took.
     pub duration: Duration,
+    /// Redacted resolved arguments passed to this step, when interpolation succeeded.
+    pub args: Option<Value>,
     /// The JSON result, when the step produced one.
     pub result: Option<Value>,
+    /// Redacted variables saved by `save:` from this step's result.
+    pub saved: BTreeMap<String, String>,
     /// Every assertion evaluated for this step.
     pub assertions: Vec<AssertionReport>,
     /// The problem that stopped the case, if this step caused it.
@@ -115,6 +120,8 @@ pub struct StepReport {
 pub struct CaseReport {
     /// File the case came from.
     pub file: PathBuf,
+    /// Lowercase hex SHA-256 of the source case file bytes, when known.
+    pub case_sha256: Option<String>,
     /// Case name.
     pub name: String,
     /// Project the case declares.
@@ -125,6 +132,8 @@ pub struct CaseReport {
     pub layer: Option<String>,
     /// Tags the case declares.
     pub tags: Vec<String>,
+    /// Sorted names of CLI or `--vars-file` variables supplied for this run.
+    pub overridden_vars: Vec<String>,
     /// Case state.
     pub status: CaseStatus,
     /// How long the case took.
@@ -298,18 +307,22 @@ mod tests {
         RunReport {
             cases: vec![CaseReport {
                 file: PathBuf::from("case.yaml"),
+                case_sha256: None,
                 name: "case".to_string(),
                 project: None,
                 suite: None,
                 layer: None,
                 tags: Vec::new(),
+                overridden_vars: Vec::new(),
                 status: CaseStatus::Error,
                 duration: Duration::ZERO,
                 steps: vec![StepReport {
                     name: "test.step".to_string(),
                     status: StepStatus::Error,
                     duration: Duration::ZERO,
+                    args: None,
                     result: None,
+                    saved: BTreeMap::new(),
                     assertions: Vec::new(),
                     error: Some(Problem {
                         kind,
@@ -439,7 +452,9 @@ mod tests {
                 name: "test.cleanup".to_string(),
                 status: StepStatus::Passed,
                 duration: Duration::ZERO,
+                args: None,
                 result: None,
+                saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: None,
             },
@@ -447,7 +462,9 @@ mod tests {
                 name: "test.broken_cleanup".to_string(),
                 status: StepStatus::Error,
                 duration: Duration::ZERO,
+                args: None,
                 result: None,
+                saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {
                     kind: ProblemKind::Environment,
@@ -458,7 +475,9 @@ mod tests {
                 name: "test.optional_cleanup".to_string(),
                 status: StepStatus::Skipped,
                 duration: Duration::ZERO,
+                args: None,
                 result: None,
+                saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {
                     kind: ProblemKind::Execution,

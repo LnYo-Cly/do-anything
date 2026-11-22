@@ -164,6 +164,7 @@ da run cases/ --jobs 4
 da run cases/ --bundle-dir /tmp/da-failures
 da run cases/ --no-bundle
 da run cases/ --record evidence/
+da run cases/ --record evidence/ --trace-steps
 da report evidence/
 da report evidence/ -o evidence.html --shareable
 da --output json run cases/
@@ -510,7 +511,7 @@ on the session directory rejects concurrent operations on the same session ID.
 
 | Subcommand | Purpose & Key Options |
 | --- | --- |
-| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), print `session_id` |
+| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), optionally attach declared read-only observers (`--observe SPEC`), print `session_id` |
 | `da session step <id> ...` | Reattach resources, run one step (`<step> --arg k=v`, `--use` + `--with`, `--step`, or `-f <file\|->`, optional `--save name=jsonpath`), update state, detach; returns `snapshot` after browser steps |
 | `da session snapshot <id>` | Capture the current accessibility tree without running a step (`--ref <id>`, `--max-depth`, `--max-nodes`) |
 | `da session export <id>` | Emit deterministic YAML case (`-o <file>`, `--name <title>`, `--include-reads`, `--yaml`); skips pure `browser.read` without `expect`/`save` by default |
@@ -560,6 +561,28 @@ $ da session export s-1794974416388-44376-0 -o login-flow.yaml --name "Login flo
 Exported `login-flow.yaml` replaces transient `ref` values with live-verified
 stable locators while keeping `${env:DEMO_PASS}` untouched (never storing any
 resolved secret value inside `.da/sessions/`):
+
+#### Session observers and step audit log
+
+`da session start` accepts repeatable `--observe SPEC` flags to attach declared
+read-only observers (such as `log.file` or `browser.network`) across every
+subsequent `da session step` call:
+
+```sh
+da session start --observe app_log=log.file:path=app.log --observe net=browser.network
+da session start --observe 'app_log=log.file:{"path":"app.log"}'
+```
+
+Syntax errors exit 2 (`usage`); unknown observer names, invalid observer
+arguments, or unresolved `${env:NAME}` secrets fail with exit 3 before creating
+any session directory. Attached observers expose `$.observed.<name>` in each
+step result before `expect` and `save` run.
+
+Each entry in `.da/sessions/<id>/steps.jsonl` records:
+
+- `started_at_ms`: Unix epoch milliseconds when the step started;
+- `duration_ms`: execution duration in milliseconds;
+- `result`: the redacted step result JSON (or `null` when absent), while `raw_args` continues to preserve unexpanded `${env:NAME}` references.
 
 ```yaml
 name: Login flow
@@ -2886,11 +2909,13 @@ case result and the rest of the bundle are unaffected.
 | `schema_version` | Version of the layout, currently `1`. |
 | `da_version` | Version of `da` that wrote the bundle. |
 | `case_file` | Case file, with `/` as the separator. |
+| `case_sha256` | Lowercase hex SHA-256 of the source case file bytes. |
 | `case_name` | Name of the case. |
 | `project` | Project the case declares, or `null`. |
 | `suite` | Suite the case declares, or `null`. |
 | `layer` | Layer the case declares, or `null`. |
 | `tags` | Tags the case declares, or `[]`. |
+| `overridden_vars` | Sorted list of variable names supplied via `--vars-file` or `--var` (names only; never values). |
 | `status` | `passed`, `failed` or `error`. A failure bundle contains only the last two; a run record also contains `passed`. |
 | `created_at` | Unix milliseconds. |
 
@@ -2947,6 +2972,23 @@ now has a screenshot and DOM snapshot too. Without `--record`, a passing case
 still takes no screenshot: the zero-overhead rule for ordinary runs is
 unchanged.
 
+To capture session evidence after **every executed step** (for example, one
+masked screenshot and DOM snapshot per step during interactive UI flows), add
+`--trace-steps` alongside `--record`:
+
+```sh
+da run cases/ --record evidence/ --trace-steps
+```
+
+`--trace-steps` requires `--record` (passing `--trace-steps` alone exits with
+code 2). When enabled, each executed step writes non-empty session evidence
+under `trace/steps/<i>/<kind>/` and each `finally` step writes under
+`trace/finally/<i>/<kind>/` (where `<i>` is the 0-based index within that
+block; unexecuted post-failure steps produce no trace directory). When
+`--trace-steps` is omitted, per-step evidence collection is not invoked at all.
+Any `local_only` constraint reported by a session also sets `"local_only": true`
+in `meta.json`.
+
 `--record` and failure bundles are independent. Failure bundles still go to
 `.da/failures` (or `--bundle-dir`) unless `--no-bundle` is given. A failing case
 can therefore appear in both places, written from the same collected evidence.
@@ -2961,10 +3003,13 @@ writes `<directory>/report.html` by default, or the file named by
 `--output json` for one JSON object. A missing directory, or a directory with no
 complete case, is a usage error (exit 2).
 
-The report contains an overview, a step timeline for each case, the assertions
-with their expected and actual values, and side-by-side cards for the observed
-HTTP response, database rows, CLI output, network requests, log lines, DOM
-snapshot and interface screenshot. An optional step that did not reach its
+The report contains an overview, a step timeline for each case (including
+collapsible resolved step arguments, saved variables, and any per-step artifacts
+recorded under `trace/`), the assertions with their expected and actual values,
+and side-by-side cards for the observed HTTP response, database rows, CLI
+output, network requests, log lines, DOM snapshot and interface screenshot.
+Both case-level screenshots and per-step traced screenshots obey `--shareable`,
+`local_only`, and the 2 MiB / 10 MiB image budgets. An optional step that did not reach its
 assertions appears as `SKIPPED` with the reason, is counted in the report's
 skipped total, and does not stop the rest of the case from being recorded. It is
 one static HTML file: CSS is inline,
@@ -3050,7 +3095,9 @@ Summary: 1 case (0 passed, 1 failed, 0 errors, 0 filtered), 2 steps (1 passed, 1
           "name": "http.request",
           "status": "failed",
           "duration_ms": 6,
+          "args": { "url": "http://127.0.0.1:8080/login", "method": "POST" },
           "result": { "status": 200, "headers": { "content-type": "application/json" }, "body": { "token": "t-123" } },
+          "saved": {},
           "error": { "kind": "assertion", "message": "1 of 2 assertions failed" },
           "assertions": [
             { "path": "$.status", "comparison": "equals", "expected": 201, "actual": 200, "passed": false, "message": null },
@@ -3066,7 +3113,9 @@ Summary: 1 case (0 passed, 1 failed, 0 errors, 0 filtered), 2 steps (1 passed, 1
 ```
 
 `bundle` is the directory of the case's failure bundle, or `null` when the case
-passed or bundles are off. When a case declares `finally:`, its cleanup step
+passed or bundles are off. Every executed step report includes redacted resolved
+`args` and redacted `saved` variables (`{}` when nothing was saved). When a case
+declares `finally:`, its cleanup step
 reports appear under `finally` on that case object (omitted when no `finally:`
 block is present). `bundle_errors` lists the bundles that could not be
 written; they never change the exit code. Every case also carries its

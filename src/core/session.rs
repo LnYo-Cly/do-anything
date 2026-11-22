@@ -131,6 +131,15 @@ pub trait Session: Send + AsAny {
         Ok(Vec::new())
     }
 
+    /// Returns per-step diagnostic files when `--trace-steps` is enabled.
+    ///
+    /// Called only immediately after an executed step when the runner has
+    /// tracing turned on. Default is empty so opt-in is zero-overhead for
+    /// sessions that do not capture per-step artifacts.
+    fn step_evidence(&mut self) -> Result<Vec<Evidence>, String> {
+        Ok(Vec::new())
+    }
+
     /// Detaches this resource so a later process can reattach without closing it.
     ///
     /// Returns `Ok(Some(handle))` with an opaque JSON handle when the session
@@ -304,11 +313,25 @@ impl Sessions {
     /// stopping the others. A session that returns no files and no error is
     /// left out, so a case with no evidence adds no directory to its bundle.
     pub fn collect_evidence(&mut self) -> Vec<SessionEvidence> {
+        self.collect_evidence_with(|session| session.evidence())
+    }
+
+    /// Collects per-step evidence from every open session after one step runs.
+    ///
+    /// Sessions that return no files and no error are omitted.
+    pub fn collect_step_evidence(&mut self) -> Vec<SessionEvidence> {
+        self.collect_evidence_with(|session| session.step_evidence())
+    }
+
+    fn collect_evidence_with(
+        &mut self,
+        mut read: impl FnMut(&mut dyn Session) -> Result<Vec<Evidence>, String>,
+    ) -> Vec<SessionEvidence> {
         let mut groups = Vec::new();
         for entry in &mut self.entries {
             let local_only_reason = entry.session.local_only_reason();
             let evidence_is_local_only = local_only_reason.is_some();
-            match entry.session.evidence() {
+            match read(&mut *entry.session) {
                 Ok(files) if files.is_empty() => {}
                 Ok(files) => groups.push(SessionEvidence {
                     kind: entry.kind.to_string(),
@@ -492,6 +515,12 @@ pub(crate) fn check_kind(kind: &str) -> Result<(), String> {
         return Err(format!(
             "session kind `{kind}` is a path segment, not a name; use lowercase letters, digits, `.`, `_` and `-`"
         ));
+    }
+    if kind == "trace" {
+        return Err(
+            "session kind `trace` is reserved by the failure bundle; choose another kind"
+                .to_string(),
+        );
     }
     if let Some(character) = kind
         .chars()

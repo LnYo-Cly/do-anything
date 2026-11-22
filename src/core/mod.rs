@@ -19,3 +19,4 @@ pub mod runner;
 pub mod schema;
 pub mod secrets;
 pub mod session;
+pub mod sha256;

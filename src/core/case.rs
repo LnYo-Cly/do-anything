@@ -173,6 +173,22 @@ pub struct LoadedCase {
     pub path: PathBuf,
     /// The parsed case.
     pub case: Case,
+    /// Lowercase hex SHA-256 of the source case file bytes, when loaded from disk.
+    pub case_sha256: Option<String>,
+    /// Sorted names of variables supplied via `--vars-file` or `--var`.
+    pub overridden_vars: Vec<String>,
+}
+
+impl LoadedCase {
+    /// Wraps a parsed case with no file hash or variable overrides.
+    pub fn new(path: PathBuf, case: Case) -> Self {
+        Self {
+            path,
+            case,
+            case_sha256: None,
+            overridden_vars: Vec::new(),
+        }
+    }
 }
 
 /// A case file that could not be loaded or is not valid.
@@ -1248,7 +1264,7 @@ fn parse_observations(raw: RawObservations) -> Result<Vec<Observation>, Problem>
 /// The name becomes a key of every step result, which an assertion addresses as
 /// `$.observed.<name>`, so it follows the same character rule as a registered
 /// name and needs no bracket escaping.
-fn validate_observation_name(name: &str) -> Result<(), String> {
+pub fn validate_observation_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(
             "the name is empty; use lowercase letters, digits, `.`, `_` and `-`".to_string(),
@@ -2059,6 +2075,8 @@ pub fn load_file(path: &Path) -> Result<LoadedCase, CaseError> {
     Ok(LoadedCase {
         path: path.to_path_buf(),
         case,
+        case_sha256: Some(crate::core::sha256::hex(text.as_bytes())),
+        overridden_vars: Vec::new(),
     })
 }
 

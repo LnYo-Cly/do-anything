@@ -2248,3 +2248,105 @@ fn session_step_uploads_files_through_a_ref_and_exports_a_replayable_step() {
         String::from_utf8_lossy(&replay.stdout)
     );
 }
+
+#[test]
+fn da_session_start_observe_browser_network_collects_requests_across_steps() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+
+    let server = support::TestServer::start();
+    let dir = TempDir::new("browser-session-network");
+    let closed = support::closed_port();
+    let url = server.url(&format!(
+        "/browser/network?case=session&closed={closed}&delay=1500"
+    ));
+
+    let start = run_da_in(
+        dir.path(),
+        &["session", "start", "--observe", "net=browser.network"],
+    );
+    assert_eq!(
+        start.status.code(),
+        Some(0),
+        "session start failed: {}",
+        String::from_utf8_lossy(&start.stdout)
+    );
+    let id = json_stdout(&start)["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={url}"),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{:?}", open);
+
+    let click = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.click",
+            "--arg",
+            "css=#net-all",
+        ],
+    );
+    assert_eq!(click.status.code(), Some(0), "{:?}", click);
+
+    let wait_step = "browser.wait:\n  css: \"#network-done\"\nexpect:\n  - path: $.observed.net.requests[0].method\n    exists: true\nsave:\n  first_req_url: $.observed.net.requests[0].url\n";
+    let wait = run_da_stdin(dir.path(), &["session", "step", &id], wait_step);
+    assert_eq!(
+        wait.status.code(),
+        Some(0),
+        "wait step failed: {}",
+        String::from_utf8_lossy(&wait.stdout)
+    );
+    let wait_json = json_stdout(&wait);
+    let reqs = wait_json["step"]["result"]["observed"]["net"]["requests"]
+        .as_array()
+        .expect("observed.net.requests array");
+    assert!(
+        reqs.iter().any(|r| {
+            r["method"] == "POST"
+                && r["url"]
+                    .as_str()
+                    .is_some_and(|u| u.contains("/health?kind=post"))
+                && r["status"] == 200
+        }),
+        "expected /health POST request in observed.net.requests: {reqs:?}"
+    );
+    assert!(
+        reqs.iter().any(|r| {
+            r["url"]
+                .as_str()
+                .is_some_and(|u| u.contains("/nowhere?kind=missing"))
+                && r["status"] == 404
+        }),
+        "expected /nowhere 404 request in observed.net.requests: {reqs:?}"
+    );
+
+    let steps_path = dir
+        .path()
+        .join(".da/sessions")
+        .join(&id)
+        .join("steps.jsonl");
+    let jsonl = fs::read_to_string(&steps_path).expect("steps.jsonl");
+    let last: Value =
+        serde_json::from_str(jsonl.lines().last().expect("last line")).expect("last line json");
+    assert!(last["started_at_ms"].as_u64().is_some_and(|t| t > 0));
+    assert!(last["duration_ms"].as_u64().is_some());
+    assert!(last["result"]["observed"]["net"]["requests"].is_array());
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{:?}", stop);
+}

@@ -24,6 +24,36 @@ pub const DEFAULT_DIRECTORY: &str = ".da/failures";
 /// Longest part of a directory name taken from a case name.
 const MAX_NAME: usize = 40;
 
+/// Which phase of a case a per-step trace belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StepPhase {
+    /// Main `steps` list.
+    Steps,
+    /// Cleanup `finally` list.
+    Finally,
+}
+
+impl StepPhase {
+    /// Subdirectory name under `<bundle>/trace/`.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::Steps => "steps",
+            Self::Finally => "finally",
+        }
+    }
+}
+
+/// Per-step session evidence captured immediately after one step executes.
+#[derive(Debug, Clone)]
+pub struct StepTrace {
+    /// Whether the step ran in `steps` or `finally`.
+    pub phase: StepPhase,
+    /// Zero-based index within that list.
+    pub index: usize,
+    /// Session evidence groups returned after the step finished.
+    pub evidence: Vec<SessionEvidence>,
+}
+
 /// How a writer names the directory that holds its case directories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layout {
@@ -106,6 +136,19 @@ impl FailureBundles {
         secrets: &Secrets,
         evidence: &[SessionEvidence],
     ) -> Result<PathBuf, String> {
+        self.write_with_traces(position, case, secrets, evidence, &[])
+    }
+
+    /// Writes a case bundle with case-level evidence and optional per-step
+    /// trace evidence staged under `trace/{steps,finally}/<idx>/<kind>/`.
+    pub fn write_with_traces(
+        &mut self,
+        position: usize,
+        case: &CaseReport,
+        secrets: &Secrets,
+        evidence: &[SessionEvidence],
+        step_traces: &[StepTrace],
+    ) -> Result<PathBuf, String> {
         // Checked before anything is created, so a case file that vanished
         // leaves no empty directory behind.
         std::fs::metadata(&case.file).map_err(|error| {
@@ -131,7 +174,7 @@ impl FailureBundles {
             ));
         }
 
-        if let Err(detail) = stage(&staging, case, &final_dir, secrets, evidence) {
+        if let Err(detail) = stage(&staging, case, &final_dir, secrets, evidence, step_traces) {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(self.failure_message(case, detail));
         }
@@ -148,7 +191,7 @@ impl FailureBundles {
         }
         // The metadata comes last: it is what tells a reader that the rest of
         // the directory is complete.
-        if let Err(detail) = write_meta(&final_dir, case, secrets, evidence) {
+        if let Err(detail) = write_meta(&final_dir, case, secrets, evidence, step_traces) {
             let _ = std::fs::remove_dir_all(&final_dir);
             return Err(self.failure_message(case, detail));
         }
@@ -193,6 +236,7 @@ fn stage(
     final_dir: &Path,
     secrets: &Secrets,
     evidence: &[SessionEvidence],
+    step_traces: &[StepTrace],
 ) -> Result<(), String> {
     let case_copy = staging.join("case.yaml");
     std::fs::copy(&case.file, &case_copy).map_err(|error| {
@@ -213,7 +257,22 @@ fn stage(
         &staging.join("report.json"),
         &secrets.redact_json(&output::case_json(&reported)),
     )?;
-    stage_evidence(staging, evidence, secrets)
+    stage_evidence(staging, evidence, secrets)?;
+    for trace in step_traces {
+        if trace
+            .evidence
+            .iter()
+            .all(|group| group.files.is_empty() && group.error.is_none())
+        {
+            continue;
+        }
+        let step_dir = staging
+            .join("trace")
+            .join(trace.phase.dir_name())
+            .join(trace.index.to_string());
+        stage_evidence(&step_dir, &trace.evidence, secrets)?;
+    }
+    Ok(())
 }
 
 /// Writes each session's evidence under a directory named after its kind.
@@ -270,12 +329,20 @@ fn write_meta(
     case: &CaseReport,
     secrets: &Secrets,
     evidence: &[SessionEvidence],
+    step_traces: &[StepTrace],
 ) -> Result<(), String> {
     let local_only_reason = case.local_only_reason.clone().or_else(|| {
-        let reasons: Vec<&str> = evidence
+        let mut reasons: Vec<&str> = Vec::new();
+        for group in evidence
             .iter()
-            .filter_map(|group| group.local_only_reason.as_deref())
-            .collect();
+            .chain(step_traces.iter().flat_map(|t| t.evidence.iter()))
+        {
+            if let Some(reason) = group.local_only_reason.as_deref()
+                && !reasons.contains(&reason)
+            {
+                reasons.push(reason);
+            }
+        }
         if reasons.is_empty() {
             None
         } else {
@@ -284,16 +351,34 @@ fn write_meta(
     });
     let local_only = case.local_only
         || local_only_reason.is_some()
-        || evidence.iter().any(|group| group.evidence_is_local_only);
+        || evidence
+            .iter()
+            .chain(step_traces.iter().flat_map(|t| t.evidence.iter()))
+            .any(|group| group.evidence_is_local_only);
+    let case_sha256 = match &case.case_sha256 {
+        Some(hash) => hash.clone(),
+        None => {
+            let case_copy = dir.join("case.yaml");
+            let bytes = std::fs::read(&case_copy).map_err(|error| {
+                format!(
+                    "could not read `{}` to hash it: {error}",
+                    paths::display(&case_copy)
+                )
+            })?;
+            crate::core::sha256::hex(&bytes)
+        }
+    };
     let mut meta = json!({
         "schema_version": SCHEMA_VERSION,
         "da_version": env!("CARGO_PKG_VERSION"),
         "case_file": paths::display(&case.file),
+        "case_sha256": case_sha256,
         "case_name": case.name,
         "project": case.project,
         "suite": case.suite,
         "layer": case.layer,
         "tags": case.tags,
+        "overridden_vars": case.overridden_vars,
         "status": case.status.as_str(),
         "local_only": local_only,
         "created_at": now_millis(),
@@ -390,20 +475,25 @@ mod tests {
     use crate::core::report::{CaseStatus, StepReport, StepStatus};
 
     fn failing_case(file: PathBuf) -> CaseReport {
+        use std::collections::BTreeMap;
         CaseReport {
             file,
+            case_sha256: None,
             name: "Wrong exit code".to_string(),
             project: Some("shop".to_string()),
             suite: Some("smoke".to_string()),
             layer: Some("cli".to_string()),
             tags: vec!["smoke".to_string(), "fast".to_string()],
+            overridden_vars: Vec::new(),
             status: CaseStatus::Failed,
             duration: Duration::from_millis(3),
             steps: vec![StepReport {
                 name: "cli.run".to_string(),
                 status: StepStatus::Failed,
                 duration: Duration::from_millis(2),
+                args: None,
                 result: Some(json!({"exit_code": 0})),
+                saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: None,
             }],
@@ -735,6 +825,62 @@ mod tests {
             meta["local_only_reason"],
             json!("connected target *** holds external state")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_with_traces_stages_step_dirs_and_deduplicates_local_only_reason() {
+        use crate::core::session::Evidence;
+
+        let dir = fixture("step-traces-meta");
+        let source = dir.join("case.yaml");
+        std::fs::write(&source, "name: traced\nsteps: []\n").expect("case.yaml");
+        let mut bundles = FailureBundles::record(dir.join("record"));
+        let mut secrets = Secrets::new();
+        secrets.record("s3cr3t-tok");
+        let case = failing_case(source);
+        let step_traces = vec![
+            StepTrace {
+                phase: StepPhase::Steps,
+                index: 0,
+                evidence: vec![SessionEvidence {
+                    kind: "test.kind".to_string(),
+                    files: vec![Evidence::text("step.log", "s3cr3t-tok ok").unwrap()],
+                    error: None,
+                    evidence_is_local_only: true,
+                    local_only_reason: Some("profile s3cr3t-tok".to_string()),
+                }],
+            },
+            StepTrace {
+                phase: StepPhase::Finally,
+                index: 0,
+                evidence: vec![SessionEvidence {
+                    kind: "test.kind".to_string(),
+                    files: vec![Evidence::text("cleanup.log", "cleanup ok").unwrap()],
+                    error: None,
+                    evidence_is_local_only: true,
+                    local_only_reason: Some("profile s3cr3t-tok".to_string()),
+                }],
+            },
+        ];
+
+        let bundle = bundles
+            .write_with_traces(0, &case, &secrets, &[], &step_traces)
+            .expect("bundle");
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("trace/steps/0/test.kind/step.log")).unwrap(),
+            "*** ok"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("trace/finally/0/test.kind/cleanup.log")).unwrap(),
+            "cleanup ok"
+        );
+        let meta: Value =
+            serde_json::from_str(&std::fs::read_to_string(bundle.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["local_only"], json!(true));
+        assert_eq!(meta["local_only_reason"], json!("profile ***"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

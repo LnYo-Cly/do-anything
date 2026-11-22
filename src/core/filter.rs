@@ -168,10 +168,7 @@ mod tests {
     }
 
     fn loaded(case: Case) -> LoadedCase {
-        LoadedCase {
-            path: PathBuf::from("case.yaml"),
-            case,
-        }
+        LoadedCase::new(PathBuf::from("case.yaml"), case)
     }
 
     #[test]

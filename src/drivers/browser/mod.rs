@@ -123,6 +123,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     registry.register_session_validator("browser.upload", validate_upload_session)?;
     registry.register_session_validator("browser.wait", validate_wait_session)?;
     registry.register_session_validator("browser.read", validate_read_session)?;
+    registry.register_arg_redactor("browser.set_cookies", redact_set_cookies_args)?;
     Ok(())
 }
 
@@ -5898,6 +5899,10 @@ impl Session for BrowserSession {
         self.step_metadata.take()
     }
 
+    fn step_evidence(&mut self) -> Result<Vec<Evidence>, String> {
+        self.evidence()
+    }
+
     fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
         if self.connection.is_none() {
             return Err(
@@ -7692,6 +7697,47 @@ fn read_located(
         result["value"] = value;
     }
     Ok(result)
+}
+
+fn is_env_placeholder(value: &str) -> bool {
+    value.starts_with("${env:") && value.ends_with('}') && !value[6..value.len() - 1].contains('}')
+}
+
+fn mask_sensitive_value(slot: &mut Value) {
+    match slot {
+        Value::String(s) if !is_env_placeholder(s) => *slot = Value::String("***".to_string()),
+        Value::String(_) => {}
+        _ => *slot = Value::String("***".to_string()),
+    }
+}
+
+/// Replaces cookie values and `local_storage` values in `browser.set_cookies`
+/// arguments before they enter step reports, HTML reports, or session logs,
+/// while preserving `${env:NAME}` placeholders for deterministic session export.
+fn redact_set_cookies_args(args: &Value) -> Value {
+    let mut redacted = args.clone();
+    let Some(root) = redacted.as_object_mut() else {
+        return redacted;
+    };
+    if let Some(Value::Array(cookies)) = root.get_mut("cookies") {
+        for cookie in cookies {
+            if let Some(obj) = cookie.as_object_mut()
+                && let Some(val) = obj.get_mut("value")
+            {
+                mask_sensitive_value(val);
+            }
+        }
+    }
+    if let Some(Value::Object(origins)) = root.get_mut("local_storage") {
+        for entries in origins.values_mut() {
+            if let Some(map) = entries.as_object_mut() {
+                for val in map.values_mut() {
+                    mask_sensitive_value(val);
+                }
+            }
+        }
+    }
+    redacted
 }
 
 fn run_set_cookies(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
@@ -11014,10 +11060,7 @@ mod tests {
         };
 
         let outcome = runner::run(
-            &[LoadedCase {
-                path: "mock-browser-retry.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("mock-browser-retry.yaml".into(), case)],
             &reg,
             &EventBus::new(),
             None,
@@ -12406,6 +12449,33 @@ mod tests {
             Some("http://127.0.0.1:8080/app")
         );
         assert_eq!(host_only[0].domain, None);
+    }
+
+    #[test]
+    fn redact_set_cookies_args_masks_values_and_keeps_env_placeholders() {
+        let scrubbed = redact_set_cookies_args(&json!({
+            "cookies": [
+                { "name": "sid", "value": "s3cr3t-session", "url": "http://127.0.0.1/" },
+                { "name": "env_ck", "value": "${env:MY_COOKIE}", "url": "http://127.0.0.1/" }
+            ],
+            "local_storage": {
+                "http://127.0.0.1": { "auth_token": "s3cr3t-token", "env_tok": "${env:TOK}" },
+                "current": { "k": "inline-val" }
+            }
+        }));
+        assert_eq!(scrubbed["cookies"][0]["name"], "sid");
+        assert_eq!(scrubbed["cookies"][0]["value"], "***");
+        assert_eq!(scrubbed["cookies"][0]["url"], "http://127.0.0.1/");
+        assert_eq!(scrubbed["cookies"][1]["value"], "${env:MY_COOKIE}");
+        assert_eq!(
+            scrubbed["local_storage"]["http://127.0.0.1"]["auth_token"],
+            "***"
+        );
+        assert_eq!(
+            scrubbed["local_storage"]["http://127.0.0.1"]["env_tok"],
+            "${env:TOK}"
+        );
+        assert_eq!(scrubbed["local_storage"]["current"]["k"], "***");
     }
 }
 

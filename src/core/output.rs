@@ -583,7 +583,9 @@ fn step_value(step: &StepReport) -> Value {
         "name": step.name,
         "status": step.status.as_str(),
         "duration_ms": millis(step.duration),
+        "args": step.args,
         "result": step.result,
+        "saved": step.saved,
         "assertions": step.assertions.iter().map(assertion_value).collect::<Vec<Value>>(),
         "error": step.error.as_ref().map(problem_value),
     })
@@ -613,6 +615,7 @@ fn millis(duration: std::time::Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -623,18 +626,22 @@ mod tests {
         RunOutcome::Completed(crate::core::report::RunReport {
             cases: vec![CaseReport {
                 file: PathBuf::from("cases/login.yaml"),
+                case_sha256: None,
                 name: "Login".to_string(),
                 project: Some("shop".to_string()),
                 suite: Some("smoke".to_string()),
                 layer: Some("api".to_string()),
                 tags: vec!["smoke".to_string()],
+                overridden_vars: Vec::new(),
                 status: CaseStatus::Failed,
                 duration: Duration::from_millis(3),
                 steps: vec![StepReport {
                     name: "sample.call".to_string(),
                     status: StepStatus::Failed,
                     duration: Duration::from_millis(2),
+                    args: None,
                     result: Some(json!({"status": 200})),
+                    saved: BTreeMap::new(),
                     assertions: vec![AssertionReport {
                         path: "$.status".to_string(),
                         comparison: "equals".to_string(),
@@ -669,11 +676,13 @@ mod tests {
         RunOutcome::Completed(crate::core::report::RunReport {
             cases: vec![CaseReport {
                 file: PathBuf::from("cases/banner.yaml"),
+                case_sha256: None,
                 name: "Banner".to_string(),
                 project: None,
                 suite: None,
                 layer: None,
                 tags: Vec::new(),
+                overridden_vars: Vec::new(),
                 status: CaseStatus::Passed,
                 duration: Duration::from_millis(5),
                 steps: vec![
@@ -681,7 +690,9 @@ mod tests {
                         name: "sample.click".to_string(),
                         status: StepStatus::Skipped,
                         duration: Duration::from_millis(2),
+                        args: None,
                         result: Some(json!({"found": false})),
+                        saved: BTreeMap::new(),
                         assertions: vec![AssertionReport {
                             path: "$.found".to_string(),
                             comparison: "equals".to_string(),
@@ -699,7 +710,9 @@ mod tests {
                         name: "sample.after".to_string(),
                         status: StepStatus::Passed,
                         duration: Duration::from_millis(1),
+                        args: None,
                         result: Some(json!({"ok": true})),
+                        saved: BTreeMap::new(),
                         assertions: Vec::new(),
                         error: None,
                     },
@@ -777,7 +790,9 @@ mod tests {
             name: "sample.never".to_string(),
             status: StepStatus::Skipped,
             duration: Duration::ZERO,
+            args: None,
             result: None,
+            saved: BTreeMap::new(),
             assertions: Vec::new(),
             error: None,
         });
@@ -1232,7 +1247,9 @@ mod tests {
                 name: "sample.cleanup".to_string(),
                 status: StepStatus::Error,
                 duration: Duration::from_millis(2),
+                args: None,
                 result: Some(json!({ "token": "s3cr3t-value" })),
+                saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {
                     kind: ProblemKind::Execution,
@@ -1243,7 +1260,9 @@ mod tests {
                 name: "sample.optional_cleanup".to_string(),
                 status: StepStatus::Skipped,
                 duration: Duration::from_millis(1),
+                args: None,
                 result: None,
+                saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {
                     kind: ProblemKind::Execution,

@@ -37,6 +37,9 @@ static CREATED: AtomicUsize = AtomicUsize::new(0);
 /// The number of sessions the fake driver tried to close in the current test.
 static CLOSED: AtomicUsize = AtomicUsize::new(0);
 
+/// The number of times `Session::step_evidence` was called in the current test.
+static STEP_EVIDENCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
 /// Serializes the tests in this file, because they share the fake driver's
 /// counters.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -53,10 +56,15 @@ fn test_guard() -> MutexGuard<'static, ()> {
 fn reset_counts() {
     CREATED.store(0, Ordering::SeqCst);
     CLOSED.store(0, Ordering::SeqCst);
+    STEP_EVIDENCE_CALLS.store(0, Ordering::SeqCst);
     STATE_LOG
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
+}
+
+fn step_evidence_calls() -> usize {
+    STEP_EVIDENCE_CALLS.load(Ordering::SeqCst)
 }
 
 fn state_log() -> Vec<String> {
@@ -133,6 +141,12 @@ impl Session for StatefulSession {
 
     fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
         push_state_log(format!("evidence:{}", self.state));
+        Ok(vec![Evidence::text("state.txt", self.state.clone())?])
+    }
+
+    fn step_evidence(&mut self) -> Result<Vec<Evidence>, String> {
+        STEP_EVIDENCE_CALLS.fetch_add(1, Ordering::SeqCst);
+        push_state_log(format!("step_evidence:{}", self.state));
         Ok(vec![Evidence::text("state.txt", self.state.clone())?])
     }
 }
@@ -442,10 +456,7 @@ fn case(name: &str, steps: Vec<Step>) -> Case {
 }
 
 fn loaded(case: Case) -> LoadedCase {
-    LoadedCase {
-        path: PathBuf::from("case.yaml"),
-        case,
-    }
+    LoadedCase::new(PathBuf::from("case.yaml"), case)
 }
 
 fn run_cases(cases: Vec<LoadedCase>, jobs: usize) -> RunOutcome {
@@ -680,7 +691,7 @@ fn a_close_error_is_redacted_in_text_json_and_the_failure_bundle() {
     secrets.record("s3cr3t-value");
 
     let outcome = runner::run(
-        &[LoadedCase { path: source, case }],
+        &[LoadedCase::new(source, case)],
         &registry(),
         &EventBus::new(),
         Some(&mut bundles),
@@ -875,10 +886,7 @@ fn finally_preserves_main_failure_evidence_and_runs_every_finally_step() {
 
     let mut bundles = FailureBundles::new(dir.path().join("failures"));
     let outcome = runner::run(
-        &[LoadedCase {
-            path: source,
-            case: test_case,
-        }],
+        &[LoadedCase::new(source, test_case)],
         &registry(),
         &EventBus::new(),
         Some(&mut bundles),
@@ -952,10 +960,7 @@ fn finally_failure_after_passing_main_steps_collects_evidence_before_close() {
 
     let mut bundles = FailureBundles::new(dir.path().join("failures"));
     let outcome = runner::run(
-        &[LoadedCase {
-            path: source,
-            case: test_case,
-        }],
+        &[LoadedCase::new(source, test_case)],
         &registry(),
         &EventBus::new(),
         Some(&mut bundles),
@@ -997,4 +1002,174 @@ fn finally_failure_after_passing_main_steps_collects_evidence_before_close() {
     );
     assert_eq!(created(), 1);
     assert_eq!(closed(), 1);
+}
+
+#[test]
+fn omitting_trace_steps_never_calls_step_evidence_and_writes_no_trace_dir() {
+    let _guard = test_guard();
+    reset_counts();
+    let dir = TempDir::new("no-trace-steps");
+    let source = dir.write(
+        "case.yaml",
+        "name: no trace\nsteps:\n  - test.set_state:\n      state: one\n  - test.set_state:\n      state: two\n",
+    );
+
+    let test_case = case(
+        "no trace",
+        vec![
+            step_with("test.set_state", json!({ "state": "one" })),
+            step_with("test.set_state", json!({ "state": "two" })),
+        ],
+    );
+    let mut record = FailureBundles::record(dir.path().join("record"));
+    let outcome = runner::run_with(
+        &[LoadedCase::new(source, test_case)],
+        &registry(),
+        &EventBus::new(),
+        runner::RecordWriters {
+            failures: None,
+            record: Some(&mut record),
+            trace_steps: false,
+        },
+        &Filters::default(),
+        &mut Secrets::new(),
+        1,
+    );
+
+    assert_eq!(outcome.exit_code(), ExitCode::Success, "{outcome:?}");
+    assert_eq!(
+        step_evidence_calls(),
+        0,
+        "step_evidence must not run when trace_steps=false"
+    );
+    let bundle = dir.path().join("record/0-no-trace");
+    assert!(
+        bundle.join("meta.json").is_file(),
+        "recorded bundle must exist"
+    );
+    assert!(!bundle.join("trace").exists());
+}
+
+#[test]
+fn trace_steps_captures_executed_main_and_finally_steps_redacts_and_skips_unexecuted() {
+    struct LocalOnlySecretSession {
+        state: String,
+    }
+    impl Session for LocalOnlySecretSession {
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn local_only_reason(&self) -> Option<String> {
+            Some("profile contains secret-tok-42".to_string())
+        }
+
+        fn step_evidence(&mut self) -> Result<Vec<Evidence>, String> {
+            STEP_EVIDENCE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Evidence::text(
+                "trace.log",
+                format!(
+                    "state={} raw=secret-tok-42 pct={} b64={}\n",
+                    self.state,
+                    support::percent_encode(b"secret-tok-42"),
+                    support::base64_encode(b"secret-tok-42"),
+                ),
+            )?])
+        }
+    }
+
+    let _guard = test_guard();
+    reset_counts();
+    let dir = TempDir::new("trace-steps-sessions");
+    let source = dir.write(
+        "case.yaml",
+        "name: trace steps\nsteps:\n  - test.local_set:\n      state: step0\n",
+    );
+
+    let mut reg = Registry::new();
+    reg.register(StepDefinition {
+        name: "test.local_set",
+        description: "mutate local session",
+        args_schema: json!({"type": "object"}),
+        validate: |_| Ok(()),
+        check_retry: do_anything::core::registry::disallow_retry,
+        lint_warnings: do_anything::core::registry::no_lint_warnings,
+        run: |args, sessions| {
+            let next = args["state"].as_str().unwrap_or_default().to_string();
+            let sess = sessions
+                .get_or_create("test.local", || {
+                    Ok(LocalOnlySecretSession {
+                        state: String::new(),
+                    })
+                })
+                .map_err(StepError::Execution)?;
+            sess.state = next;
+            Ok(json!({ "ok": true }))
+        },
+    })
+    .expect("register test.local_set");
+
+    let step0 = step_with("test.local_set", json!({ "state": "step0" }));
+    let mut step1_fail = step_with("test.local_set", json!({ "state": "step1" }));
+    step1_fail.expect = vec![Expectation {
+        path: "$.ok".to_string(),
+        matcher: Matcher::Equals(json!(false)),
+    }];
+    let step2_unexecuted = step_with("test.local_set", json!({ "state": "never" }));
+    let finally0 = step_with("test.local_set", json!({ "state": "cleanup0" }));
+
+    let mut test_case = case("trace steps", vec![step0, step1_fail, step2_unexecuted]);
+    test_case.finally = vec![finally0];
+
+    let mut secrets = Secrets::new();
+    secrets.record("secret-tok-42");
+
+    let mut record = FailureBundles::record(dir.path().join("record"));
+    let outcome = runner::run_with(
+        &[LoadedCase::new(source, test_case)],
+        &reg,
+        &EventBus::new(),
+        runner::RecordWriters {
+            failures: None,
+            record: Some(&mut record),
+            trace_steps: true,
+        },
+        &Filters::default(),
+        &mut secrets,
+        1,
+    );
+
+    assert_eq!(outcome.exit_code(), ExitCode::TestFailure, "{outcome:?}");
+    // Step 0 (executed), Step 1 (executed + failed), Finally 0 (executed). Step 2 was pre-skipped.
+    assert_eq!(step_evidence_calls(), 3);
+
+    let bundle = dir.path().join("record/0-trace-steps");
+    let t0 = std::fs::read_to_string(bundle.join("trace/steps/0/test.local/trace.log"))
+        .expect("step 0 trace");
+    let t1 = std::fs::read_to_string(bundle.join("trace/steps/1/test.local/trace.log"))
+        .expect("step 1 trace");
+    assert!(t0.contains("state=step0 raw=*** pct=*** b64=***"), "{t0}");
+    assert!(t1.contains("state=step1 raw=*** pct=*** b64=***"), "{t1}");
+    assert!(
+        !bundle.join("trace/steps/2").exists(),
+        "unexecuted step must not have trace dir"
+    );
+
+    let tf0 = std::fs::read_to_string(bundle.join("trace/finally/0/test.local/trace.log"))
+        .expect("finally 0 trace");
+    assert!(
+        tf0.contains("state=cleanup0 raw=*** pct=*** b64=***"),
+        "{tf0}"
+    );
+
+    let meta: Value = serde_json::from_str(
+        &std::fs::read_to_string(bundle.join("meta.json")).expect("meta.json"),
+    )
+    .expect("valid meta.json");
+    assert_eq!(meta["local_only"], true);
+    let reason = meta["local_only_reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains("secret-tok-42"),
+        "secret leaked in meta.json: {reason}"
+    );
 }

@@ -91,6 +91,7 @@ pub struct SessionDefinition {
 }
 
 type ValidateFn = fn(&Value) -> Result<(), String>;
+type ArgRedactorFn = fn(&Value) -> Value;
 
 /// The steps, observers and detachable sessions available to the runner.
 #[derive(Default)]
@@ -99,6 +100,7 @@ pub struct Registry {
     observers: BTreeMap<&'static str, ObserverDefinition>,
     sessions: BTreeMap<&'static str, SessionDefinition>,
     session_validators: BTreeMap<&'static str, ValidateFn>,
+    arg_redactors: BTreeMap<&'static str, ArgRedactorFn>,
 }
 
 impl Registry {
@@ -208,6 +210,31 @@ impl Registry {
             return Err(format!("`{step_name}` is not a registered step"));
         };
         (definition.validate)(args)
+    }
+
+    /// Registers a step-specific argument redactor called before resolved step
+    /// arguments enter reports, terminals, bundles, or session logs.
+    pub fn register_arg_redactor(
+        &mut self,
+        step_name: &'static str,
+        redact: fn(&Value) -> Value,
+    ) -> Result<(), String> {
+        if !self.steps.contains_key(step_name) {
+            return Err(format!(
+                "cannot register argument redactor for unregistered step `{step_name}`"
+            ));
+        }
+        self.arg_redactors.insert(step_name, redact);
+        Ok(())
+    }
+
+    /// Returns a scrubbed copy of `args` for `step_name` using any registered
+    /// argument redactor, or clones `args` unchanged when none is registered.
+    pub fn redact_step_args(&self, step_name: &str, args: &Value) -> Value {
+        match self.arg_redactors.get(step_name) {
+            Some(redact) => redact(args),
+            None => args.clone(),
+        }
     }
 }
 
