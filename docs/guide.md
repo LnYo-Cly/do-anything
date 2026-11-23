@@ -126,11 +126,12 @@ variable unset they print why and skip, and with `DA_TEST_ANDROID=1` a missing
 device fails the suite.
 
 The desktop tests in `tests/desktop.rs` run when `--features desktop` is
-enabled (`cargo test --features desktop --test desktop`). Schema, lint, and
-non-Windows `#88` stub checks run everywhere; on Windows the suite compiles a
-temporary WinForms fixture with `csc.exe` and exercises `da session` snapshots,
-exports, input-masked failure screenshots, `at:` coordinate pinning, and
-closed-window error classification.
+enabled (`cargo test --features desktop --test desktop -- --test-threads=1`).
+Schema and lint checks run everywhere; on Windows (`csc.exe` WinForms fixture),
+Linux (`python3-gi` GTK3 fixture under `xvfb-run` + `dbus-run-session`), and
+macOS (`swiftc` AppKit fixture), the suite exercises `da session` snapshots,
+exports, input-masked failure screenshots, `at:` coordinate pinning, `attach`
+`local_only` semantics, and closed-window / pure-Wayland error classification.
 
 ### Self-test suite
 
@@ -2843,15 +2844,22 @@ the suite instead.
 
 The `desktop.*` steps drive native desktop GUI applications through an
 accessibility tree rather than pixel guessing. They are provided by the
-opt-in `desktop` cargo feature (`cargo build --features desktop`): Tier 1
-implements Windows UI Automation (`#84`), while macOS and Linux backends are
-tracked in `#88` (on non-Windows builds, `desktop.*` steps compile cleanly and
-return an environment error referencing `#88`).
+opt-in `desktop` cargo feature (`cargo build --features desktop`) across all
+three desktop operating systems:
 
-An in-process `COINIT_MULTITHREADED` worker thread executes bulk-cached UI
-Automation tree walks (`UICacheRequest`) and simulates input under an exclusive
-host-level desktop lock so concurrent `da` runs never interleave mouse or
-keyboard actions.
+- **Windows (`#[cfg(windows)]`)**: UI Automation (`IUIAutomation` bulk-cached
+  inside a dedicated `COINIT_MULTITHREADED` worker) + `PrintWindow` capture +
+  `SendInput` fallback.
+- **Linux (`#[cfg(target_os = "linux")]`)**: AT-SPI2 over synchronous D-Bus
+  (`zbus` with `async-io`, setting `GTK_MODULES=gail:atk-bridge` and
+  `QT_ACCESSIBILITY=1` on launched children) + pure-Rust X11 `GetImage` capture
+  and `XTEST` fallback (`x11rb`).
+- **macOS (`#[cfg(target_os = "macos")]`)**: `AXUIElement` Accessibility APIs +
+  `/usr/sbin/screencapture -x -o -l <CGWindowID>` capture + `CGEvent` (`enigo`)
+  fallback.
+
+Input simulation and window captures run under an exclusive host-level desktop
+lock so concurrent `da` runs never interleave mouse or keyboard actions.
 
 #### Steps
 
@@ -2866,31 +2874,35 @@ keyboard actions.
 | `desktop.read` | Locator (or `ref` in `da session`), optional `timeout_ms` | `role`, `name`, `value` (`null` when `is_password`), `automation_id`, `class_name`, `bounds`, `enabled`, `is_password` |
 | `desktop.screenshot` | `path`; optional `mask_inputs` (default `true`), `timeout_ms` | `path`, `width`, `height`, `masked_inputs`, `masked_count` |
 
-- **Locators**: match controls by `automation_id`, `role` (`Button`, `Edit`,
-  `Text`, `CheckBox`, `ComboBox`, `MenuItem`, `Pane`, `Window`, …), exact
-  `name`, case-insensitive `text` substring, `class_name`, container scope
-  `within`, and 0-based `nth`. Volatile WinForms `HWND`-derived
-  `AutomationId` values (`AutomationId == NativeWindowHandle`) are filtered out
-  automatically during snapshots and locator synthesis so exported cases stay
-  portable across runs.
+- **Locators**: match controls by `automation_id` (Windows `AutomationId`,
+  Linux AT-SPI2 `AccessibleId` / `id`, macOS `AXIdentifier`), `role` (`Button`,
+  `Edit`, `Text`, `CheckBox`, `ComboBox`, `MenuItem`, `Pane`, `Window`, …),
+  exact `name`, case-insensitive `text` substring, `class_name`, container scope
+  `within`, and 0-based `nth`. Volatile WinForms `HWND`-derived `AutomationId`
+  values and internal AppKit `_NS:*` identifiers are filtered out automatically
+  during snapshots and locator synthesis so exported cases stay portable across
+  runs.
 - **`desktop.attach` is `local_only`**: attaching to an already-running
   desktop window never kills that process on close and marks the run
   `local_only: true`, because pre-existing local window state can contain
   unmanaged data.
 - **Sessions & export (`da session`)**: `desktop` sessions detach and reattach
-  across CLI/MCP calls by persisted `pid`, `hwnd`, `owned_launch`, and kernel
-  `process_start_filetime` (verified before reattaching or terminating an owned
-  process so Windows PID reuse never touches an unrelated process).
+  across CLI/MCP calls by persisted `pid`, window handle (`hwnd`),
+  `owned_launch`, and kernel process start identity (`FILETIME` on Windows,
+  `/proc/<pid>/stat` `starttime` on Linux, `ps -o lstart=` on macOS) verified
+  before reattaching or terminating an owned process so PID reuse never touches
+  an unrelated process.
   `da session snapshot` assigns bounded `e1`, `e2`, … refs; `da session export`
-  synthesizes deterministic locators (and reverse-looks up `ElementFromPoint`
-  when `at:` hit a named interactive control), skips bare `desktop.read` steps
+  synthesizes deterministic locators (and reverse-looks up hit controls when
+  `at:` clicked a named interactive element), skips bare `desktop.read` steps
   without `expect` or `save` unless `--include-reads` is passed, disambiguates
   `text` vs `value` on `desktop.type`, and pins `at.window` on remaining
   coordinate clicks.
 - **Failure evidence & input masking**: on failure, the session captures
-  `desktop/screenshot.png` (painting every `Edit` and `IsPassword` control's
-  `BoundingRectangle` solid black by default) and `Secrets`-redacted
-  `desktop/uia-tree.json` (never exposing password values).
+  `desktop/screenshot.png` (`0600` permissions on Unix, painting every `Edit`
+  and password control's bounding box solid black by default, scaled to Retina
+  backing pixels on macOS) and `Secrets`-redacted `desktop/uia-tree.json`
+  (never exposing password values).
 
 ```yaml
 name: Native desktop login flow
@@ -2912,15 +2924,32 @@ steps:
       text: Welcome
 ```
 
-#### UIPI, elevation, and custom-drawn surfaces
+#### Platform permissions, Wayland boundaries, and custom-drawn surfaces
 
-- **UIPI and closed windows**: Windows User Interface Privilege Isolation
+- **Windows UIPI and closed windows**: Windows User Interface Privilege Isolation
   (UIPI) blocks a standard medium-integrity `da` process from driving an
   elevated Administrator window (`E_ACCESSDENIED`, `0x80070005`). Because UIA
   also briefly returns `0x80070005` while tearing down a window that just
   exited, `da` checks child exit status and `element_from_handle` / process
   liveness before reporting a UIPI elevation mismatch — closed windows fail fast
   with `"desktop window closed"` instead of a misleading elevation error.
+- **macOS TCC Accessibility & Screen Recording**: macOS requires **Accessibility**
+  permission (`System Settings -> Privacy & Security -> Accessibility`) for the
+  terminal or CI runner driving `AXUIElement` and `CGEvent`, and **Screen
+  Recording** permission for `/usr/sbin/screencapture` window screenshots. When
+  denied (`kAXErrorAPIDisabled` / `-25211` or failed `screencapture`), `da`
+  exits with code `4` (`Environment`) and names the exact System Settings pane;
+  dead or exited PIDs (`-25204`) are checked first so closed windows never
+  masquerade as TCC errors.
+- **Linux X11/Xvfb vs pure Wayland**: semantic AT-SPI2 steps (`desktop.launch`,
+  `desktop.attach`, `da session snapshot`, `desktop.click` via `Action`,
+  `desktop.type` via `EditableText`, `desktop.wait`, `desktop.read`) work over
+  D-Bus on both X11/Xvfb and pure Wayland. Because pure Wayland compositors
+  prohibit unprivileged clients from capturing arbitrary windows or injecting
+  global keystrokes, `desktop.screenshot`, `desktop.press`, and `at:` coordinate
+  fallbacks require an X11 display (`DISPLAY` via X11, XWayland, or headless
+  `xvfb-run -a dbus-run-session --`) and return an actionable exit-`4`
+  `Environment` error when `DISPLAY` is unavailable.
 - **Canvas & custom-drawn widgets (`at:`)**: controls painted directly with
   GDI, Direct2D, or `DrawingContext` expose no child UIA nodes. Use
   window-relative `at: { x, y, window: { width, height } }` as an explicit

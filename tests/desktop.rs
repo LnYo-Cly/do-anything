@@ -1,7 +1,7 @@
 #![cfg(feature = "desktop")]
 
 //! Integration, schema, lint, session, export, and screenshot-masking tests
-//! for the `desktop.*` driver (`#84`).
+//! for the cross-platform `desktop.*` driver (`#84`, `#88`).
 
 mod support;
 
@@ -11,21 +11,21 @@ use std::process::{Command, Output};
 use serde_json::{Value, json};
 use support::TempDir;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::sync::{Mutex, OnceLock};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 
 /// Serializes interactive desktop tests inside this binary so two tests never
 /// compete for focus or input simultaneously.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 static TEST_DESKTOP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn desktop_test_guard() -> std::sync::MutexGuard<'static, ()> {
     TEST_DESKTOP_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -281,10 +281,10 @@ fn compile_fixture(dir: &Path) -> PathBuf {
     exe_path
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 struct ProcessGuard(Option<std::process::Child>);
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if let Some(child) = &mut self.0 {
@@ -452,15 +452,15 @@ steps:
     assert!(joined.iter().any(|m| m.contains("`at.window`")));
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 #[test]
-fn desktop_non_windows_stub_returns_tracking_issue_environment_error() {
+fn desktop_unsupported_os_stub_returns_environment_error() {
     let dir = TempDir::new("desktop-stub");
     let case_path = dir.path().join("stub.yaml");
     std::fs::write(
         &case_path,
         "\
-name: Non-Windows stub
+name: Unsupported OS stub
 steps:
   - desktop.launch:
       command: app
@@ -494,8 +494,8 @@ steps:
         })
         .unwrap_or_default();
     assert!(
-        err.contains("#88") && err.contains("Windows"),
-        "expected #88 Environment error on non-Windows, got: {report}"
+        err.contains("Windows, Linux, and macOS"),
+        "expected unsupported-OS Environment error, got: {report}"
     );
 }
 
@@ -1545,5 +1545,1580 @@ fn desktop_session_stop_kills_owned_pid_and_refuses_recycled_or_tampered_pid() {
             .unwrap()
             .is_none(),
         "fail-closed stop must NEVER kill an unrelated process when identity metadata is missing"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_unix_pid_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn decode_png_rgba(path: &Path) -> (u32, u32, Vec<u8>) {
+    let file = std::fs::File::open(path).expect("open png");
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::ALPHA | png::Transformations::STRIP_16,
+    );
+    let mut reader = decoder.read_info().expect("read png info");
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).expect("decode png frame");
+    buf.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity((buf.len() / 3) * 4);
+            for rgb in buf.as_chunks::<3>().0 {
+                out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            out
+        }
+        other => panic!("unexpected PNG color type in test screenshot: {other:?}"),
+    };
+    (info.width, info.height, rgba)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_unix_mode_0600(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .expect("screenshot metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode,
+        0o600,
+        "expected screenshot `{}` permissions 0600, got {mode:04o}",
+        path.display()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn extract_case_error_message(report: &Value) -> String {
+    report["cases"][0]["error"]["message"]
+        .as_str()
+        .or_else(|| report["cases"][0]["error"].as_str())
+        .or_else(|| {
+            report["cases"][0]["steps"].as_array().and_then(|steps| {
+                steps
+                    .iter()
+                    .rev()
+                    .find_map(|s| s["error"]["message"].as_str())
+            })
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+// ============================================================================
+// Linux AT-SPI2 + X11/XTEST Integration Tests
+// ============================================================================
+
+#[cfg(target_os = "linux")]
+const LINUX_GTK_FIXTURE_PY: &str = r#"#!/usr/bin/env python3
+import sys
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+
+def set_a11y(widget, aid=None, name=None):
+    acc = widget.get_accessible()
+    if acc is not None:
+        if aid is not None and hasattr(acc, "set_accessible_id"):
+            acc.set_accessible_id(aid)
+        if name is not None:
+            acc.set_name(name)
+
+title = "DA Linux Fixture"
+secret = ""
+idx = 1
+while idx < len(sys.argv):
+    if sys.argv[idx] == "--title" and idx + 1 < len(sys.argv):
+        title = sys.argv[idx + 1]
+        idx += 2
+    elif sys.argv[idx] == "--secret" and idx + 1 < len(sys.argv):
+        secret = sys.argv[idx + 1]
+        idx += 2
+    else:
+        idx += 1
+
+css = Gtk.CssProvider()
+css.load_from_data(b"""
+window { background-image: none; background-color: rgb(240, 240, 245); }
+entry#userEntry { background-image: none; background-color: rgb(255, 180, 60); color: rgb(20, 20, 20); }
+entry#pwEntry { background-image: none; background-color: rgb(0, 220, 220); color: rgb(0, 60, 60); }
+""")
+screen = Gdk.Screen.get_default()
+if screen is not None:
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, css, Gtk.STYLE_PROVIDER_PRIORITY_USER
+    )
+
+win = Gtk.Window(title=title)
+win.set_default_size(440, 320)
+win.set_size_request(440, 320)
+win.set_resizable(False)
+win.move(60, 60)
+win.connect("destroy", Gtk.main_quit)
+
+vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+vbox.set_margin_top(12)
+vbox.set_margin_bottom(12)
+vbox.set_margin_start(16)
+vbox.set_margin_end(16)
+win.add(vbox)
+
+user_entry = Gtk.Entry()
+user_entry.set_name("userEntry")
+set_a11y(user_entry, aid="usernameBox", name="Username")
+vbox.pack_start(user_entry, False, False, 0)
+
+pw_entry = Gtk.Entry()
+pw_entry.set_name("pwEntry")
+pw_entry.set_visibility(False)
+set_a11y(pw_entry, aid="passwordBox", name="Password")
+vbox.pack_start(pw_entry, False, False, 0)
+
+btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+vbox.pack_start(btn_row, False, False, 0)
+
+status_label = Gtk.Label.new("Status:Ready")
+set_a11y(status_label, aid="statusLabel")
+
+def on_submit(_btn):
+    u = user_entry.get_text()
+    p = pw_entry.get_text()
+    status_label.set_text(f"Submitted:{u}|pwlen={len(p)}")
+
+submit_btn = Gtk.Button.new_with_label("Submit")
+set_a11y(submit_btn, aid="submitBtn", name="Submit")
+submit_btn.connect("clicked", on_submit)
+btn_row.pack_start(submit_btn, False, False, 0)
+
+def on_close(_btn):
+    GLib.timeout_add(30, lambda: (win.destroy(), False)[1])
+
+close_btn = Gtk.Button.new_with_label("CloseWindow")
+set_a11y(close_btn, aid="closeBtn", name="CloseWindow")
+close_btn.connect("clicked", on_close)
+btn_row.pack_start(close_btn, False, False, 0)
+
+vbox.pack_start(status_label, False, False, 0)
+
+if secret:
+    secret_label = Gtk.Label.new(f"SecretEcho:{secret}")
+    set_a11y(secret_label, aid="secretEcho")
+    vbox.pack_start(secret_label, False, False, 0)
+
+canvas = Gtk.DrawingArea()
+canvas.set_size_request(200, 64)
+canvas.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+set_a11y(canvas, aid="drawCanvas")
+
+def on_draw(_widget, cr):
+    cr.set_source_rgb(0.85, 0.90, 0.98)
+    cr.paint()
+    return False
+
+def on_canvas_press(_widget, event):
+    status_label.set_text(f"Canvas:{int(event.x)},{int(event.y)}")
+    return True
+
+canvas.connect("draw", on_draw)
+canvas.connect("button-press-event", on_canvas_press)
+vbox.pack_start(canvas, False, False, 0)
+
+def on_key_press(_widget, event):
+    if (event.state & Gdk.ModifierType.CONTROL_MASK) and Gdk.keyval_to_lower(event.keyval) == Gdk.KEY_s:
+        status_label.set_text("Shortcut:Ctrl+S")
+        return True
+    return False
+
+win.connect("key-press-event", on_key_press)
+win.show_all()
+Gtk.main()
+"#;
+
+#[cfg(target_os = "linux")]
+fn write_linux_fixture(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("gtk_fixture.py");
+    std::fs::write(&script, LINUX_GTK_FIXTURE_PY).expect("write gtk_fixture.py");
+    let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+    script
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_linux_session_snapshot_drive_export_lint_and_replay() {
+    let _guard = desktop_test_guard();
+    let dir = TempDir::new("desktop-linux-session-replay");
+    let script = write_linux_fixture(dir.path());
+    let title = format!("DA Linux Session {}", std::process::id());
+
+    let started = json_stdout(&run_da(
+        dir.path(),
+        &["session", "start", "--output", "json"],
+        &[],
+    ));
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let launch_step = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.launch",
+            "--output",
+            "json",
+            "--with",
+            &json!({
+                "command": "python3",
+                "args": [script, "--title", title],
+                "window_title_contains": title,
+                "timeout_ms": 20000
+            })
+            .to_string(),
+        ],
+        &[],
+    ));
+    assert!(
+        launch_step["ok"].as_bool().unwrap_or(false),
+        "{launch_step}"
+    );
+    let launched_pid = launch_step["step"]["result"]["pid"]
+        .as_u64()
+        .expect("launched pid") as u32;
+
+    let snap = json_stdout(&run_da(
+        dir.path(),
+        &["session", "snapshot", &session_id, "--output", "json"],
+        &[],
+    ));
+    assert!(snap["ok"].as_bool().unwrap_or(false), "{snap}");
+    let elements = snap["snapshot"]["elements"]
+        .as_array()
+        .or_else(|| snap["snapshots"]["desktop"]["elements"].as_array())
+        .unwrap_or_else(|| panic!("snapshot elements missing: {snap}"));
+
+    let find_ref = |aid: &str, fallback_name: &str| -> String {
+        elements
+            .iter()
+            .find(|el| {
+                el["automation_id"].as_str() == Some(aid)
+                    || (!fallback_name.is_empty() && el["name"].as_str() == Some(fallback_name))
+            })
+            .unwrap_or_else(|| panic!("missing element `{aid}` in snapshot: {snap}"))["ref"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let user_ref = find_ref("usernameBox", "Username");
+    let pass_ref = find_ref("passwordBox", "Password");
+    let submit_ref = find_ref("submitBtn", "Submit");
+    let status_ref = find_ref("statusLabel", "Status:Ready");
+
+    let s1 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.type",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": user_ref, "text": "alice"}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(s1["ok"].as_bool().unwrap_or(false), "{s1}");
+
+    let s2 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.type",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": pass_ref, "text": "${env:DA_TEST_DESKTOP_SECRET}"}).to_string(),
+        ],
+        &[("DA_TEST_DESKTOP_SECRET", "s3cret-pass")],
+    ));
+    assert!(s2["ok"].as_bool().unwrap_or(false), "{s2}");
+
+    let s3 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.click",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": submit_ref}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(s3["ok"].as_bool().unwrap_or(false), "{s3}");
+
+    let s4 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.read",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": status_ref}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(s4["ok"].as_bool().unwrap_or(false), "{s4}");
+    assert_eq!(s4["step"]["result"]["name"], "Submitted:alice|pwlen=11");
+
+    let pw_read = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.read",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": pass_ref}).to_string(),
+        ],
+        &[],
+    ));
+    assert_eq!(pw_read["step"]["result"]["is_password"], true);
+    assert!(
+        pw_read["step"]["result"]["value"].is_null(),
+        "password field value must never be returned: {pw_read}"
+    );
+
+    let case_path = dir.path().join("exported-linux-desktop.yaml");
+    let export_default = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "export",
+            &session_id,
+            "--output",
+            "json",
+            "--name",
+            "Linux desktop login replay",
+            "-o",
+            case_path.to_str().unwrap(),
+        ],
+        &[],
+    ));
+    assert!(
+        export_default["ok"].as_bool().unwrap_or(false),
+        "{export_default}"
+    );
+    let yaml_text = export_default["yaml"].as_str().unwrap();
+    assert!(!yaml_text.contains("ref:"));
+    assert!(!yaml_text.contains("s3cret-pass"));
+    assert!(yaml_text.contains("${env:DA_TEST_DESKTOP_SECRET}"));
+
+    let stopped = json_stdout(&run_da(
+        dir.path(),
+        &["session", "stop", &session_id, "--output", "json"],
+        &[],
+    ));
+    assert!(stopped["ok"].as_bool().unwrap_or(false), "{stopped}");
+    assert!(
+        !is_unix_pid_alive(launched_pid),
+        "`da session stop` must terminate owned launched Linux process PID {launched_pid}"
+    );
+
+    let mut final_yaml = std::fs::read_to_string(&case_path).expect("read exported yaml");
+    final_yaml
+        .push_str("  - desktop.wait:\n      role: Text\n      text: Submitted:alice|pwlen=11\n");
+    std::fs::write(&case_path, final_yaml).expect("update exported yaml");
+
+    let lint = run_da(
+        dir.path(),
+        &["lint", "--output", "json", case_path.to_str().unwrap()],
+        &[("DA_TEST_DESKTOP_SECRET", "s3cret-pass")],
+    );
+    assert!(
+        lint.status.success(),
+        "da lint failed: {}",
+        stderr_str(&lint)
+    );
+
+    let replay = run_da(
+        dir.path(),
+        &[
+            "run",
+            "--output",
+            "json",
+            "--no-bundle",
+            case_path.to_str().unwrap(),
+        ],
+        &[("DA_TEST_DESKTOP_SECRET", "s3cret-pass")],
+    );
+    assert!(
+        replay.status.success(),
+        "da run replay failed:\n{}\n{}",
+        stdout_str(&replay),
+        stderr_str(&replay)
+    );
+    let replay_json = json_stdout(&replay);
+    assert_eq!(replay_json["summary"]["cases_passed"], 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_linux_failure_bundle_masks_inputs_and_redacts_secrets() {
+    let _guard = desktop_test_guard();
+    let dir = TempDir::new("desktop-linux-mask");
+    let script = write_linux_fixture(dir.path());
+    let title = format!("DA Linux Mask {}", std::process::id());
+    let secret_value = "LINUX-TOP-SECRET-8841";
+    let case_path = dir.path().join("mask-failure.yaml");
+    let masked_path = dir.path().join("shot-masked.png");
+    let unmasked_path = dir.path().join("shot-unmasked.png");
+
+    std::fs::write(
+        &case_path,
+        format!(
+            "\
+name: Linux masked screenshot and redacted tree
+steps:
+  - desktop.launch:
+      command: python3
+      args:
+        - \"{}\"
+        - --title
+        - \"{title}\"
+        - --secret
+        - \"${{env:DA_TEST_DESKTOP_SECRET}}\"
+      window_title_contains: \"{title}\"
+      timeout_ms: 20000
+  - desktop.type:
+      role: Edit
+      name: Password
+      text: \"${{env:DA_TEST_DESKTOP_SECRET}}\"
+  - desktop.read:
+      role: Edit
+      name: Password
+    save:
+      pw_bounds: $.bounds
+  - desktop.screenshot:
+      path: shot-masked.png
+  - desktop.screenshot:
+      path: shot-unmasked.png
+      mask_inputs: false
+  - desktop.wait:
+      role: Text
+      text: NEVER-APPEARS
+      timeout_ms: 250
+",
+            script.display()
+        ),
+    )
+    .expect("write mask case");
+
+    let bundle_root = dir.path().join("bundles");
+    let output = run_da(
+        dir.path(),
+        &[
+            "run",
+            "--output",
+            "json",
+            "--bundle-dir",
+            bundle_root.to_str().unwrap(),
+            case_path.to_str().unwrap(),
+        ],
+        &[("DA_TEST_DESKTOP_SECRET", secret_value)],
+    );
+    assert!(!output.status.success(), "expected failing desktop.wait");
+    let report = json_stdout(&output);
+    assert!(
+        !report.to_string().contains(secret_value),
+        "stdout JSON report leaked secret: {report}"
+    );
+
+    assert_unix_mode_0600(&masked_path);
+    assert_unix_mode_0600(&unmasked_path);
+
+    let pw_bounds = report["cases"][0]["steps"][2]["result"]["bounds"].clone();
+    let bx = pw_bounds["x"].as_i64().unwrap().max(0) as u32;
+    let by = pw_bounds["y"].as_i64().unwrap().max(0) as u32;
+    let bw = pw_bounds["width"].as_i64().unwrap().max(1) as u32;
+    let bh = pw_bounds["height"].as_i64().unwrap().max(1) as u32;
+
+    let bundle_dir = PathBuf::from(report["cases"][0]["bundle"].as_str().expect("bundle path"));
+    let bundle_png = bundle_dir.join("desktop").join("screenshot.png");
+    let bundle_tree = bundle_dir.join("desktop").join("uia-tree.json");
+    assert!(bundle_png.is_file(), "missing {}", bundle_png.display());
+    assert!(bundle_tree.is_file(), "missing {}", bundle_tree.display());
+
+    let (uw, uh, unmasked) = decode_png_rgba(&unmasked_path);
+    let (mw, mh, masked) = decode_png_rgba(&masked_path);
+    let (fw, fh, fail_png) = decode_png_rgba(&bundle_png);
+    assert_eq!((uw, uh), (mw, mh));
+    assert_eq!((uw, uh), (fw, fh));
+
+    let sample_center = |w: u32, h: u32, buf: &[u8]| -> [u8; 4] {
+        let cx = (bx + bw / 2).min(w - 1);
+        let cy = (by + bh / 2).min(h - 1);
+        let idx = ((cy * w + cx) * 4) as usize;
+        [buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]]
+    };
+
+    assert_ne!(
+        &sample_center(uw, uh, &unmasked)[..3],
+        &[0, 0, 0],
+        "unmasked password input center should not be solid black"
+    );
+    assert_eq!(
+        sample_center(mw, mh, &masked),
+        [0, 0, 0, 255],
+        "masked screenshot must paint Edit/Password center solid black"
+    );
+    assert_eq!(
+        sample_center(fw, fh, &fail_png),
+        [0, 0, 0, 255],
+        "failure bundle screenshot must paint Edit/Password center solid black"
+    );
+
+    let tree_text = std::fs::read_to_string(&bundle_tree).expect("read uia-tree.json");
+    assert!(
+        !tree_text.contains(secret_value),
+        "uia-tree.json leaked secret value: {tree_text}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_linux_at_press_attach_closed_window_and_pure_wayland_boundary() {
+    let _guard = desktop_test_guard();
+    let dir = TempDir::new("desktop-linux-wayland-and-at");
+    let script = write_linux_fixture(dir.path());
+    let title = format!("DA Linux Onscreen {}", std::process::id());
+
+    // 1. Test `at:` canvas + `desktop.press` (`Ctrl+S`) + closed-window fast error on X11/Xvfb.
+    let started = json_stdout(&run_da(
+        dir.path(),
+        &["session", "start", "--output", "json"],
+        &[],
+    ));
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    let launch = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.launch",
+            "--output",
+            "json",
+            "--with",
+            &json!({
+                "command": "python3",
+                "args": [script, "--title", title],
+                "window_title_contains": title,
+                "timeout_ms": 20000
+            })
+            .to_string(),
+        ],
+        &[],
+    ));
+    assert!(launch["ok"].as_bool().unwrap_or(false), "{launch}");
+    let win_w = launch["step"]["result"]["window"]["width"]
+        .as_u64()
+        .unwrap();
+    let win_h = launch["step"]["result"]["window"]["height"]
+        .as_u64()
+        .unwrap();
+
+    let bad_size = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.click",
+            "--output",
+            "json",
+            "--with",
+            &json!({
+                "at": { "x": 30, "y": 30, "window": { "width": win_w + 50, "height": win_h } }
+            })
+            .to_string(),
+        ],
+        &[],
+    ));
+    assert!(!bad_size["ok"].as_bool().unwrap_or(true), "{bad_size}");
+
+    let press_res = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.press",
+            "--output",
+            "json",
+            "--with",
+            &json!({"key": "Ctrl+S"}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(press_res["ok"].as_bool().unwrap_or(false), "{press_res}");
+
+    let wait_shortcut = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.wait",
+            "--output",
+            "json",
+            "--with",
+            &json!({
+                "role": "Text",
+                "text": "Shortcut:Ctrl+S",
+                "timeout_ms": 5000
+            })
+            .to_string(),
+        ],
+        &[],
+    ));
+    assert!(
+        wait_shortcut["ok"].as_bool().unwrap_or(false),
+        "{wait_shortcut}"
+    );
+
+    // Click CloseWindow, then verify subsequent session step fails fast (< 5s, not 15s)
+    // with an actionable closed-window `environment` error, AND verify `da run` handles
+    // `desktop.wait` (`state: gone`, `window_closed: true`) followed by fast closed-window exit.
+    let close_click = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.click",
+            "--output",
+            "json",
+            "--with",
+            &json!({"role": "Button", "name": "CloseWindow"}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(
+        close_click["ok"].as_bool().unwrap_or(false),
+        "{close_click}"
+    );
+
+    let fast_start = Instant::now();
+    let after_close = run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.click",
+            "--output",
+            "json",
+            "--with",
+            &json!({"role": "Button", "name": "Submit", "timeout_ms": 15000}).to_string(),
+        ],
+        &[],
+    );
+    assert!(!after_close.status.success());
+    let after_close_json = json_stdout(&after_close);
+    assert_eq!(after_close_json["error"]["kind"], "environment");
+    assert!(
+        after_close_json["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("desktop window closed"),
+        "expected closed-window message, got: {after_close_json}"
+    );
+    assert!(
+        fast_start.elapsed().as_secs() < 12,
+        "closed-window desktop.click on Linux session must fail fast, took {:?}",
+        fast_start.elapsed()
+    );
+
+    let _ = run_da(
+        dir.path(),
+        &["session", "stop", &session_id, "--output", "json"],
+        &[],
+    );
+
+    let run_close_title = format!("DA Linux RunClose {}", std::process::id());
+    let run_close_case = dir.path().join("closed-window-linux.yaml");
+    std::fs::write(
+        &run_close_case,
+        format!(
+            "\
+name: Linux closed window wait gone and fast failure
+steps:
+  - desktop.launch:
+      command: python3
+      args:
+        - \"{}\"
+        - --title
+        - \"{run_close_title}\"
+      window_title_contains: \"{run_close_title}\"
+      timeout_ms: 20000
+  - desktop.click:
+      role: Button
+      name: CloseWindow
+  - desktop.wait:
+      role: Button
+      name: Submit
+      state: gone
+      timeout_ms: 5000
+  - desktop.click:
+      role: Button
+      name: Submit
+      timeout_ms: 15000
+",
+            script.display()
+        ),
+    )
+    .expect("write linux closed-window case");
+
+    let run_close_start = Instant::now();
+    let run_close_out = run_da(
+        dir.path(),
+        &[
+            "run",
+            "--output",
+            "json",
+            "--no-bundle",
+            run_close_case.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let run_close_elapsed = run_close_start.elapsed();
+    assert!(!run_close_out.status.success());
+    let run_close_report = json_stdout(&run_close_out);
+    assert_eq!(
+        run_close_report["cases"][0]["steps"][2]["status"], "passed",
+        "desktop.wait state: gone should pass when window closes: {run_close_report}"
+    );
+    let run_close_err = extract_case_error_message(&run_close_report);
+    assert!(
+        run_close_err.to_lowercase().contains("closed")
+            || run_close_err.to_lowercase().contains("exited"),
+        "expected closed-window error, got: {run_close_report}"
+    );
+    assert!(
+        run_close_elapsed.as_secs() < 12,
+        "closed-window click in da run should fail fast without waiting 15s, took {run_close_elapsed:?}"
+    );
+
+    // 2. Pure-Wayland (`DISPLAY` unset) boundary + `desktop.attach` `local_only`:
+    // Semantic AT-SPI2 attach/type/click/wait SUCCEED with `DISPLAY` unset, while X11
+    // `desktop.screenshot` returns an actionable `Environment` error (exit code 4).
+    let ext_title = format!("DA Linux WaylandSim {}", std::process::id());
+    let ext_child = Command::new("python3")
+        .args([script.to_str().unwrap(), "--title", &ext_title])
+        .env("GTK_MODULES", "gail:atk-bridge")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn external GTK3 fixture");
+    let ext_pid = ext_child.id();
+    let mut ext_guard = ProcessGuard(Some(ext_child));
+
+    let semantic_wayland_case = dir.path().join("wayland-semantic.yaml");
+    std::fs::write(
+        &semantic_wayland_case,
+        format!(
+            "\
+name: Semantic AT-SPI2 without X11 DISPLAY
+steps:
+  - desktop.attach:
+      pid: {ext_pid}
+      title_contains: \"{ext_title}\"
+      timeout_ms: 20000
+  - desktop.type:
+      role: Edit
+      name: Username
+      text: wayland_user
+  - desktop.click:
+      role: Button
+      name: Submit
+  - desktop.wait:
+      role: Text
+      text: Submitted:wayland_user|pwlen=0
+      timeout_ms: 5000
+"
+        ),
+    )
+    .expect("write wayland semantic case");
+
+    let mut semantic_cmd = Command::new(da());
+    semantic_cmd
+        .current_dir(dir.path())
+        .env_remove("DISPLAY")
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .args([
+            "run",
+            "--output",
+            "json",
+            "--no-bundle",
+            semantic_wayland_case.to_str().unwrap(),
+        ]);
+    let semantic_out = semantic_cmd.output().expect("run semantic wayland case");
+    assert!(
+        semantic_out.status.success(),
+        "semantic AT-SPI2 steps must succeed without X11 DISPLAY:\n{}\n{}",
+        stdout_str(&semantic_out),
+        stderr_str(&semantic_out)
+    );
+    let semantic_report = json_stdout(&semantic_out);
+    assert_eq!(semantic_report["cases"][0]["local_only"], true);
+
+    let wayland_shot_case = dir.path().join("wayland-screenshot.yaml");
+    std::fs::write(
+        &wayland_shot_case,
+        format!(
+            "\
+name: Pure Wayland screenshot environment error
+steps:
+  - desktop.attach:
+      pid: {ext_pid}
+      title_contains: \"{ext_title}\"
+      timeout_ms: 10000
+  - desktop.screenshot:
+      path: wayland-fail.png
+"
+        ),
+    )
+    .expect("write wayland screenshot case");
+
+    let mut shot_cmd = Command::new(da());
+    shot_cmd
+        .current_dir(dir.path())
+        .env_remove("DISPLAY")
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .args([
+            "run",
+            "--output",
+            "json",
+            "--no-bundle",
+            wayland_shot_case.to_str().unwrap(),
+        ]);
+    let shot_out = shot_cmd.output().expect("run wayland screenshot case");
+    assert_eq!(
+        shot_out.status.code(),
+        Some(4),
+        "expected exit code 4 (Environment) on pure Wayland screenshot:\n{}",
+        stdout_str(&shot_out)
+    );
+    let shot_report = json_stdout(&shot_out);
+    let shot_err = extract_case_error_message(&shot_report);
+    assert!(
+        shot_err.contains("DISPLAY") && shot_err.contains("Wayland"),
+        "expected actionable Wayland/DISPLAY diagnostic, got: {shot_err}"
+    );
+
+    assert!(
+        ext_guard.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "desktop.attach must never kill the external GTK3 process"
+    );
+}
+
+// ============================================================================
+// macOS AXUIElement + Enigo + screencapture Integration Tests
+// ============================================================================
+
+#[cfg(target_os = "macos")]
+const MACOS_APPKIT_FIXTURE_SWIFT: &str = r#"
+import Cocoa
+
+final class CanvasView: NSView {
+    var onClick: ((Int, Int) -> Void)?
+    override var isFlipped: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedRed: 0.85, green: 0.90, blue: 0.98, alpha: 1.0).setFill()
+        dirtyRect.fill()
+    }
+    override func mouseDown(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        onClick?(Int(pt.x.rounded()), Int(pt.y.rounded()))
+    }
+}
+
+final class KeyWindow: NSWindow {
+    var onCtrlS: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown {
+            let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            if (event.modifierFlags.contains(.control) || event.modifierFlags.contains(.command)) && chars == "s" {
+                onCtrlS?()
+                return
+            }
+        }
+        super.sendEvent(event)
+    }
+}
+
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let titleText: String
+    let secretText: String
+    var window: KeyWindow!
+    var usernameField: NSTextField!
+    var passwordField: NSSecureTextField!
+    var statusLabel: NSTextField!
+
+    init(titleText: String, secretText: String) {
+        self.titleText = titleText
+        self.secretText = secretText
+    }
+
+    @objc func onSubmit(_ sender: Any?) {
+        let u = usernameField.stringValue
+        let p = passwordField.stringValue
+        statusLabel.stringValue = "Submitted:\(u)|pwlen=\(p.count)"
+    }
+
+    @objc func onClose(_ sender: Any?) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.appearance = NSAppearance(named: .aqua)
+        let rect = NSRect(x: 80, y: 120, width: 440, height: 320)
+        window = KeyWindow(
+            contentRect: rect,
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = titleText
+        window.backgroundColor = NSColor(calibratedRed: 0.94, green: 0.94, blue: 0.96, alpha: 1.0)
+        let content = FlippedView(frame: NSRect(x: 0, y: 0, width: 440, height: 320))
+        window.contentView = content
+
+        usernameField = NSTextField(frame: NSRect(x: 20, y: 20, width: 220, height: 26))
+        usernameField.setAccessibilityIdentifier("usernameBox")
+        usernameField.setAccessibilityLabel("Username")
+        usernameField.drawsBackground = true
+        usernameField.backgroundColor = NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.25, alpha: 1.0)
+        content.addSubview(usernameField)
+
+        passwordField = NSSecureTextField(frame: NSRect(x: 20, y: 56, width: 220, height: 26))
+        passwordField.setAccessibilityIdentifier("passwordBox")
+        passwordField.setAccessibilityLabel("Password")
+        passwordField.drawsBackground = true
+        passwordField.backgroundColor = NSColor(calibratedRed: 0.0, green: 0.86, blue: 0.86, alpha: 1.0)
+        content.addSubview(passwordField)
+
+        let submitBtn = NSButton(title: "Submit", target: self, action: #selector(onSubmit(_:)))
+        submitBtn.frame = NSRect(x: 20, y: 94, width: 110, height: 30)
+        submitBtn.setAccessibilityIdentifier("submitBtn")
+        content.addSubview(submitBtn)
+
+        let closeBtn = NSButton(title: "CloseWindow", target: self, action: #selector(onClose(_:)))
+        closeBtn.frame = NSRect(x: 140, y: 94, width: 120, height: 30)
+        closeBtn.setAccessibilityIdentifier("closeBtn")
+        content.addSubview(closeBtn)
+
+        statusLabel = NSTextField(labelWithString: "Status:Ready")
+        statusLabel.frame = NSRect(x: 20, y: 136, width: 380, height: 24)
+        statusLabel.setAccessibilityIdentifier("statusLabel")
+        content.addSubview(statusLabel)
+
+        if !secretText.isEmpty {
+            let secretEcho = NSTextField(labelWithString: "SecretEcho:\(secretText)")
+            secretEcho.frame = NSRect(x: 20, y: 166, width: 380, height: 22)
+            secretEcho.setAccessibilityIdentifier("secretEcho")
+            content.addSubview(secretEcho)
+        }
+
+        let canvas = CanvasView(frame: NSRect(x: 20, y: 200, width: 200, height: 70))
+        canvas.setAccessibilityElement(true)
+        canvas.setAccessibilityRole(.group)
+        canvas.setAccessibilityIdentifier("drawCanvas")
+        canvas.onClick = { [weak self] x, y in
+            self?.statusLabel.stringValue = "Canvas:\(x),\(y)"
+        }
+        content.addSubview(canvas)
+
+        window.onCtrlS = { [weak self] in
+            self?.statusLabel.stringValue = "Shortcut:Ctrl+S"
+        }
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+var titleArg = "DA macOS Fixture"
+var secretArg = ""
+var argIdx = 1
+let cliArgs = CommandLine.arguments
+while argIdx < cliArgs.count {
+    if cliArgs[argIdx] == "--title", argIdx + 1 < cliArgs.count {
+        titleArg = cliArgs[argIdx + 1]
+        argIdx += 2
+    } else if cliArgs[argIdx] == "--secret", argIdx + 1 < cliArgs.count {
+        secretArg = cliArgs[argIdx + 1]
+        argIdx += 2
+    } else {
+        argIdx += 1
+    }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.regular)
+let delegate = AppDelegate(titleText: titleArg, secretText: secretArg)
+app.delegate = delegate
+app.run()
+"#;
+
+#[cfg(target_os = "macos")]
+fn compile_macos_fixture(dir: &Path) -> PathBuf {
+    let swift_path = dir.join("fixture.swift");
+    let bin_path = dir.join("DesktopFixtureMac");
+    std::fs::write(&swift_path, MACOS_APPKIT_FIXTURE_SWIFT).expect("write fixture.swift");
+
+    let output = Command::new("swiftc")
+        .args([
+            "-swift-version",
+            "5",
+            swift_path.to_str().unwrap(),
+            "-o",
+            bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to invoke swiftc");
+    assert!(
+        output.status.success(),
+        "swiftc failed:\n{}\n{}",
+        stdout_str(&output),
+        stderr_str(&output)
+    );
+    bin_path
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn desktop_macos_session_snapshot_drive_export_lint_and_replay() {
+    let _guard = desktop_test_guard();
+    let dir = TempDir::new("desktop-macos-session-replay");
+    let exe = compile_macos_fixture(dir.path());
+    let title = format!("DA macOS Session {}", std::process::id());
+
+    let started = json_stdout(&run_da(
+        dir.path(),
+        &["session", "start", "--output", "json"],
+        &[],
+    ));
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let launch_step = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.launch",
+            "--output",
+            "json",
+            "--with",
+            &json!({
+                "command": exe,
+                "args": ["--title", title],
+                "window_title_contains": title,
+                "timeout_ms": 20000
+            })
+            .to_string(),
+        ],
+        &[],
+    ));
+    assert!(
+        launch_step["ok"].as_bool().unwrap_or(false),
+        "{launch_step}"
+    );
+    let launched_pid = launch_step["step"]["result"]["pid"]
+        .as_u64()
+        .expect("launched pid") as u32;
+
+    let snap = json_stdout(&run_da(
+        dir.path(),
+        &["session", "snapshot", &session_id, "--output", "json"],
+        &[],
+    ));
+    assert!(snap["ok"].as_bool().unwrap_or(false), "{snap}");
+    let elements = snap["snapshot"]["elements"]
+        .as_array()
+        .or_else(|| snap["snapshots"]["desktop"]["elements"].as_array())
+        .unwrap_or_else(|| panic!("snapshot elements missing: {snap}"));
+
+    let find_ref = |aid: &str| -> String {
+        elements
+            .iter()
+            .find(|el| el["automation_id"].as_str() == Some(aid))
+            .unwrap_or_else(|| panic!("missing element `{aid}` in snapshot: {snap}"))["ref"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let user_ref = find_ref("usernameBox");
+    let pass_ref = find_ref("passwordBox");
+    let submit_ref = find_ref("submitBtn");
+    let status_ref = find_ref("statusLabel");
+
+    let s1 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.type",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": user_ref, "text": "alice"}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(s1["ok"].as_bool().unwrap_or(false), "{s1}");
+
+    let s2 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.type",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": pass_ref, "text": "${env:DA_TEST_DESKTOP_SECRET}"}).to_string(),
+        ],
+        &[("DA_TEST_DESKTOP_SECRET", "s3cret-pass")],
+    ));
+    assert!(s2["ok"].as_bool().unwrap_or(false), "{s2}");
+
+    let s3 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.click",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": submit_ref}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(s3["ok"].as_bool().unwrap_or(false), "{s3}");
+
+    let s4 = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.read",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": status_ref}).to_string(),
+        ],
+        &[],
+    ));
+    assert!(s4["ok"].as_bool().unwrap_or(false), "{s4}");
+    assert_eq!(s4["step"]["result"]["name"], "Submitted:alice|pwlen=11");
+
+    let pw_read = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &session_id,
+            "desktop.read",
+            "--output",
+            "json",
+            "--with",
+            &json!({"ref": pass_ref}).to_string(),
+        ],
+        &[],
+    ));
+    assert_eq!(pw_read["step"]["result"]["is_password"], true);
+    assert!(
+        pw_read["step"]["result"]["value"].is_null(),
+        "password field value must never be returned: {pw_read}"
+    );
+
+    let case_path = dir.path().join("exported-macos-desktop.yaml");
+    let export_default = json_stdout(&run_da(
+        dir.path(),
+        &[
+            "session",
+            "export",
+            &session_id,
+            "--output",
+            "json",
+            "--name",
+            "macOS desktop login replay",
+            "-o",
+            case_path.to_str().unwrap(),
+        ],
+        &[],
+    ));
+    assert!(
+        export_default["ok"].as_bool().unwrap_or(false),
+        "{export_default}"
+    );
+    let yaml_text = export_default["yaml"].as_str().unwrap();
+    assert!(!yaml_text.contains("ref:"));
+    assert!(!yaml_text.contains("s3cret-pass"));
+    assert!(yaml_text.contains("automation_id: usernameBox"));
+    assert!(yaml_text.contains("automation_id: submitBtn"));
+    assert!(yaml_text.contains("${env:DA_TEST_DESKTOP_SECRET}"));
+
+    let stopped = json_stdout(&run_da(
+        dir.path(),
+        &["session", "stop", &session_id, "--output", "json"],
+        &[],
+    ));
+    assert!(stopped["ok"].as_bool().unwrap_or(false), "{stopped}");
+    assert!(
+        !is_unix_pid_alive(launched_pid),
+        "`da session stop` must terminate owned launched macOS process PID {launched_pid}"
+    );
+
+    let mut final_yaml = std::fs::read_to_string(&case_path).expect("read exported yaml");
+    final_yaml.push_str(
+        "  - desktop.wait:\n      automation_id: statusLabel\n      text: Submitted:alice|pwlen=11\n",
+    );
+    std::fs::write(&case_path, final_yaml).expect("update exported yaml");
+
+    let lint = run_da(
+        dir.path(),
+        &["lint", "--output", "json", case_path.to_str().unwrap()],
+        &[("DA_TEST_DESKTOP_SECRET", "s3cret-pass")],
+    );
+    assert!(
+        lint.status.success(),
+        "da lint failed: {}",
+        stderr_str(&lint)
+    );
+
+    let replay = run_da(
+        dir.path(),
+        &[
+            "run",
+            "--output",
+            "json",
+            "--no-bundle",
+            case_path.to_str().unwrap(),
+        ],
+        &[("DA_TEST_DESKTOP_SECRET", "s3cret-pass")],
+    );
+    assert!(
+        replay.status.success(),
+        "da run replay failed:\n{}\n{}",
+        stdout_str(&replay),
+        stderr_str(&replay)
+    );
+    let replay_json = json_stdout(&replay);
+    assert_eq!(replay_json["summary"]["cases_passed"], 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn desktop_macos_failure_bundle_masks_inputs_and_redacts_secrets() {
+    let _guard = desktop_test_guard();
+    let dir = TempDir::new("desktop-macos-mask");
+    let exe = compile_macos_fixture(dir.path());
+    let title = format!("DA macOS Mask {}", std::process::id());
+    let secret_value = "MACOS-TOP-SECRET-7731";
+    let case_path = dir.path().join("mask-failure.yaml");
+    let masked_path = dir.path().join("shot-masked.png");
+    let unmasked_path = dir.path().join("shot-unmasked.png");
+
+    std::fs::write(
+        &case_path,
+        format!(
+            "\
+name: macOS masked screenshot and redacted tree
+steps:
+  - desktop.launch:
+      command: \"{}\"
+      args:
+        - --title
+        - \"{title}\"
+        - --secret
+        - \"${{env:DA_TEST_DESKTOP_SECRET}}\"
+      window_title_contains: \"{title}\"
+      timeout_ms: 20000
+  - desktop.type:
+      automation_id: passwordBox
+      text: \"${{env:DA_TEST_DESKTOP_SECRET}}\"
+  - desktop.read:
+      automation_id: passwordBox
+    save:
+      pw_bounds: $.bounds
+  - desktop.screenshot:
+      path: shot-masked.png
+  - desktop.screenshot:
+      path: shot-unmasked.png
+      mask_inputs: false
+  - desktop.wait:
+      automation_id: statusLabel
+      text: NEVER-APPEARS
+      timeout_ms: 250
+",
+            exe.display()
+        ),
+    )
+    .expect("write mask case");
+
+    let bundle_root = dir.path().join("bundles");
+    let output = run_da(
+        dir.path(),
+        &[
+            "run",
+            "--output",
+            "json",
+            "--bundle-dir",
+            bundle_root.to_str().unwrap(),
+            case_path.to_str().unwrap(),
+        ],
+        &[("DA_TEST_DESKTOP_SECRET", secret_value)],
+    );
+    assert!(!output.status.success(), "expected failing desktop.wait");
+    let report = json_stdout(&output);
+    assert!(
+        !report.to_string().contains(secret_value),
+        "stdout JSON report leaked secret: {report}"
+    );
+
+    assert_unix_mode_0600(&masked_path);
+    assert_unix_mode_0600(&unmasked_path);
+
+    let win_w = report["cases"][0]["steps"][0]["result"]["window"]["width"]
+        .as_u64()
+        .unwrap()
+        .max(1) as f64;
+    let win_h = report["cases"][0]["steps"][0]["result"]["window"]["height"]
+        .as_u64()
+        .unwrap()
+        .max(1) as f64;
+    let pw_bounds = report["cases"][0]["steps"][2]["result"]["bounds"].clone();
+    let bx = pw_bounds["x"].as_i64().unwrap().max(0) as f64;
+    let by = pw_bounds["y"].as_i64().unwrap().max(0) as f64;
+    let bw = pw_bounds["width"].as_i64().unwrap().max(1) as f64;
+    let bh = pw_bounds["height"].as_i64().unwrap().max(1) as f64;
+
+    let bundle_dir = PathBuf::from(report["cases"][0]["bundle"].as_str().expect("bundle path"));
+    let bundle_png = bundle_dir.join("desktop").join("screenshot.png");
+    let bundle_tree = bundle_dir.join("desktop").join("uia-tree.json");
+    assert!(bundle_png.is_file(), "missing {}", bundle_png.display());
+    assert!(bundle_tree.is_file(), "missing {}", bundle_tree.display());
+
+    let (uw, uh, unmasked) = decode_png_rgba(&unmasked_path);
+    let (mw, mh, masked) = decode_png_rgba(&masked_path);
+    let (fw, fh, fail_png) = decode_png_rgba(&bundle_png);
+    assert_eq!((uw, uh), (mw, mh));
+    assert_eq!((uw, uh), (fw, fh));
+
+    let sample_center = |w: u32, h: u32, buf: &[u8]| -> [u8; 4] {
+        let sx = f64::from(w) / win_w;
+        let sy = f64::from(h) / win_h;
+        let cx = ((bx + bw * 0.5) * sx).round().clamp(0.0, f64::from(w - 1)) as u32;
+        let cy = ((by + bh * 0.5) * sy).round().clamp(0.0, f64::from(h - 1)) as u32;
+        let idx = ((cy * w + cx) * 4) as usize;
+        [buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]]
+    };
+
+    assert_ne!(
+        &sample_center(uw, uh, &unmasked)[..3],
+        &[0, 0, 0],
+        "unmasked password input center should not be solid black"
+    );
+    assert_eq!(
+        sample_center(mw, mh, &masked),
+        [0, 0, 0, 255],
+        "masked screenshot must paint Edit/AXSecureTextField center solid black"
+    );
+    assert_eq!(
+        sample_center(fw, fh, &fail_png),
+        [0, 0, 0, 255],
+        "failure bundle screenshot must paint Edit/AXSecureTextField center solid black"
+    );
+
+    let tree_text = std::fs::read_to_string(&bundle_tree).expect("read uia-tree.json");
+    assert!(
+        !tree_text.contains(secret_value),
+        "uia-tree.json leaked secret value: {tree_text}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn desktop_macos_at_press_attach_and_closed_window() {
+    let _guard = desktop_test_guard();
+    let dir = TempDir::new("desktop-macos-at-attach");
+    let exe = compile_macos_fixture(dir.path());
+    let title = format!("DA macOS Onscreen {}", std::process::id());
+
+    // 1. `at:` size mismatch, `desktop.press` (`Ctrl+S`), and closed-window fast error.
+    let case_path = dir.path().join("closed-and-press.yaml");
+    std::fs::write(
+        &case_path,
+        format!(
+            "\
+name: macOS press and closed window
+steps:
+  - desktop.launch:
+      command: \"{}\"
+      args:
+        - --title
+        - \"{title}\"
+      window_title_contains: \"{title}\"
+      timeout_ms: 20000
+  - desktop.press:
+      key: Ctrl+S
+  - desktop.wait:
+      automation_id: statusLabel
+      text: Shortcut:Ctrl+S
+      timeout_ms: 5000
+  - desktop.click:
+      automation_id: closeBtn
+  - desktop.wait:
+      automation_id: submitBtn
+      state: gone
+      timeout_ms: 5000
+  - desktop.click:
+      automation_id: submitBtn
+      timeout_ms: 15000
+",
+            exe.display()
+        ),
+    )
+    .expect("write closed-and-press case");
+
+    let start = Instant::now();
+    let out = run_da(
+        dir.path(),
+        &[
+            "run",
+            "--output",
+            "json",
+            "--no-bundle",
+            case_path.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let elapsed = start.elapsed();
+    assert!(!out.status.success());
+    let report = json_stdout(&out);
+    let err_msg = extract_case_error_message(&report);
+    assert!(
+        err_msg.to_lowercase().contains("closed") || err_msg.to_lowercase().contains("exited"),
+        "expected closed-window error, got: {report}"
+    );
+    assert!(
+        elapsed.as_secs() < 15,
+        "closed-window click should fail fast without waiting 15s, took {elapsed:?}"
+    );
+
+    // 2. `desktop.attach` marks `local_only: true` and preserves the external process.
+    let ext_title = format!("DA macOS Attach {}", std::process::id());
+    let ext_child = Command::new(&exe)
+        .args(["--title", &ext_title])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn external macOS fixture");
+    let ext_pid = ext_child.id();
+    let mut ext_guard = ProcessGuard(Some(ext_child));
+
+    let attach_case = dir.path().join("attach-macos.yaml");
+    std::fs::write(
+        &attach_case,
+        format!(
+            "\
+name: macOS attach external window
+steps:
+  - desktop.attach:
+      pid: {ext_pid}
+      title_contains: \"{ext_title}\"
+      timeout_ms: 20000
+  - desktop.read:
+      automation_id: statusLabel
+    expect:
+      - path: \"$.name\"
+        equals: Status:Ready
+"
+        ),
+    )
+    .expect("write macOS attach case");
+
+    let attach_run = run_da(
+        dir.path(),
+        &[
+            "run",
+            "--output",
+            "json",
+            "--no-bundle",
+            attach_case.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        attach_run.status.success(),
+        "desktop.attach on macOS failed:\n{}\n{}",
+        stdout_str(&attach_run),
+        stderr_str(&attach_run)
+    );
+    let attach_report = json_stdout(&attach_run);
+    assert_eq!(attach_report["cases"][0]["local_only"], true);
+    assert!(
+        ext_guard.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "desktop.attach must never terminate the attached external macOS process"
     );
 }

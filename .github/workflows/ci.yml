@@ -122,7 +122,7 @@ jobs:
           args="--lib --bins"
           for f in tests/*.rs; do
             name=$(basename "$f" .rs)
-            if [ "$name" != "browser" ]; then
+            if [ "$name" != "browser" ] && [ "$name" != "desktop" ]; then
               args="$args --test $name"
             fi
           done
@@ -141,8 +141,19 @@ jobs:
         run: cargo test --no-default-features --features android ${{ steps.targets.outputs.args }}
       - name: Test (desktop feature)
         run: cargo test --no-default-features --features desktop ${{ steps.targets.outputs.args }} -- --test-threads=1
+      - name: Install Linux desktop test dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb at-spi2-core dbus-x11 python3-gi gir1.2-gtk-3.0
+      - name: Test (desktop on Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: xvfb-run -a dbus-run-session -- cargo test --features desktop --test desktop -- --test-threads=1
       - name: Test (desktop on Windows)
         if: matrix.os == 'windows-latest'
+        run: cargo test --features desktop --test desktop -- --test-threads=1
+      - name: Test (desktop on macOS)
+        if: matrix.os == 'macos-latest'
         run: cargo test --features desktop --test desktop -- --test-threads=1
       - name: Doctests
         run: cargo test --doc
