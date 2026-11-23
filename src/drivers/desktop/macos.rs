@@ -10,8 +10,7 @@
 //! Retina backing scale) before encoding `0600` PNG files.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,11 +61,11 @@ struct FoundMacWindow {
     height: u32,
 }
 
-struct TempFileGuard(PathBuf);
+struct TempDirGuard(PathBuf);
 
-impl Drop for TempFileGuard {
+impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -644,6 +643,7 @@ impl DesktopBackend {
             self.hwnd = num;
         }
         let (png_bytes, width, height, masked_count) = capture_macos_window_png(
+            self.pid,
             &live.app_el,
             &live.win_el,
             self.hwnd,
@@ -715,9 +715,15 @@ impl DesktopBackend {
                         .flatten()
                         .unwrap_or(0)
                 };
-                let shot =
-                    capture_macos_window_png(&live.app_el, &live.win_el, win_id, &live.data, true)
-                        .map(|(bytes, _, _, _)| bytes);
+                let shot = capture_macos_window_png(
+                    self.pid,
+                    &live.app_el,
+                    &live.win_el,
+                    win_id,
+                    &live.data,
+                    true,
+                )
+                .map(|(bytes, _, _, _)| bytes);
                 (Ok(live.data), Some(shot))
             }
             Err(err) => (Err(err), None),
@@ -1480,7 +1486,83 @@ fn enigo_send_key_chord(mods: &[KeyModifier], main_key: &MainKey) -> Result<(), 
     Ok(())
 }
 
+fn resolve_macos_cg_window_id(pid: u32, tree: &SharedTreeData) -> Option<i64> {
+    let script = r#"
+ObjC.import('Cocoa');
+ObjC.import('CoreGraphics');
+function run() {
+  const pid = Number(ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('DA_MACOS_PID')));
+  const raw = $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly, $.kCGNullWindowID);
+  const list = raw ? (ObjC.deepUnwrap(ObjC.castRefToObject(raw)) || []) : [];
+  const wins = list.filter(w => Number(w.kCGWindowOwnerPID) === pid && (w.kCGWindowLayer === 0 || w.kCGWindowLayer === undefined));
+  return JSON.stringify(wins.map(w => ({ id: Number(w.kCGWindowNumber || 0), b: w.kCGWindowBounds || {} })));
+}
+"#;
+    let output = Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript", "-e", script])
+        .env("DA_MACOS_PID", pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: Vec<Value> = serde_json::from_slice(&output.stdout).ok()?;
+    let mut best: Option<(i64, f64)> = None;
+    for item in parsed {
+        let id = item["id"].as_i64().unwrap_or(0);
+        if id <= 0 {
+            continue;
+        }
+        let bx = item["b"]["X"].as_f64().unwrap_or(0.0);
+        let by = item["b"]["Y"].as_f64().unwrap_or(0.0);
+        let bw = item["b"]["Width"].as_f64().unwrap_or(0.0);
+        let bh = item["b"]["Height"].as_f64().unwrap_or(0.0);
+        let score = (bx - f64::from(tree.win_left)).abs()
+            + (by - f64::from(tree.win_top)).abs()
+            + (bw - f64::from(tree.win_width)).abs()
+            + (bh - f64::from(tree.win_height)).abs();
+        if best.is_none_or(|(_, best_score)| score < best_score) {
+            best = Some((id, score));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+fn invoke_screencapture(args: &[&str], out_path: &Path) -> Result<Vec<u8>, String> {
+    let _ = std::fs::remove_file(out_path);
+    let output = Command::new("/usr/sbin/screencapture")
+        .args(args)
+        .arg(out_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("failed to invoke `/usr/sbin/screencapture`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "`screencapture` exited with {}: {}",
+            output.status,
+            if stderr.is_empty() {
+                "no diagnostic output"
+            } else {
+                &stderr
+            }
+        ));
+    }
+    let raw_png = std::fs::read(out_path)
+        .map_err(|err| format!("`screencapture` did not write output PNG ({err})"))?;
+    if raw_png.is_empty() {
+        return Err("`screencapture` produced an empty PNG".to_string());
+    }
+    Ok(raw_png)
+}
+
 fn capture_macos_window_png(
+    pid: u32,
     app_el: &AXUIElement,
     win_el: &AXUIElement,
     window_id: i64,
@@ -1490,63 +1572,53 @@ fn capture_macos_window_png(
     focus_ax_window(app_el, win_el);
 
     let seq = TEMP_CAPTURE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp_path =
-        std::env::temp_dir().join(format!("da-macos-winshot-{}-{seq}.png", std::process::id()));
-    let _ = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temp_path);
-    let _cleanup = TempFileGuard(temp_path.clone());
+    let temp_dir =
+        std::env::temp_dir().join(format!("da-macos-winshot-{}-{seq}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&temp_dir)
+        .map_err(|err| {
+            StepError::Environment(format!(
+                "failed to create temporary screenshot directory `{}`: {err}",
+                paths::display(&temp_dir)
+            ))
+        })?;
+    let _cleanup = TempDirGuard(temp_dir.clone());
+    let temp_path = temp_dir.join("shot.png");
 
-    let mut cmd = Command::new("/usr/sbin/screencapture");
-    cmd.arg("-x");
-    if window_id > 0 {
-        cmd.args(["-o", "-l", &window_id.to_string()]);
+    let resolved_wid = if window_id > 0 {
+        window_id
     } else {
-        cmd.args([
-            "-R",
-            &format!(
-                "{},{},{},{}",
-                tree.win_left,
-                tree.win_top,
-                tree.win_width.max(1),
-                tree.win_height.max(1)
-            ),
-        ]);
-    }
-    cmd.arg(&temp_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        resolve_macos_cg_window_id(pid, tree).unwrap_or(0)
+    };
+    let rect_arg = format!(
+        "{},{},{},{}",
+        tree.win_left,
+        tree.win_top,
+        tree.win_width.max(1),
+        tree.win_height.max(1)
+    );
 
-    let output = cmd.output().map_err(|err| {
-        StepError::Environment(format!("failed to invoke `/usr/sbin/screencapture`: {err}"))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(StepError::Environment(format!(
-            "macOS window screenshot failed (`screencapture` exited with {}): {} — {TCC_SCREEN_RECORDING_HINT}",
-            output.status,
-            if stderr.is_empty() {
-                "no diagnostic output"
-            } else {
-                &stderr
-            }
-        )));
-    }
-
-    let raw_png = std::fs::read(&temp_path).map_err(|err| {
-        StepError::Environment(format!(
-            "macOS `screencapture` did not write output PNG ({err}) — {TCC_SCREEN_RECORDING_HINT}"
-        ))
-    })?;
-    if raw_png.is_empty() {
-        return Err(StepError::Environment(format!(
-            "macOS `screencapture` produced an empty PNG — {TCC_SCREEN_RECORDING_HINT}"
-        )));
-    }
+    let raw_png = if resolved_wid > 0 {
+        let wid_str = resolved_wid.to_string();
+        match invoke_screencapture(&["-x", "-o", "-l", &wid_str], &temp_path) {
+            Ok(bytes) => bytes,
+            Err(win_err) => invoke_screencapture(&["-x", "-R", &rect_arg], &temp_path).map_err(
+                |rect_err| {
+                    StepError::Environment(format!(
+                        "macOS window screenshot failed (window `-l {wid_str}`: {win_err}; rect `-R {rect_arg}`: {rect_err}) — {TCC_SCREEN_RECORDING_HINT}"
+                    ))
+                },
+            )?,
+        }
+    } else {
+        invoke_screencapture(&["-x", "-R", &rect_arg], &temp_path).map_err(|rect_err| {
+            StepError::Environment(format!(
+                "macOS window screenshot failed (rect `-R {rect_arg}`: {rect_err}) — {TCC_SCREEN_RECORDING_HINT}"
+            ))
+        })?
+    };
 
     let (width, height, mut rgba) = decode_png_to_rgba8(&raw_png)?;
     let masked_count = if mask_inputs {

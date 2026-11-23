@@ -2059,6 +2059,16 @@ steps:
         !report.to_string().contains(secret_value),
         "stdout JSON report leaked secret: {report}"
     );
+    for idx in 0..5 {
+        assert_eq!(
+            report["cases"][0]["steps"][idx]["status"], "passed",
+            "expected step {idx} to pass before desktop.wait fails: {report}"
+        );
+    }
+    assert_eq!(
+        report["cases"][0]["steps"][5]["status"], "error",
+        "expected desktop.wait (step 5) to timeout/error: {report}"
+    );
 
     assert_unix_mode_0600(&masked_path);
     assert_unix_mode_0600(&unmasked_path);
@@ -2251,11 +2261,25 @@ fn desktop_linux_at_press_attach_closed_window_and_pure_wayland_boundary() {
         ],
         &[],
     );
-    assert!(!after_close.status.success());
+    assert_eq!(
+        after_close.status.code(),
+        Some(4),
+        "closed-window desktop.click must exit 4 (Environment): stdout={}\nstderr={}",
+        stdout_str(&after_close),
+        stderr_str(&after_close)
+    );
     let after_close_json = json_stdout(&after_close);
-    assert_eq!(after_close_json["error"]["kind"], "environment");
+    let after_close_err = if after_close_json["error"].is_object() {
+        &after_close_json["error"]
+    } else {
+        &after_close_json["step"]["error"]
+    };
+    assert_eq!(
+        after_close_err["kind"], "environment",
+        "expected environment error in error or step.error, got: {after_close_json}"
+    );
     assert!(
-        after_close_json["error"]["message"]
+        after_close_err["message"]
             .as_str()
             .unwrap_or("")
             .contains("desktop window closed"),
@@ -2933,6 +2957,16 @@ steps:
     assert!(
         !report.to_string().contains(secret_value),
         "stdout JSON report leaked secret: {report}"
+    );
+    for idx in 0..5 {
+        assert_eq!(
+            report["cases"][0]["steps"][idx]["status"], "passed",
+            "expected step {idx} to pass before desktop.wait fails: {report}"
+        );
+    }
+    assert_eq!(
+        report["cases"][0]["steps"][5]["status"], "error",
+        "expected desktop.wait (step 5) to timeout/error: {report}"
     );
 
     assert_unix_mode_0600(&masked_path);
