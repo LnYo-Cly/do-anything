@@ -19,6 +19,18 @@ pub const STEPS_FILE: &str = "steps.jsonl";
 pub const LOCK_FILE: &str = "lock";
 
 /// Persistent metadata of one interactive session stored in `state.json`.
+/// One declared observer persisted in `state.json` for `da session step`.
+///
+/// `raw_args` keeps unexpanded `${env:NAME}` references so secret values never
+/// enter the session directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StoredObservation {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub raw_args: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     pub schema_version: u32,
@@ -32,6 +44,8 @@ pub struct SessionState {
     pub vars: BTreeMap<String, String>,
     #[serde(default)]
     pub env_names: BTreeSet<String>,
+    #[serde(default)]
+    pub observe: Vec<StoredObservation>,
 }
 
 /// One expectation stored in the step log for deterministic YAML export.
@@ -51,6 +65,10 @@ pub struct StepRecord {
     pub index: usize,
     pub action: String,
     pub raw_args: Value,
+    /// Set when an inline sensitive value in `raw_args` was masked to `***`
+    /// before persisting to `steps.jsonl`, making `raw_args` non-replayable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted_args: bool,
     #[serde(default)]
     pub expect: Vec<StoredExpectation>,
     #[serde(default)]
@@ -73,6 +91,15 @@ pub struct StepRecord {
     /// on a different window size instead of clicking the wrong place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_viewport: Option<Value>,
+    /// Unix epoch milliseconds when the step started executing.
+    #[serde(default)]
+    pub started_at_ms: u64,
+    /// Step execution duration in milliseconds.
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// Redacted step output JSON (or `null` when the step produced no result).
+    #[serde(default)]
+    pub result: Option<Value>,
 }
 
 /// Exclusive non-blocking lock on one session directory.
@@ -242,6 +269,10 @@ pub fn append_step(
         .synthesized_locator
         .as_ref()
         .map(|loc| secrets.redact_json(loc));
+    sanitized.result = sanitized
+        .result
+        .as_ref()
+        .map(|value| secrets.redact_json(value));
 
     let path = session_dir.join(STEPS_FILE);
     let mut file = OpenOptions::new()
@@ -451,4 +482,93 @@ pub fn list_and_reap(
         reaped,
         errors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_session_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "da-store-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn legacy_step_record_and_session_state_deserialize_with_defaults() {
+        let state: SessionState = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "id": "sess-legacy",
+            "created_at_ms": 100,
+            "last_active_ms": 200,
+            "idle_timeout_ms": 60000
+        }))
+        .expect("legacy SessionState");
+        assert!(state.observe.is_empty());
+
+        let dir = temp_session_dir("legacy");
+        let legacy_step = serde_json::json!({
+            "index": 1,
+            "action": "http.request",
+            "raw_args": { "url": "http://localhost/health" },
+            "status": "passed"
+        });
+        fs::write(dir.join(STEPS_FILE), format!("{legacy_step}\n")).unwrap();
+
+        let steps = load_steps(&dir).expect("load legacy steps");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].started_at_ms, 0);
+        assert_eq!(steps[0].duration_ms, 0);
+        assert_eq!(steps[0].result, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_step_redacts_secrets_in_result() {
+        let dir = temp_session_dir("redact-result");
+        let mut secrets = Secrets::new();
+        secrets.record("tok-secret-999");
+
+        let record = StepRecord {
+            index: 1,
+            action: "http.request".to_string(),
+            raw_args: serde_json::json!({ "header": "${env:TOKEN}" }),
+            redacted_args: false,
+            expect: Vec::new(),
+            save: BTreeMap::new(),
+            optional: false,
+            status: "passed".to_string(),
+            error: None,
+            used_ref: None,
+            synthesized_locator: None,
+            fragile: false,
+            observed_viewport: None,
+            started_at_ms: 1_700_000_000_000,
+            duration_ms: 42,
+            result: Some(serde_json::json!({
+                "body": { "echo": "tok-secret-999" }
+            })),
+        };
+
+        append_step(&dir, &record, &secrets).expect("append_step");
+        let loaded = load_steps(&dir).expect("load_steps");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].started_at_ms, 1_700_000_000_000);
+        assert_eq!(loaded[0].duration_ms, 42);
+        assert_eq!(
+            loaded[0].result,
+            Some(serde_json::json!({ "body": { "echo": "***" } }))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

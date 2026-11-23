@@ -10,6 +10,7 @@
 //! document contains inline CSS, no script, and a Content-Security-Policy that
 //! forbids every network request.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read;
@@ -172,6 +173,7 @@ struct CaseRecord {
     meta: Value,
     report: Value,
     evidence: Vec<EvidenceFile>,
+    step_traces: BTreeMap<(bool, usize), Vec<EvidenceFile>>,
     local_only: bool,
     local_only_reason: Option<String>,
 }
@@ -340,6 +342,7 @@ fn read_cases(root: &Path) -> Result<Vec<CaseRecord>, ReportError> {
             .filter(|reason| !reason.is_empty())
             .map(str::to_string);
         let evidence = read_evidence(&directory)?;
+        let step_traces = read_step_traces(&directory)?;
         cases.push(CaseRecord {
             local_only,
             local_only_reason,
@@ -347,6 +350,7 @@ fn read_cases(root: &Path) -> Result<Vec<CaseRecord>, ReportError> {
             meta,
             report,
             evidence,
+            step_traces,
         });
     }
     Ok(cases)
@@ -377,10 +381,62 @@ fn case_position(path: &Path) -> Option<u64> {
 }
 
 fn read_evidence(case: &Path) -> Result<Vec<EvidenceFile>, ReportError> {
-    let entries = fs::read_dir(case).map_err(|error| {
+    read_evidence_groups(case, &["trace"])
+}
+
+fn read_step_traces(
+    case: &Path,
+) -> Result<BTreeMap<(bool, usize), Vec<EvidenceFile>>, ReportError> {
+    let mut traces = BTreeMap::new();
+    let trace_root = case.join("trace");
+    if !trace_root.is_dir() {
+        return Ok(traces);
+    }
+    for (is_finally, phase_name) in [(false, "steps"), (true, "finally")] {
+        let phase_dir = trace_root.join(phase_name);
+        if !phase_dir.is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(&phase_dir).map_err(|error| {
+            ReportError::input(format!(
+                "could not read the trace directory `{}`: {error}",
+                paths::display(&phase_dir)
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ReportError::input(format!(
+                    "could not read an entry in `{}`: {error}",
+                    paths::display(&phase_dir)
+                ))
+            })?;
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(step_index) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let files = read_evidence_groups(&entry.path(), &[])?;
+            if !files.is_empty() {
+                traces.insert((is_finally, step_index), files);
+            }
+        }
+    }
+    Ok(traces)
+}
+
+fn read_evidence_groups(
+    parent: &Path,
+    skip_dirs: &[&str],
+) -> Result<Vec<EvidenceFile>, ReportError> {
+    let entries = fs::read_dir(parent).map_err(|error| {
         ReportError::input(format!(
             "could not read the case directory `{}`: {error}",
-            paths::display(case)
+            paths::display(parent)
         ))
     })?;
     let mut groups = Vec::new();
@@ -388,9 +444,13 @@ fn read_evidence(case: &Path) -> Result<Vec<EvidenceFile>, ReportError> {
         let entry = entry.map_err(|error| {
             ReportError::input(format!(
                 "could not read an entry in `{}`: {error}",
-                paths::display(case)
+                paths::display(parent)
             ))
         })?;
+        let name = entry.file_name();
+        if skip_dirs.iter().any(|skip| name == *skip) {
+            continue;
+        }
         if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             groups.push(entry.path());
         }
@@ -492,6 +552,7 @@ fn render_page(cases: &[CaseRecord], shareable: bool, budget: &mut ImageBudget) 
     );
     html.push_str("<title>da run evidence report</title>\n<style>\n");
     html.push_str(STYLE);
+    html.push_str(TRACE_STYLE);
     html.push_str("</style>\n</head>\n<body>\n<main>\n<header class=\"hero\">\n");
     html.push_str("<p class=\"eyebrow\">da evidence report</p>\n<h1>Run evidence</h1>\n");
     if shareable {
@@ -616,7 +677,7 @@ fn render_case(
         } else {
             html.push_str("<div class=\"steps\">\n");
             for (position, step) in steps.iter().enumerate() {
-                render_step(html, position, step);
+                render_step(html, false, position, step, case, shareable, budget);
             }
             html.push_str("</div>\n");
         }
@@ -627,7 +688,7 @@ fn render_case(
     {
         html.push_str("<div class=\"steps finally\"><h3>Cleanup (finally)</h3>\n");
         for (position, step) in finally.iter().enumerate() {
-            render_step(html, position, step);
+            render_step(html, true, position, step, case, shareable, budget);
         }
         html.push_str("</div>\n");
     }
@@ -636,7 +697,15 @@ fn render_case(
     html.push_str("</section>\n");
 }
 
-fn render_step(html: &mut String, position: usize, step: &Value) {
+fn render_step(
+    html: &mut String,
+    is_finally: bool,
+    position: usize,
+    step: &Value,
+    case: &CaseRecord,
+    shareable: bool,
+    budget: &mut ImageBudget,
+) {
     let status = step
         .get("status")
         .and_then(Value::as_str)
@@ -658,8 +727,29 @@ fn render_step(html: &mut String, position: usize, step: &Value) {
         html.push_str(&escape_text(&problem_text(problem)));
         html.push_str("</p>\n");
     }
+    if let Some(args) = step.get("args")
+        && !args.is_null()
+    {
+        html.push_str("<details class=\"raw\"><summary>Resolved arguments</summary><pre>");
+        html.push_str(&escape_text(&pretty(args)));
+        html.push_str("</pre></details>\n");
+    }
     if let Some(assertions) = step.get("assertions").and_then(Value::as_array) {
         render_assertions(html, assertions);
+    }
+    if let Some(saved) = step.get("saved").and_then(Value::as_object)
+        && !saved.is_empty()
+    {
+        html.push_str("<div class=\"card saved\"><h4>Saved variables</h4><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th>Value</th></tr></thead><tbody>");
+        for (var_name, var_val) in saved {
+            let _ = write!(
+                html,
+                "<tr><td><code>{}</code></td><td><code>{}</code></td></tr>",
+                escape_text(var_name),
+                escape_text(&display_value(var_val))
+            );
+        }
+        html.push_str("</tbody></table></div></div>\n");
     }
     if let Some(result) = step.get("result") {
         html.push_str("<div class=\"layers\">\n");
@@ -671,6 +761,22 @@ fn render_step(html: &mut String, position: usize, step: &Value) {
         html.push_str("<details class=\"raw\"><summary>Raw step result</summary><pre>");
         html.push_str(&escape_text(&pretty(result)));
         html.push_str("</pre></details>\n");
+    }
+    if let Some(trace_files) = case.step_traces.get(&(is_finally, position)) {
+        render_evidence_files(
+            html,
+            trace_files,
+            case,
+            shareable,
+            budget,
+            EvidenceHeadings {
+                images: "Step screenshots",
+                doms: "Step DOM snapshots",
+                texts: "Step text evidence",
+                binaries: "Step binary evidence",
+                wrapper_class: "step-evidence",
+            },
+        );
     }
     html.push_str("</article>\n");
 }
@@ -907,20 +1013,54 @@ fn render_log(html: &mut String, name: &str, value: &Value, lines: &[Value]) {
     html.push_str("</div>\n");
 }
 
+struct EvidenceHeadings {
+    images: &'static str,
+    doms: &'static str,
+    texts: &'static str,
+    binaries: &'static str,
+    wrapper_class: &'static str,
+}
+
 fn render_case_evidence(
     html: &mut String,
     case: &CaseRecord,
     shareable: bool,
     budget: &mut ImageBudget,
 ) {
-    let images: Vec<&EvidenceFile> = case
-        .evidence
+    render_evidence_files(
+        html,
+        &case.evidence,
+        case,
+        shareable,
+        budget,
+        EvidenceHeadings {
+            images: "Interface evidence",
+            doms: "DOM snapshots",
+            texts: "Other text evidence",
+            binaries: "Other binary evidence",
+            wrapper_class: "case-evidence",
+        },
+    );
+}
+
+fn render_evidence_files(
+    html: &mut String,
+    files: &[EvidenceFile],
+    case: &CaseRecord,
+    shareable: bool,
+    budget: &mut ImageBudget,
+    headings: EvidenceHeadings,
+) {
+    let class = headings.wrapper_class;
+    let images: Vec<&EvidenceFile> = files
         .iter()
         .filter(|file| matches!(file.kind, EvidenceKind::Image(_)))
         .collect();
     if !images.is_empty() {
-        html.push_str(
-            "<div class=\"case-evidence\"><h3>Interface evidence</h3><div class=\"screenshots\">",
+        let _ = write!(
+            html,
+            "<div class=\"{class}\"><h3>{}</h3><div class=\"screenshots\">",
+            headings.images
         );
         for image in images {
             let reason = if shareable {
@@ -990,13 +1130,12 @@ fn render_case_evidence(
         html.push_str("</div></div>\n");
     }
 
-    let doms: Vec<&EvidenceFile> = case
-        .evidence
+    let doms: Vec<&EvidenceFile> = files
         .iter()
         .filter(|file| file.kind == EvidenceKind::Dom)
         .collect();
     if !doms.is_empty() {
-        html.push_str("<div class=\"case-evidence\"><h3>DOM snapshots</h3>");
+        let _ = write!(html, "<div class=\"{class}\"><h3>{}</h3>", headings.doms);
         for dom in doms {
             let _ = write!(
                 html,
@@ -1025,13 +1164,12 @@ fn render_case_evidence(
         html.push_str("</div>\n");
     }
 
-    let texts: Vec<&EvidenceFile> = case
-        .evidence
+    let texts: Vec<&EvidenceFile> = files
         .iter()
         .filter(|file| file.kind == EvidenceKind::Text)
         .collect();
     if !texts.is_empty() {
-        html.push_str("<div class=\"case-evidence\"><h3>Other text evidence</h3>");
+        let _ = write!(html, "<div class=\"{class}\"><h3>{}</h3>", headings.texts);
         for text in texts {
             let _ = write!(
                 html,
@@ -1060,14 +1198,15 @@ fn render_case_evidence(
         html.push_str("</div>\n");
     }
 
-    let binaries: Vec<&EvidenceFile> = case
-        .evidence
+    let binaries: Vec<&EvidenceFile> = files
         .iter()
         .filter(|file| file.kind == EvidenceKind::Binary)
         .collect();
     if !binaries.is_empty() {
-        html.push_str(
-            "<div class=\"case-evidence\"><h3>Other binary evidence</h3><ul class=\"binary-list\">",
+        let _ = write!(
+            html,
+            "<div class=\"{class}\"><h3>{}</h3><ul class=\"binary-list\">",
+            headings.binaries
         );
         for binary in binaries {
             let _ = write!(
@@ -1186,6 +1325,8 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 }
 
 const STYLE: &str = r#":root{color-scheme:light;--paper:#faf7f0;--panel:#fff;--soft:#f7f3ea;--ink:#302c27;--muted:#756d62;--line:#ddd4c7;--accent:#b0713c;--pass:#356346;--fail:#9a3f3f;--error:#8a542c;--blue:#3f6485}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:none;margin:0 auto;padding:0 clamp(16px,2.4vw,32px) 64px}code{font-size:.92em;background:#efe9dd;padding:.04rem .25rem;border-radius:3px}pre{overflow:auto;background:var(--soft);border:1px solid var(--line);padding:.8rem;white-space:pre-wrap;word-break:break-word;font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}h1,h2,h3,h4,h5{margin:0;line-height:1.2}.hero{padding:2.4rem 0 1.4rem;border-bottom:1px solid var(--line)}.eyebrow{text-transform:uppercase;letter-spacing:.16em;font-size:.75rem;color:var(--accent);font-weight:700;margin:0}.hero h1{font:700 clamp(2.2rem,4vw,4.2rem)/1.02 Georgia,serif;margin:.3rem 0}.lede{max-width:85ch;color:var(--muted);margin:.4rem 0 1.2rem}.metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}.metric{background:var(--panel);border:1px solid var(--line);padding:.7rem .8rem}.metric strong{display:block;font:700 1.8rem/1 Georgia,serif;color:var(--blue)}.metric span{font-size:.82rem;color:var(--muted)}.case{padding:2rem 0;border-bottom:1px solid var(--line)}.case-head{display:flex;gap:1rem;align-items:flex-start}.case-title{min-width:0}.case-title h2{font:700 1.6rem/1.2 Georgia,serif;overflow-wrap:anywhere}.status{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:.2rem .55rem;font-size:.76rem;font-weight:700;letter-spacing:.04em;background:var(--soft);white-space:nowrap}.status.passed{color:var(--pass);border-color:#8fb59b;background:#e5f0e7}.status.failed{color:var(--fail);border-color:#c58d8d;background:#f3e2e2}.status.error{color:var(--error);border-color:#d0a478;background:#f3e3d5}.status.skipped{color:var(--muted);border-color:#bbb1a2;background:#f0ece4}.step.skipped{border-style:dashed}.chips{display:flex;gap:.35rem;flex-wrap:wrap;margin:.55rem 0 0}.chips span{border:1px solid var(--line);background:var(--soft);border-radius:999px;padding:.08rem .45rem;font-size:.76rem;color:var(--muted)}.claim{font-weight:700}.steps{margin-top:1.2rem}.step{border:1px solid var(--line);background:var(--panel);margin:1rem 0;padding:1rem}.step-head{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:.55rem}.step-head h3{font-size:1.05rem;overflow-wrap:anywhere}.step-index{color:var(--muted);font:700 .9rem ui-monospace,Consolas,monospace}.duration{color:var(--muted);font-size:.82rem;margin-left:auto}.problem{border-left:4px solid var(--fail);background:#f7eaea;padding:.55rem .7rem;margin:.7rem 0;overflow-wrap:anywhere}.layers{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:.8rem;margin-top:.8rem}.card{border:1px solid var(--line);background:var(--soft);padding:.8rem;margin:.7rem 0;min-width:0}.card h4{font-size:.98rem;color:var(--blue);margin-bottom:.45rem}.card h5{margin:.55rem 0 .2rem;font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}.note{color:var(--muted);font-size:.8rem;margin:.2rem 0}.status-line{margin:.2rem 0 .4rem}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:.82rem}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:.35rem .45rem;overflow-wrap:anywhere}th{color:var(--blue);font-size:.76rem;text-transform:uppercase;letter-spacing:.03em}td code{white-space:pre-wrap;word-break:break-word}.assert{font-weight:700;font-size:.76rem}.assert.pass{color:var(--pass)}.assert.fail{color:var(--fail)}.raw,.card details{margin-top:.55rem}.raw summary,.card summary{cursor:pointer;color:var(--blue);font-size:.85rem}.case-evidence{margin-top:1.1rem}.case-evidence>h3{font:700 1.15rem/1.2 Georgia,serif;margin:.3rem 0}.screenshots{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:.8rem}.screenshots figure{margin:0;border:1px solid var(--line);background:var(--panel);padding:.55rem}.screenshots img{display:block;max-width:100%;height:auto;background:#fff}.screenshots figcaption{font-size:.8rem;color:var(--muted);margin-top:.35rem;overflow-wrap:anywhere}.omission{background:#f3e3d5;border-left:4px solid var(--accent);padding:.55rem .7rem;margin:.45rem 0;overflow-wrap:anywhere}.binary-list{font-size:.85rem;color:var(--muted)}.footer{padding:1.6rem 0;color:var(--muted);font-size:.82rem}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.case-head{display:block}.case-head .status{margin-bottom:.35rem}.duration{margin-left:0}}"#;
+
+const TRACE_STYLE: &str = ".step-evidence{margin-top:.8rem}.step-evidence h3{font-size:1rem;margin:.6rem 0 .4rem}.saved table td:first-child{font-weight:600}";
 
 #[cfg(test)]
 mod tests {

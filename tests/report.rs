@@ -883,3 +883,201 @@ finally:
     assert!(html.contains("Legacy case without finally"));
     assert!(html.contains("legacy"));
 }
+
+#[test]
+fn step_trace_artifacts_args_saved_and_shareable_local_only_budget_render_safely() {
+    let dir = TempDir::new("report-step-traces");
+    let record = dir.path().join("record");
+
+    let trace_report = json!({
+        "status": "passed",
+        "duration_ms": 15,
+        "steps": [
+            {
+                "name": "http.request",
+                "status": "passed",
+                "duration_ms": 5,
+                "args": { "url": "http://127.0.0.1/trace?q=<script>arg_xss</script>" },
+                "saved": { "tok_out": "<b>saved_val</b>" },
+                "result": { "status": 200 },
+                "assertions": [],
+                "error": null
+            },
+            {
+                "name": "cli.run",
+                "status": "passed",
+                "duration_ms": 3,
+                "args": { "command": "echo", "args": ["ok"] },
+                "saved": {},
+                "result": { "exit_code": 0, "stdout": "ok", "stderr": "" },
+                "assertions": [],
+                "error": null
+            }
+        ],
+        "finally": [
+            {
+                "name": "browser.click",
+                "status": "passed",
+                "duration_ms": 7,
+                "args": { "css": "#cleanup" },
+                "saved": {},
+                "result": {},
+                "assertions": [],
+                "error": null
+            }
+        ],
+        "error": null,
+        "close_errors": []
+    });
+
+    let case0 = write_case(
+        &record,
+        "0-traced",
+        &malicious_meta("Traced case"),
+        &trace_report,
+        PNG,
+    );
+    // Remove case-level screenshots on case0 so per-step trace image rendering is unambiguous.
+    let _ = fs::remove_dir_all(case0.join("browser"));
+    fs::create_dir_all(case0.join("trace/steps/0/browser")).unwrap();
+    fs::create_dir_all(case0.join("trace/finally/0/browser")).unwrap();
+    fs::write(case0.join("trace/steps/0/browser/screenshot.png"), PNG).unwrap();
+    fs::write(
+        case0.join("trace/steps/0/browser/dom.html"),
+        "<!doctype html><html><body><p>step0-dom-text</p><script>evilDom()</script></body></html>",
+    )
+    .unwrap();
+    fs::write(
+        case0.join("trace/finally/0/browser/events.log"),
+        "finally-trace-line </script> ok\n",
+    )
+    .unwrap();
+    fs::write(case0.join("trace/finally/0/browser/screenshot.png"), PNG).unwrap();
+
+    // Case 1 is marked local_only: step-trace images must NOT embed even in normal mode.
+    let mut local_meta = malicious_meta("Local only traced");
+    local_meta["local_only"] = json!(true);
+    local_meta["local_only_reason"] = json!("named profile contains <script>alert(1)</script>");
+    let mut local_report = trace_report.clone();
+    local_report["finally"] = json!([]);
+    let case1 = write_case(&record, "1-local", &local_meta, &local_report, PNG);
+    let _ = fs::remove_dir_all(case1.join("browser"));
+    fs::create_dir_all(case1.join("trace/steps/0/browser")).unwrap();
+    fs::write(case1.join("trace/steps/0/browser/screenshot.png"), PNG).unwrap();
+
+    let normal = dir.path().join("normal.html");
+    let out = run_da(&["report", path_str(&record), "-o", path_str(&normal)]);
+    assert_eq!(exit_code(&out), Some(0), "stderr: {}", stderr(&out));
+    let html = read(&normal);
+    assert!(
+        html.contains("&lt;script&gt;arg_xss&lt;/script&gt;"),
+        "missing escaped step args"
+    );
+    assert!(
+        html.contains("tok_out") && html.contains("&lt;b&gt;saved_val&lt;/b&gt;"),
+        "missing escaped saved var"
+    );
+    assert!(html.contains("step0-dom-text"), "missing step0 traced DOM");
+    assert!(
+        !html.contains("<script>evilDom()</script>"),
+        "unescaped DOM script"
+    );
+    assert!(
+        html.contains("finally-trace-line &lt;/script&gt; ok"),
+        "missing escaped finally trace log"
+    );
+    assert!(
+        html.contains("data:image/png;base64,"),
+        "normal report should embed non-local trace PNG"
+    );
+    // Step 0 + finally 0 of case0 = 2 images; case1 must NOT contribute a 3rd because it's local_only.
+    assert_eq!(
+        html.matches("data:image/").count(),
+        2,
+        "expected exactly 2 embedded PNGs (local_only must omit)"
+    );
+    assert!(html.contains("named profile contains &lt;script&gt;alert(1)&lt;/script&gt;"));
+
+    let shareable = dir.path().join("shareable.html");
+    let sout = run_da(&[
+        "report",
+        path_str(&record),
+        "-o",
+        path_str(&shareable),
+        "--shareable",
+    ]);
+    assert_eq!(exit_code(&sout), Some(0), "stderr: {}", stderr(&sout));
+    let shtml = read(&shareable);
+    assert!(
+        !shtml.contains("data:image/"),
+        "--shareable must omit all step-trace PNGs"
+    );
+    assert!(shtml.contains("step0-dom-text"));
+    assert!(shtml.contains("finally-trace-line"));
+
+    // Byte-budget enforcement across step-trace images (2 MiB single, 10 MiB total).
+    let budget_dir = TempDir::new("report-step-budget");
+    let budget_record = budget_dir.path().join("record");
+    let mut med_png = PNG.to_vec();
+    med_png.resize(1_800_000, 0);
+    let mut big_png = PNG.to_vec();
+    big_png.resize(2_200_000, 0);
+
+    let mut big_steps = Vec::new();
+    let case_b = write_case(
+        &budget_record,
+        "0-many",
+        &malicious_meta("Large trace PNGs"),
+        &trace_report,
+        PNG,
+    );
+    let _ = fs::remove_dir_all(case_b.join("browser"));
+    // 7 x 1.8 MiB steps (5 fit under 10 MiB = 9.0 MiB; 6th & 7th exceed 10 MiB) + 1 x 2.2 MiB step (> 2 MiB single limit).
+    for i in 0..8usize {
+        big_steps.push(json!({
+            "name": "browser.click",
+            "status": "passed",
+            "duration_ms": 1,
+            "args": { "index": i },
+            "saved": {},
+            "result": {},
+            "assertions": [],
+            "error": null
+        }));
+        let step_dir = case_b.join(format!("trace/steps/{i}/browser"));
+        fs::create_dir_all(&step_dir).unwrap();
+        let bytes = if i == 7 { &big_png } else { &med_png };
+        fs::write(step_dir.join("screenshot.png"), bytes).unwrap();
+    }
+    let mut big_report = trace_report;
+    big_report["steps"] = Value::Array(big_steps);
+    big_report["finally"] = json!([]);
+    fs::write(
+        case_b.join("report.json"),
+        serde_json::to_vec_pretty(&big_report).unwrap(),
+    )
+    .unwrap();
+
+    let budget_html = budget_dir.path().join("budget.html");
+    let bout = run_da(&[
+        "report",
+        path_str(&budget_record),
+        "-o",
+        path_str(&budget_html),
+    ]);
+    assert_eq!(exit_code(&bout), Some(0), "stderr: {}", stderr(&bout));
+    let bhtml = read(&budget_html);
+    assert_eq!(
+        bhtml.matches("data:image/").count(),
+        5,
+        "total image budget must cap at 10 MiB"
+    );
+    assert!(
+        bhtml.contains("10 MiB total image budget"),
+        "expected total budget omission note"
+    );
+    assert!(
+        bhtml.contains("2 MiB single-image limit"),
+        "expected single-image limit note"
+    );
+}

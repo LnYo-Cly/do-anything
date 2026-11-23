@@ -8,14 +8,15 @@
 pub mod export;
 pub mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 use serde_saphyr::Location;
 
-use crate::core::case::{self, SavedValue, Step};
+use crate::core::case::{self, Observation, SavedValue, Step};
+use crate::core::observer::ObserverError;
 use crate::core::output;
 use crate::core::paths;
 use crate::core::registry::Registry;
@@ -26,7 +27,9 @@ use crate::core::session::Sessions;
 use crate::exit::ExitCode;
 
 use self::export::ExportOptions;
-use self::store::{LockError, SessionLock, SessionState, StepRecord, StoredExpectation};
+use self::store::{
+    LockError, SessionLock, SessionState, StepRecord, StoredExpectation, StoredObservation,
+};
 
 /// Default directory relative to the working directory for session storage.
 pub const DEFAULT_SESSIONS_DIR: &str = ".da/sessions";
@@ -54,6 +57,7 @@ pub enum SessionRequest {
     Start {
         sessions_dir: PathBuf,
         idle_timeout_ms: u64,
+        observe: Vec<StoredObservation>,
     },
     Step {
         sessions_dir: PathBuf,
@@ -99,7 +103,8 @@ pub fn handle(request: SessionRequest, registry: &Registry) -> SessionResponse {
         SessionRequest::Start {
             sessions_dir,
             idle_timeout_ms,
-        } => handle_start(&sessions_dir, idle_timeout_ms, registry),
+            observe,
+        } => handle_start(&sessions_dir, idle_timeout_ms, observe, registry),
         SessionRequest::Step {
             sessions_dir,
             id,
@@ -148,7 +153,17 @@ fn error_response(code: ExitCode, kind: &str, message: impl Into<String>) -> Ses
     }
 }
 
-fn handle_start(sessions_dir: &Path, idle_timeout_ms: u64, registry: &Registry) -> SessionResponse {
+fn handle_start(
+    sessions_dir: &Path,
+    idle_timeout_ms: u64,
+    observe: Vec<StoredObservation>,
+    registry: &Registry,
+) -> SessionResponse {
+    let (observer_names, env_names) = match validate_start_observations(&observe, registry) {
+        Ok(validated) => validated,
+        Err(response) => return response,
+    };
+
     let list_report = match store::list_and_reap(sessions_dir, None, registry) {
         Ok(result) => result,
         Err(message) => return error_response(ExitCode::Environment, "environment", message),
@@ -176,7 +191,8 @@ fn handle_start(sessions_dir: &Path, idle_timeout_ms: u64, registry: &Registry) 
         idle_timeout_ms,
         handles: BTreeMap::new(),
         vars: BTreeMap::new(),
-        env_names: Default::default(),
+        env_names,
+        observe,
     };
     let secrets = Secrets::new();
     if let Err(message) = store::save_state(&session_dir, &state, &secrets) {
@@ -191,6 +207,7 @@ fn handle_start(sessions_dir: &Path, idle_timeout_ms: u64, registry: &Registry) 
             "session_id": id,
             "dir": paths::display(&session_dir),
             "idle_timeout_ms": idle_timeout_ms,
+            "observers": observer_names,
             "reaped": list_report.reaped,
             "reap_errors": list_report.errors,
         }),
@@ -297,8 +314,21 @@ fn handle_step(
         }
     };
 
-    let report = runner::run_single_step(
+    let started_at_ms = store::now_ms();
+    let observations: Vec<Observation> = state
+        .observe
+        .iter()
+        .map(|obs| Observation {
+            name: obs.name.clone(),
+            kind: obs.kind.clone(),
+            args: obs.raw_args.clone(),
+            location: Location::UNKNOWN,
+            args_location: Location::UNKNOWN,
+        })
+        .collect();
+    let report = runner::run_single_step_with_observations(
         &step,
+        &observations,
         registry,
         &mut state.vars,
         &mut secrets,
@@ -306,7 +336,7 @@ fn handle_step(
     );
     let step_meta = sessions.take_step_metadata();
 
-    let (synthesized_locator, fragile, used_ref) = extract_synthesis(&step, &step_meta);
+    let synthesis = extract_synthesis(&step, &step_meta);
 
     let mut snapshot_error: Option<String> = None;
     let snapshot = if !matches!(
@@ -335,9 +365,9 @@ fn handle_step(
         existing_steps.len() + 1,
         &step,
         &report,
-        used_ref,
-        synthesized_locator,
-        fragile,
+        registry,
+        started_at_ms,
+        synthesis,
     );
     if let Err(err) = store::append_step(&session_dir, &record, &secrets) {
         return error_response(ExitCode::Environment, "environment", secrets.redact(&err));
@@ -470,7 +500,7 @@ fn handle_export(
         Ok(records) => records,
         Err(message) => return error_response(ExitCode::Environment, "environment", message),
     };
-    let result = match export::export_session(&state.id, &records, options) {
+    let result = match export::export_session(&state.id, &state.observe, &records, options) {
         Ok(result) => result,
         Err(message) => return error_response(ExitCode::InvalidCase, "invalid_input", message),
     };
@@ -717,10 +747,13 @@ fn insert_nested(root: &mut Map<String, Value>, path: &[&str], value: Value) -> 
     insert_nested(child, tail, value)
 }
 
-fn extract_synthesis(
-    step: &Step,
-    metadata: &BTreeMap<String, Value>,
-) -> (Option<Value>, bool, Option<String>) {
+struct StepSynthesis {
+    used_ref: Option<String>,
+    synthesized_locator: Option<Value>,
+    fragile: bool,
+}
+
+fn extract_synthesis(step: &Step, metadata: &BTreeMap<String, Value>) -> StepSynthesis {
     let used_ref = step
         .args
         .get("ref")
@@ -737,19 +770,27 @@ fn extract_synthesis(
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .or(used_ref);
-            return (Some(locator), fragile, meta_ref);
+            return StepSynthesis {
+                used_ref: meta_ref,
+                synthesized_locator: Some(locator),
+                fragile,
+            };
         }
     }
-    (None, false, used_ref)
+    StepSynthesis {
+        used_ref,
+        synthesized_locator: None,
+        fragile: false,
+    }
 }
 
 fn build_step_record(
     index: usize,
     step: &Step,
     report: &StepReport,
-    used_ref: Option<String>,
-    synthesized_locator: Option<Value>,
-    fragile: bool,
+    registry: &Registry,
+    started_at_ms: u64,
+    synthesis: StepSynthesis,
 ) -> StepRecord {
     let expect = step
         .expect
@@ -778,20 +819,244 @@ fn build_step_record(
         .and(report.result.as_ref())
         .and_then(|result| result.get("viewport"))
         .cloned();
+    let raw_args = registry.redact_template_args(&step.action, &step.args);
+    let redacted_args = raw_args != step.args;
     StepRecord {
         index,
         action: step.action.clone(),
-        raw_args: step.args.clone(),
+        raw_args,
+        redacted_args,
         expect,
         save,
         optional: step.optional,
         status: report.status.as_str().to_string(),
         error: report.error.as_ref().map(|problem| problem.message.clone()),
-        used_ref,
-        synthesized_locator,
-        fragile,
+        used_ref: synthesis.used_ref,
+        synthesized_locator: synthesis.synthesized_locator,
+        fragile: synthesis.fragile,
         observed_viewport,
+        started_at_ms,
+        duration_ms: u64::try_from(report.duration.as_millis()).unwrap_or(u64::MAX),
+        result: report.result.clone(),
     }
+}
+
+/// Parses repeatable CLI `--observe` flags (`NAME=KIND`, `NAME=KIND:key=val`,
+/// `NAME=KIND:{...}`, or YAML/JSON `NAME: { KIND: {...} }`).
+///
+/// Syntax errors return `Err` for CLI `Usage` reporting; semantic checks
+/// (unknown observer, invalid arguments, unset secrets) happen in
+/// `handle_start` so they report `ExitCode::InvalidCase`.
+pub fn parse_observe_specs(
+    specs: &[String],
+    registry: &Registry,
+) -> Result<Vec<StoredObservation>, String> {
+    let mut out = Vec::with_capacity(specs.len());
+    for raw in specs {
+        parse_one_observe_spec(raw, registry, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn parse_one_observe_spec(
+    raw: &str,
+    registry: &Registry,
+    out: &mut Vec<StoredObservation>,
+) -> Result<(), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("`--observe` specification must not be empty".to_string());
+    }
+
+    let colon_before_eq = trimmed
+        .find(':')
+        .is_some_and(|colon| trimmed.find('=').is_none_or(|eq| colon < eq));
+    if trimmed.starts_with('{') || colon_before_eq {
+        return parse_observe_mapping(trimmed, out);
+    }
+
+    let Some((raw_name, rest)) = trimmed.split_once('=') else {
+        return Err(format!(
+            "invalid `--observe` specification `{raw}`; expected `NAME=KIND` or `NAME=KIND:ARGS`"
+        ));
+    };
+    let name = raw_name.trim();
+    let rest = rest.trim();
+    if name.is_empty() || rest.is_empty() {
+        return Err(format!(
+            "invalid `--observe` specification `{raw}`; expected `NAME=KIND` or `NAME=KIND:ARGS`"
+        ));
+    }
+
+    let (kind, raw_args) = match rest.split_once(':') {
+        None => (rest.to_string(), Value::Object(Map::new())),
+        Some((raw_kind, raw_arg_spec)) => {
+            let kind = raw_kind.trim();
+            let arg_spec = raw_arg_spec.trim();
+            if kind.is_empty() || arg_spec.is_empty() {
+                return Err(format!(
+                    "invalid `--observe` specification `{raw}`; expected `NAME=KIND:ARGS`"
+                ));
+            }
+            let parsed_args = if arg_spec.starts_with('{') {
+                let parsed = case::parse_json_value(arg_spec)
+                    .map_err(|error| format!("invalid `--observe` JSON/YAML arguments: {error}"))?;
+                if !parsed.is_object() {
+                    return Err("`--observe` arguments must be an object".to_string());
+                }
+                parsed
+            } else if arg_spec.contains('=') {
+                parse_observe_kv_args(arg_spec, kind, registry)?
+            } else {
+                return Err(format!(
+                    "invalid `--observe` argument `{arg_spec}`; expected `key=value` or `{{...}}`"
+                ));
+            };
+            (kind.to_string(), parsed_args)
+        }
+    };
+
+    out.push(StoredObservation {
+        name: name.to_string(),
+        kind,
+        raw_args,
+    });
+    Ok(())
+}
+
+fn parse_observe_mapping(raw: &str, out: &mut Vec<StoredObservation>) -> Result<(), String> {
+    let parsed = case::parse_json_value(raw)
+        .map_err(|error| format!("invalid `--observe` mapping: {error}"))?;
+    let Value::Object(entries) = parsed else {
+        return Err("`--observe` mapping must be `{ NAME: { KIND: ARGS } }`".to_string());
+    };
+    if entries.is_empty() {
+        return Err("`--observe` mapping must declare at least one observer".to_string());
+    }
+    for (name, spec) in entries {
+        let Value::Object(kinds) = spec else {
+            return Err(format!(
+                "observation `{name}` must map to `{{ KIND: ARGS }}`"
+            ));
+        };
+        if kinds.len() != 1 {
+            return Err(format!(
+                "observation `{name}` must declare exactly one observer kind"
+            ));
+        }
+        let (kind, args) = kinds.into_iter().next().expect("checked len == 1");
+        let args = match args {
+            Value::Object(_) => args,
+            Value::Null => Value::Object(Map::new()),
+            _ => {
+                return Err(format!(
+                    "observation `{name}` (`{kind}`) arguments must be an object"
+                ));
+            }
+        };
+        out.push(StoredObservation {
+            name,
+            kind,
+            raw_args: args,
+        });
+    }
+    Ok(())
+}
+
+fn parse_observe_kv_args(arg_spec: &str, kind: &str, registry: &Registry) -> Result<Value, String> {
+    let pairs: Vec<&str> = if arg_spec.contains(',') && arg_spec.split(',').all(|p| p.contains('='))
+    {
+        arg_spec.split(',').collect()
+    } else {
+        vec![arg_spec]
+    };
+
+    let properties = registry
+        .observer(kind)
+        .and_then(|def| def.args_schema.get("properties"))
+        .and_then(Value::as_object);
+
+    let mut map = Map::new();
+    for pair in pairs {
+        let Some((raw_key, raw_value)) = pair.split_once('=') else {
+            return Err(format!(
+                "invalid `--observe` argument `{pair}`; expected `key=value`"
+            ));
+        };
+        let key = raw_key.trim();
+        let segments: Vec<&str> = key.split('.').collect();
+        if key.is_empty() || segments.iter().any(|s| s.is_empty()) {
+            return Err(format!("invalid `--observe` argument path `{key}`"));
+        }
+        let coerced = if segments.len() == 1 {
+            coerce_arg_value(properties.and_then(|p| p.get(segments[0])), raw_value)?
+        } else {
+            coerce_arg_value(None, raw_value)?
+        };
+        insert_nested(&mut map, &segments, coerced)?;
+    }
+    Ok(Value::Object(map))
+}
+
+fn validate_start_observations(
+    observations: &[StoredObservation],
+    registry: &Registry,
+) -> Result<(Vec<String>, BTreeSet<String>), SessionResponse> {
+    let mut seen = BTreeSet::new();
+    let mut env_names = BTreeSet::new();
+    for obs in observations {
+        case::validate_observation_name(&obs.name)
+            .map_err(|msg| error_response(ExitCode::InvalidCase, "invalid_input", msg))?;
+        if !seen.insert(obs.name.as_str()) {
+            return Err(error_response(
+                ExitCode::InvalidCase,
+                "invalid_input",
+                format!("duplicate observation name `{}`", obs.name),
+            ));
+        }
+        env_names.extend(case::env_references(&obs.raw_args));
+    }
+
+    let mut secrets = store::secrets_from_env_names(&env_names);
+    let empty_vars = BTreeMap::new();
+    let mut names = Vec::with_capacity(observations.len());
+    for obs in observations {
+        let args = case::interpolate(&obs.raw_args, &empty_vars, &mut secrets).map_err(|err| {
+            error_response(
+                ExitCode::InvalidCase,
+                "invalid_input",
+                secrets.redact(&format!("observation `{}`: {}", obs.name, err.message)),
+            )
+        })?;
+        let Some(def) = registry.observer(&obs.kind) else {
+            return Err(error_response(
+                ExitCode::InvalidCase,
+                "invalid_input",
+                format!(
+                    "observation `{}`: `{}` is not a registered observer",
+                    obs.name, obs.kind
+                ),
+            ));
+        };
+        (def.create)(&args).map_err(|error| {
+            let (exit_code, kind) = match &error {
+                ObserverError::InvalidArguments(_) => (ExitCode::InvalidCase, "invalid_input"),
+                ObserverError::Environment(_) => (ExitCode::Environment, "environment"),
+            };
+            error_response(
+                exit_code,
+                kind,
+                secrets.redact(&format!(
+                    "observation `{}` (`{}`): {}",
+                    obs.name,
+                    def.name,
+                    error.message()
+                )),
+            )
+        })?;
+        names.push(obs.name.clone());
+    }
+    Ok((names, env_names))
 }
 
 fn exit_code_for_step(report: &StepReport) -> ExitCode {
@@ -811,4 +1076,147 @@ fn exit_code_for_step(report: &StepReport) -> ExitCode {
 #[allow(dead_code, reason = "kept for future transport adapters")]
 fn _unused_location() -> Location {
     Location::UNKNOWN
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::observer::{ObserverDefinition, ObserverError};
+    use crate::core::session::Sessions;
+
+    fn test_registry() -> Registry {
+        struct NullObserver;
+        impl crate::core::observer::Observer for NullObserver {
+            fn start(&mut self, _sessions: &mut Sessions) -> Result<(), ObserverError> {
+                Ok(())
+            }
+
+            fn collect(&mut self, _sessions: &mut Sessions) -> Result<Value, ObserverError> {
+                Ok(json!({}))
+            }
+        }
+
+        let mut registry = Registry::new();
+        registry
+            .register_observer(ObserverDefinition {
+                name: "test.obs",
+                description: "stub observer",
+                args_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "max_entries": { "type": "integer" }
+                    }
+                }),
+                validate: |_| Ok(()),
+                create: |args| {
+                    if let Some(p) = args.get("path").and_then(Value::as_str)
+                        && p.is_empty()
+                    {
+                        return Err(ObserverError::InvalidArguments("empty path".to_string()));
+                    }
+                    Ok(Box::new(NullObserver))
+                },
+            })
+            .expect("register test.obs");
+        registry
+    }
+
+    #[test]
+    fn parse_observe_specs_supports_shorthand_kv_windows_paths_json_and_yaml_mapping() {
+        let registry = test_registry();
+        let specs = vec![
+            "net=test.obs".to_string(),
+            r"app=test.obs:path=C:\logs\app.log,max_entries=10".to_string(),
+            r#"json_obs=test.obs:{"path":"/tmp/x.log"}"#.to_string(),
+            r#"{"yml_obs":{"test.obs":{"path":"/var/log/a.log"}}}"#.to_string(),
+        ];
+
+        let parsed = parse_observe_specs(&specs, &registry).expect("valid observe specs");
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].name, "net");
+        assert_eq!(parsed[0].kind, "test.obs");
+        assert_eq!(parsed[0].raw_args, json!({}));
+
+        assert_eq!(parsed[1].name, "app");
+        assert_eq!(
+            parsed[1].raw_args,
+            json!({ "path": r"C:\logs\app.log", "max_entries": 10 })
+        );
+
+        assert_eq!(parsed[2].name, "json_obs");
+        assert_eq!(parsed[2].raw_args, json!({ "path": "/tmp/x.log" }));
+
+        assert_eq!(parsed[3].name, "yml_obs");
+        assert_eq!(parsed[3].raw_args, json!({ "path": "/var/log/a.log" }));
+    }
+
+    #[test]
+    fn parse_observe_specs_rejects_malformed_inputs() {
+        let registry = test_registry();
+        for bad in [
+            "bad-spec",
+            "=test.obs",
+            "a=",
+            "a=test.obs:",
+            "a=test.obs:no_eq",
+        ] {
+            assert!(
+                parse_observe_specs(&[bad.to_string()], &registry).is_err(),
+                "expected syntax error for `{bad}`"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_start_rejects_bad_observers_without_leaving_session_dir() {
+        let registry = test_registry();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("da-sess-bad-obs-{nanos}"));
+
+        // Invalid args
+        let resp = handle(
+            SessionRequest::Start {
+                sessions_dir: dir.clone(),
+                idle_timeout_ms: 60_000,
+                observe: vec![StoredObservation {
+                    name: "app".to_string(),
+                    kind: "test.obs".to_string(),
+                    raw_args: json!({ "path": "" }),
+                }],
+            },
+            &registry,
+        );
+        assert_eq!(resp.exit_code, ExitCode::InvalidCase);
+        assert!(!dir.exists(), "failed start must not create sessions dir");
+
+        // Duplicate name
+        let dup = handle(
+            SessionRequest::Start {
+                sessions_dir: dir.clone(),
+                idle_timeout_ms: 60_000,
+                observe: vec![
+                    StoredObservation {
+                        name: "app".to_string(),
+                        kind: "test.obs".to_string(),
+                        raw_args: json!({}),
+                    },
+                    StoredObservation {
+                        name: "app".to_string(),
+                        kind: "test.obs".to_string(),
+                        raw_args: json!({}),
+                    },
+                ],
+            },
+            &registry,
+        );
+        assert_eq!(dup.exit_code, ExitCode::InvalidCase);
+        assert!(
+            !dir.exists(),
+            "duplicate start must not create sessions dir"
+        );
+    }
 }

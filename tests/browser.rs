@@ -8246,3 +8246,132 @@ steps:
     );
     assert_no_state_secrets("the precedence output", &stdout(&output));
 }
+
+#[test]
+fn record_with_trace_steps_captures_masked_per_step_artifacts_and_renders_report() {
+    const SECRET: &str = "trace-browser-Secr3t/77";
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-trace-steps");
+    let case_path = dir.write(
+        "trace-browser.yaml",
+        &format!(
+            r##"name: Browser step traces
+steps:
+  - browser.open:
+      url: "{base}/browser/form"
+    expect:
+      - path: $.url
+        exists: true
+  - browser.type:
+      css: "#name"
+      text: "${{env:DA_BR_TRACE_SEC}}"
+  - browser.read:
+      css: "#greeting"
+    expect:
+      - path: $.text
+        equals: never
+  - browser.read:
+      css: "#greeting"
+finally:
+  - browser.open:
+      url: "{base}/browser/record?secret=${{env:DA_BR_TRACE_SEC}}"
+"##,
+            base = server.url("")
+        ),
+    );
+
+    // Without --trace-steps, no trace/ directory is written.
+    let no_trace_rec = dir.path().join("rec-plain");
+    let plain_out = run_da_with_env(
+        dir.path(),
+        &[
+            "run",
+            path_str(&case_path),
+            "--record",
+            path_str(&no_trace_rec),
+            "--no-bundle",
+        ],
+        &[("DA_BR_TRACE_SEC", SECRET.to_string())],
+    );
+    assert_eq!(
+        exit_code(&plain_out),
+        Some(1),
+        "stderr: {}",
+        stderr(&plain_out)
+    );
+    let plain_case_dir = fs::read_dir(&no_trace_rec)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("recorded plain case dir");
+    assert!(!plain_case_dir.join("trace").exists());
+
+    // With --trace-steps, executed steps and finally steps capture redacted masked artifacts.
+    let trace_rec = dir.path().join("rec-traced");
+    let traced_out = run_da_with_env(
+        dir.path(),
+        &[
+            "run",
+            path_str(&case_path),
+            "--record",
+            path_str(&trace_rec),
+            "--trace-steps",
+            "--no-bundle",
+        ],
+        &[("DA_BR_TRACE_SEC", SECRET.to_string())],
+    );
+    assert_eq!(
+        exit_code(&traced_out),
+        Some(1),
+        "stderr: {}",
+        stderr(&traced_out)
+    );
+    let traced_case_dir = fs::read_dir(&trace_rec)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("recorded traced case dir");
+
+    for step_idx in [0usize, 1, 2] {
+        let png_path =
+            traced_case_dir.join(format!("trace/steps/{step_idx}/browser/screenshot.png"));
+        let dom_path = traced_case_dir.join(format!("trace/steps/{step_idx}/browser/dom.html"));
+        assert!(png_path.is_file(), "missing {}", png_path.display());
+        assert!(is_png(&fs::read(&png_path).unwrap()));
+        let dom = fs::read_to_string(&dom_path).unwrap();
+        assert!(
+            !dom.contains(SECRET),
+            "raw secret leaked in {}",
+            dom_path.display()
+        );
+    }
+    assert!(
+        !traced_case_dir.join("trace/steps/3").exists(),
+        "post-failure unexecuted step must not be traced"
+    );
+    assert!(
+        traced_case_dir
+            .join("trace/finally/0/browser/screenshot.png")
+            .is_file()
+    );
+    assert!(
+        traced_case_dir
+            .join("trace/finally/0/browser/dom.html")
+            .is_file()
+    );
+
+    let html_out = dir.path().join("report.html");
+    let rep = run_da_in(
+        dir.path(),
+        &["report", path_str(&trace_rec), "-o", path_str(&html_out)],
+    );
+    assert_eq!(exit_code(&rep), Some(0), "stderr: {}", stderr(&rep));
+    let html = fs::read_to_string(&html_out).unwrap();
+    assert!(!html.contains(SECRET), "secret leaked into report.html");
+    assert!(html.contains("data:image/png;base64,"));
+}

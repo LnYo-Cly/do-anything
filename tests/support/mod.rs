@@ -611,6 +611,7 @@ fn write_log(body: &str) -> Result<(), String> {
     let text = request["text"]
         .as_str()
         .ok_or("`text` must be a string holding the content")?;
+    let secret_forms = request["secret_forms"].as_str();
     let append = request["append"].as_bool().unwrap_or(false);
 
     let mut options = fs::OpenOptions::new();
@@ -625,6 +626,15 @@ fn write_log(body: &str) -> Result<(), String> {
         .map_err(|error| format!("could not open {path}: {error}"))?;
     file.write_all(text.as_bytes())
         .map_err(|error| format!("could not write {path}: {error}"))?;
+    if let Some(secret) = secret_forms {
+        let extra = format!(
+            "raw={secret} pct={} b64={}\n",
+            percent_encode(secret.as_bytes()),
+            base64_encode(secret.as_bytes()),
+        );
+        file.write_all(extra.as_bytes())
+            .map_err(|error| format!("could not write encoded secret forms to {path}: {error}"))?;
+    }
     file.flush()
         .map_err(|error| format!("could not flush {path}: {error}"))
 }
@@ -802,6 +812,7 @@ fn browser_network(query: &str) -> String {
     let label = escape_html(&query_value(query, "case"));
     let closed = query_value(query, "closed");
     let closed = closed.parse::<u16>().unwrap_or(9);
+    let delay = query_value(query, "delay").parse::<u64>().unwrap_or(300);
     format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>Network page</title><link rel="icon" href="data:,"></head>
@@ -826,7 +837,7 @@ document.getElementById('net-all').addEventListener('click', function () {{
         document.getElementById('network-target').appendChild(p);
       }}, 100);
     }});
-  }}, 300);
+  }}, {delay});
 }});
 </script>
 </body></html>"#

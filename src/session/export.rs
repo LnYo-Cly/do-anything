@@ -3,7 +3,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::core::case;
-use crate::session::store::StepRecord;
+use crate::session::store::{StepRecord, StoredObservation};
 
 /// Options controlling how a session is exported to YAML.
 #[derive(Debug, Clone, Default)]
@@ -27,6 +27,7 @@ pub struct ExportResult {
 /// Builds a deterministic, `da lint`-valid YAML case file from recorded session steps.
 pub fn export_session(
     session_id: &str,
+    observe: &[StoredObservation],
     records: &[StepRecord],
     options: &ExportOptions,
 ) -> Result<ExportResult, String> {
@@ -65,6 +66,13 @@ pub fn export_session(
             continue;
         }
 
+        if record.redacted_args {
+            return Err(format!(
+                "step {} (`{}`) passed an inline secret value that was redacted to `***` in the session log; re-run it with a `${{env:NAME}}` or saved `${{var}}` placeholder so the exported case can replay without embedding secrets",
+                record.index, record.action
+            ));
+        }
+
         let args = materialize_args(record)?;
         let exported_index = exported.len() + 1;
         let viewport = coordinates_viewport(&args);
@@ -98,6 +106,21 @@ pub fn export_session(
 
     let mut yaml = String::new();
     yaml.push_str(&format!("name: {}\n", format_scalar_string(&case_name)));
+    if !observe.is_empty() {
+        yaml.push_str("observe:\n");
+        for item in observe {
+            yaml.push_str(&format!("  {}:\n", format_key(&item.name)));
+            yaml.push_str(&format!("    {}:", format_key(&item.kind)));
+            match &item.raw_args {
+                Value::Null => yaml.push_str(" {}\n"),
+                Value::Object(map) if map.is_empty() => yaml.push_str(" {}\n"),
+                other => {
+                    yaml.push('\n');
+                    write_yaml_value(&mut yaml, other, 6);
+                }
+            }
+        }
+    }
     yaml.push_str("steps:\n");
 
     for (record, args) in &exported {
@@ -450,4 +473,142 @@ fn is_yaml_reserved_or_number(text: &str) -> bool {
         return true;
     }
     text.parse::<i64>().is_ok() || text.parse::<f64>().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn sample_record(
+        index: usize,
+        action: &str,
+        raw_args: Value,
+        redacted_args: bool,
+    ) -> StepRecord {
+        StepRecord {
+            index,
+            action: action.to_string(),
+            raw_args,
+            redacted_args,
+            expect: Vec::new(),
+            save: BTreeMap::new(),
+            optional: false,
+            status: "passed".to_string(),
+            error: None,
+            used_ref: None,
+            synthesized_locator: None,
+            fragile: false,
+            observed_viewport: None,
+            started_at_ms: 1,
+            duration_ms: 1,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn export_preserves_saved_variable_placeholders_in_set_cookies() {
+        let mut cli_step = sample_record(
+            1,
+            "cli.run",
+            json!({ "command": "echo", "args": ["tok"] }),
+            false,
+        );
+        cli_step
+            .save
+            .insert("tok".to_string(), "$.stdout".to_string());
+        let cookie_step = sample_record(
+            2,
+            "browser.set_cookies",
+            json!({
+                "cookies": [{
+                    "name": "sid",
+                    "value": "${tok}",
+                    "url": "http://127.0.0.1/"
+                }]
+            }),
+            false,
+        );
+        let exported = export_session(
+            "s1",
+            &[],
+            &[cli_step, cookie_step],
+            &ExportOptions::default(),
+        )
+        .expect("export saved-var cookie");
+        assert!(
+            exported.yaml.contains("\"${tok}\"") || exported.yaml.contains("${tok}"),
+            "expected ${{tok}} placeholder in exported YAML, got:\n{}",
+            exported.yaml
+        );
+        assert!(
+            !exported.yaml.contains("***"),
+            "unexpected redacted placeholder in exported YAML:\n{}",
+            exported.yaml
+        );
+    }
+
+    #[test]
+    fn export_refuses_inline_redacted_secret_arguments() {
+        let cookie_step = sample_record(
+            1,
+            "browser.set_cookies",
+            json!({
+                "cookies": [{
+                    "name": "sid",
+                    "value": "***",
+                    "url": "http://127.0.0.1/"
+                }]
+            }),
+            true,
+        );
+        let err = export_session("s2", &[], &[cookie_step], &ExportOptions::default())
+            .expect_err("inline redacted secret must fail export");
+        assert!(err.contains("browser.set_cookies"), "{err}");
+        assert!(
+            err.contains("${env:NAME}") && err.contains("${var}"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn export_preserves_session_observers_and_env_placeholders() {
+        let mut step = sample_record(
+            1,
+            "cli.run",
+            json!({ "command": "echo", "args": ["ok"] }),
+            false,
+        );
+        step.expect.push(crate::session::store::StoredExpectation {
+            path: "$.observed.app_log.lines".to_string(),
+            comparison: "equals".to_string(),
+            expected: json!([]),
+        });
+        step.save.insert(
+            "captured".to_string(),
+            "$.observed.app_log.text".to_string(),
+        );
+        let observe = vec![
+            StoredObservation {
+                name: "app_log".to_string(),
+                kind: "log.file".to_string(),
+                raw_args: json!({ "path": "${env:APP_LOG_PATH}" }),
+            },
+            StoredObservation {
+                name: "net".to_string(),
+                kind: "browser.network".to_string(),
+                raw_args: json!({}),
+            },
+        ];
+        let exported = export_session("s3", &observe, &[step], &ExportOptions::default())
+            .expect("export with observers");
+        assert!(
+            exported.yaml.contains("observe:\n  app_log:\n    log.file:\n      path: \"${env:APP_LOG_PATH}\"\n  net:\n    browser.network: {}\n"),
+            "unexpected exported YAML:\n{}",
+            exported.yaml
+        );
+    }
 }

@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use serde_saphyr::Location;
 
 use crate::core::assert::{self, AssertionReport};
-use crate::core::bundle::FailureBundles;
+use crate::core::bundle::{FailureBundles, StepPhase, StepTrace};
 use crate::core::case::{
     self, CaseError, CaseWarning, Expectation, LoadedCase, Observation, SavedValue, Step,
 };
@@ -57,6 +57,17 @@ pub fn run(
     run_with_record(cases, registry, bus, bundles, None, filters, secrets, jobs)
 }
 
+/// Bundle writers and step-trace options for one run.
+#[derive(Default)]
+pub struct RecordWriters<'a> {
+    /// Failure-only bundle writer (`--bundle-dir` / default `.da/failures`).
+    pub failures: Option<&'a mut FailureBundles>,
+    /// Complete run record writer (`--record <DIRECTORY>`).
+    pub record: Option<&'a mut FailureBundles>,
+    /// Capture per-step session evidence after each executed step (`--trace-steps`).
+    pub trace_steps: bool,
+}
+
 /// Runs the selected cases and writes every one of them to `record`.
 ///
 /// `record` is the `--record` writer. Its presence makes the runner collect a
@@ -71,6 +82,31 @@ pub fn run_with_record(
     bus: &EventBus,
     bundles: Option<&mut FailureBundles>,
     record: Option<&mut FailureBundles>,
+    filters: &Filters,
+    secrets: &mut Secrets,
+    jobs: usize,
+) -> RunOutcome {
+    run_with(
+        cases,
+        registry,
+        bus,
+        RecordWriters {
+            failures: bundles,
+            record,
+            trace_steps: false,
+        },
+        filters,
+        secrets,
+        jobs,
+    )
+}
+
+/// Runs the selected cases with explicit bundle writers and step-trace options.
+pub fn run_with(
+    cases: &[LoadedCase],
+    registry: &Registry,
+    bus: &EventBus,
+    writers: RecordWriters<'_>,
     filters: &Filters,
     secrets: &mut Secrets,
     jobs: usize,
@@ -103,8 +139,9 @@ pub fn run_with_record(
     let next = AtomicUsize::new(0);
     let collected = Mutex::new(Collected::new(selected.len()));
     let secrets = Mutex::new(secrets);
-    let bundles = bundles.map(Mutex::new);
-    let record = record.map(Mutex::new);
+    let trace_steps = writers.trace_steps && writers.record.is_some();
+    let bundles = writers.failures.map(Mutex::new);
+    let record = writers.record.map(Mutex::new);
     let workers = jobs.max(1).min(selected.len());
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -118,6 +155,7 @@ pub fn run_with_record(
                         BundleWriters {
                             failures: bundles.as_ref(),
                             record: record.as_ref(),
+                            trace_steps,
                         },
                         &collected,
                         &secrets,
@@ -193,6 +231,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct BundleWriters<'a> {
     failures: Option<&'a Mutex<&'a mut FailureBundles>>,
     record: Option<&'a Mutex<&'a mut FailureBundles>>,
+    trace_steps: bool,
 }
 
 /// Runs one selected case and stores its report at its own position.
@@ -212,6 +251,7 @@ fn run_one(
     let CaseRun {
         mut report,
         evidence,
+        step_traces,
     } = run_case(
         index,
         loaded,
@@ -220,6 +260,7 @@ fn run_one(
         secrets,
         writers.failures.is_some(),
         writers.record.is_some(),
+        writers.trace_steps,
     );
     if report.status != CaseStatus::Passed
         && let Some(writer) = writers.failures
@@ -239,7 +280,9 @@ fn run_one(
         // its workers take turns the same way.
         let mut writer = lock(writer);
         let secrets = lock(secrets);
-        if let Err(message) = writer.write_with_evidence(index, &report, &secrets, &evidence) {
+        if let Err(message) =
+            writer.write_with_traces(index, &report, &secrets, &evidence, &step_traces)
+        {
             lock(collected).bundle_errors.push((index, message));
         }
     }
@@ -529,8 +572,13 @@ fn positioned(loaded: &LoadedCase, location: Location, message: String) -> CaseE
 struct CaseRun {
     report: CaseReport,
     evidence: Vec<SessionEvidence>,
+    step_traces: Vec<StepTrace>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "evidence flags reflect independent failure, record, and trace options"
+)]
 fn run_case(
     index: usize,
     loaded: &LoadedCase,
@@ -539,6 +587,7 @@ fn run_case(
     secrets: &Mutex<&mut Secrets>,
     collect_failure_evidence: bool,
     collect_passing_evidence: bool,
+    collect_step_evidence: bool,
 ) -> CaseRun {
     let started = Instant::now();
     let mut vars = loaded.case.vars.clone();
@@ -549,6 +598,7 @@ fn run_case(
         sessions.set_base_directory(directory);
     }
     let mut steps = Vec::with_capacity(loaded.case.steps.len());
+    let mut step_traces = Vec::new();
     // One observation per declared name belongs to this case and to no other,
     // so two cases that run at the same time never share what they collect.
     let (mut observations, mut stopped) =
@@ -570,7 +620,9 @@ fn run_case(
                 name: step.action.clone(),
                 status: StepStatus::Skipped,
                 duration: Duration::ZERO,
+                args: None,
                 result: None,
+                saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: None,
             });
@@ -585,6 +637,16 @@ fn run_case(
             &mut observations,
             &mut sessions,
         );
+        if collect_step_evidence {
+            let captured = sessions.collect_step_evidence();
+            if !captured.is_empty() {
+                step_traces.push(StepTrace {
+                    phase: StepPhase::Steps,
+                    index: position,
+                    evidence: captured,
+                });
+            }
+        }
         if let Some(problem) = problem {
             stopped = Some(problem);
         }
@@ -612,6 +674,16 @@ fn run_case(
             &mut observations,
             &mut sessions,
         );
+        if collect_step_evidence {
+            let captured = sessions.collect_step_evidence();
+            if !captured.is_empty() {
+                step_traces.push(StepTrace {
+                    phase: StepPhase::Finally,
+                    index: position,
+                    evidence: captured,
+                });
+            }
+        }
         if finally_error.is_none()
             && let Some(problem) = problem
         {
@@ -664,11 +736,13 @@ fn run_case(
     CaseRun {
         report: CaseReport {
             file: loaded.path.clone(),
+            case_sha256: loaded.case_sha256.clone(),
             name: loaded.case.name.clone(),
             project: loaded.case.project.clone(),
             suite: loaded.case.suite.clone(),
             layer: loaded.case.layer.clone(),
             tags: loaded.case.tags.clone(),
+            overridden_vars: loaded.overridden_vars.clone(),
             status,
             duration: started.elapsed(),
             steps,
@@ -680,6 +754,7 @@ fn run_case(
             local_only_reason,
         },
         evidence,
+        step_traces,
     }
 }
 
@@ -711,7 +786,9 @@ fn run_one_step(
         name: step.action.clone(),
         status: StepStatus::Passed,
         duration: Duration::ZERO,
+        args: None,
         result: None,
+        saved: BTreeMap::new(),
         assertions: Vec::new(),
         error: None,
     };
@@ -723,6 +800,8 @@ fn run_one_step(
         ctx.secrets,
         observations,
         sessions,
+        &mut report.args,
+        &mut report.saved,
     ) {
         Ok((result, assertions)) => {
             let failed = assertions.iter().filter(|item| !item.passed).count();
@@ -794,15 +873,22 @@ fn create_observations(
     vars: &BTreeMap<String, String>,
     secrets: &Mutex<&mut Secrets>,
 ) -> Result<Vec<ObservationSlot>, Problem> {
+    create_observations_with(declared, registry, |raw| {
+        let mut guard = lock(secrets);
+        case::interpolate(raw, vars, &mut guard).map_err(|error| error.message)
+    })
+}
+
+fn create_observations_with(
+    declared: &[Observation],
+    registry: &Registry,
+    mut resolve_args: impl FnMut(&Value) -> Result<Value, String>,
+) -> Result<Vec<ObservationSlot>, Problem> {
     let mut slots = Vec::with_capacity(declared.len());
     for observation in declared {
-        let args = {
-            let mut secrets = lock(secrets);
-            case::interpolate(&observation.args, vars, &mut secrets)
-        }
-        .map_err(|error| Problem {
+        let args = resolve_args(&observation.args).map_err(|message| Problem {
             kind: ProblemKind::InvalidInput,
-            message: format!("observation `{}`: {}", observation.name, error.message),
+            message: format!("observation `{}`: {message}", observation.name),
         })?;
         let Some(definition) = registry.observer(&observation.kind) else {
             return Err(Problem {
@@ -840,6 +926,10 @@ fn problem_kind_of(error: &ObserverError) -> ProblemKind {
 }
 
 /// A step's arguments and the observations collected around it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "records resolved args and saved variables alongside step outcome without losing them on error"
+)]
 fn execute_step(
     step: &Step,
     registry: &Registry,
@@ -847,6 +937,8 @@ fn execute_step(
     secrets: &Mutex<&mut Secrets>,
     observations: &mut [ObservationSlot],
     sessions: &mut Sessions,
+    resolved_args: &mut Option<Value>,
+    saved_vars: &mut BTreeMap<String, String>,
 ) -> Result<(Value, Vec<AssertionReport>), Problem> {
     let definition = registry.get(&step.action).ok_or_else(|| Problem {
         kind: ProblemKind::InvalidInput,
@@ -860,22 +952,24 @@ fn execute_step(
     // runs, so one slow step cannot hold the others up.
     let args = {
         let mut secrets = lock(secrets);
-        case::interpolate(&step.args, vars, &mut secrets)
-    }
-    .map_err(|error| Problem {
-        kind: ProblemKind::Execution,
-        message: error.message,
-    })?;
+        let expanded =
+            case::interpolate(&step.args, vars, &mut secrets).map_err(|error| Problem {
+                kind: ProblemKind::Execution,
+                message: error.message,
+            })?;
+        *resolved_args =
+            Some(secrets.redact_json(&registry.redact_step_args(&step.action, &expanded)));
+        expanded
+    };
 
     let Some(policy) = &step.retry else {
         let result = run_attempt(definition, &args, observations, sessions)?;
-        let assertions = evaluate_all(&step.expect, &result);
-        // A case that already failed an assertion is not allowed to change the
-        // variables that later steps would see.
-        if assertions.iter().all(|item| item.passed) {
-            save_values(&step.save, &result, vars)?;
+        let evaluated = evaluate_and_save(step, result, vars)?;
+        if !evaluated.saved.is_empty() {
+            let secrets = lock(secrets);
+            *saved_vars = redact_saved_map(&evaluated.saved, &secrets);
         }
-        return Ok((result, assertions));
+        return Ok((evaluated.result, evaluated.assertions));
     };
 
     if let Err(message) = (definition.check_retry)(&args) {
@@ -895,7 +989,9 @@ fn execute_step(
                     let mut assertions = until_assertions;
                     assertions.extend(evaluate_all(&step.expect, &result));
                     if assertions.iter().all(|item| item.passed) {
-                        save_values(&step.save, &result, vars)?;
+                        let saved = save_values(&step.save, &result, vars)?;
+                        let secrets = lock(secrets);
+                        *saved_vars = redact_saved_map(&saved, &secrets);
                     }
                     return Ok((result, assertions));
                 }
@@ -974,26 +1070,34 @@ fn run_attempt(
     }
 }
 
+struct EvaluatedStep {
+    result: Value,
+    assertions: Vec<AssertionReport>,
+    saved: BTreeMap<String, String>,
+}
+
 /// Evaluates `step.expect` against `result` and applies `step.save` to `vars`
 /// when every assertion passes.
 fn evaluate_and_save(
     step: &Step,
     result: Value,
     vars: &mut BTreeMap<String, String>,
-) -> Result<(Value, Vec<AssertionReport>), Problem> {
-    let assertions: Vec<AssertionReport> = step
-        .expect
-        .iter()
-        .map(|expectation| assert::evaluate(expectation, &result))
-        .collect();
+) -> Result<EvaluatedStep, Problem> {
+    let assertions = evaluate_all(&step.expect, &result);
 
     // A case that already failed an assertion is not allowed to change the
     // variables that later steps would see.
-    if assertions.iter().all(|item| item.passed) {
-        save_values(&step.save, &result, vars)?;
-    }
+    let saved = if assertions.iter().all(|item| item.passed) {
+        save_values(&step.save, &result, vars)?
+    } else {
+        BTreeMap::new()
+    };
 
-    Ok((result, assertions))
+    Ok(EvaluatedStep {
+        result,
+        assertions,
+        saved,
+    })
 }
 
 fn collect_observations(
@@ -1027,17 +1131,32 @@ pub fn run_single_step(
     secrets: &mut Secrets,
     sessions: &mut Sessions,
 ) -> StepReport {
+    run_single_step_with_observations(step, &[], registry, vars, secrets, sessions)
+}
+
+/// Executes a single interactive step with attached observers, collecting
+/// `observed.<name>` before `expect` and `save` and redacting step outputs.
+pub fn run_single_step_with_observations(
+    step: &Step,
+    observations: &[Observation],
+    registry: &Registry,
+    vars: &mut BTreeMap<String, String>,
+    secrets: &mut Secrets,
+    sessions: &mut Sessions,
+) -> StepReport {
     let started = Instant::now();
     let mut report = StepReport {
         name: step.action.clone(),
         status: StepStatus::Passed,
         duration: Duration::ZERO,
+        args: None,
         result: None,
+        saved: BTreeMap::new(),
         assertions: Vec::new(),
         error: None,
     };
 
-    let outcome: Result<(Value, Vec<AssertionReport>), Problem> = (|| {
+    let outcome: Result<EvaluatedStep, Problem> = (|| {
         let definition = registry.get(&step.action).ok_or_else(|| Problem {
             kind: ProblemKind::InvalidInput,
             message: format!("`{}` is not a registered step", step.action),
@@ -1055,6 +1174,7 @@ pub fn run_single_step(
             kind: ProblemKind::InvalidInput,
             message: error.message,
         })?;
+        report.args = Some(secrets.redact_json(&registry.redact_step_args(&step.action, &args)));
         let validation = if sessions.is_interactive() {
             registry.validate_for_session(&step.action, &args)
         } else {
@@ -1064,24 +1184,40 @@ pub fn run_single_step(
             kind: ProblemKind::InvalidInput,
             message: format!("`{}` {message}", step.action),
         })?;
-        let result = (definition.run)(&args, sessions).map_err(problem_from_step_error)?;
+        let mut slots = if observations.is_empty() {
+            Vec::new()
+        } else {
+            let empty_vars = BTreeMap::new();
+            create_observations_with(observations, registry, |raw| {
+                case::interpolate(raw, &empty_vars, secrets).map_err(|error| error.message)
+            })?
+        };
+        let result = run_attempt(definition, &args, &mut slots, sessions)?;
         evaluate_and_save(step, result, vars)
     })();
 
     match outcome {
-        Ok((result, assertions)) => {
-            let failed = assertions.iter().filter(|item| !item.passed).count();
+        Ok(evaluated) => {
+            let failed = evaluated
+                .assertions
+                .iter()
+                .filter(|item| !item.passed)
+                .count();
             if failed == 0 {
                 report.status = StepStatus::Passed;
             } else {
                 report.status = StepStatus::Failed;
                 report.error = Some(Problem {
                     kind: ProblemKind::Assertion,
-                    message: format!("{failed} of {} assertions failed", assertions.len()),
+                    message: format!(
+                        "{failed} of {} assertions failed",
+                        evaluated.assertions.len()
+                    ),
                 });
             }
-            report.result = Some(result);
-            report.assertions = assertions;
+            report.result = Some(secrets.redact_json(&evaluated.result));
+            report.saved = redact_saved_map(&evaluated.saved, secrets);
+            report.assertions = evaluated.assertions;
         }
         Err(problem) => {
             report.status = StepStatus::Error;
@@ -1152,7 +1288,8 @@ fn save_values(
     saves: &[SavedValue],
     result: &Value,
     vars: &mut BTreeMap<String, String>,
-) -> Result<(), Problem> {
+) -> Result<BTreeMap<String, String>, Problem> {
+    let mut entries = Vec::with_capacity(saves.len());
     for saved in saves {
         let selected = result.query(&saved.path).map_err(|error| Problem {
             kind: ProblemKind::Execution,
@@ -1160,7 +1297,7 @@ fn save_values(
         })?;
         match selected.as_slice() {
             [value] => {
-                vars.insert(saved.name.clone(), variable_text(value));
+                entries.push((saved.name.clone(), variable_text(value)));
             }
             [] => {
                 return Err(Problem {
@@ -1184,7 +1321,22 @@ fn save_values(
             }
         }
     }
-    Ok(())
+    let mut saved_map = BTreeMap::new();
+    for (name, value) in entries {
+        vars.insert(name.clone(), value.clone());
+        saved_map.insert(name, value);
+    }
+    Ok(saved_map)
+}
+
+fn redact_saved_map(
+    saved: &BTreeMap<String, String>,
+    secrets: &Secrets,
+) -> BTreeMap<String, String> {
+    saved
+        .iter()
+        .map(|(k, v)| (secrets.redact(k), secrets.redact(v)))
+        .collect()
 }
 
 fn variable_text(value: &Value) -> String {
@@ -1442,10 +1594,10 @@ mod tests {
     }
 
     fn loaded(steps: Vec<Step>) -> Vec<LoadedCase> {
-        vec![LoadedCase {
-            path: "case.yaml".into(),
-            case: test_case("case", steps),
-        }]
+        vec![LoadedCase::new(
+            "case.yaml".into(),
+            test_case("case", steps),
+        )]
     }
 
     /// A step that calls one of the test steps that fails without arguments.
@@ -1713,10 +1865,10 @@ mod tests {
             arg_locations: Vec::new(),
         };
         let mut cases = loaded(vec![failing]);
-        cases.push(LoadedCase {
-            path: "other.yaml".into(),
-            case: test_case("other", vec![broken]),
-        });
+        cases.push(LoadedCase::new(
+            "other.yaml".into(),
+            test_case("other", vec![broken]),
+        ));
 
         let outcome = run(
             &cases,
@@ -1736,10 +1888,10 @@ mod tests {
         let mut bad = echo(json!(1), Vec::new());
         bad.args = json!({});
         let mut cases = loaded(vec![bad]);
-        cases.push(LoadedCase {
-            path: "other.yaml".into(),
-            case: test_case("other", vec![echo(json!(1), Vec::new())]),
-        });
+        cases.push(LoadedCase::new(
+            "other.yaml".into(),
+            test_case("other", vec![echo(json!(1), Vec::new())]),
+        ));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = std::sync::Arc::clone(&seen);
         let mut bus = EventBus::new();
@@ -2182,10 +2334,10 @@ mod tests {
         }];
         let mut cases = loaded(vec![failing]);
         cases[0].path = source;
-        cases.push(LoadedCase {
-            path: "other.yaml".into(),
-            case: test_case("other", vec![echo(json!(1), Vec::new())]),
-        });
+        cases.push(LoadedCase::new(
+            "other.yaml".into(),
+            test_case("other", vec![echo(json!(1), Vec::new())]),
+        ));
 
         let mut bundles = FailureBundles::new(dir.join("failures"));
         let bus = EventBus::new();
@@ -2219,10 +2371,10 @@ mod tests {
         cases[0].case.project = Some("shop".to_string());
         cases[0].case.layer = Some("api".to_string());
         cases[0].case.tags = vec!["smoke".to_string()];
-        let mut excluded = LoadedCase {
-            path: "other.yaml".into(),
-            case: test_case("other", vec![echo(json!(2), Vec::new())]),
-        };
+        let mut excluded = LoadedCase::new(
+            "other.yaml".into(),
+            test_case("other", vec![echo(json!(2), Vec::new())]),
+        );
         excluded.case.layer = Some("cli".to_string());
         cases.push(excluded);
         let filters = Filters {
@@ -2285,9 +2437,9 @@ mod tests {
     fn a_filter_does_not_hide_an_invalid_case() {
         let mut cases = loaded(vec![echo(json!(1), Vec::new())]);
         cases[0].case.layer = Some("api".to_string());
-        let mut broken = LoadedCase {
-            path: "broken.yaml".into(),
-            case: test_case(
+        let mut broken = LoadedCase::new(
+            "broken.yaml".into(),
+            test_case(
                 "broken",
                 vec![Step {
                     action: "no.such.step".to_string(),
@@ -2302,7 +2454,7 @@ mod tests {
                     arg_locations: Vec::new(),
                 }],
             ),
-        };
+        );
         broken.case.layer = Some("cli".to_string());
         cases.push(broken);
         let filters = Filters {
@@ -2339,10 +2491,10 @@ mod tests {
         // in the opposite order.
         let mut cases = Vec::new();
         for (name, millis) in [("a", 400_u64), ("b", 200), ("c", 100), ("d", 0)] {
-            cases.push(LoadedCase {
-                path: format!("{name}.yaml").into(),
-                case: test_case(name, vec![wait(millis, json!(name))]),
-            });
+            cases.push(LoadedCase::new(
+                format!("{name}.yaml").into(),
+                test_case(name, vec![wait(millis, json!(name))]),
+            ));
         }
 
         let finished = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -2388,9 +2540,11 @@ mod tests {
     fn a_job_count_outside_the_range_still_runs_every_case_once() {
         let cases: Vec<LoadedCase> = ["a", "b", "c"]
             .into_iter()
-            .map(|name| LoadedCase {
-                path: format!("{name}.yaml").into(),
-                case: test_case(name, vec![echo(json!(1), Vec::new())]),
+            .map(|name| {
+                LoadedCase::new(
+                    format!("{name}.yaml").into(),
+                    test_case(name, vec![echo(json!(1), Vec::new())]),
+                )
             })
             .collect();
 
@@ -2434,12 +2588,14 @@ mod tests {
             }
         });
         let cases: Vec<LoadedCase> = (0..3)
-            .map(|index| LoadedCase {
-                path: format!("case-{index}.yaml").into(),
-                case: test_case(
-                    &format!("case {index}"),
-                    vec![wait(20, json!(1)), wait(10, json!(2))],
-                ),
+            .map(|index| {
+                LoadedCase::new(
+                    format!("case-{index}.yaml").into(),
+                    test_case(
+                        &format!("case {index}"),
+                        vec![wait(20, json!(1)), wait(10, json!(2))],
+                    ),
+                )
             })
             .collect();
 
@@ -2486,10 +2642,10 @@ mod tests {
                 path: "$".to_string(),
                 matcher: crate::core::case::Matcher::Equals(json!("right")),
             }];
-            cases.push(LoadedCase {
-                path: source,
-                case: test_case(&format!("case {index}"), vec![failing]),
-            });
+            cases.push(LoadedCase::new(
+                source,
+                test_case(&format!("case {index}"), vec![failing]),
+            ));
         }
 
         let mut bundles = FailureBundles::new(dir.join("failures"));
@@ -2537,10 +2693,7 @@ mod tests {
     fn run_one_case(case: Case) -> RunOutcome {
         let registry = registry();
         run(
-            &[LoadedCase {
-                path: "case.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("case.yaml".into(), case)],
             &registry,
             &EventBus::new(),
             None,
@@ -2806,10 +2959,7 @@ mod tests {
         case.observe = vec![observation("snap", "test.attempt", json!({}))];
 
         let outcome = run(
-            &[LoadedCase {
-                path: "retry.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("retry.yaml".into(), case)],
             &reg,
             &EventBus::new(),
             None,
@@ -2997,10 +3147,7 @@ mod tests {
         case.observe = vec![observation("buf", "test.draining", json!({}))];
 
         let outcome = run(
-            &[LoadedCase {
-                path: "retry-drain.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("retry-drain.yaml".into(), case)],
             &reg,
             &EventBus::new(),
             None,
@@ -3079,10 +3226,7 @@ mod tests {
         case.observe = vec![observation("buf", "test.draining", json!({}))];
 
         let outcome = run(
-            &[LoadedCase {
-                path: "optional-drain.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("optional-drain.yaml".into(), case)],
             &reg,
             &EventBus::new(),
             None,
@@ -3137,10 +3281,7 @@ mod tests {
         case.observe = vec![observation("app_log", "test.broken", json!({}))];
 
         let outcome = run(
-            &[LoadedCase {
-                path: "broken-retry.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("broken-retry.yaml".into(), case)],
             &reg,
             &EventBus::new(),
             None,
@@ -3259,10 +3400,7 @@ mod tests {
         case.observe = vec![observation("snap", "test.attempt", json!({}))];
 
         let outcome = run(
-            &[LoadedCase {
-                path: "until-over.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("until-over.yaml".into(), case)],
             &reg,
             &EventBus::new(),
             None,
@@ -3316,10 +3454,7 @@ mod tests {
             case.observe = vec![observation("buf", "test.draining", json!({}))];
 
             let outcome = run(
-                &[LoadedCase {
-                    path: "err-over-non-opt.yaml".into(),
-                    case,
-                }],
+                &[LoadedCase::new("err-over-non-opt.yaml".into(), case)],
                 &reg,
                 &EventBus::new(),
                 None,
@@ -3359,10 +3494,7 @@ mod tests {
             case.observe = vec![observation("buf", "test.draining", json!({}))];
 
             let outcome = run(
-                &[LoadedCase {
-                    path: "err-over.yaml".into(),
-                    case,
-                }],
+                &[LoadedCase::new("err-over.yaml".into(), case)],
                 &reg,
                 &EventBus::new(),
                 None,
@@ -3453,10 +3585,7 @@ mod tests {
         pass_case.observe = vec![observation("buf", "test.draining", json!({}))];
 
         let pass_outcome = run(
-            &[LoadedCase {
-                path: "in-flight-pass.yaml".into(),
-                case: pass_case,
-            }],
+            &[LoadedCase::new("in-flight-pass.yaml".into(), pass_case)],
             &reg,
             &EventBus::new(),
             None,
@@ -3661,10 +3790,7 @@ mod tests {
         case.finally = vec![fin_one, fin_two];
 
         let outcome = run(
-            &[LoadedCase {
-                path: "finally-vars.yaml".into(),
-                case,
-            }],
+            &[LoadedCase::new("finally-vars.yaml".into(), case)],
             &registry(),
             &EventBus::new(),
             None,
@@ -3697,10 +3823,7 @@ mod tests {
         let mut case = test_case("finally-unwritten-save", vec![main_fail]);
         case.finally = vec![non_optional_cleanup, optional_cleanup, final_cleanup];
 
-        let loaded_case = vec![LoadedCase {
-            path: "finally-unwritten.yaml".into(),
-            case,
-        }];
+        let loaded_case = vec![LoadedCase::new("finally-unwritten.yaml".into(), case)];
         assert!(
             preflight(&loaded_case, &registry(), &mut Secrets::new()).is_empty(),
             "preflight must allow finally steps to reference main step save variables"
@@ -3796,6 +3919,115 @@ mod tests {
                 .iter()
                 .all(|warning| !warning.message.contains("test.echo")),
             "a step without a warning hook must not warn"
+        );
+    }
+
+    #[test]
+    fn single_step_with_observations_collects_before_expect_and_save_and_redacts() {
+        struct StubObserver(String);
+        impl Observer for StubObserver {
+            fn start(&mut self, _sessions: &mut Sessions) -> Result<(), ObserverError> {
+                Ok(())
+            }
+
+            fn collect(&mut self, _sessions: &mut Sessions) -> Result<Value, ObserverError> {
+                Ok(json!({ "line": self.0 }))
+            }
+        }
+
+        let mut registry = Registry::new();
+        registry
+            .register(StepDefinition {
+                name: "test.echo",
+                description: "echo input",
+                args_schema: json!({"type": "object"}),
+                validate: |_args| Ok(()),
+                check_retry: crate::core::registry::disallow_retry,
+                lint_warnings: crate::core::registry::no_lint_warnings,
+                run: |args, _sessions| Ok(json!({ "reply": args["msg"] })),
+            })
+            .expect("register test.echo");
+        registry
+            .register_observer(crate::core::observer::ObserverDefinition {
+                name: "test.obs",
+                description: "stub observer",
+                args_schema: json!({"type": "object"}),
+                validate: |_args| Ok(()),
+                create: |args| {
+                    let text = args
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ObserverError::InvalidArguments("needs text".to_string()))?;
+                    Ok(Box::new(StubObserver(text.to_string())))
+                },
+            })
+            .expect("register test.obs");
+
+        let mut vars = BTreeMap::new();
+        vars.insert("saved_prior".to_string(), "should-not-leak".to_string());
+        let mut secrets = Secrets::new();
+        secrets.record("s3cr3t-obs");
+
+        let step = Step {
+            action: "test.echo".to_string(),
+            args: json!({ "msg": "s3cr3t-obs" }),
+            expect: vec![
+                Expectation {
+                    path: "$.observed.probe.line".to_string(),
+                    matcher: crate::core::case::Matcher::Contains(json!("observed-ok")),
+                },
+                Expectation {
+                    path: "$.reply".to_string(),
+                    matcher: crate::core::case::Matcher::Contains(json!("s3cr3t-obs")),
+                },
+            ],
+            save: vec![crate::core::case::SavedValue {
+                name: "obs_line".to_string(),
+                path: "$.observed.probe.line".to_string(),
+            }],
+            retry: None,
+            optional: false,
+            location: serde_saphyr::Location::UNKNOWN,
+            args_location: serde_saphyr::Location::UNKNOWN,
+            retry_location: serde_saphyr::Location::UNKNOWN,
+            arg_locations: Vec::new(),
+        };
+        let observations = vec![Observation {
+            name: "probe".to_string(),
+            kind: "test.obs".to_string(),
+            args: json!({ "text": "observed-ok s3cr3t-obs" }),
+            location: serde_saphyr::Location::UNKNOWN,
+            args_location: serde_saphyr::Location::UNKNOWN,
+        }];
+
+        let mut sessions = Sessions::new();
+        let report = run_single_step_with_observations(
+            &step,
+            &observations,
+            &registry,
+            &mut vars,
+            &mut secrets,
+            &mut sessions,
+        );
+
+        assert_eq!(report.status, StepStatus::Passed);
+        assert_eq!(report.args, Some(json!({ "msg": "***" })));
+        assert_eq!(
+            report.result,
+            Some(json!({
+                "reply": "***",
+                "observed": {
+                    "probe": { "line": "observed-ok ***" }
+                }
+            }))
+        );
+        assert_eq!(
+            report.saved.get("obs_line").map(String::as_str),
+            Some("observed-ok ***")
+        );
+        assert_eq!(
+            vars.get("obs_line").map(String::as_str),
+            Some("observed-ok s3cr3t-obs")
         );
     }
 }

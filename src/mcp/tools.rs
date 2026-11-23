@@ -226,6 +226,7 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
         SessionRequest::Start {
             sessions_dir: context.sessions_dir.to_path_buf(),
             idle_timeout_ms: context.idle_timeout_ms,
+            observe: Vec::new(),
         },
         context.registry,
     ))
@@ -596,8 +597,10 @@ fn load_cases(
     }
 
     let mut expanded = Vec::with_capacity(overrides.len());
+    let mut overridden_names = std::collections::BTreeSet::new();
     let mut errors = Vec::new();
     for (name, value) in overrides {
+        overridden_names.insert(name.clone());
         match case::expand_env(value, secrets) {
             Ok(value) => expanded.push((name.clone(), value)),
             Err(message) => errors.push(CaseError {
@@ -606,6 +609,7 @@ fn load_cases(
             }),
         }
     }
+    let overridden_vars: Vec<String> = overridden_names.into_iter().collect();
 
     let mut cases = Vec::with_capacity(files.len());
     for file in &files {
@@ -622,6 +626,7 @@ fn load_cases(
                 for (name, value) in &expanded {
                     loaded.case.vars.insert(name.clone(), value.clone());
                 }
+                loaded.overridden_vars = overridden_vars.clone();
                 cases.push(loaded);
             }
             Err(error) => errors.push(error),

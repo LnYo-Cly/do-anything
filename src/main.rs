@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -89,6 +90,9 @@ enum Command {
         /// Write the evidence of every executed case into this empty directory.
         #[arg(long, value_name = "DIRECTORY")]
         record: Option<PathBuf>,
+        /// Capture per-step session evidence (such as screenshots and DOM snapshots) under `trace/`. Requires `--record`.
+        #[arg(long)]
+        trace_steps: bool,
         /// Runs up to N cases at the same time. Defaults to 1.
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_jobs)]
         jobs: usize,
@@ -146,7 +150,11 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     /// Create a new interactive session directory.
-    Start,
+    Start {
+        /// Attach a declared observer (`NAME=KIND`, `NAME=KIND:key=val`, or YAML/JSON mapping). Repeat for more than one.
+        #[arg(long = "observe", value_name = "SPEC")]
+        observe: Vec<String>,
+    },
     /// Execute one step in an existing session.
     Step {
         /// Session identifier returned by `da session start`.
@@ -267,12 +275,16 @@ fn main() -> ExitCode {
             bundle_dir,
             no_bundle,
             record,
+            trace_steps,
             jobs,
         } => {
             let sources = match VarSources::load(&vars_files, &vars) {
                 Ok(sources) => sources,
                 Err(message) => return usage_error(&message),
             };
+            if trace_steps && record.is_none() {
+                return usage_error("`--trace-steps` requires `--record <DIRECTORY>`");
+            }
             if let Some(directory) = &record
                 && let Err(message) = check_record_directory(directory)
             {
@@ -294,6 +306,7 @@ fn main() -> ExitCode {
                     bundle_dir,
                     no_bundle,
                     record,
+                    trace_steps,
                     jobs,
                 },
             )
@@ -352,10 +365,17 @@ fn run_session(
     let mut print_raw_yaml = false;
 
     let request = match action {
-        SessionCommand::Start => SessionRequest::Start {
-            sessions_dir,
-            idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
-        },
+        SessionCommand::Start { observe } => {
+            let parsed_observe = match session::parse_observe_specs(&observe, registry) {
+                Ok(items) => items,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            SessionRequest::Start {
+                sessions_dir,
+                idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
+                observe: parsed_observe,
+            }
+        }
         SessionCommand::Step {
             id,
             action,
@@ -369,18 +389,7 @@ fn run_session(
             let step_input =
                 match resolve_step_input(action, use_step, args, with, step, file, save) {
                     Ok(input) => input,
-                    Err(message) => {
-                        if format == OutputFormat::Json {
-                            let err = serde_json::json!({
-                                "ok": false,
-                                "error": { "kind": "usage", "message": message }
-                            });
-                            let _ = write_stdout(&format!("{err}\n"));
-                        } else {
-                            let _ = write_stderr(&format!("error: {message}\n"));
-                        }
-                        return DaExitCode::Usage.into();
-                    }
+                    Err(message) => return session_usage_error(format, &message),
                 };
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             SessionRequest::Step {
@@ -441,6 +450,19 @@ fn run_session(
         let _ = write_stdout(&format!("{rendered}\n"));
     }
     response.exit_code.into()
+}
+
+fn session_usage_error(format: OutputFormat, message: &str) -> ExitCode {
+    if format == OutputFormat::Json {
+        let err = serde_json::json!({
+            "ok": false,
+            "error": { "kind": "usage", "message": message }
+        });
+        let _ = write_stdout(&format!("{err}\n"));
+    } else {
+        let _ = write_stderr(&format!("error: {message}\n"));
+    }
+    DaExitCode::Usage.into()
 }
 
 fn resolve_step_input(
@@ -615,6 +637,7 @@ struct RunOptions {
     bundle_dir: Option<PathBuf>,
     no_bundle: bool,
     record: Option<PathBuf>,
+    trace_steps: bool,
     jobs: usize,
 }
 
@@ -674,12 +697,15 @@ fn execute(registry: &Registry, options: &RunOptions, secrets: &mut Secrets) -> 
     let mut record = options.record.clone().map(FailureBundles::record);
 
     let bus = EventBus::new();
-    runner::run_with_record(
+    runner::run_with(
         &cases,
         registry,
         &bus,
-        bundles.as_mut(),
-        record.as_mut(),
+        runner::RecordWriters {
+            failures: bundles.as_mut(),
+            record: record.as_mut(),
+            trace_steps: options.trace_steps,
+        },
         &options.filters,
         secrets,
         options.jobs,
@@ -774,8 +800,10 @@ fn load_cases(paths: &[PathBuf], sources: &VarSources, secrets: &mut Secrets) ->
     // A value in a vars file may itself reference the environment; the problem
     // then belongs to that file, not to the case the value ends up in.
     let mut overrides: Vec<(String, String)> = Vec::new();
+    let mut overridden_names = BTreeSet::new();
     for (file, entries) in &sources.files {
         for (name, value) in entries {
+            overridden_names.insert(name.clone());
             match case::expand_env(value, secrets) {
                 Ok(value) => overrides.push((name.clone(), value)),
                 Err(message) => errors.push(CaseError {
@@ -785,7 +813,11 @@ fn load_cases(paths: &[PathBuf], sources: &VarSources, secrets: &mut Secrets) ->
             }
         }
     }
+    for (name, _) in &sources.inline {
+        overridden_names.insert(name.clone());
+    }
     overrides.extend(sources.inline.iter().cloned());
+    let overridden_vars: Vec<String> = overridden_names.into_iter().collect();
 
     for file in &files {
         match case::load_file(file) {
@@ -801,6 +833,7 @@ fn load_cases(paths: &[PathBuf], sources: &VarSources, secrets: &mut Secrets) ->
                 for (name, value) in &overrides {
                     loaded_case.case.vars.insert(name.clone(), value.clone());
                 }
+                loaded_case.overridden_vars = overridden_vars.clone();
                 cases.push(loaded_case);
             }
             Err(error) => errors.push(error),
