@@ -214,7 +214,7 @@ fn run_case(
         finally: Vec::new(),
     };
     let outcome = runner::run(
-        &[LoadedCase { path: source, case }],
+        &[LoadedCase::new(source, case)],
         &fs_registry(),
         &EventBus::new(),
         bundles,
@@ -449,6 +449,39 @@ fn max_entries_cap_enforced_at_start_and_collect() {
         .expect("starting above max_entries must error");
     assert_eq!(start_err.kind, ProblemKind::Environment);
     assert!(start_err.message.contains("max_entries"));
+}
+
+#[test]
+fn max_entries_cap_applies_while_enumerating_a_large_directory() {
+    let dir = TempDir::new("fs-watch-limit-large");
+    let watched = dir.path().join("watched");
+    fs::create_dir_all(&watched).expect("watched dir must exist");
+    for index in 0..512 {
+        fs::write(watched.join(format!("entry-{index:04}.txt")), "x\n")
+            .expect("fixture file must write");
+    }
+
+    let report = run_case(
+        &dir,
+        vec![obs_fs(
+            "fs",
+            json!({ "path": watched.to_string_lossy(), "max_entries": 8 }),
+        )],
+        vec![step_mutate(&watched, "noop", vec![])],
+        None,
+        &mut Secrets::new(),
+    );
+    assert_eq!(report.cases[0].status, CaseStatus::Error);
+    let message = report.cases[0]
+        .error
+        .as_ref()
+        .expect("over-cap enumeration must fail")
+        .message
+        .clone();
+    assert!(
+        message.contains("max_entries") && message.contains("8"),
+        "the cap must be reported before any snapshot is retained: {message}"
+    );
 }
 
 #[test]

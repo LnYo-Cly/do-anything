@@ -1883,21 +1883,27 @@ with a `name` that is already running is an execution error (exit 1). If the
 process exits before emitting `ready_pattern`, `proc.start` fails immediately
 with an execution error (exit 1); if `ready_timeout_ms` expires, `proc.start`
 kills the process tree and fails with a timeout (exit 5), keeping any captured
-logs for failure bundles.
+logs for failure bundles. Reusing the name of a process whose leader already
+exited first stops that old process tree, so descendants cannot outlive the
+name, and keeps its captured logs in the same evidence files.
 
 #### `proc.send`
 
 Writes UTF-8 text verbatim to a running process's standard input and optionally
-closes stdin.
+closes stdin. The write runs on a dedicated thread, so a child that stops
+reading stdin cannot block the case.
 
 | Argument | Meaning |
 | --- | --- |
 | `name` | Logical process name. Defaults to `"default"`. |
 | `input` | Text written verbatim to stdin (no implicit newline is added). |
 | `eof` | Close stdin after writing `input` (or immediately when `input` is omitted). Defaults to `false`. |
+| `timeout_ms` | Maximum wait for the write or stdin close in milliseconds. Defaults to `5000`. |
 
 At least one of `input` or `eof: true` must be provided. Returns
-`{ "name", "bytes_written", "eof" }`.
+`{ "name", "bytes_written", "eof" }`. If the write cannot complete within
+`timeout_ms`, `proc.send` stops the process tree and fails with a timeout
+(exit 5); a cleanup failure is appended to the error.
 
 #### `proc.wait_output`
 
@@ -1955,7 +1961,10 @@ steps:
   process group (`process_group(0)`) and uses `taskkill /PID <pid> /T /F` on
   Windows. When a case ends — whether it passed, failed, errored, or timed out
   — `da` kills every still-running process tree even if `proc.stop` was never
-  called.
+  called. On Windows, an exited leader is followed by an independent descendant
+  scan by process lineage, so a child or grandchild that redirected its output
+  to `null` or a file is still terminated and any survivor is reported as a
+  teardown error instead of passing silently.
 - **Bounded non-blocking pipe draining:** background threads drain stdout and
   stderr continuously into 1 MiB sliding buffers per stream so a chatty process
   never blocks on a full OS pipe.

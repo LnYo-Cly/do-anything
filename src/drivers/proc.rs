@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -40,6 +41,7 @@ const DEFAULT_NAME: &str = "default";
 const DEFAULT_READY_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_STOP_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_SEND_TIMEOUT_MS: u64 = 5_000;
 
 const READ_CHUNK: usize = 8 * 1024;
 /// Maximum retained bytes per stream (stdout / stderr) per named process.
@@ -157,6 +159,10 @@ struct ProcSendArgs {
     /// Close standard input after writing `input` (or immediately if `input` is omitted).
     #[serde(default)]
     eof: bool,
+    /// Maximum wait for the write to be accepted in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_send_timeout_ms")]
+    timeout_ms: u64,
 }
 
 /// Which output stream `proc.wait_output` searches.
@@ -223,6 +229,10 @@ fn default_stop_timeout_ms() -> u64 {
     DEFAULT_STOP_TIMEOUT_MS
 }
 
+fn default_send_timeout_ms() -> u64 {
+    DEFAULT_SEND_TIMEOUT_MS
+}
+
 fn validate_process_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -262,6 +272,9 @@ fn check_send(args: &ProcSendArgs) -> Result<(), String> {
     validate_process_name(&args.name)?;
     if args.input.is_none() && !args.eof {
         return Err("invalid arguments: `proc.send` requires `input` or `eof: true`".to_string());
+    }
+    if args.timeout_ms == 0 {
+        return Err("invalid arguments: `timeout_ms` must be at least 1".to_string());
     }
     Ok(())
 }
@@ -439,9 +452,109 @@ fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
+enum StdinWriteError {
+    Closed,
+    TimedOut,
+    Io(std::io::Error),
+}
+
+struct StdinRequest {
+    bytes: Vec<u8>,
+    close: bool,
+    done: mpsc::Sender<std::io::Result<()>>,
+}
+
+/// Writes to a child's stdin on its own thread so a child that stops reading
+/// cannot block the runner past a deadline.
+struct StdinWriter {
+    sender: Option<mpsc::Sender<StdinRequest>>,
+    handle: Option<JoinHandle<()>>,
+    closed: bool,
+}
+
+impl StdinWriter {
+    fn spawn(mut stdin: ChildStdin) -> Self {
+        let (sender, receiver) = mpsc::channel::<StdinRequest>();
+        let handle = thread::spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                if request.close {
+                    let _ = request.done.send(Ok(()));
+                    break;
+                }
+                let result = stdin.write_all(&request.bytes).and_then(|()| stdin.flush());
+                let failed = result.is_err();
+                let _ = request.done.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            handle: Some(handle),
+            closed: false,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), StdinWriteError> {
+        if self.closed {
+            return Err(StdinWriteError::Closed);
+        }
+        let sender = self.sender.as_ref().ok_or(StdinWriteError::Closed)?;
+        let (done, result) = mpsc::channel();
+        sender
+            .send(StdinRequest {
+                bytes: bytes.to_vec(),
+                close: false,
+                done,
+            })
+            .map_err(|_| StdinWriteError::Closed)?;
+        match result.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(StdinWriteError::Io(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(StdinWriteError::TimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(StdinWriteError::Closed),
+        }
+    }
+
+    fn close(&mut self, timeout: Duration) -> Result<(), StdinWriteError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let Some(sender) = self.sender.take() else {
+            return Ok(());
+        };
+        let (done, result) = mpsc::channel();
+        if sender
+            .send(StdinRequest {
+                bytes: Vec::new(),
+                close: true,
+                done,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+        let outcome = match result.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(StdinWriteError::Io(error)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(StdinWriteError::TimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+        };
+        drop(sender);
+        if outcome.is_ok()
+            && let Some(handle) = self.handle.take()
+        {
+            let _ = handle.join();
+        }
+        outcome
+    }
+}
+
 struct ManagedProcess {
     child: Child,
-    stdin: Option<ChildStdin>,
+    stdin: Option<StdinWriter>,
     streams: Arc<SharedStreams>,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
@@ -493,7 +606,7 @@ impl ManagedProcess {
         let mut child = command
             .spawn()
             .map_err(|error| spawn_error(&args.command, &error))?;
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().map(StdinWriter::spawn);
         let stdout_pipe = child
             .stdout
             .take()
@@ -645,14 +758,12 @@ impl ManagedProcess {
             if self.refresh_exit().is_ok_and(|status| status.is_some()) {
                 let first_exit = *exited_at.get_or_insert_with(Instant::now);
                 if pipes_closed || first_exit.elapsed() >= DRAIN_TIMEOUT {
-                    let (out, err) = self.snapshot_unconsumed();
                     let status_text = self
                         .exit_status
                         .and_then(|s| s.code())
                         .map_or_else(|| "signal".to_string(), |c| format!("exit code {c}"));
-                    let snippet = output_excerpt(&out, &err);
                     return Err(StepError::Execution(format!(
-                        "`{step_name}` for process `{name}` exited ({status_text}) before emitting `{pattern}`{snippet}"
+                        "`{step_name}` for process `{name}` exited ({status_text}) before emitting `{pattern}`; see the `proc/` logs in the failure bundle for captured stdout and stderr"
                     )));
                 }
             } else if pipes_closed {
@@ -662,10 +773,8 @@ impl ManagedProcess {
 
             let now = Instant::now();
             if now >= deadline {
-                let (out, err) = self.snapshot_unconsumed();
-                let snippet = output_excerpt(&out, &err);
                 return Err(StepError::Timeout(format!(
-                    "`{step_name}` for process `{name}` did not observe `{pattern}` within {} ms{snippet}",
+                    "`{step_name}` for process `{name}` did not observe `{pattern}` within {} ms; see the `proc/` logs in the failure bundle for captured stdout and stderr",
                     timeout.as_millis()
                 )));
             }
@@ -713,7 +822,9 @@ impl ManagedProcess {
 
         // Close stdin first so processes waiting on EOF can exit cleanly.
         let stdin_was_already_closed = self.stdin.is_none();
-        drop(self.stdin.take());
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.close(Duration::from_millis(100));
+        }
 
         let mut was_running = self.refresh_exit()?.is_none();
         if was_running && stdin_was_already_closed && self.both_pipes_closed() {
@@ -737,19 +848,12 @@ impl ManagedProcess {
         }
 
         let pid = self.child.id();
-        let pipes_closed = self.both_pipes_closed();
-        let kill_result = terminate_process_tree(
-            &mut self.child,
-            &mut self.exit_status,
-            pid,
-            timeout,
-            pipes_closed,
-        );
+        let kill_result =
+            terminate_process_tree(&mut self.child, &mut self.exit_status, pid, timeout);
 
         self.drain_pipes(DRAIN_TIMEOUT.min(timeout.max(Duration::from_millis(100))));
-        self.stopped = true;
-
         kill_result.map_err(|error| format!("process `{name}` (pid {pid}): {error}"))?;
+        self.stopped = true;
         Ok(was_running)
     }
 
@@ -766,6 +870,13 @@ impl ManagedProcess {
 struct ProcSession {
     processes: BTreeMap<String, ManagedProcess>,
     order: Vec<String>,
+    retired: Vec<RetiredLogs>,
+}
+
+struct RetiredLogs {
+    name: String,
+    stdout: String,
+    stderr: String,
 }
 
 impl ProcSession {
@@ -800,13 +911,23 @@ impl Session for ProcSession {
     }
 
     fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
-        let single_default = self.order.len() == 1 && self.order[0] == DEFAULT_NAME;
-        let mut files = Vec::new();
+        let mut logs: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for retired in &self.retired {
+            let entry = logs.entry(retired.name.clone()).or_default();
+            append_evidence(&mut entry.0, &retired.stdout);
+            append_evidence(&mut entry.1, &retired.stderr);
+        }
         for name in &self.order {
-            let Some(proc) = self.processes.get(name) else {
-                continue;
-            };
-            let (stdout, stderr) = proc.snapshot_evidence();
+            let entry = logs.entry(name.clone()).or_default();
+            if let Some(proc) = self.processes.get(name) {
+                let (stdout, stderr) = proc.snapshot_evidence();
+                append_evidence(&mut entry.0, &stdout);
+                append_evidence(&mut entry.1, &stderr);
+            }
+        }
+        let single_default = logs.len() == 1 && logs.contains_key(DEFAULT_NAME);
+        let mut files = Vec::new();
+        for (name, (stdout, stderr)) in logs {
             let (out_name, err_name) = if single_default {
                 ("stdout.log".to_string(), "stderr.log".to_string())
             } else {
@@ -825,6 +946,16 @@ impl Session for ProcSession {
     }
 }
 
+fn append_evidence(destination: &mut String, part: &str) {
+    if part.is_empty() {
+        return;
+    }
+    if !destination.is_empty() {
+        destination.push_str("\n[... earlier process logs ...]\n");
+    }
+    destination.push_str(part);
+}
+
 fn run_start(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: ProcStartArgs = parse(args).map_err(StepError::InvalidArguments)?;
     check_start(&args).map_err(StepError::InvalidArguments)?;
@@ -833,13 +964,34 @@ fn run_start(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
         .get_or_create::<ProcSession>(SESSION_KIND, || Ok(ProcSession::default()))
         .map_err(StepError::Environment)?;
 
-    if let Some(existing) = session.processes.get_mut(&args.name)
-        && existing.is_running()
-    {
-        return Err(StepError::Execution(format!(
-            "process `{}` is already running; stop it with `proc.stop` first or choose another `name`",
-            args.name
-        )));
+    let mut retired_logs = None;
+    if let Some(existing) = session.processes.get_mut(&args.name) {
+        if existing.is_running() {
+            return Err(StepError::Execution(format!(
+                "process `{}` is already running; stop it with `proc.stop` first or choose another `name`",
+                args.name
+            )));
+        }
+        // Reusing a name must not drop the old process object without stopping
+        // its tree: an exited leader can still own live descendants.
+        existing
+            .stop(&args.name, Duration::from_millis(DEFAULT_STOP_TIMEOUT_MS))
+            .map_err(|error| {
+                StepError::Environment(format!(
+                    "could not retire exited process `{}` before restarting it: {error}",
+                    args.name
+                ))
+            })?;
+        let (stdout, stderr) = existing.snapshot_evidence();
+        retired_logs = Some((stdout, stderr));
+    }
+    if let Some((stdout, stderr)) = retired_logs {
+        session.processes.remove(&args.name);
+        session.retired.push(RetiredLogs {
+            name: args.name.clone(),
+            stdout,
+            stderr,
+        });
     }
 
     let proc = ManagedProcess::spawn(&args)?;
@@ -923,31 +1075,67 @@ fn run_send(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         )));
     }
 
+    let timeout = Duration::from_millis(args.timeout_ms);
     let mut bytes_written = 0_usize;
     if let Some(text) = &args.input {
-        let Some(stdin) = proc.stdin.as_mut() else {
-            return Err(StepError::Execution(format!(
-                "stdin of process `{}` is already closed",
-                args.name
-            )));
+        let written = match proc.stdin.as_mut() {
+            Some(stdin) => stdin.write(text.as_bytes(), timeout),
+            None => Err(StdinWriteError::Closed),
         };
-        stdin.write_all(text.as_bytes()).map_err(|error| {
-            StepError::Execution(format!(
-                "could not write to stdin of process `{}`: {error}",
-                args.name
-            ))
-        })?;
-        stdin.flush().map_err(|error| {
-            StepError::Execution(format!(
-                "could not flush stdin of process `{}`: {error}",
-                args.name
-            ))
-        })?;
-        bytes_written = text.len();
+        match written {
+            Ok(()) => bytes_written = text.len(),
+            Err(StdinWriteError::Closed) => {
+                return Err(StepError::Execution(format!(
+                    "stdin of process `{}` is already closed",
+                    args.name
+                )));
+            }
+            Err(StdinWriteError::Io(error)) => {
+                return Err(StepError::Execution(format!(
+                    "could not write to stdin of process `{}`: {error}",
+                    args.name
+                )));
+            }
+            Err(StdinWriteError::TimedOut) => {
+                let cleanup =
+                    match proc.stop(&args.name, Duration::from_millis(DEFAULT_STOP_TIMEOUT_MS)) {
+                        Ok(_) => String::new(),
+                        Err(error) => format!("; process-tree cleanup also failed: {error}"),
+                    };
+                return Err(StepError::Timeout(format!(
+                    "`proc.send` for process `{}` could not write {} bytes within {} ms because the process stopped reading its input; the process tree was stopped{cleanup}",
+                    args.name,
+                    text.len(),
+                    args.timeout_ms
+                )));
+            }
+        }
     }
 
-    if args.eof {
-        drop(proc.stdin.take());
+    if args.eof
+        && let Some(mut stdin) = proc.stdin.take()
+    {
+        match stdin.close(timeout) {
+            Ok(()) | Err(StdinWriteError::Closed) => {}
+            Err(StdinWriteError::Io(error)) => {
+                return Err(StepError::Execution(format!(
+                    "could not close stdin of process `{}`: {error}",
+                    args.name
+                )));
+            }
+            Err(StdinWriteError::TimedOut) => {
+                drop(stdin);
+                let cleanup =
+                    match proc.stop(&args.name, Duration::from_millis(DEFAULT_STOP_TIMEOUT_MS)) {
+                        Ok(_) => String::new(),
+                        Err(error) => format!("; process-tree cleanup also failed: {error}"),
+                    };
+                return Err(StepError::Timeout(format!(
+                    "`proc.send` for process `{}` could not close stdin within {} ms; the process tree was stopped{cleanup}",
+                    args.name, args.timeout_ms
+                )));
+            }
+        }
     }
 
     Ok(json!({
@@ -1023,50 +1211,23 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn output_excerpt(stdout: &str, stderr: &str) -> String {
-    let out = stdout.trim();
-    let err = stderr.trim();
-    match (out.is_empty(), err.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => format!("; stdout: {}", truncate_excerpt(out)),
-        (true, false) => format!("; stderr: {}", truncate_excerpt(err)),
-        (false, false) => format!(
-            "; stdout: {}; stderr: {}",
-            truncate_excerpt(out),
-            truncate_excerpt(err)
-        ),
-    }
-}
-
-fn truncate_excerpt(text: &str) -> String {
-    const LIMIT: usize = 300;
-    if text.chars().count() <= LIMIT {
-        text.to_string()
-    } else {
-        let prefix: String = text.chars().take(LIMIT).collect();
-        format!("{prefix}...")
-    }
-}
-
 fn terminate_process_tree(
     child: &mut Child,
     exit_status: &mut Option<ExitStatus>,
     pid: u32,
     timeout: Duration,
-    pipes_closed: bool,
 ) -> Result<(), String> {
     #[cfg(unix)]
     {
-        let _ = pipes_closed;
         terminate_unix_process_group(child, exit_status, pid, timeout)
     }
     #[cfg(windows)]
     {
-        terminate_windows_process_tree(child, exit_status, pid, timeout, pipes_closed)
+        terminate_windows_process_tree(child, exit_status, pid, timeout)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (pid, timeout, pipes_closed);
+        let _ = (pid, timeout);
         if exit_status.is_none() {
             let _ = child.kill();
             *exit_status = child.wait().ok();
@@ -1261,39 +1422,34 @@ fn terminate_windows_process_tree(
     exit_status: &mut Option<ExitStatus>,
     pid: u32,
     timeout: Duration,
-    pipes_closed: bool,
 ) -> Result<(), String> {
-    let already_exited = exit_status.is_some()
-        || matches!(child.try_wait(), Ok(Some(status)) if { *exit_status = Some(status); true });
-
-    if already_exited && pipes_closed {
-        return Ok(());
-    }
-
-    let taskkill = windows_system_tool(&["taskkill.exe"], "taskkill");
-    let pid_str = pid.to_string();
-    let mut cmd = Command::new(&taskkill);
-    cmd.args(["/PID", &pid_str, "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let taskkill_status = run_bounded_helper(cmd, timeout.min(KILL_HELPER_TIMEOUT));
-
-    if !pipes_closed && (already_exited || !taskkill_status.is_some_and(|s| s.success())) {
-        // If the parent already exited while a descendant still holds pipes
-        // open, `taskkill /PID <parent>` reports not-found while `self.child`
-        // still holds the parent's HANDLE (preventing PID reuse).
-        kill_windows_orphaned_descendants(pid, timeout.max(Duration::from_secs(5)));
+    if exit_status.is_none()
+        && let Ok(Some(status)) = child.try_wait()
+    {
+        *exit_status = Some(status);
     }
 
     if exit_status.is_none() {
+        let taskkill_ok = taskkill_windows_tree(pid, timeout.min(KILL_HELPER_TIMEOUT));
         let _ = child.kill();
         *exit_status = child
             .wait()
             .map(Some)
             .map_err(|error| format!("could not wait for process exit: {error}"))?;
+        if taskkill_ok {
+            // `taskkill /T` already walked and killed the live tree.
+            return Ok(());
+        }
     }
-    Ok(())
+
+    // A child can exit while a grandchild survives with stdout/stderr attached
+    // to files or null. Pipe EOF therefore says nothing about the process
+    // tree, so inspect descendants by PID lineage and verify they are gone.
+    // Windows PowerShell startup dominates the cost here, so one bounded
+    // process owns the enumerate/kill/verify loop instead of one probe per
+    // iteration.
+    let budget = timeout.max(Duration::from_secs(10));
+    terminate_windows_descendants(pid, budget)
 }
 
 #[cfg(windows)]
@@ -1313,54 +1469,341 @@ fn windows_system_tool(parts: &[&str], fallback: &str) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn run_bounded_helper(mut command: Command, budget: Duration) -> Option<ExitStatus> {
-    let mut helper = command.spawn().ok()?;
-    let deadline = Instant::now() + budget;
-    loop {
-        match helper.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-    let _ = helper.kill();
-    let _ = helper.wait();
-    None
+struct HelperOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
 }
 
 #[cfg(windows)]
-fn kill_windows_orphaned_descendants(root_pid: u32, budget: Duration) {
-    let powershell = windows_system_tool(
+fn run_bounded_helper(mut command: Command, budget: Duration) -> Option<HelperOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut helper = command.spawn().ok()?;
+    let stdout = helper.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+    let stderr = helper.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+    let deadline = Instant::now() + budget;
+    let status = loop {
+        match helper.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break None;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    };
+    let Some(status) = status else {
+        let _ = helper.kill();
+        let _ = helper.wait();
+        return None;
+    };
+    let stdout = join_reader(stdout, Duration::from_secs(1))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let stderr = join_reader(stderr, Duration::from_secs(1))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    Some(HelperOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(windows)]
+fn join_reader(handle: Option<JoinHandle<Vec<u8>>>, timeout: Duration) -> Option<Vec<u8>> {
+    let handle = handle?;
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    handle.join().ok()
+}
+
+#[cfg(windows)]
+fn taskkill_windows_tree(pid: u32, budget: Duration) -> bool {
+    let taskkill = windows_system_tool(&["taskkill.exe"], "taskkill");
+    let pid_text = pid.to_string();
+    let mut command = Command::new(taskkill);
+    command.args(["/PID", &pid_text, "/T", "/F"]);
+    run_bounded_helper(command, budget).is_some_and(|output| output.status.success())
+}
+
+#[cfg(windows)]
+fn terminate_windows_descendants(root_pid: u32, budget: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + budget;
+    match terminate_windows_descendants_wmic(root_pid, deadline) {
+        Ok(Some(())) => Ok(()),
+        Ok(None) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            terminate_windows_descendants_powershell(
+                root_pid,
+                remaining.max(Duration::from_secs(1)),
+            )
+        }
+        Err(wmic_error) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < Duration::from_secs(1) {
+                return Err(wmic_error);
+            }
+            terminate_windows_descendants_powershell(root_pid, remaining)
+                .map_err(|powershell_error| format!("{wmic_error}; {powershell_error}"))
+        }
+    }
+}
+
+/// Enumerates the process table with WMIC and terminates every descendant of
+/// `root_pid`. Returns `Ok(None)` only when WMIC is unavailable before any
+/// teardown was attempted, so the caller can fall back to PowerShell.
+#[cfg(windows)]
+fn terminate_windows_descendants_wmic(
+    root_pid: u32,
+    deadline: Instant,
+) -> Result<Option<()>, String> {
+    let Some(wmic) = windows_wmic() else {
+        return Ok(None);
+    };
+    let mut attempted = false;
+    let mut last_targets = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(descendant_survivor_error(&last_targets));
+        }
+        let parents = match windows_process_parent_map(&wmic, remaining) {
+            Ok(parents) => parents,
+            Err(_error) if !attempted => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let targets = windows_descendants(root_pid, &parents);
+        if targets.is_empty() {
+            return Ok(Some(()));
+        }
+        last_targets = targets.clone();
+        attempted = true;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(descendant_survivor_error(&last_targets));
+        }
+        let _ = taskkill_windows_pids(&targets, remaining.min(KILL_HELPER_TIMEOUT));
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+fn windows_wmic() -> Option<PathBuf> {
+    let path = windows_system_tool(&["wbem", "WMIC.exe"], "wmic.exe");
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn windows_process_parent_map(
+    wmic: &std::path::Path,
+    budget: Duration,
+) -> Result<BTreeMap<u32, u32>, String> {
+    let mut command = Command::new(wmic);
+    command.args(["process", "get", "ProcessId,ParentProcessId", "/format:csv"]);
+    let output = run_bounded_helper(command, budget).ok_or_else(|| {
+        "could not enumerate Windows processes within the teardown budget".to_string()
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not enumerate Windows processes ({}): {}",
+            output.status,
+            output.stderr.trim()
+        ));
+    }
+    let mut parents = BTreeMap::new();
+    for line in output.stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.contains("ParentProcessId") {
+            continue;
+        }
+        let mut fields = line.rsplit(',');
+        let Some(pid) = fields
+            .next()
+            .and_then(|field| field.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(parent) = fields
+            .next()
+            .and_then(|field| field.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        parents.insert(pid, parent);
+    }
+    if parents.is_empty() {
+        return Err("Windows process enumeration returned no rows".to_string());
+    }
+    Ok(parents)
+}
+
+#[cfg(windows)]
+fn windows_descendants(root_pid: u32, parents: &BTreeMap<u32, u32>) -> Vec<u32> {
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (&pid, &parent) in parents {
+        children.entry(parent).or_default().push(pid);
+    }
+    let mut targets = Vec::new();
+    let mut seen = BTreeMap::new();
+    let mut queue = VecDeque::from([root_pid]);
+    while let Some(parent) = queue.pop_front() {
+        for &child in children.get(&parent).into_iter().flatten() {
+            if seen.insert(child, ()).is_none() {
+                queue.push_back(child);
+                targets.push(child);
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets
+}
+
+#[cfg(windows)]
+fn descendant_survivor_error(targets: &[u32]) -> String {
+    if targets.is_empty() {
+        "descendant teardown did not complete within the budget".to_string()
+    } else {
+        format!(
+            "descendant processes survived teardown: {}",
+            targets
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+#[cfg(windows)]
+fn taskkill_windows_pids(pids: &[u32], budget: Duration) -> bool {
+    let taskkill = windows_system_tool(&["taskkill.exe"], "taskkill");
+    let mut command = Command::new(taskkill);
+    for pid in pids {
+        command.args(["/PID", &pid.to_string()]);
+    }
+    command.args(["/T", "/F"]);
+    run_bounded_helper(command, budget).is_some_and(|output| output.status.success())
+}
+
+#[cfg(windows)]
+fn terminate_windows_descendants_powershell(root_pid: u32, budget: Duration) -> Result<(), String> {
+    let powershell = windows_powershell();
+    let script = WINDOWS_DESCENDANT_SCRIPT
+        .replace("__ROOT_PID__", &root_pid.to_string())
+        .replace("__BUDGET_MS__", &budget.as_millis().max(1).to_string());
+    let mut command = Command::new(powershell);
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let output = run_bounded_helper(command, budget + Duration::from_secs(2)).ok_or_else(|| {
+        "could not inspect or terminate descendant processes within the teardown budget".to_string()
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let survivors = output
+        .stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    if survivors.is_empty() {
+        return Err(format!(
+            "descendant teardown failed ({}): {}",
+            output.status,
+            output.stderr.trim()
+        ));
+    }
+    Err(format!(
+        "descendant processes survived teardown: {}",
+        survivors
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// Prefer PowerShell 7 when the host has it because its startup is cheaper;
+/// Windows PowerShell 5.1 is always available as the fallback.
+#[cfg(windows)]
+fn windows_powershell() -> PathBuf {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("pwsh.exe");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    windows_system_tool(
         &["WindowsPowerShell", "v1.0", "powershell.exe"],
         "powershell.exe",
-    );
-    let script = format!(
-        "$procs = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId; \
-         $queue = [System.Collections.Generic.Queue[uint32]]::new(); \
-         $seen = [System.Collections.Generic.HashSet[uint32]]::new(); \
-         $queue.Enqueue({root_pid}); \
-         $targets = @(); \
-         while ($queue.Count -gt 0) {{ \
-           $p = $queue.Dequeue(); \
-           foreach ($c in $procs | Where-Object {{ $_.ParentProcessId -eq $p }}) {{ \
-             $cid = [uint32]$c.ProcessId; \
-             if ($seen.Add($cid)) {{ $queue.Enqueue($cid); $targets += $cid }} \
-           }} \
-         }}; \
-         foreach ($t in $targets) {{ Stop-Process -Id $t -Force -ErrorAction SilentlyContinue }}"
-    );
-    let mut cmd = Command::new(powershell);
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = run_bounded_helper(cmd, budget);
+    )
 }
+
+#[cfg(windows)]
+const WINDOWS_DESCENDANT_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$root = __ROOT_PID__
+$deadline = [DateTime]::UtcNow.AddMilliseconds(__BUDGET_MS__)
+while ($true) {
+  $children = @{}
+  foreach ($process in Get-CimInstance Win32_Process) {
+    $parent_id = [int]$process.ParentProcessId
+    if (-not $children.ContainsKey($parent_id)) {
+      $children[$parent_id] = [System.Collections.Generic.List[int]]::new()
+    }
+    $children[$parent_id].Add([int]$process.ProcessId)
+  }
+  $queue = [System.Collections.Generic.Queue[int]]::new()
+  $seen = [System.Collections.Generic.HashSet[int]]::new()
+  $queue.Enqueue([int]$root)
+  $targets = [System.Collections.Generic.List[int]]::new()
+  while ($queue.Count -gt 0) {
+    $parent = $queue.Dequeue()
+    $kids = $children[$parent]
+    if ($null -ne $kids) {
+      foreach ($kid in $kids) {
+        $kid_id = [int]$kid
+        if ($seen.Add($kid_id)) {
+          $queue.Enqueue($kid_id)
+          $targets.Add($kid_id)
+        }
+      }
+    }
+  }
+  if ($targets.Count -eq 0) { exit 0 }
+  if ([DateTime]::UtcNow -ge $deadline) {
+    foreach ($target in $targets) { Write-Output $target }
+    exit 2
+  }
+  foreach ($target in $targets) {
+    Stop-Process -Id $target -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Milliseconds 50
+}
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -1380,6 +1823,7 @@ mod tests {
         assert!(validate_send(&json!({"eof": true})).is_ok());
         assert!(validate_send(&json!({})).is_err());
         assert!(validate_send(&json!({"eof": false})).is_err());
+        assert!(validate_send(&json!({"input": "hi", "timeout_ms": 0})).is_err());
 
         assert!(validate_wait_output(&json!({"pattern": "ok"})).is_ok());
         assert!(validate_wait_output(&json!({"pattern": ""})).is_err());

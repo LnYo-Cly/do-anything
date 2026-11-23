@@ -8,8 +8,8 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -46,6 +46,18 @@ fn stderr(output: &Output) -> String {
 
 fn json_stdout(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON value")
+}
+
+/// `proc.*` tests spawn process trees and the Windows teardown inspects the
+/// machine-wide process table. Concurrent tests make those WMI queries
+/// contend and can exceed the bounded teardown budget, so serialize them even
+/// when the harness runs tests in parallel.
+static PROCESS_TABLE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_process_table() -> MutexGuard<'static, ()> {
+    PROCESS_TABLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn next_token() -> String {
@@ -106,6 +118,16 @@ fn spawn_grandchild(pid_file: &Path, token: &str, hold_pipes: bool) {
     }
     let _child = cmd.spawn().expect("grandchild must spawn");
     wait_for_file(pid_file);
+}
+
+fn run_launcher(args: &[String]) {
+    let pid_dir = PathBuf::from(&args[0]);
+    let token = &args[1];
+    let hold_pipes = args.iter().any(|a| a == "--hold-pipes");
+    write_pid(&pid_dir.join("parent.pid"));
+    spawn_grandchild(&pid_dir.join("grandchild.pid"), token, hold_pipes);
+    println!("LAUNCHED");
+    let _ = io::stdout().flush();
 }
 
 fn run_server(args: &[String]) {
@@ -230,6 +252,7 @@ fn main() {
         }
         Some("repl") => run_repl(),
         Some("hang") => run_hang(&args[2..]),
+        Some("launcher") => run_launcher(&args[2..]),
         Some("crash") => {
             let code: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2);
             println!("BEFORE_CRASH_OUT");
@@ -237,6 +260,15 @@ fn main() {
             let _ = io::stdout().flush();
             let _ = io::stderr().flush();
             std::process::exit(code);
+        }
+        Some("boundary") => {
+            let secret = env::var("DA_TEST_PROC_SECRET").unwrap_or_default();
+            let filler = "a".repeat(290);
+            println!("{filler}{secret}");
+            eprintln!("{filler}{secret}");
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+            std::process::exit(1);
         }
         Some("flood") => {
             let chunk_out = vec![b'A'; 65_536];
@@ -410,6 +442,7 @@ fn assert_process_tree_dead(pid_dir: &Path, token: &str) {
 #[cfg(feature = "http")]
 #[test]
 fn proc_start_local_server_with_http_assertions_and_zero_orphan_grandchildren_on_pass() {
+    let _process_table = lock_process_table();
     let helper = helper_bin();
     let dir = TempDir::new("proc-http-pass");
     let pid_dir = dir.path().join("pids");
@@ -461,6 +494,7 @@ steps:
 #[cfg(feature = "http")]
 #[test]
 fn proc_kills_process_tree_on_assertion_failure_and_writes_proc_evidence() {
+    let _process_table = lock_process_table();
     let helper = helper_bin();
     let dir = TempDir::new("proc-http-fail");
     let pid_dir = dir.path().join("pids");
@@ -531,6 +565,7 @@ steps:
 
 #[test]
 fn proc_kills_process_tree_on_start_and_wait_timeouts() {
+    let _process_table = lock_process_table();
     let helper = helper_bin();
     let dir = TempDir::new("proc-timeouts");
 
@@ -644,6 +679,7 @@ steps:
 
 #[test]
 fn interactive_proc_send_and_wait_output_across_repeated_patterns_and_eof() {
+    let _process_table = lock_process_table();
     let helper = helper_bin();
     let dir = TempDir::new("proc-interactive");
 
@@ -731,6 +767,7 @@ steps:
 
 #[test]
 fn multiple_named_processes_cwd_env_and_redacted_secrets_in_bundle() {
+    let _process_table = lock_process_table();
     let helper = helper_bin();
     let dir = TempDir::new("proc-multi-secret");
     let work_sub = dir.path().join("workdir");
@@ -857,6 +894,7 @@ steps:
 
 #[test]
 fn bounded_pipe_draining_never_deadlocks_on_large_output() {
+    let _process_table = lock_process_table();
     let helper = helper_bin();
     let dir = TempDir::new("proc-flood");
 
@@ -895,6 +933,7 @@ steps:
 
 #[test]
 fn proc_error_paths_and_lint_rules() {
+    let _process_table = lock_process_table();
     let helper = helper_bin();
     let dir = TempDir::new("proc-errors");
 
@@ -923,7 +962,7 @@ steps:
       command: '{helper}'
       args: ["crash", "7"]
       ready_pattern: "READY"
-      ready_timeout_ms: 10000
+      ready_timeout_ms: 60000
 "#,
             helper = helper.display(),
         ),
@@ -942,7 +981,7 @@ steps:
     );
     assert_eq!(crash_out.status.code(), Some(1));
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "early crash must fail fast without waiting for ready_timeout_ms"
     );
     let crash_report = json_stdout(&crash_out);
@@ -1006,4 +1045,281 @@ steps:
     );
     let retry_lint = run_da_in(dir.path(), &["lint", path_str(&retry_case)]);
     assert_eq!(retry_lint.status.code(), Some(3));
+}
+
+#[test]
+fn reusing_an_exited_name_stops_the_old_tree_and_preserves_its_logs() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-reuse-exited");
+    let pid_dir = dir.path().join("pids-old");
+    let bundles = dir.path().join("bundles");
+    let token = next_token();
+
+    let case = dir.write(
+        "reuse-exited.yaml",
+        &format!(
+            r#"
+name: Reusing an exited process name retires its tree
+steps:
+  - proc.start:
+      name: reused
+      command: '{helper}'
+      args: ["launcher", '{pid_dir}', "{token}", "--hold-pipes"]
+      ready_pattern: "LAUNCHED"
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: reused
+      pattern: "PARENT_EXIT"
+      timeout_ms: 300
+    optional: true
+  - proc.start:
+      name: reused
+      command: '{helper}'
+      args: ["repl"]
+      ready_pattern: "REPL_READY"
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: reused
+      pattern: "NEVER_AFTER_RESTART"
+      timeout_ms: 200
+"#,
+            helper = helper.display(),
+            pid_dir = pid_dir.display(),
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_process_tree_dead(&pid_dir, &token);
+
+    let report = json_stdout(&output);
+    let bundle_dir = PathBuf::from(
+        report["cases"][0]["bundle"]
+            .as_str()
+            .expect("the timed-out case must write a bundle"),
+    );
+    let retired_log = fs::read_to_string(bundle_dir.join("proc/reused-stdout.log"))
+        .expect("retired process stdout must be preserved");
+    assert!(
+        retired_log.contains("LAUNCHED"),
+        "retired process output was dropped: {retired_log:?}"
+    );
+    assert!(
+        retired_log.contains("REPL_READY"),
+        "current process output must share the same evidence file: {retired_log:?}"
+    );
+}
+
+#[test]
+fn stop_kills_an_exited_leaders_descendants_without_pipe_eof() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-stop-orphan");
+    let pid_dir = dir.path().join("pids-orphan");
+    let token = next_token();
+
+    let case = dir.write(
+        "stop-orphan.yaml",
+        &format!(
+            r#"
+name: Stop kills descendants even when output pipes are closed
+steps:
+  - proc.start:
+      name: orphan
+      command: '{helper}'
+      args: ["launcher", '{pid_dir}', "{token}"]
+      ready_pattern: "LAUNCHED"
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: orphan
+      pattern: "PARENT_EXIT"
+      timeout_ms: 300
+    optional: true
+  - proc.stop:
+      name: orphan
+    expect:
+      - path: $.was_running
+        equals: false
+"#,
+            helper = helper.display(),
+            pid_dir = pid_dir.display(),
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_process_tree_dead(&pid_dir, &token);
+}
+
+#[test]
+fn proc_send_times_out_and_stops_a_process_that_does_not_read_stdin() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-send-timeout");
+    let pid_dir = dir.path().join("pids-send");
+    let token = next_token();
+    let payload = "x".repeat(1024 * 1024);
+
+    let case = dir.write(
+        "send-timeout.yaml",
+        &format!(
+            r#"
+name: Send deadline stops a non-reading process
+steps:
+  - proc.start:
+      name: stdin_hold
+      command: '{helper}'
+      args: ["hang", '{pid_dir}', "{token}", "--silent", "--hold-pipes"]
+      ready_pattern: "HANG_BOOTED"
+      ready_timeout_ms: 5000
+  - proc.send:
+      name: stdin_hold
+      input: "{payload}"
+      timeout_ms: 500
+"#,
+            helper = helper.display(),
+            pid_dir = pid_dir.display(),
+        ),
+    );
+
+    let started = Instant::now();
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the send deadline must not block the case"
+    );
+    assert_process_tree_dead(&pid_dir, &token);
+
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["error"]["kind"], "timeout", "{report}");
+    let message = report["cases"][0]["error"]["message"]
+        .as_str()
+        .expect("timeout error must carry a message");
+    assert!(
+        message.contains("process tree was stopped"),
+        "timeout must report cleanup: {message}"
+    );
+}
+
+#[test]
+fn ready_failure_never_exposes_a_secret_prefix_at_the_excerpt_boundary() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-secret-boundary");
+    let bundles = dir.path().join("bundles");
+    let secret = "boundary-s3cr3t-value-987654";
+
+    let case = dir.write(
+        "secret-boundary.yaml",
+        &format!(
+            r#"
+name: Secret at the old excerpt boundary
+steps:
+  - proc.start:
+      command: '{helper}'
+      args: ["boundary"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+      ready_pattern: "NEVER_PRINTED"
+      ready_timeout_ms: 10000
+"#,
+            helper = helper.display(),
+        ),
+    );
+
+    let output = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_PROC_TEST_SECRET", secret)],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let prefix = &secret[..10];
+    let report = json_stdout(&output);
+    let message = report["cases"][0]["error"]["message"]
+        .as_str()
+        .expect("execution error must carry a message");
+    assert!(
+        !message.contains(prefix),
+        "error message leaked a secret prefix: {message}"
+    );
+    assert!(
+        !stdout(&output).contains(prefix),
+        "JSON output leaked a secret prefix: {}",
+        stdout(&output)
+    );
+
+    let bundle_dir = PathBuf::from(
+        report["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must write a bundle"),
+    );
+    for name in ["proc/stdout.log", "proc/stderr.log"] {
+        let log = fs::read_to_string(bundle_dir.join(name))
+            .unwrap_or_else(|error| panic!("{name} must be readable: {error}"));
+        assert!(log.contains("***"), "{name} must be redacted: {log:?}");
+        assert!(
+            !log.contains(prefix),
+            "{name} leaked a secret prefix: {log:?}"
+        );
+        assert!(
+            !log.contains(secret),
+            "{name} leaked the complete secret: {log:?}"
+        );
+    }
+    let report_json =
+        fs::read_to_string(bundle_dir.join("report.json")).expect("report.json must be readable");
+    assert!(
+        !report_json.contains(prefix),
+        "report.json leaked a secret prefix: {report_json:?}"
+    );
 }

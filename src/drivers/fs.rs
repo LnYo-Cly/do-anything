@@ -192,11 +192,8 @@ fn snapshot_tree(
             Err(error) => return Err(environment(&dir_path, &error)),
         };
 
-        let mut children = Vec::new();
-        for entry in read_dir {
-            let entry = entry.map_err(|error| environment(&dir_path, &error))?;
-            children.push(entry);
-        }
+        let mut children =
+            collect_directory_entries(read_dir, &mut entries_seen, max_entries, root, &dir_path)?;
         children.sort_by_key(|entry| entry.file_name());
 
         let mut subdirs = Vec::new();
@@ -206,11 +203,6 @@ fn snapshot_tree(
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
                 Err(error) => return Err(environment(&entry.path(), &error)),
             };
-
-            entries_seen = entries_seen.saturating_add(1);
-            if entries_seen > max_entries {
-                return Err(max_entries_error(root, max_entries));
-            }
 
             if file_type.is_symlink() {
                 continue;
@@ -241,6 +233,32 @@ fn snapshot_tree(
     }
 
     Ok(files)
+}
+
+/// Reads one directory while counting every entry against the snapshot cap.
+///
+/// The cap is checked before an entry is retained, so a directory larger than
+/// `max_entries` cannot allocate an arbitrary vector before failing.
+fn collect_directory_entries<I>(
+    entries: I,
+    entries_seen: &mut u64,
+    max_entries: u64,
+    root: &Path,
+    dir_path: &Path,
+) -> Result<Vec<std::fs::DirEntry>, ObserverError>
+where
+    I: Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| environment(dir_path, &error))?;
+        *entries_seen = entries_seen.saturating_add(1);
+        if *entries_seen > max_entries {
+            return Err(max_entries_error(root, max_entries));
+        }
+        children.push(entry);
+    }
+    Ok(children)
 }
 
 fn read_fingerprint(path: &Path, hash: bool) -> Result<Option<FileFingerprint>, ObserverError> {
@@ -491,6 +509,8 @@ impl Sha256 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
 
     fn hex(bytes: &[u8]) -> String {
@@ -527,5 +547,41 @@ mod tests {
         assert!(validate(&json!({"path": "out", "max_entries": 0})).is_err());
         assert!(validate(&json!({"path": "out", "extra": true})).is_err());
         assert!(validate(&json!({"path": "out"})).is_ok());
+    }
+
+    #[test]
+    fn max_entries_stops_reading_directory_after_the_cap() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "da-fs-cap-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the cap fixture must be creatable");
+        for index in 0..20 {
+            std::fs::write(dir.join(format!("entry-{index:02}.txt")), "x")
+                .expect("the cap fixture file must be writable");
+        }
+
+        let mut entries_seen = 0;
+        let mut next_calls = 0;
+        let entries = std::fs::read_dir(&dir)
+            .expect("the cap fixture must be readable")
+            .inspect(|_| {
+                next_calls += 1;
+            });
+        let result = collect_directory_entries(entries, &mut entries_seen, 3, &dir, &dir);
+        assert!(result.is_err(), "a directory over the cap must fail");
+        assert_eq!(
+            entries_seen, 4,
+            "the cap must count the entry that exceeds it"
+        );
+        assert_eq!(
+            next_calls, 4,
+            "enumeration must stop at the cap instead of reading every entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
