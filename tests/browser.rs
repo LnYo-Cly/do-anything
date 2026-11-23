@@ -8378,6 +8378,7 @@ finally:
 
 struct CuServer {
     port: u16,
+    hits: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -8387,6 +8388,8 @@ impl CuServer {
         let listener = support::bind_browser_safe_listener();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits_log = std::sync::Arc::clone(&hits);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_flag = std::sync::Arc::clone(&stop);
         let owned_routes: Vec<(String, String)> = routes
@@ -8407,6 +8410,9 @@ impl CuServer {
                             .next()
                             .and_then(|l| l.split_whitespace().nth(1))
                             .unwrap_or("/");
+                        if let Ok(mut guard) = hits_log.lock() {
+                            guard.push(target.to_string());
+                        }
                         let path = target.split('?').next().unwrap_or(target);
                         let (status, body) = owned_routes
                             .iter()
@@ -8432,6 +8438,7 @@ impl CuServer {
         });
         Self {
             port,
+            hits,
             stop,
             handle: Some(handle),
         }
@@ -8439,6 +8446,20 @@ impl CuServer {
 
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+
+    fn hits_matching(&self, prefix: &str) -> Vec<String> {
+        self.hits
+            .lock()
+            .expect("lock CuServer hits")
+            .iter()
+            .filter(|u| u.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    fn clear_hits(&self) {
+        self.hits.lock().expect("lock CuServer hits").clear();
     }
 }
 
@@ -8733,6 +8754,86 @@ steps:
         stdout(&bad_out).contains("viewport"),
         "viewport mismatch error must explain size mismatch: {}",
         stdout(&bad_out)
+    );
+
+    // Nested same-origin iframes (`top -> #outer -> #inner -> #deep-btn`) scroll
+    // outward from innermost to outermost enclosing frame.
+    let nested_cu = CuServer::start(vec![
+        (
+            "/nested-top",
+            r##"<!doctype html><html><body style="margin:0;height:2200px">
+              <iframe id="outer" src="/nested-outer" style="position:absolute;top:1500px;left:20px;width:400px;height:200px;border:1px solid #333"></iframe>
+            </body></html>"##,
+        ),
+        (
+            "/nested-outer",
+            r##"<!doctype html><html><body style="margin:0;height:900px">
+              <iframe id="inner" src="/nested-inner" style="position:absolute;top:520px;left:10px;width:320px;height:120px;border:1px solid #666"></iframe>
+            </body></html>"##,
+        ),
+        (
+            "/nested-inner",
+            r##"<!doctype html><html><body style="margin:0;height:400px">
+              <button id="deep-btn" style="position:absolute;top:240px;left:20px" onclick="this.textContent='clicked'">Deep</button>
+            </body></html>"##,
+        ),
+    ]);
+    let nested_case = dir.write(
+        "scroll-nested-frames.yaml",
+        &format!(
+            r##"name: scroll nested enclosing frames into view
+steps:
+  - browser.open:
+      url: "{}"
+      width: 800
+      height: 600
+  - browser.scroll:
+      css: "#deep-btn"
+      within:
+        css: "#inner"
+        within:
+          css: "#outer"
+      into_view: true
+    expect:
+      - path: $.scrolled
+        equals: true
+      - path: $.scroll_y
+        not_equals: 0
+  - browser.click:
+      css: "#deep-btn"
+      within:
+        css: "#inner"
+        within:
+          css: "#outer"
+  - browser.read:
+      css: "#deep-btn"
+      within:
+        css: "#inner"
+        within:
+          css: "#outer"
+    expect:
+      - path: $.text
+        equals: "clicked"
+"##,
+            nested_cu.url("/nested-top")
+        ),
+    );
+    let nested_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&nested_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&nested_out),
+        Some(0),
+        "nested iframe scroll into view must pass: stdout={}\nstderr={}",
+        stdout(&nested_out),
+        stderr(&nested_out)
     );
 }
 
@@ -9364,25 +9465,574 @@ steps:
 }
 
 #[test]
+fn browser_drag_mixed_at_and_locator_fails_closed_when_locator_scrolls_page() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![(
+        "/mixed-drag",
+        r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; height: 2200px; font-family: sans-serif; position: relative; }
+  .item { position: absolute; left: 40px; width: 100px; height: 40px; border: 1px solid #333; display: flex; align-items: center; justify-content: center; user-select: none; }
+  #src { top: 80px; background: #cde; }
+  #near-src { left: 200px; top: 1460px; background: #edc; }
+  #dst { top: 1500px; background: #dfd; }
+  #mouse-log { position: fixed; right: 4px; top: 4px; font-size: 11px; }
+</style></head>
+<body>
+  <div id="src" class="item" draggable="true">Src</div>
+  <div id="near-src" class="item" draggable="true">NearSrc</div>
+  <div id="dst" class="item">Dst</div>
+  <div id="mouse-log"></div>
+  <script>
+    const logEl = document.getElementById('mouse-log');
+    function record(ev) {
+      logEl.textContent += (logEl.textContent ? ';' : '') + ev;
+      fetch('/mouse-event?ev=' + encodeURIComponent(ev)).catch(() => {});
+    }
+    window.addEventListener('mousedown', e => {
+      const id = (e.target && e.target.id) ? e.target.id : (e.target ? e.target.tagName : 'none');
+      record('down=' + id);
+    }, true);
+    window.addEventListener('mouseup', e => {
+      const id = (e.target && e.target.id) ? e.target.id : (e.target ? e.target.tagName : 'none');
+      record('up=' + id);
+    }, true);
+    for (const id of ['src', 'near-src']) {
+      document.getElementById(id).addEventListener('dragstart', e => {
+        e.dataTransfer.setData('text/plain', id);
+        record('dragstart=' + id);
+      });
+    }
+    const dst = document.getElementById('dst');
+    dst.addEventListener('dragenter', e => e.preventDefault());
+    dst.addEventListener('dragover', e => e.preventDefault());
+    dst.addEventListener('drop', e => {
+      e.preventDefault();
+      record('drop=' + dst.id + '(' + e.dataTransfer.getData('text/plain') + ')');
+    });
+  </script>
+</body>
+</html>"##,
+    )]);
+
+    let dir = TempDir::new("browser-mixed-drag-scroll");
+
+    // Probe actual inner viewport dimensions for `width: 640, height: 480`.
+    let probe = dir.write(
+        "probe-vp.yaml",
+        &format!(
+            r##"name: probe viewport
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 480
+  - browser.hover:
+      at: {{ x: 10, y: 10 }}
+"##,
+            cu.url("/mixed-drag")
+        ),
+    );
+    let probe_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&probe), "--no-bundle"],
+    );
+    assert_eq!(exit_code(&probe_out), Some(0), "{}", stdout(&probe_out));
+    let probe_json = json_stdout(&probe_out);
+    let vp = &probe_json["cases"][0]["steps"][1]["result"]["viewport"];
+    let vw = vp["width"].as_u64().expect("viewport width");
+    let vh = vp["height"].as_u64().expect("viewport height");
+    cu.clear_hits();
+
+    // 1. `from.at` (#src at y=80..120 -> x=90, y=100) + `to.locator` (#dst at y=1500):
+    // resolving `#dst` scrolls the document and MUST fail closed (exit 1) with ZERO mouse events!
+    let mixed_from_at = dir.write(
+        "mixed-from-at.yaml",
+        &format!(
+            r##"name: mixed from.at to.locator offscreen
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 480
+  - browser.drag:
+      from: {{ at: {{ x: 90, y: 100, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#dst" }}
+"##,
+            cu.url("/mixed-drag")
+        ),
+    );
+    let bundles = dir.path().join("mixed-bundles");
+    let fail_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&mixed_from_at),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(
+        exit_code(&fail_out),
+        Some(1),
+        "mixed at+locator scroll must fail closed as TestFailure (1): stdout={}\nstderr={}",
+        stdout(&fail_out),
+        stderr(&fail_out)
+    );
+    let fail_json = json_stdout(&fail_out);
+    let err_msg = case_error(&fail_json);
+    assert!(
+        err_msg.contains("scrolled the page") && err_msg.contains("browser.scroll"),
+        "error must explain scroll invalidation and remediation: {err_msg}"
+    );
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire before mixed drag fails closed, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+    let bundle = PathBuf::from(fail_json["cases"][0]["bundle"].as_str().expect("bundle"));
+    let dom_html = fs::read_to_string(bundle.join("browser/dom.html")).expect("bundle dom.html");
+    assert!(
+        dom_html.contains("<div id=\"mouse-log\"></div>"),
+        "DOM mouse log must remain completely empty (no down=BODY!): {dom_html}"
+    );
+
+    // 2. Reverse mixed direction (`from.locator` offscreen + `to.at`) also fails closed with 0 mouse events.
+    cu.clear_hits();
+    let mixed_to_at = dir.write(
+        "mixed-to-at.yaml",
+        &format!(
+            r##"name: mixed from.locator to.at offscreen
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 480
+  - browser.drag:
+      from: {{ css: "#dst" }}
+      to: {{ at: {{ x: 90, y: 100, viewport: {{ width: {vw}, height: {vh} }} }} }}
+"##,
+            cu.url("/mixed-drag")
+        ),
+    );
+    let fail2_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&mixed_to_at),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&fail2_out), Some(1), "{}", stdout(&fail2_out));
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire on reverse mixed drag failure, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+
+    // 3. Locating BOTH `#src` (y=80) and `#dst` (y=1500) in `640x480` succeeds cleanly on `#src` -> `#dst`.
+    cu.clear_hits();
+    let both_located = dir.write(
+        "both-located.yaml",
+        &format!(
+            r##"name: locate both src and offscreen dst
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 480
+  - browser.drag:
+      from: {{ css: "#src" }}
+      to: {{ css: "#dst" }}
+  - browser.read:
+      css: "#mouse-log"
+    expect:
+      - path: $.text
+        contains: "down=src"
+      - path: $.text
+        contains: "drop=dst(src)"
+"##,
+            cu.url("/mixed-drag")
+        ),
+    );
+    let both_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&both_located),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&both_out),
+        Some(0),
+        "locating both #src and #dst must succeed: stdout={}\nstderr={}",
+        stdout(&both_out),
+        stderr(&both_out)
+    );
+    assert!(
+        !stdout(&both_out).contains("down=BODY"),
+        "located drag must press #src, never BODY: {}",
+        stdout(&both_out)
+    );
+
+    // 4. Scrolling into view first with `browser.scroll`, then running mixed `at` + `#dst` succeeds!
+    let scroll_probe = dir.write(
+        "scroll-probe.yaml",
+        &format!(
+            r##"name: probe scroll offset after into_view
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 480
+  - browser.scroll:
+      css: "#dst"
+      into_view: true
+"##,
+            cu.url("/mixed-drag")
+        ),
+    );
+    let sp_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&scroll_probe),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&sp_out), Some(0), "{}", stdout(&sp_out));
+    let scroll_y = json_stdout(&sp_out)["cases"][0]["steps"][1]["result"]["scroll_y"]
+        .as_f64()
+        .expect("scroll_y");
+    let near_src_vy = (1480.0 - scroll_y).round() as i64;
+
+    cu.clear_hits();
+    let scroll_then_mixed = dir.write(
+        "scroll-then-mixed.yaml",
+        &format!(
+            r##"name: scroll first then mixed drag
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 480
+  - browser.scroll:
+      css: "#dst"
+      into_view: true
+  - browser.drag:
+      from: {{ at: {{ x: 250, y: {near_src_vy}, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#dst" }}
+  - browser.read:
+      css: "#mouse-log"
+    expect:
+      - path: $.text
+        contains: "down=near-src"
+      - path: $.text
+        contains: "drop=dst(near-src)"
+"##,
+            cu.url("/mixed-drag")
+        ),
+    );
+    let stm_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&scroll_then_mixed),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&stm_out),
+        Some(0),
+        "scrolling first then mixed drag must succeed: stdout={}\nstderr={}",
+        stdout(&stm_out),
+        stderr(&stm_out)
+    );
+}
+
+#[test]
+fn browser_clipboard_rejects_connected_and_headed_browsers_as_environment() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![(
+        "/clip-guard",
+        r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Clip Guard</title></head>
+<body>
+  <div id="ready">ready</div>
+  <script>
+    try {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        get() {
+          fetch('/clip-touched').catch(() => {});
+          throw new Error('navigator.clipboard must not be touched');
+        }
+      });
+    } catch (_) {}
+  </script>
+</body>
+</html>"##,
+    )]);
+
+    let dir = TempDir::new("browser-clipboard-isolation");
+
+    // (a) `connect` mode rejects both `browser.set_clipboard` and `browser.read_clipboard`
+    // with ExitCode::Environment (4) before touching `navigator.clipboard`.
+    let external = UserBrowser::start();
+    let conn_secret = "conn-clip-secret-778899";
+    for (name, step_yaml) in [
+        (
+            "connect-set-clip",
+            "  - browser.set_clipboard:\n      text: \"${env:DA_CONN_CLIP_SECRET}\"\n",
+        ),
+        ("connect-read-clip", "  - browser.read_clipboard: {}\n"),
+    ] {
+        cu.clear_hits();
+        let case = dir.write(
+            &format!("{name}.yaml"),
+            &format!(
+                "name: {name}\nsteps:\n  - browser.open:\n      connect: \"{}\"\n      url: \"{}\"\n{step_yaml}",
+                external.connect_url(),
+                cu.url("/clip-guard")
+            ),
+        );
+        let out = run_da_with_env(
+            dir.path(),
+            &["--output", "json", "run", path_str(&case), "--no-bundle"],
+            &[("DA_CONN_CLIP_SECRET", conn_secret.to_string())],
+        );
+        assert_eq!(
+            exit_code(&out),
+            Some(4),
+            "{name} must fail with ExitCode::Environment (4): stdout={}\nstderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            !stdout(&out).contains(conn_secret) && !stderr(&out).contains(conn_secret),
+            "{name} leaked secret!\nstdout={}\nstderr={}",
+            stdout(&out),
+            stderr(&out)
+        );
+        let j = json_stdout(&out);
+        assert_eq!(j["cases"][0]["steps"][0]["status"], json!("passed"), "{j}");
+        assert_eq!(j["cases"][0]["steps"][1]["status"], json!("error"), "{j}");
+        let msg = case_error(&j);
+        assert!(
+            msg.contains("connect") && msg.contains("headless: true"),
+            "{name} error must explain connected clipboard isolation: {msg}"
+        );
+        assert!(
+            cu.hits_matching("/clip-touched").is_empty(),
+            "{name} must fail before touching navigator.clipboard"
+        );
+    }
+    drop(external);
+
+    // (b) `headless: false` rejects both `browser.set_clipboard` and `browser.read_clipboard`
+    // with ExitCode::Environment (4) before touching `navigator.clipboard`.
+    let has_display = !cfg!(target_os = "linux")
+        || std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let headed_secret = "headed-clip-secret-556677";
+
+    if has_display {
+        for (name, step_yaml) in [
+            (
+                "headed-set-clip",
+                "  - browser.set_clipboard:\n      text: \"${env:DA_HEADED_CLIP_SECRET}\"\n",
+            ),
+            ("headed-read-clip", "  - browser.read_clipboard: {}\n"),
+        ] {
+            cu.clear_hits();
+            let case = dir.write(
+                &format!("{name}.yaml"),
+                &format!(
+                    "name: {name}\nsteps:\n  - browser.open:\n      headless: false\n      url: \"{}\"\n{step_yaml}",
+                    cu.url("/clip-guard")
+                ),
+            );
+            let out = run_da_with_env(
+                dir.path(),
+                &["--output", "json", "run", path_str(&case), "--no-bundle"],
+                &[("DA_HEADED_CLIP_SECRET", headed_secret.to_string())],
+            );
+            assert_eq!(
+                exit_code(&out),
+                Some(4),
+                "{name} must fail with ExitCode::Environment (4): stdout={}\nstderr={}",
+                stdout(&out),
+                stderr(&out)
+            );
+            assert!(
+                !stdout(&out).contains(headed_secret) && !stderr(&out).contains(headed_secret),
+                "{name} leaked secret!\nstdout={}\nstderr={}",
+                stdout(&out),
+                stderr(&out)
+            );
+            let j = json_stdout(&out);
+            assert_eq!(j["cases"][0]["steps"][0]["status"], json!("passed"), "{j}");
+            assert_eq!(j["cases"][0]["steps"][1]["status"], json!("error"), "{j}");
+            let msg = case_error(&j);
+            assert!(
+                msg.contains("headless: false") && msg.contains("headless: true"),
+                "{name} error must explain headed clipboard isolation: {msg}"
+            );
+            assert!(
+                cu.hits_matching("/clip-touched").is_empty(),
+                "{name} must reject before touching navigator.clipboard"
+            );
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (name, step_yaml) in [
+                (
+                    "headed-stub-set-clip",
+                    "  - browser.set_clipboard:\n      text: \"${env:DA_HEADED_CLIP_SECRET}\"\n",
+                ),
+                ("headed-stub-read-clip", "  - browser.read_clipboard: {}\n"),
+            ] {
+                let done_file = dir.path().join(format!("{name}.done"));
+                let done_for_server = done_file.clone();
+                let (port, handle) = spawn_mock_devtools(move |mut socket| {
+                    while let Some(cmd) = read_mock_cdp(&mut socket) {
+                        let method = cmd["method"].as_str().unwrap_or_default();
+                        match method {
+                            "Target.getTargets" => send_mock_cdp(
+                                &mut socket,
+                                &json!({
+                                    "id": cmd["id"],
+                                    "result": { "targetInfos": [{ "targetId": "t-h1", "type": "page", "url": "about:blank" }] }
+                                }),
+                            ),
+                            "Target.attachToTarget" => send_mock_cdp(
+                                &mut socket,
+                                &json!({ "id": cmd["id"], "result": { "sessionId": "s-h1" } }),
+                            ),
+                            "Page.enable"
+                            | "Runtime.enable"
+                            | "Network.enable"
+                            | "Page.navigate"
+                            | "Target.setDiscoverTargets"
+                            | "Page.setLifecycleEventsEnabled"
+                            | "Emulation.setDeviceMetricsOverride" => {
+                                send_mock_cdp(
+                                    &mut socket,
+                                    &json!({ "id": cmd["id"], "result": {} }),
+                                );
+                            }
+                            "Runtime.evaluate" => {
+                                let expr = cmd["params"]["expression"].as_str().unwrap_or_default();
+                                assert!(
+                                    !expr.contains("clipboard"),
+                                    "headed clipboard step must fail before evaluating clipboard JS: {expr}"
+                                );
+                                let val = if expr == "location.href" {
+                                    "http://127.0.0.1/clip-guard"
+                                } else if expr == "document.readyState" {
+                                    "complete"
+                                } else {
+                                    "Clip Guard"
+                                };
+                                send_mock_cdp(
+                                    &mut socket,
+                                    &json!({ "id": cmd["id"], "result": { "result": { "type": "string", "value": val } } }),
+                                );
+                            }
+                            "Browser.grantPermissions" | "Emulation.setFocusEmulationEnabled" => {
+                                panic!("headed clipboard step must not send {method}");
+                            }
+                            "Browser.close" => {
+                                send_mock_cdp(
+                                    &mut socket,
+                                    &json!({ "id": cmd["id"], "result": {} }),
+                                );
+                                let _ = fs::write(&done_for_server, b"done");
+                                break;
+                            }
+                            _ => send_mock_cdp(
+                                &mut socket,
+                                &json!({ "id": cmd["id"], "result": {} }),
+                            ),
+                        }
+                    }
+                    let _ = fs::write(&done_for_server, b"done");
+                });
+
+                let stub = dir.path().join(format!("{name}-chrome.sh"));
+                let script = format!(
+                    "#!/bin/sh\nprofile=\"\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --headless*) exit 91 ;;\n    --user-data-dir=*) profile=\"${{arg#--user-data-dir=}}\" ;;\n  esac\ndone\nprintf '%s\\n/devtools/browser/mock\\n' '{port}' > \"$profile/DevToolsActivePort\"\nwhile [ ! -f '{}' ]; do sleep 0.02; done\n",
+                    done_file.display()
+                );
+                fs::write(&stub, script).expect("write stub chrome");
+                let mut perms = fs::metadata(&stub).expect("stub metadata").permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&stub, perms).expect("chmod stub");
+
+                let case = dir.write(
+                    &format!("{name}.yaml"),
+                    &format!(
+                        "name: {name}\nsteps:\n  - browser.open:\n      headless: false\n      url: \"http://127.0.0.1/clip-guard\"\n{step_yaml}"
+                    ),
+                );
+                let out = run_da_with_env(
+                    dir.path(),
+                    &["--output", "json", "run", path_str(&case), "--no-bundle"],
+                    &[
+                        ("DA_CHROME", stub.to_string_lossy().into_owned()),
+                        ("DA_HEADED_CLIP_SECRET", headed_secret.to_string()),
+                    ],
+                );
+                let _ = fs::write(&done_file, b"done");
+                handle.join().expect("join mock server");
+
+                assert_eq!(exit_code(&out), Some(4), "{}", stdout(&out));
+                let j = json_stdout(&out);
+                assert_eq!(j["cases"][0]["steps"][0]["status"], json!("passed"), "{j}");
+                assert_eq!(j["cases"][0]["steps"][1]["status"], json!("error"), "{j}");
+                let msg = case_error(&j);
+                assert!(
+                    msg.contains("headless: false") && msg.contains("headless: true"),
+                    "{msg}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn computer_use_mock_closed_tab_fails_fast_as_environment_error() {
     let dir = TempDir::new("browser-cu-dead-tab");
-    for (name, step_yaml, needs_node_query) in [
-        ("scroll", "  - browser.scroll:\n      delta_y: 100\n", false),
-        ("hover", "  - browser.hover:\n      css: \"#btn\"\n", true),
+    for (name, step_yaml) in [
+        ("scroll", "  - browser.scroll:\n      delta_y: 100\n"),
+        ("hover", "  - browser.hover:\n      css: \"#btn\"\n"),
         (
             "drag",
             "  - browser.drag:\n      from: { css: \"#a\" }\n      to: { css: \"#b\" }\n",
-            true,
         ),
-        (
-            "set_clipboard",
-            "  - browser.set_clipboard:\n      text: \"abc\"\n",
-            false,
-        ),
-        ("read_clipboard", "  - browser.read_clipboard: {}\n", false),
     ] {
         let (port, handle) = spawn_mock_devtools(move |mut socket| {
-            let mut returned_first_eval = false;
             while let Some(cmd) = read_mock_cdp(&mut socket) {
                 let method = cmd["method"].as_str().unwrap_or_default();
                 match method {
@@ -9397,41 +10047,38 @@ fn computer_use_mock_closed_tab_fails_fast_as_environment_error() {
                     "Page.enable"
                     | "Runtime.enable"
                     | "Network.enable"
+                    | "Page.navigate"
                     | "Target.setDiscoverTargets"
                     | "Page.setLifecycleEventsEnabled"
-                    | "Emulation.setDeviceMetricsOverride"
-                    | "Browser.grantPermissions"
-                    | "Emulation.setFocusEmulationEnabled" => {
+                    | "Emulation.setDeviceMetricsOverride" => {
                         send_mock_cdp(&mut socket, &json!({ "id": cmd["id"], "result": {} }));
                     }
-                    "Page.navigate" => {
-                        send_mock_cdp(
-                            &mut socket,
-                            &json!({ "id": cmd["id"], "result": { "frameId": "f1", "loaderId": "l1" } }),
-                        );
-                        send_mock_cdp(
-                            &mut socket,
-                            &json!({ "method": "Page.loadEventFired", "sessionId": "s-cu-1", "params": { "timestamp": 1.0 } }),
-                        );
-                    }
-                    "Runtime.evaluate" if !returned_first_eval && needs_node_query => {
-                        returned_first_eval = true;
-                        send_mock_cdp(
-                            &mut socket,
-                            &json!({
-                                "id": cmd["id"],
-                                "error": { "code": -32001, "message": "Session with given id not found." }
-                            }),
-                        );
-                    }
-                    "Runtime.evaluate" | "DOM.getDocument" => {
-                        send_mock_cdp(
-                            &mut socket,
-                            &json!({
-                                "id": cmd["id"],
-                                "error": { "code": -32001, "message": "Session with given id not found." }
-                            }),
-                        );
+                    "Runtime.evaluate" => {
+                        let expr = cmd["params"]["expression"].as_str().unwrap_or_default();
+                        if expr == "location.href"
+                            || expr == "document.title"
+                            || expr == "document.readyState"
+                        {
+                            let val = if expr == "location.href" {
+                                "http://127.0.0.1/cu"
+                            } else if expr == "document.readyState" {
+                                "complete"
+                            } else {
+                                "CU"
+                            };
+                            send_mock_cdp(
+                                &mut socket,
+                                &json!({ "id": cmd["id"], "result": { "result": { "type": "string", "value": val } } }),
+                            );
+                        } else {
+                            send_mock_cdp(
+                                &mut socket,
+                                &json!({
+                                    "id": cmd["id"],
+                                    "error": { "code": -32001, "message": "Session with given id not found." }
+                                }),
+                            );
+                        }
                     }
                     "Target.closeTarget" => {
                         send_mock_cdp(
@@ -9470,6 +10117,12 @@ fn computer_use_mock_closed_tab_fails_fast_as_environment_error() {
             "closed tab during {name} must return exit code 4 (Environment): stdout={}\nstderr={}",
             stdout(&out),
             stderr(&out)
+        );
+        let j = json_stdout(&out);
+        assert_eq!(
+            j["cases"][0]["steps"][0]["status"],
+            json!("passed"),
+            "browser.open must succeed before {name} hits closed tab: {j}"
         );
     }
 }

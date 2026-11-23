@@ -1647,8 +1647,8 @@ running and the user's other tabs are untouched.
 | `browser.scroll` | viewport `delta_x`/`delta_y`, `at` coordinates + `delta_x`/`delta_y`, locator + `delta_x`/`delta_y`, or locator (with optional `into_view: true`); optional `timeout_ms`, `dialog` | `scrolled` (`true`), `scroll_x`, `scroll_y`; `into_view`, `scroll_left`/`scroll_top`, or `x`/`y`/`viewport` when applicable; `dialog` when one opened |
 | `browser.hover` | locator, or explicit `at` coordinates; optional `timeout_ms`, `dialog` | `hovered` (`true`), optional `text`; with `at`, `x`, `y` and `viewport`; `dialog` when one opened |
 | `browser.drag` | `from` and `to` (each a locator, or explicit `at` coordinates); optional `timeout_ms`, `dialog` | `dragged` (`true`), `from: { x, y }`, `to: { x, y }`; `viewport` when an endpoint uses `at`; `dialog` when one opened |
-| `browser.set_clipboard` | `text` required (supports `${env:NAME}` secrets); optional `timeout_ms` | `characters` (character count only; never echoes `text`) |
-| `browser.read_clipboard` | optional `timeout_ms`; safe with `retry` | `text` (redacted with `***` when matching `${env:NAME}`) |
+| `browser.set_clipboard` | `text` required (supports `${env:NAME}` secrets); optional `timeout_ms`; requires isolated `da`-launched `headless: true` browser | `characters` (character count only; never echoes `text`) |
+| `browser.read_clipboard` | optional `timeout_ms`; safe with `retry`; requires isolated `da`-launched `headless: true` browser | `text` (redacted with `***` when matching `${env:NAME}`) |
 | `browser.screenshot` | `path` required | `path`, `bytes` |
 | `browser.set_cookies` | `cookies` (non-empty array of `{ name, value, url \| domain, path?, http_only?, secure?, same_site? }`) and/or `local_storage` (non-empty `<origin> \| current` → `{ key: value }` map); at least one of the two | `cookies_set`, `local_storage_set` |
 | `browser.save_state` | `path` required | `path`, `cookies`, `local_storage` (counts only) |
@@ -2048,7 +2048,7 @@ is driving halfway through. `timeout_ms` applies to each navigation, so a later
 
 #### Scrolling, hovering, dragging, and scoped clipboard
 
-All four Computer Use primitives run strictly inside the owned CDP page target —
+All five Computer Use steps run strictly inside the owned CDP page target —
 they never move the host OS cursor, hijack unrelated desktop windows, or read/write
 arbitrary `Runtime.evaluate` strings.
 
@@ -2064,14 +2064,19 @@ arbitrary `Runtime.evaluate` strings.
   Returns `{ "hovered": true }` plus optional `text` (or `x`, `y`, `viewport`
   for `at`).
 - **`browser.drag`** resolves `from` and `to` (each a locator, a session `ref`,
-  or explicit `at` coordinates), re-verifies `from` if scrolling `to` shifted the
-  page, and drives a stepped CDP pointer drag with `Input.setInterceptDrags` and
-  `Input.dispatchDragEvent` (`dragEnter`, `dragOver`, `drop`), handling both
-  pointer-event controls and HTML5 `draggable` elements across main documents,
-  open shadow DOM, and same-origin `<iframe>`s. Using `at` on either endpoint
-  emits a `da lint` warning and pins `viewport` during `da session export`.
+  or explicit `at` coordinates), re-verifies located endpoints when scrolling
+  shifts the page, and drives a stepped CDP pointer drag with
+  `Input.setInterceptDrags` and `Input.dispatchDragEvent` (`dragEnter`,
+  `dragOver`, `drop`), handling both pointer-event controls and HTML5 `draggable`
+  elements across main documents, open shadow DOM, and same-origin `<iframe>`s.
+  When an `at` endpoint is paired with a located endpoint and resolving that
+  located endpoint scrolls the page, `browser.drag` fails closed before
+  dispatching any mouse events because scrolling invalidated the fixed `at`
+  viewport coordinates (scroll first with `browser.scroll` or use deterministic
+  locators for both endpoints). Using `at` on either endpoint emits a `da lint`
+  warning and pins `viewport` during `da session export`.
 - **`browser.set_clipboard` and `browser.read_clipboard`** read and write text
-  in the browser-scoped clipboard via `navigator.clipboard` (granting
+  in the isolated headless browser clipboard via `navigator.clipboard` (granting
   `clipboardReadWrite` / `clipboardSanitizedWrite` on the page origin and
   enabling focus emulation on that page target). Both steps require a secure
   context (`http://127.0.0.1`, `http://localhost`, `https://`, or `file://`) and
@@ -2082,12 +2087,13 @@ arbitrary `Runtime.evaluate` strings.
   - `browser.read_clipboard` returns `{ "text": ... }` and is safe to pair with
     `retry`. Any value read from `${env:NAME}` is redacted as `***` across text
     output, `--output json`, `steps.jsonl`, `state.json`, and failure bundles.
-  - **External browser (`connect`) boundary:** clipboard values preexisting on
-    an externally connected user browser (`browser.open: { connect: ... }`) before
-    `da` starts did not come from `${env:NAME}`. Just like preexisting cookies
-    or storage in a connected browser, `da` never read those values from the
-    environment and cannot redact them; connected runs mark their evidence
-    `local_only`.
+  - **Strict `headless: true` isolation boundary:** both clipboard steps require
+    an isolated `da`-launched `headless: true` browser and fail fast with exit
+    code `4` (`Environment`) before touching `navigator.clipboard` whenever the
+    browser was opened with `connect` (attached to an external browser) or
+    `headless: false` (where Chromium backs `navigator.clipboard` onto the host
+    OS clipboard). Secrets and host OS clipboard contents never cross the
+    session boundary.
 
 ```yaml
 name: Hover, drag, scroll, and copy with secret redaction

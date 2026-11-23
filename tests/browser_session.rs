@@ -2920,6 +2920,25 @@ fn session_connect_closed_tab_fails_fast_as_environment_and_preserves_user_tab()
         .clone();
     let target_ref = find_ref_by_role_and_name(&tree2, "button", "Act").expect("Act ref");
 
+    // While `/owned` is still alive, connected sessions must reject clipboard steps
+    // with exit code 4 (Environment) so external/host clipboard state is never touched.
+    for (clip_label, clip_yaml) in [
+        (
+            "connect-set-clip",
+            "browser.set_clipboard:\n  text: \"probe\"\n",
+        ),
+        ("connect-read-clip", "browser.read_clipboard: {}\n"),
+    ] {
+        let rejected = run_da_stdin(dir.path(), &["session", "step", &id2], clip_yaml);
+        assert_eq!(
+            rejected.status.code(),
+            Some(4),
+            "{clip_label} in connected session must return Environment exit 4, got stdout={}\nstderr={}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+
     // Externally close ONLY the `/owned` tab via DevTools HTTP endpoint.
     let tabs: Value = serde_json::from_str(&devtools_http_get_or_post(port, "GET", "/json/list"))
         .expect("list tabs");
@@ -2959,7 +2978,12 @@ fn session_connect_closed_tab_fails_fast_as_environment_and_preserves_user_tab()
             "hover-ref",
             format!("browser.hover:\n  ref: {target_ref}\n"),
         ),
-        ("read-clip", "browser.read_clipboard: {}\n".to_string()),
+        (
+            "drag-ref",
+            format!(
+                "browser.drag:\n  from: {{ ref: {target_ref} }}\n  to: {{ ref: {target_ref} }}\n"
+            ),
+        ),
     ] {
         let failed = run_da_stdin(dir.path(), &["session", "step", &id2], &stdin_yaml);
         assert_eq!(
