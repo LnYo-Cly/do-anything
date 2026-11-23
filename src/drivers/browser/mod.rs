@@ -360,7 +360,7 @@ fn drag_step() -> Result<StepDefinition, String> {
 fn set_clipboard_step() -> Result<StepDefinition, String> {
     step::<SetClipboardArgs>(
         STEP_NAMES[14],
-        "Writes `text` to the browser-scoped clipboard without touching the host OS clipboard, returning `{ \"characters\": ... }`.",
+        "Writes `text` to the browser-scoped clipboard in an isolated `headless: true` browser without touching the host OS clipboard, returning `{ \"characters\": ... }`.",
         validate_set_clipboard,
         run_set_clipboard,
     )
@@ -370,7 +370,7 @@ fn set_clipboard_step() -> Result<StepDefinition, String> {
 fn read_clipboard_step() -> Result<StepDefinition, String> {
     let mut definition = step::<ReadClipboardArgs>(
         STEP_NAMES[15],
-        "Reads `{ \"text\": ... }` from the browser-scoped clipboard; safe to pair with `retry`.",
+        "Reads `{ \"text\": ... }` from the browser-scoped clipboard in an isolated `headless: true` browser; safe to pair with `retry`.",
         validate_read_clipboard,
         run_read_clipboard,
     )?;
@@ -3237,7 +3237,7 @@ impl BrowserSession {
         tabs.enable_discovery(&mut connection, deadline)?;
         tabs.refresh(&mut connection, deadline)?;
         let mut clipboard_focus_page = None;
-        if !parsed.clipboard_origins.is_empty() {
+        if parsed.connect.is_none() && parsed.headless && !parsed.clipboard_origins.is_empty() {
             let scope = PageScope {
                 target_id: tabs.current().to_string(),
                 session_id: page.clone(),
@@ -9031,30 +9031,42 @@ fn dispatch_mouse_move(
 }
 
 /// Scrolls any enclosing same-origin frames into view when the local point `(px, py)`
-/// lies outside that frame's viewport.
+/// lies outside that frame's viewport. `collectEnclosingFrames` returns
+/// `[outermost, ..., innermost]`, so local coordinates transform outward from
+/// `frames.length - 1` down to `0` (matching `mapLocalPointToViewport`).
 const SCROLL_ENCLOSING_FRAMES_JS: &str = r#"var scrollEnclosingFrames = function (target, px, py) {
   var frames = collectEnclosingFrames(target);
   if (!frames) return;
   var curX = px;
   var curY = py;
-  for (var i = 0; i < frames.length; i++) {
+  for (var i = frames.length - 1; i >= 0; i--) {
     var f = frames[i];
     var fDoc = f.ownerDocument || document;
     var fWin = fDoc.defaultView || window;
     var fb = frameTransform(f);
     if (!fb || !fb.ok) return;
-    curX = fb.ox + fb.sx * curX;
-    curY = fb.oy + fb.sy * curY;
+    var nextX = fb.ox + fb.sx * curX;
+    var nextY = fb.oy + fb.sy * curY;
     var fVw = fWin.innerWidth || (fDoc.documentElement && fDoc.documentElement.clientWidth) || 0;
     var fVh = fWin.innerHeight || (fDoc.documentElement && fDoc.documentElement.clientHeight) || 0;
-    if (curX < 0 || curX >= fVw || curY < 0 || curY >= fVh) {
+    if (nextX < 0 || nextX >= fVw || nextY < 0 || nextY >= fVh) {
       f.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
       var fbAfter = frameTransform(f);
       if (fbAfter && fbAfter.ok) {
-        curX = fbAfter.ox + fbAfter.sx * (curX - fb.ox) / (fb.sx || 1);
-        curY = fbAfter.oy + fbAfter.sy * (curY - fb.oy) / (fb.sy || 1);
+        nextX = fbAfter.ox + fbAfter.sx * curX;
+        nextY = fbAfter.oy + fbAfter.sy * curY;
+      }
+      if (nextX < 0 || nextX >= fVw || nextY < 0 || nextY >= fVh) {
+        fWin.scrollBy(nextX - fVw / 2, nextY - fVh / 2);
+        var fbScrolled = frameTransform(f);
+        if (fbScrolled && fbScrolled.ok) {
+          nextX = fbScrolled.ox + fbScrolled.sx * curX;
+          nextY = fbScrolled.oy + fbScrolled.sy * curY;
+        }
       }
     }
+    curX = nextX;
+    curY = nextY;
   }
 };"#;
 
@@ -9595,10 +9607,24 @@ fn resolve_drag_endpoint(
     })
 }
 
+fn poll_drag_intercepted(session: &mut BrowserSession) -> Result<Option<Value>, StepError> {
+    let connection = session.connection_mut()?;
+    let _ = connection.poll_messages();
+    match connection.take_queued_method("Input.dragIntercepted") {
+        Some(event) => Ok(Some(event)),
+        None => {
+            std::thread::sleep(Duration::from_millis(12));
+            let _ = connection.poll_messages();
+            Ok(connection.take_queued_method("Input.dragIntercepted"))
+        }
+    }
+}
+
 fn dispatch_drag_gesture(
     session: &mut BrowserSession,
     from: &ResolvedDragEndpoint,
-    to: &ResolvedDragEndpoint,
+    to: &mut ResolvedDragEndpoint,
+    mid_drag_to: Option<Located>,
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<(), StepError> {
@@ -9637,27 +9663,59 @@ fn dispatch_drag_gesture(
             dialog,
         )?;
 
-        const DRAG_STEPS: u32 = 10;
-        for step in 1..=DRAG_STEPS {
-            let ratio = f64::from(step) / f64::from(DRAG_STEPS);
-            let xi = from.x + (to.x - from.x) * ratio;
-            let yi = from.y + (to.y - from.y) * ratio;
-            dispatch_mouse_move(session, &to.desc, "drag", (xi, yi), 1, deadline, dialog)?;
-            std::thread::sleep(Duration::from_millis(6));
+        let mut intercepted = None;
+        if let Some(to_loc) = mid_drag_to {
+            // Kick off pointer motion across Chromium's drag threshold while `from`
+            // is still under the pointer, then bring the offscreen target into view.
+            let nudge_y = if from.y > 24.0 {
+                from.y - 12.0
+            } else {
+                from.y + 12.0
+            };
+            const INIT_STEPS: u32 = 3;
+            for step in 1..=INIT_STEPS {
+                let ratio = f64::from(step) / f64::from(INIT_STEPS);
+                let yi = from.y + (nudge_y - from.y) * ratio;
+                dispatch_mouse_move(
+                    session,
+                    &from.desc,
+                    "drag",
+                    (from.x, yi),
+                    1,
+                    deadline,
+                    dialog,
+                )?;
+                std::thread::sleep(Duration::from_millis(6));
+            }
+            intercepted = poll_drag_intercepted(session)?;
+
+            let refreshed_to =
+                session.wait_located_actionable(&to.desc, to_loc.0, deadline, dialog)?;
+            to.x = refreshed_to.x;
+            to.y = refreshed_to.y;
+
+            const REM_STEPS: u32 = 7;
+            for step in 1..=REM_STEPS {
+                let ratio = f64::from(step) / f64::from(REM_STEPS);
+                let xi = from.x + (to.x - from.x) * ratio;
+                let yi = nudge_y + (to.y - nudge_y) * ratio;
+                dispatch_mouse_move(session, &to.desc, "drag", (xi, yi), 1, deadline, dialog)?;
+                std::thread::sleep(Duration::from_millis(6));
+            }
+        } else {
+            const DRAG_STEPS: u32 = 10;
+            for step in 1..=DRAG_STEPS {
+                let ratio = f64::from(step) / f64::from(DRAG_STEPS);
+                let xi = from.x + (to.x - from.x) * ratio;
+                let yi = from.y + (to.y - from.y) * ratio;
+                dispatch_mouse_move(session, &to.desc, "drag", (xi, yi), 1, deadline, dialog)?;
+                std::thread::sleep(Duration::from_millis(6));
+            }
         }
 
-        let intercepted = {
-            let connection = session.connection_mut()?;
-            let _ = connection.poll_messages();
-            match connection.take_queued_method("Input.dragIntercepted") {
-                Some(event) => Some(event),
-                None => {
-                    std::thread::sleep(Duration::from_millis(12));
-                    let _ = connection.poll_messages();
-                    connection.take_queued_method("Input.dragIntercepted")
-                }
-            }
-        };
+        if intercepted.is_none() {
+            intercepted = poll_drag_intercepted(session)?;
+        }
 
         if let Some(event) = intercepted {
             let data = event
@@ -9728,6 +9786,13 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     };
     let session = session(sessions)?;
 
+    let any_located = parsed.from.at.is_none() || parsed.to.at.is_none();
+    let scroll_before_from = if any_located {
+        Some(read_window_scroll(session, deadline, &mut dialog)?)
+    } else {
+        None
+    };
+
     let mut from = resolve_drag_endpoint(
         session,
         &parsed.from,
@@ -9740,6 +9805,11 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     if interactive {
         update_drag_metadata(session, &from.synth, &empty_to);
     }
+    let scroll_after_from = if any_located {
+        Some(read_window_scroll(session, deadline, &mut dialog)?)
+    } else {
+        None
+    };
 
     let mut to = resolve_drag_endpoint(
         session,
@@ -9752,9 +9822,52 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     if interactive {
         update_drag_metadata(session, &from.synth, &to.synth);
     }
+    let scroll_after_to = if any_located {
+        Some(read_window_scroll(session, deadline, &mut dialog)?)
+    } else {
+        None
+    };
 
-    // Re-inspect `from` if resolving `to` may have scrolled the page, then update `to`
-    // if bringing `from` back into view shifted coordinates again.
+    // Guard mixed `at` + located drags: if resolving the located endpoint scrolled
+    // the document, the fixed viewport `at` coordinates no longer point at the same
+    // page content. Fail closed before dispatching any mouse events.
+    if from.located.is_none() && to.located.is_some() {
+        let (sx1, sy1) = scroll_after_from.unwrap_or((0.0, 0.0));
+        let (sx2, sy2) = scroll_after_to.unwrap_or((0.0, 0.0));
+        if (sx2 - sx1).abs() > 0.5 || (sy2 - sy1).abs() > 0.5 {
+            return Err(StepError::Execution(format!(
+                "cannot drag from {} to {}: resolving {} scrolled the page from ({}, {}) to ({}, {}), invalidating the fixed `from.at` viewport coordinates; scroll first with `browser.scroll` or use deterministic locators for both endpoints",
+                from.desc,
+                to.desc,
+                to.desc,
+                coordinate_number(sx1),
+                coordinate_number(sy1),
+                coordinate_number(sx2),
+                coordinate_number(sy2),
+            )));
+        }
+    }
+    if from.located.is_some() && to.located.is_none() {
+        let (sx0, sy0) = scroll_before_from.unwrap_or((0.0, 0.0));
+        let (sx1, sy1) = scroll_after_from.unwrap_or((0.0, 0.0));
+        if (sx1 - sx0).abs() > 0.5 || (sy1 - sy0).abs() > 0.5 {
+            return Err(StepError::Execution(format!(
+                "cannot drag from {} to {}: resolving {} scrolled the page from ({}, {}) to ({}, {}), invalidating the fixed `to.at` viewport coordinates; scroll first with `browser.scroll` or use deterministic locators for both endpoints",
+                from.desc,
+                to.desc,
+                from.desc,
+                coordinate_number(sx0),
+                coordinate_number(sy0),
+                coordinate_number(sx1),
+                coordinate_number(sy1),
+            )));
+        }
+    }
+
+    // Re-inspect `from` if resolving `to` may have scrolled the page. When `from`
+    // and `to` cannot fit in the viewport simultaneously, bring `from` into view for
+    // `mousePressed` and defer bringing `to` back into view until mid-drag.
+    let mut mid_drag_to = None;
     if let (Some(from_loc), Some(to_loc)) = (from.located.take(), to.located.take()) {
         let refreshed_from =
             session.wait_located_actionable(&from.desc, from_loc.0, deadline, &mut dialog)?;
@@ -9762,7 +9875,11 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
             (refreshed_from.x - from.x).abs() > 0.5 || (refreshed_from.y - from.y).abs() > 0.5;
         from.x = refreshed_from.x;
         from.y = refreshed_from.y;
-        if moved {
+        let (sx2, sy2) = scroll_after_to.unwrap_or((0.0, 0.0));
+        let (sx3, sy3) = read_window_scroll(session, deadline, &mut dialog)?;
+        if (sx3 - sx2).abs() > 0.5 || (sy3 - sy2).abs() > 0.5 {
+            mid_drag_to = Some(to_loc);
+        } else if moved {
             let refreshed_to =
                 session.wait_located_actionable(&to.desc, to_loc.0, deadline, &mut dialog)?;
             to.x = refreshed_to.x;
@@ -9770,7 +9887,7 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         }
     }
 
-    dispatch_drag_gesture(session, &from, &to, deadline, &mut dialog)?;
+    dispatch_drag_gesture(session, &from, &mut to, mid_drag_to, deadline, &mut dialog)?;
 
     let mut result = json!({
         "dragged": true,
@@ -9824,11 +9941,28 @@ fn enable_focus_emulation(
     .map(|_| ())
 }
 
+fn ensure_clipboard_isolated(session: &BrowserSession, step_name: &str) -> Result<(), StepError> {
+    if session.connect.is_some() || matches!(session.origin, Some(Origin::Connected)) {
+        let endpoint = session.connect.as_deref().unwrap_or("external browser");
+        return Err(StepError::Environment(format!(
+            "`{step_name}` cannot run on a connected external browser (`connect: {endpoint}`): `browser.set_clipboard` and `browser.read_clipboard` require an isolated `da`-launched `headless: true` browser so secrets and host OS clipboard contents never cross the session boundary"
+        )));
+    }
+    if !session.headless {
+        return Err(StepError::Environment(format!(
+            "`{step_name}` cannot run with `headless: false`: headed browsers back `navigator.clipboard` onto the host OS clipboard; `browser.set_clipboard` and `browser.read_clipboard` require an isolated `da`-launched `headless: true` browser so secrets and host OS clipboard contents never cross the session boundary"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_clipboard_ready(
     session: &mut BrowserSession,
+    step_name: &str,
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<(), StepError> {
+    ensure_clipboard_isolated(session, step_name)?;
     let scope = session.scope();
     let info = {
         let connection = session.connection_mut()?;
@@ -9895,7 +10029,7 @@ fn run_set_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, Ste
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let mut dialog = DialogContext::fail_fast();
     let session = session(sessions)?;
-    ensure_clipboard_ready(session, deadline, &mut dialog)?;
+    ensure_clipboard_ready(session, STEP_NAMES[14], deadline, &mut dialog)?;
 
     let encoded_text = serde_json::to_string(&args.text).map_err(|error| {
         StepError::InvalidArguments(format!("could not encode clipboard text: {error}"))
@@ -9922,7 +10056,7 @@ fn run_read_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, St
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
     let mut dialog = DialogContext::fail_fast();
     let session = session(sessions)?;
-    ensure_clipboard_ready(session, deadline, &mut dialog)?;
+    ensure_clipboard_ready(session, STEP_NAMES[15], deadline, &mut dialog)?;
 
     let scope = session.scope();
     let connection = session.connection_mut()?;
@@ -14435,6 +14569,104 @@ mod tests {
             resolved_scrubbed["local_storage"]["http://127.0.0.1"]["var_tok"],
             "***"
         );
+    }
+
+    #[test]
+    fn clipboard_steps_reject_connected_and_headed_sessions_before_cdp_calls() {
+        for (mode_label, connect, headless, expected_hint) in [
+            (
+                "connected",
+                Some("http://127.0.0.1:9222".to_string()),
+                true,
+                "connected external browser",
+            ),
+            ("headed", None, false, "headless: false"),
+        ] {
+            for (step_label, is_set) in [("set_clipboard", true), ("read_clipboard", false)] {
+                let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+                    // No clipboard CDP call may arrive before the session drops.
+                    if let Ok(msg) = socket.read() {
+                        assert!(
+                            msg.is_close(),
+                            "unexpected CDP message on rejected clipboard step: {msg:?}"
+                        );
+                    }
+                });
+                let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+                    .expect("must connect to mock CDP");
+                let mut sess = mock_session(conn, "target-1", "session-1");
+                sess.origin = None;
+                sess.connect = connect.clone();
+                sess.headless = headless;
+
+                let mut sessions = Sessions::new();
+                sessions
+                    .get_or_create(SESSION_KIND, || Ok(sess))
+                    .expect("store mock session");
+                let err = if is_set {
+                    run_set_clipboard(&json!({ "text": "secret" }), &mut sessions)
+                        .expect_err("must reject clipboard write")
+                } else {
+                    run_read_clipboard(&json!({}), &mut sessions)
+                        .expect_err("must reject clipboard read")
+                };
+                drop(sessions);
+                server.join().expect("mock CDP thread must join");
+
+                match err {
+                    StepError::Environment(msg) => {
+                        assert!(
+                            msg.contains(expected_hint) && msg.contains("headless: true"),
+                            "{mode_label}/{step_label} error must explain boundary: {msg}"
+                        );
+                    }
+                    other => panic!(
+                        "{mode_label}/{step_label} must fail as StepError::Environment, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_steps_map_closed_tab_on_headless_launched_session_to_environment() {
+        for (step_label, is_set) in [("set_clipboard", true), ("read_clipboard", false)] {
+            let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], "Runtime.evaluate");
+                let reply = json!({
+                    "id": cmd["id"],
+                    "error": { "code": -32001, "message": "Session with given id not found." }
+                });
+                socket
+                    .send(tungstenite::Message::text(reply.to_string()))
+                    .expect("send -32001 error");
+            });
+            let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+                .expect("must connect to mock CDP");
+            let mut sess = mock_session(conn, "target-1", "session-1");
+            sess.origin = None;
+            sess.connect = None;
+            sess.headless = true;
+
+            let mut sessions = Sessions::new();
+            sessions
+                .get_or_create(SESSION_KIND, || Ok(sess))
+                .expect("store mock session");
+            let err = if is_set {
+                run_set_clipboard(&json!({ "text": "abc" }), &mut sessions)
+                    .expect_err("closed tab must fail")
+            } else {
+                run_read_clipboard(&json!({}), &mut sessions).expect_err("closed tab must fail")
+            };
+            drop(sessions);
+            server.join().expect("mock CDP thread must join");
+
+            assert!(
+                matches!(err, StepError::Environment(_)),
+                "{step_label} on dead headless tab must fail as Environment, got {err:?}"
+            );
+        }
     }
 }
 

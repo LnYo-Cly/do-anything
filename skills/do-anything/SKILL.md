@@ -46,8 +46,9 @@ between commands and prints JSON by default.
      locators: `browser.click`, `browser.type`, `browser.scroll` (`delta_x`/`delta_y`
      on viewport or container `ref`, or `into_view: true`), `browser.hover`,
      `browser.drag` (`from` and `to` `ref`s or locators), `browser.set_clipboard`,
-     and `browser.read_clipboard`. All interactions stay strictly scoped to the
-     owned CDP tab — never move the host OS cursor or touch unrelated windows.
+     and `browser.read_clipboard` (clipboard steps require an isolated
+     `da`-launched `headless: true` browser). All interactions stay strictly scoped
+     to the owned CDP tab — never move the host OS cursor or touch unrelated windows.
    - `browser.read` returns an element's text. After an action that starts a
      request, `browser.wait` for a locator or for `url_contains`: reading does
      not wait for text to change.
@@ -179,10 +180,11 @@ steps:
   clipboard secret or connection string; `da` reads it at run time and
   replaces the value with `***` in text output, `--output json`, session logs,
   and every bundle file (`browser.set_clipboard` returns only `characters`). A
-  literal value in a case, a vars file or `--var` is not redacted, and
-  clipboard values preexisting on an externally connected browser (`connect`)
-  before `da` starts did not come from `${env:NAME}` and stay local-only
-  (same boundary as `connect` cookies/storage).
+  literal value in a case, a vars file or `--var` is not redacted.
+  `browser.set_clipboard` and `browser.read_clipboard` require an isolated
+  `da`-launched `headless: true` browser and fail fast with exit code `4`
+  (`Environment`) when `connect` or `headless: false` is used, so `${env:NAME}`
+  secrets and host OS clipboard contents never cross the session boundary.
 - **Lint before run**, and never weaken `src/` or a test to make a case pass.
 - **Bundles and reports are evidence, not publishing material.** They hold page
   text and step arguments; a report embeds screenshots unless you pass
