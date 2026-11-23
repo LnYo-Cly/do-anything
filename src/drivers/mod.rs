@@ -13,6 +13,8 @@ pub mod browser;
 pub mod cli;
 #[cfg(feature = "db")]
 pub mod db;
+#[cfg(feature = "desktop")]
+pub mod desktop;
 #[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "log")]
@@ -36,6 +38,10 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     {
         db::register(registry)?;
     }
+    #[cfg(feature = "desktop")]
+    {
+        desktop::register(registry)?;
+    }
     #[cfg(feature = "http")]
     {
         http::register(registry)?;
@@ -45,6 +51,7 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         feature = "browser",
         feature = "cli",
         feature = "db",
+        feature = "desktop",
         feature = "http"
     )))]
     {

@@ -5,9 +5,9 @@
 
 mod support;
 
-#[cfg(any(feature = "browser", feature = "cli"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "desktop"))]
 use std::fs;
-#[cfg(any(feature = "browser", feature = "cli"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "desktop"))]
 use std::path::Path;
 #[cfg(feature = "cli")]
 use std::path::PathBuf;
@@ -59,7 +59,12 @@ fn schema() -> &'static Value {
     &SCHEMA
 }
 
-#[cfg(any(feature = "browser", feature = "cli", feature = "http"))]
+#[cfg(any(
+    feature = "browser",
+    feature = "cli",
+    feature = "desktop",
+    feature = "http"
+))]
 fn validator(schema: &'static Value) -> jsonschema::Validator {
     jsonschema::validator_for(schema).expect("the emitted schema must compile")
 }
@@ -306,7 +311,13 @@ fn step_definition(name: &str) -> do_anything::core::registry::StepDefinition {
 }
 
 /// Every registered step definition, keyed by name.
-#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(
+    feature = "browser",
+    feature = "cli",
+    feature = "db",
+    feature = "desktop",
+    feature = "http"
+))]
 fn built_in_registry() -> do_anything::core::registry::Registry {
     let mut registry = do_anything::core::registry::Registry::new();
     do_anything::drivers::register(&mut registry).expect("the built-in drivers must register");
@@ -319,7 +330,13 @@ fn built_in_registry() -> do_anything::core::registry::Registry {
 ///
 /// The values only have to pass `validate`; it checks arguments without
 /// starting the program or opening a connection.
-#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(
+    feature = "browser",
+    feature = "cli",
+    feature = "db",
+    feature = "desktop",
+    feature = "http"
+))]
 fn valid_arguments(step: &str) -> Value {
     match step {
         "browser.open" => json!({"url": "http://127.0.0.1:1/"}),
@@ -344,6 +361,14 @@ fn valid_arguments(step: &str) -> Value {
         "android.screenshot" => json!({"path": "screen.png"}),
         "android.dump" => json!({}),
         "android.tap_on" => json!({"text": "OK"}),
+        "desktop.launch" => json!({"command": "notepad.exe"}),
+        "desktop.attach" => json!({"pid": 1234}),
+        "desktop.click" => json!({"automation_id": "ok"}),
+        "desktop.type" => json!({"automation_id": "user", "text": "alice"}),
+        "desktop.press" => json!({"key": "Enter"}),
+        "desktop.wait" => json!({"automation_id": "status"}),
+        "desktop.read" => json!({"automation_id": "status"}),
+        "desktop.screenshot" => json!({"path": "out.png"}),
         other => panic!("add the valid arguments of `{other}` to this test"),
     }
 }
@@ -352,7 +377,13 @@ fn valid_arguments(step: &str) -> Value {
 ///
 /// A bound that the schema can express but this list cannot construct is
 /// caught by the assertion on the constructed value, which fails loudly.
-#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(
+    feature = "browser",
+    feature = "cli",
+    feature = "db",
+    feature = "desktop",
+    feature = "http"
+))]
 fn declared_bounds(schema: &Value) -> Vec<(&'static str, Value)> {
     ["minimum", "minLength", "pattern"]
         .into_iter()
@@ -362,7 +393,13 @@ fn declared_bounds(schema: &Value) -> Vec<(&'static str, Value)> {
 
 /// A value that violates one bound, and a value on the bound when one can be
 /// constructed generically.
-#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(
+    feature = "browser",
+    feature = "cli",
+    feature = "db",
+    feature = "desktop",
+    feature = "http"
+))]
 fn bound_values(keyword: &str, bound: &Value) -> (Value, Option<Value>) {
     match keyword {
         "minimum" => {
@@ -398,7 +435,13 @@ fn bound_values(keyword: &str, bound: &Value) -> (Value, Option<Value>) {
 /// neither may be looser than the other. The reverse direction, a value that
 /// `validate` refuses while the schema accepts it, is covered by the two
 /// `*_timeout_of_zero_*` tests above.
-#[cfg(any(feature = "browser", feature = "cli", feature = "db", feature = "http"))]
+#[cfg(any(
+    feature = "browser",
+    feature = "cli",
+    feature = "db",
+    feature = "desktop",
+    feature = "http"
+))]
 #[test]
 fn every_declared_argument_bound_is_enforced_by_validate() {
     let registry = built_in_registry();
@@ -458,6 +501,7 @@ fn every_declared_argument_bound_is_enforced_by_validate() {
 
     let drivers = usize::from(cfg!(feature = "browser"))
         + usize::from(cfg!(feature = "cli"))
+        + usize::from(cfg!(feature = "desktop"))
         + usize::from(cfg!(feature = "http"));
     assert!(
         checked >= drivers,
@@ -792,7 +836,7 @@ fn the_schema_accepts_every_valid_repository_case() {
 }
 
 /// Whether this build can describe an observation at all.
-#[cfg(any(feature = "browser", feature = "cli"))]
+#[cfg(any(feature = "browser", feature = "cli", feature = "desktop"))]
 fn describes_observations(schema: &Value) -> bool {
     schema["properties"]["observe"]["additionalProperties"] != Value::Bool(false)
 }
@@ -863,7 +907,11 @@ fn browser_dialog_schema_agrees_with_validate() {
 /// A build with `http` and `cli` but no `browser` cannot describe the browser
 /// example, and that is not a schema defect: the same rule already applies to
 /// an example that declares an observer.
-#[cfg(any(feature = "browser", all(feature = "http", feature = "cli")))]
+#[cfg(any(
+    feature = "browser",
+    feature = "desktop",
+    all(feature = "http", feature = "cli")
+))]
 fn describes_steps(schema: &Value, instance: &Value) -> bool {
     instance["steps"].as_array().is_none_or(|steps| {
         steps.iter().all(|step| {
@@ -876,7 +924,11 @@ fn describes_steps(schema: &Value, instance: &Value) -> bool {
     })
 }
 
-#[cfg(any(feature = "browser", all(feature = "http", feature = "cli")))]
+#[cfg(any(
+    feature = "browser",
+    feature = "desktop",
+    all(feature = "http", feature = "cli")
+))]
 #[test]
 fn the_schema_accepts_every_case_example_in_the_docs() {
     let validator = validator(schema());
@@ -954,6 +1006,7 @@ fn the_schema_embeds_each_registered_step_with_its_description() {
     feature = "browser",
     feature = "cli",
     feature = "db",
+    feature = "desktop",
     feature = "http"
 )))]
 #[test]
@@ -1247,6 +1300,63 @@ fn browser_upload_schema_match_validate() {
     }
 }
 
+#[cfg(feature = "desktop")]
+#[test]
+fn desktop_steps_schema_accepts_valid_cases_and_rejects_unknown_fields() {
+    let validator = validator(schema());
+
+    let valid = json!({
+        "name": "Desktop schema check",
+        "steps": [
+            { "desktop.launch": { "command": "app.exe", "window_title_contains": "Main" } },
+            { "desktop.attach": { "pid": 42, "timeout_ms": 5000 } },
+            { "desktop.click": { "at": { "x": 10, "y": 20, "window": { "width": 440, "height": 320 } } } },
+            { "desktop.type": { "automation_id": "userBox", "text": "alice" } },
+            { "desktop.press": { "key": "Ctrl+S" } },
+            { "desktop.wait": { "automation_id": "status", "state": "present" } },
+            { "desktop.read": { "automation_id": "status" } },
+            { "desktop.screenshot": { "path": "shot.png", "mask_inputs": true } }
+        ]
+    });
+    assert!(
+        validator.is_valid(&valid),
+        "valid desktop.* case must satisfy emitted schema: {valid}"
+    );
+
+    for (label, bad_step) in [
+        (
+            "empty command",
+            json!({ "desktop.launch": { "command": "" } }),
+        ),
+        ("zero pid", json!({ "desktop.attach": { "pid": 0 } })),
+        (
+            "negative x",
+            json!({ "desktop.click": { "at": { "x": -1, "y": 0 } } }),
+        ),
+        (
+            "zero window width",
+            json!({ "desktop.click": { "at": { "x": 1, "y": 1, "window": { "width": 0, "height": 100 } } } }),
+        ),
+        (
+            "session-only ref in case schema",
+            json!({ "desktop.click": { "ref": "e1" } }),
+        ),
+        (
+            "unknown field",
+            json!({ "desktop.press": { "key": "Enter", "extra": true } }),
+        ),
+    ] {
+        let invalid = json!({
+            "name": "Invalid desktop step",
+            "steps": [bad_step]
+        });
+        assert!(
+            !validator.is_valid(&invalid),
+            "desktop schema ({label}) must reject invalid step: {invalid}"
+        );
+    }
+}
+
 /// Every file directly inside `dir` with the given extension, sorted by path.
 #[cfg(feature = "cli")]
 fn files_with_extension(dir: PathBuf, extension: &str) -> Vec<PathBuf> {
@@ -1262,7 +1372,11 @@ fn files_with_extension(dir: PathBuf, extension: &str) -> Vec<PathBuf> {
 /// Complete case files in a document: `yaml` blocks with a top-level `name:`.
 ///
 /// Fragments that show only part of a case have no `name:` line and are skipped.
-#[cfg(any(feature = "browser", all(feature = "http", feature = "cli")))]
+#[cfg(any(
+    feature = "browser",
+    feature = "desktop",
+    all(feature = "http", feature = "cli")
+))]
 fn case_examples(text: &str) -> Vec<&str> {
     text.split(
         "```yaml

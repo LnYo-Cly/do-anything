@@ -37,6 +37,14 @@ browser = ["dep:schemars", "dep:tungstenite"]
 # The `android.*` steps, which drive a device by spawning `adb`. It is off by
 # default because it is only useful on a machine with an Android device.
 android = ["dep:schemars"]
+# The `desktop.*` steps for native desktop UI automation (Windows UIA). Off by
+# default because it drives a local graphical session.
+desktop = [
+    "dep:schemars",
+    "dep:uiautomation",
+    "dep:win-screenshot",
+    "dep:png",
+]
 # The MCP JSON-RPC 2.0 server.
 mcp = []
 
@@ -61,6 +69,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # The synchronous WebSocket client the DevTools Protocol connection speaks.
 # Only the plain `ws://` handshake is used, so no TLS feature is enabled.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Safe wrapper around Windows `IUIAutomation` COM interfaces and `SendInput`.
+uiautomation = { version = "0.25", optional = true }
+# Safe `PrintWindow` RGBA capture and `EnumWindows` enumeration; shares the
+# exact `windows` crate version `uiautomation` already builds with.
+win-screenshot = { version = "4.0", optional = true }
+# Encodes masked RGBA window captures to PNG without pulling in `image`.
+png = { version = "0.18", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
