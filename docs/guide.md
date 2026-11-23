@@ -3278,11 +3278,16 @@ With `--output json` and `--against`, the object gains `against`, a
 
 `da compare <baseline_dir> <candidate_dir>` reads the `meta.json` and
 `report.json` of two directories written by `da run --record`. It never reruns a
-case. A directory without `meta.json` is incomplete and ignored, matching the
-record and bundle rule. Missing paths, a file instead of a directory, or a
-directory with no complete case record exit 2; unreadable or malformed JSON, or
-a record missing a required field, exits 3. Passing the root of a `--repeat`
-record exits 2 and names `attempt-1`, because each attempt is its own record.
+case. Every case subdirectory in both records must contain `meta.json`, which
+`--record` writes last: any incomplete subdirectory (for example, a partial or
+interrupted case directory containing `report.json` or `case.yaml` without
+`meta.json`, or a leftover `.tmp-*` staging directory) is rejected with exit 2
+even when other complete cases exist, so an interrupted run cannot masquerade as
+`added` or `removed`. Missing paths, a file instead of a directory, or a
+directory with no complete case record also exit 2; unreadable or malformed
+JSON, or a record missing a required field, exits 3. Passing the root of a
+`--repeat` record exits 2 and names `attempt-1`, because each attempt is its own
+record.
 
 Cases are matched by `(case_file, case_name)` from `meta.json`, with path
 separators normalized to `/`. The `{position}-{safe_name}` directory name is

@@ -2,11 +2,12 @@
 //!
 //! `da run --record <dir>` names each case subdirectory `{position}-{safe_name}`.
 //! When cases are added or removed between runs, those numeric prefixes shift.
-//! `da compare <baseline_dir> <candidate_dir>` reads `meta.json` and
-//! `report.json` from completed case directories, pairs cases by stable
-//! `(case_file, case_name)` identity independent of directory numbering, and
-//! classifies every case into `regressed`, `fixed`, `still_failing`,
-//! `still_passing`, `added`, or `removed`.
+//! `da compare <baseline_dir> <candidate_dir>` requires every case
+//! subdirectory in both records to contain `meta.json` (rejecting partial or
+//! interrupted runs), reads `meta.json` and `report.json`, pairs cases by
+//! stable `(case_file, case_name)` identity independent of directory
+//! numbering, and classifies every case into `regressed`, `fixed`,
+//! `still_failing`, `still_passing`, `added`, or `removed`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -284,6 +285,7 @@ fn read_recorded_run(directory: &Path, role: &str) -> Result<Vec<RecordedCase>, 
     })?;
 
     let mut case_dirs = Vec::new();
+    let mut incomplete_dirs = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             CompareError::usage(format!(
@@ -292,35 +294,58 @@ fn read_recorded_run(directory: &Path, role: &str) -> Result<Vec<RecordedCase>, 
             ))
         })?;
         let path = entry.path();
-        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        let file_type = entry.file_type().map_err(|error| {
+            CompareError::usage(format!(
+                "could not inspect `{}`: {error}",
+                paths::display(&path)
+            ))
+        })?;
+        let is_dir = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
         if !is_dir {
             continue;
         }
-        let dir_name = entry.file_name();
-        if dir_name.to_string_lossy().starts_with(".tmp-") {
-            continue;
-        }
-        let meta_path = path.join("meta.json");
-        if meta_path.exists() {
+        if path.join("meta.json").is_file() {
             case_dirs.push(path);
+        } else {
+            incomplete_dirs.push(path);
         }
     }
 
+    sort_case_dirs(&mut case_dirs);
+    sort_case_dirs(&mut incomplete_dirs);
+
+    if case_dirs.is_empty() && directory.join("attempt-1").is_dir() {
+        return Err(CompareError::usage(format!(
+            "`{}` is a `--repeat` record directory; pass one attempt directory such as `{}/attempt-1`",
+            paths::display(directory),
+            paths::display(directory)
+        )));
+    }
+
+    if let Some(incomplete) = incomplete_dirs.first() {
+        return Err(CompareError::usage(format!(
+            "the {role} record directory `{}` contains an incomplete case directory `{}` without `meta.json`; re-run `da run --record` to produce a complete record",
+            paths::display(directory),
+            paths::display(incomplete)
+        )));
+    }
+
     if case_dirs.is_empty() {
-        if directory.join("attempt-1").is_dir() {
-            return Err(CompareError::usage(format!(
-                "`{}` is a `--repeat` record directory; pass one attempt directory such as `{}/attempt-1`",
-                paths::display(directory),
-                paths::display(directory)
-            )));
-        }
         return Err(CompareError::usage(format!(
             "no complete case records in `{}`; every case directory must contain `meta.json`, which is written last",
             paths::display(directory)
         )));
     }
 
-    case_dirs.sort_by(|left, right| {
+    let mut cases = Vec::with_capacity(case_dirs.len());
+    for case_dir in case_dirs {
+        cases.push(parse_recorded_case(&case_dir)?);
+    }
+    Ok(cases)
+}
+
+fn sort_case_dirs(dirs: &mut [PathBuf]) {
+    dirs.sort_by(|left, right| {
         match (case_position(left), case_position(right)) {
             (Some(l), Some(r)) => l.cmp(&r),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -329,12 +354,6 @@ fn read_recorded_run(directory: &Path, role: &str) -> Result<Vec<RecordedCase>, 
         }
         .then_with(|| left.file_name().cmp(&right.file_name()))
     });
-
-    let mut cases = Vec::with_capacity(case_dirs.len());
-    for case_dir in case_dirs {
-        cases.push(parse_recorded_case(&case_dir)?);
-    }
-    Ok(cases)
 }
 
 fn parse_recorded_case(case_dir: &Path) -> Result<RecordedCase, CompareError> {

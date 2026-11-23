@@ -155,6 +155,196 @@ fn missing_empty_or_non_directory_paths_return_usage_exit_two() {
 }
 
 #[test]
+fn partial_case_directory_alongside_complete_case_fails_closed_with_exit_two() {
+    let dir = TempDir::new("compare-partial-record");
+
+    // 1. Candidate has 1 complete passing case + 1 incomplete failed case (`report.json` without `meta.json`).
+    // Baseline has both cases complete and passing, so silently omitting `1-login` would misclassify
+    // a real regression as `removed` and exit 0.
+    let base_full = dir.path().join("base-full");
+    write_bundle(
+        &base_full,
+        "0-health",
+        &meta_obj("cases/health.yaml", "Health", "sha-health", "passed"),
+        &report_obj(
+            "cases/health.yaml",
+            "Health",
+            "passed",
+            3,
+            json!([]),
+            Value::Null,
+        ),
+    );
+    write_bundle(
+        &base_full,
+        "1-login",
+        &meta_obj("cases/login.yaml", "Login", "sha-login", "passed"),
+        &report_obj(
+            "cases/login.yaml",
+            "Login",
+            "passed",
+            5,
+            json!([]),
+            Value::Null,
+        ),
+    );
+
+    let cand_partial = dir.path().join("cand-partial");
+    write_bundle(
+        &cand_partial,
+        "0-health",
+        &meta_obj("cases/health.yaml", "Health", "sha-health", "passed"),
+        &report_obj(
+            "cases/health.yaml",
+            "Health",
+            "passed",
+            3,
+            json!([]),
+            Value::Null,
+        ),
+    );
+    let cand_incomplete = cand_partial.join("1-login");
+    fs::create_dir_all(&cand_incomplete).expect("create candidate incomplete dir");
+    fs::write(
+        cand_incomplete.join("report.json"),
+        serde_json::to_vec_pretty(&report_obj(
+            "cases/login.yaml",
+            "Login",
+            "failed",
+            9,
+            json!([]),
+            json!({ "kind": "assertion", "message": "broken" }),
+        ))
+        .expect("serialize partial report"),
+    )
+    .expect("write partial report.json");
+
+    let cand_text = run_da(&["compare", path_str(&base_full), path_str(&cand_partial)]);
+    assert_eq!(
+        exit_code(&cand_text),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        stdout(&cand_text),
+        stderr(&cand_text)
+    );
+    assert!(
+        stdout(&cand_text).is_empty(),
+        "stdout must be empty on text error: {}",
+        stdout(&cand_text)
+    );
+    assert!(
+        stderr(&cand_text).contains("1-login") && stderr(&cand_text).contains("meta.json"),
+        "stderr: {}",
+        stderr(&cand_text)
+    );
+
+    let cand_json = run_da(&[
+        "--output",
+        "json",
+        "compare",
+        path_str(&base_full),
+        path_str(&cand_partial),
+    ]);
+    assert_eq!(exit_code(&cand_json), Some(2));
+    let cand_err: Value = serde_json::from_slice(&cand_json.stdout).expect("valid error JSON");
+    assert_eq!(cand_err["ok"], false);
+    assert_eq!(cand_err["error"]["kind"], "usage");
+    let cand_msg = cand_err["error"]["message"].as_str().expect("message");
+    assert!(
+        cand_msg.contains("1-login") && cand_msg.contains("meta.json"),
+        "message: {cand_msg}"
+    );
+
+    // 2. Baseline has 1 complete case + 1 incomplete case (`case.yaml` present, `meta.json` absent).
+    // Silently omitting `1-login` in baseline would misclassify it as `added` and exit 0.
+    let base_partial = dir.path().join("base-partial");
+    write_bundle(
+        &base_partial,
+        "0-health",
+        &meta_obj("cases/health.yaml", "Health", "sha-health", "passed"),
+        &report_obj(
+            "cases/health.yaml",
+            "Health",
+            "passed",
+            3,
+            json!([]),
+            Value::Null,
+        ),
+    );
+    let base_incomplete = base_partial.join("1-login");
+    fs::create_dir_all(&base_incomplete).expect("create baseline incomplete dir");
+    fs::write(
+        base_incomplete.join("case.yaml"),
+        "name: Login\nsteps: []\n",
+    )
+    .expect("write partial case.yaml");
+
+    let base_text = run_da(&["compare", path_str(&base_partial), path_str(&base_full)]);
+    assert_eq!(
+        exit_code(&base_text),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        stdout(&base_text),
+        stderr(&base_text)
+    );
+    assert!(
+        stderr(&base_text).contains("1-login") && stderr(&base_text).contains("meta.json"),
+        "stderr: {}",
+        stderr(&base_text)
+    );
+
+    let base_json = run_da(&[
+        "--output",
+        "json",
+        "compare",
+        path_str(&base_partial),
+        path_str(&base_full),
+    ]);
+    assert_eq!(exit_code(&base_json), Some(2));
+    let base_err: Value = serde_json::from_slice(&base_json.stdout).expect("valid error JSON");
+    assert_eq!(base_err["ok"], false);
+    assert_eq!(base_err["error"]["kind"], "usage");
+    let base_msg = base_err["error"]["message"].as_str().expect("message");
+    assert!(
+        base_msg.contains("1-login") && base_msg.contains("meta.json"),
+        "message: {base_msg}"
+    );
+
+    // 3. Leftover `.tmp-*` staging directory alongside a complete case also fails closed.
+    let staged_partial = dir.path().join("staged-partial");
+    write_bundle(
+        &staged_partial,
+        "0-health",
+        &meta_obj("cases/health.yaml", "Health", "sha-health", "passed"),
+        &report_obj(
+            "cases/health.yaml",
+            "Health",
+            "passed",
+            3,
+            json!([]),
+            Value::Null,
+        ),
+    );
+    let staging_dir = staged_partial.join(".tmp-9999-1");
+    fs::create_dir_all(&staging_dir).expect("create staging dir");
+    fs::write(staging_dir.join("case.yaml"), "name: Login\nsteps: []\n").expect("staging case");
+
+    let staged_out = run_da(&["compare", path_str(&base_full), path_str(&staged_partial)]);
+    assert_eq!(
+        exit_code(&staged_out),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        stdout(&staged_out),
+        stderr(&staged_out)
+    );
+    assert!(
+        stderr(&staged_out).contains(".tmp-9999-1"),
+        "stderr: {}",
+        stderr(&staged_out)
+    );
+}
+
+#[test]
 fn malformed_meta_or_report_returns_invalid_case_exit_three() {
     let dir = TempDir::new("compare-corrupt");
     let valid = dir.path().join("valid");
