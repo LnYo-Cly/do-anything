@@ -4929,6 +4929,26 @@ where
     (http_port, handle)
 }
 
+#[cfg(unix)]
+fn spawn_mock_ws<F>(ws_handler: F) -> (u16, thread::JoinHandle<()>)
+where
+    F: FnOnce(tungstenite::WebSocket<TcpStream>) + Send + 'static,
+{
+    let ws_listener = TcpListener::bind(("127.0.0.1", 0)).expect("must bind mock WS port");
+    let ws_port = ws_listener
+        .local_addr()
+        .expect("must read mock WS port")
+        .port();
+
+    let handle = thread::spawn(move || {
+        let (ws_stream, _) = ws_listener.accept().expect("mock DevTools WS must accept");
+        let _ = ws_stream.set_nodelay(true);
+        let socket = tungstenite::accept(ws_stream).expect("mock WS handshake must succeed");
+        ws_handler(socket);
+    });
+    (ws_port, handle)
+}
+
 fn read_mock_cdp(socket: &mut tungstenite::WebSocket<TcpStream>) -> Option<Value> {
     loop {
         match socket.read() {
@@ -9915,10 +9935,17 @@ fn browser_clipboard_rejects_connected_and_headed_browsers_as_environment() {
             ] {
                 let done_file = dir.path().join(format!("{name}.done"));
                 let done_for_server = done_file.clone();
-                let (port, handle) = spawn_mock_devtools(move |mut socket| {
+                let (port, handle) = spawn_mock_ws(move |mut socket| {
                     while let Some(cmd) = read_mock_cdp(&mut socket) {
                         let method = cmd["method"].as_str().unwrap_or_default();
                         match method {
+                            "Target.createTarget" => send_mock_cdp(
+                                &mut socket,
+                                &json!({
+                                    "id": cmd["id"],
+                                    "result": { "targetId": "t-h1" }
+                                }),
+                            ),
                             "Target.getTargets" => send_mock_cdp(
                                 &mut socket,
                                 &json!({
@@ -9982,7 +10009,7 @@ fn browser_clipboard_rejects_connected_and_headed_browsers_as_environment() {
 
                 let stub = dir.path().join(format!("{name}-chrome.sh"));
                 let script = format!(
-                    "#!/bin/sh\nprofile=\"\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --headless*) exit 91 ;;\n    --user-data-dir=*) profile=\"${{arg#--user-data-dir=}}\" ;;\n  esac\ndone\nprintf '%s\\n/devtools/browser/mock\\n' '{port}' > \"$profile/DevToolsActivePort\"\nwhile [ ! -f '{}' ]; do sleep 0.02; done\n",
+                    "#!/bin/sh\ntrap 'exit 0' TERM INT\nprofile=\"\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --headless*) exit 91 ;;\n    --user-data-dir=*) profile=\"${{arg#--user-data-dir=}}\" ;;\n  esac\ndone\nprintf '%s\\n/devtools/browser/mock\\n' '{port}' > \"$profile/DevToolsActivePort\"\nwhile [ ! -f '{}' ]; do sleep 0.02; done\n",
                     done_file.display()
                 );
                 fs::write(&stub, script).expect("write stub chrome");
