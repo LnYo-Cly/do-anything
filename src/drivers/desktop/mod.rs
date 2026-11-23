@@ -35,7 +35,7 @@ use crate::core::registry::{
     Registry, SessionDefinition, StepDefinition, StepError, allow_retry, disallow_retry,
     no_lint_warnings,
 };
-use crate::core::session::{Evidence, Session, Sessions};
+use crate::core::session::{Evidence, MaskedViewportCapture, Session, Sessions, SynthesizedTarget};
 
 /// Registered session kind for native desktop automation.
 pub const SESSION_KIND: &str = "desktop";
@@ -722,6 +722,28 @@ impl Session for DesktopSession {
         self.backend
             .as_mut()
             .and_then(|inner| inner.take_step_metadata())
+    }
+
+    fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        let inner = self.backend.as_mut().ok_or_else(|| {
+            "no active desktop window; run `desktop.launch` or `desktop.attach` before `locate`"
+                .to_string()
+        })?;
+        inner.masked_viewport_capture()
+    }
+
+    fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        let inner = self.backend.as_mut().ok_or_else(|| {
+            "no active desktop window; run `desktop.launch` or `desktop.attach` first".to_string()
+        })?;
+        inner.synthesize_ref(ref_id)
+    }
+
+    fn synthesize_at_point(&mut self, x: f64, y: f64) -> Result<Option<SynthesizedTarget>, String> {
+        let inner = self.backend.as_mut().ok_or_else(|| {
+            "no active desktop window; run `desktop.launch` or `desktop.attach` first".to_string()
+        })?;
+        inner.synthesize_at_point(x, y)
     }
 }
 

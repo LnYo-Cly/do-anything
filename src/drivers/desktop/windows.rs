@@ -32,7 +32,7 @@ use uiautomation::variants::Value as UiaValue;
 
 use crate::core::paths;
 use crate::core::registry::StepError;
-use crate::core::session::Evidence;
+use crate::core::session::{Evidence, MaskedViewportCapture, SynthesizedTarget};
 
 use super::{
     AttachArgs, ClickButton, DesktopLocator, DesktopPoint, DesktopRole, LaunchArgs, LocatorFilter,
@@ -1145,6 +1145,79 @@ impl DesktopBackend {
             }
         }
         Ok(items)
+    }
+
+    pub fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        let hwnd = self.hwnd;
+        let pid = self.pid;
+        let exit_status = self.try_child_status();
+        let (png, width, height) = self
+            .worker
+            .exec(move |ctx| {
+                let win_el = ensure_window_alive(&ctx.automation, hwnd, pid, exit_status)?;
+                let live = collect_live_tree(&ctx.automation, &win_el, pid, hwnd)?;
+                let (png_bytes, w, h, _) = capture_window_png(&live.data, hwnd, true)?;
+                Ok::<(Vec<u8>, u32, u32), StepError>((png_bytes, w, h))
+            })
+            .map_err(|e| step_error_message(&e).to_string())?
+            .map_err(|e| step_error_message(&e).to_string())?;
+        Ok(Some(MaskedViewportCapture { png, width, height }))
+    }
+
+    pub fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        let hwnd = self.hwnd;
+        let pid = self.pid;
+        let exit_status = self.try_child_status();
+        let refs = self.refs.clone();
+        let key = ref_id.to_string();
+        let (locator, fragile) = self
+            .worker
+            .exec(move |ctx| {
+                let win_el = ensure_window_alive(&ctx.automation, hwnd, pid, exit_status)?;
+                let live = collect_live_tree(&ctx.automation, &win_el, pid, hwnd)?;
+                let idx = resolve_node_in_tree(&live.data, None, Some(&key), &refs)?
+                    .ok_or_else(|| {
+                        StepError::Execution(format!(
+                            "ref `{key}` is not in the latest snapshot; run `da session snapshot` first"
+                        ))
+                    })?;
+                Ok::<(Value, bool), StepError>(synthesize_locator(idx, &live.data.nodes))
+            })
+            .map_err(|e| step_error_message(&e).to_string())?
+            .map_err(|e| step_error_message(&e).to_string())?;
+        Ok(Some(SynthesizedTarget { locator, fragile }))
+    }
+
+    pub fn synthesize_at_point(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> Result<Option<SynthesizedTarget>, String> {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+            return Ok(None);
+        }
+        let hwnd = self.hwnd;
+        let pid = self.pid;
+        let exit_status = self.try_child_status();
+        let px = x.round() as i32;
+        let py = y.round() as i32;
+        let found = self
+            .worker
+            .exec(move |ctx| {
+                let win_el = ensure_window_alive(&ctx.automation, hwnd, pid, exit_status)?;
+                let live = collect_live_tree(&ctx.automation, &win_el, pid, hwnd)?;
+                let sx = live.data.win_left + px;
+                let sy = live.data.win_top + py;
+                Ok::<Option<(Value, bool)>, StepError>(reverse_lookup_at(
+                    &ctx.automation,
+                    &live.data,
+                    pid,
+                    Point::new(sx, sy),
+                ))
+            })
+            .map_err(|e| step_error_message(&e).to_string())?
+            .map_err(|e| step_error_message(&e).to_string())?;
+        Ok(found.map(|(locator, fragile)| SynthesizedTarget { locator, fragile }))
     }
 
     fn build_snapshot_payload(

@@ -15,6 +15,7 @@ The complete reference for `da`: installation options, building from source, the
     - [Observers and parallel runs](#observers-and-parallel-runs)
   - [Sessions](#sessions)
   - [Interactive sessions (`da session`)](#interactive-sessions-da-session)
+    - [External model hooks](#external-model-hooks)
   - [Model Context Protocol (`da mcp`)](#model-context-protocol-da-mcp)
   - [Classification and filtering](#classification-and-filtering)
   - [Linting](#linting)
@@ -524,10 +525,13 @@ on the session directory rejects concurrent operations on the same session ID.
 
 | Subcommand | Purpose & Key Options |
 | --- | --- |
-| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), optionally attach declared read-only observers (`--observe SPEC`), print `session_id` |
+| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), optionally attach declared read-only observers (`--observe SPEC`) or a persisted JSON-RPC model hook (`--model-hook <exe>`, `--model-hook-arg <arg>`), print `session_id` |
 | `da session step <id> ...` | Reattach resources, run one step (`<step> --arg k=v`, `--use` + `--with`, `--step`, or `-f <file\|->`, optional `--save name=jsonpath`), update state, detach; returns `snapshot` after browser steps |
 | `da session snapshot <id>` | Capture the current accessibility tree without running a step (`--ref <id>`, `--max-depth`, `--max-nodes`) |
-| `da session export <id>` | Emit deterministic YAML case (`-o <file>`, `--name <title>`, `--include-reads`, `--yaml`); skips pure `browser.read` without `expect`/`save` by default |
+| `da session select-ref <id>` | Ask a `model/select_ref` hook (such as Jev) to pick a candidate `ref` (`--query <text>`, optional `--act <step>`, `--hook <exe>`, `--timeout-ms <ms>`) and synthesize its deterministic locator |
+| `da session locate <id>` | Send an input-masked PNG + viewport to a `model/locate` VLM hook (`--query <text>`, optional `--click`, `--hook <exe>`, `--timeout-ms <ms>`) and reverse-query the live DOM/UI tree for a deterministic locator |
+| `da session judge <id>` | Send redacted session evidence to a `model/judge` LLM/vLLM hook (`--rubric <text>`, optional `--evidence <yaml\|json>`, `--hook <exe>`, `--timeout-ms <ms>`); exits `0` when `passed` is `true` and `1` when `false` |
+| `da session export <id>` | Emit deterministic, model-free YAML case (`-o <file>`, `--name <title>`, `--include-reads`, `--yaml`); skips pure `browser.read` without `expect`/`save` and exploration-only `model.*` diagnostics |
 | `da session stop <id>` | Close all resources in the session and remove `.da/sessions/<id>/` and any temporary browser profile |
 | `da session list` | List active sessions and reap any session idle beyond `--idle-timeout-ms` (`0` reaps all idle sessions) |
 
@@ -710,6 +714,153 @@ $ da session stop s-1794974416388-44376-0
   and idle reaping close detached Chrome instances and delete both
   `.da/sessions/<id>/` and Chrome's temporary profile directory.
 
+#### External model hooks
+
+When an accessibility tree has many similar controls, an opaque `<canvas>` has no
+DOM nodes, or an agent needs an exploration-time semantic check, `da session`
+can invoke an external model adapter over synchronous stdin/stdout JSON-RPC 2.0
+without adding model SDKs to `da` or calling any model during `da run`.
+
+Configure a default hook for a session with `da session start --model-hook <exe>`
+(plus repeatable `--model-hook-arg <arg>`), or pass `--hook <exe>` (and
+`--hook-arg <arg>`) on a single `select-ref`, `locate`, or `judge` command. Each
+call spawns the executable directly without a shell, writes one single-line
+JSON-RPC 2.0 request to standard input, closes standard input, and waits up to
+`--timeout-ms` (default `30000`). A hook that exceeds `--timeout-ms` is killed
+and reaped with exit code `5` (`Timeout`); a hook that crashes, returns a
+JSON-RPC error, or returns out-of-range values fails with exit code `4`
+(`Environment`).
+
+Three atomic methods are standardized:
+
+1. **`model/select_ref`** (fast candidate selection, such as Jev):
+
+   ```json
+   {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "method": "model/select_ref",
+     "params": {
+       "session_id": "s-1794974416388-44376-0",
+       "session_kind": "browser",
+       "query": "Click the primary Save button",
+       "candidates": [
+         {"ref": "e5", "role": "textbox", "name": "Username", "value": "alice"},
+         {"ref": "e9", "role": "button", "name": "Save"}
+       ]
+     }
+   }
+   ```
+
+   Response `result`:
+
+   ```json
+   {
+     "ref": "e9",
+     "confidence": 0.97,
+     "model": "jev-0.2b",
+     "latency_ms": 14,
+     "usage": {"prompt_tokens": 84, "completion_tokens": 2},
+     "trace_id": "jev-01"
+   }
+   ```
+
+   `da` verifies that `ref` exists in `candidates`, synthesizes its
+   deterministic locator against the live session, and optionally runs an
+   immediate step when `--act <step>` is supplied (for example `--act browser.click`).
+
+2. **`model/locate`** (vision grounding models such as UI-TARS or Qwen-VL):
+
+   ```json
+   {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "method": "model/locate",
+     "params": {
+       "session_id": "s-1794974416388-44376-0",
+       "session_kind": "browser",
+       "query": "Click the chart export icon",
+       "image_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
+       "mime_type": "image/png",
+       "viewport": {"width": 1280, "height": 800}
+     }
+   }
+   ```
+
+   Response `result`:
+
+   ```json
+   {
+     "x": 100,
+     "y": 112,
+     "confidence": 0.92,
+     "model": "ui-tars-1.5-7b",
+     "latency_ms": 1821,
+     "usage": {"prompt_tokens": 512, "completion_tokens": 6},
+     "trace_id": "vlm-01"
+   }
+   ```
+
+   `da` validates `0 <= x < viewport.width` and `0 <= y < viewport.height`, then
+   reverse-queries the live DOM or UIA tree at `(x, y)`. When `(x, y)` hits an
+   interactive or `testid`-bearing element, `synthesized_locator` holds its
+   deterministic locator (`fragile: false`); when `(x, y)` lands on an opaque
+   `<canvas>`, `synthesized_locator` is `null` (`fragile: true`) and clicking
+   with `--click` (or a subsequent `browser.click` with `at`) exports
+   viewport-pinned `at: { x, y, viewport }` with the `da lint` coordinate
+   warning.
+
+3. **`model/judge`** (open-ended exploration verdicts via vLLM / Ollama / OpenAI-compatible adapters):
+
+   ```json
+   {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "method": "model/judge",
+     "params": {
+       "session_id": "s-1794974416388-44376-0",
+       "session_kind": "browser",
+       "rubric": "Confirm the dashboard loaded without error banners",
+       "snapshot": {"title": "Dashboard", "tree": []},
+       "evidence": {"steps": [], "vars": {}}
+     }
+   }
+   ```
+
+   Response `result`:
+
+   ```json
+   {
+     "passed": true,
+     "rationale": "Dashboard summary loaded with zero error banners.",
+     "confidence": 0.95,
+     "model": "qwen2.5-14b-instruct",
+     "latency_ms": 340,
+     "usage": {"prompt_tokens": 210, "completion_tokens": 18},
+     "trace_id": "judge-01"
+   }
+   ```
+
+   `da session judge` exits `0` when `passed` is `true` and `1` (`TestFailure`)
+   when `passed` is `false` (`--output text` prints a structured human summary;
+   default and `--output json` print one JSON object).
+
+Boundary and replay guarantees:
+
+- **Input masking & secret scrubbing**: `model/locate` always captures through
+  the session's input-masked screenshot path (editable fields and password inputs
+  covered with solid black `#000` before capture). Every outgoing `query`,
+  `rubric`, `candidates`, `snapshot`, and `evidence` payload is scrubbed through
+  `Secrets` before reaching the hook's stdin, and every incoming `rationale`,
+  `model`, `usage`, `trace_id`, and stderr diagnostic is scrubbed before being
+  printed or persisted.
+- **Audit trail & model-free `da run`**: `.da/sessions/<id>/steps.jsonl` records
+  `model`, `latency_ms`, `usage`, `trace_id`, and `confidence` on hook-assisted
+  entries. `da session export` omits `model.select_ref`, `model.locate`, and
+  `model.judge` diagnostic entries and writes only deterministic locators (or
+  viewport-pinned `at:` on `<canvas>`), so `da run` replays offline with zero
+  model calls.
+
 ### Model Context Protocol (`da mcp`)
 
 Some coding-agent hosts have no shell tool and can only reach the outside world
@@ -767,12 +918,17 @@ model's context on descriptions it cannot use.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `session_start` | none | `session_id` of a new session |
+| `session_start` | optional `model_hook`, `model_hook_args` | `session_id` of a new session |
 | `step` | `session_id`, `use`, optional `with`, `expect`, `save` | The step result, its assertions and, after a browser step, a fresh `snapshot` |
 | `snapshot` | `session_id`, optional `ref`, `max_depth`, `max_nodes` | The accessibility tree without running a step |
 | `export` | `session_id`, optional `name`, `include_reads`, `out` | The YAML case, byte for byte what `da session export --yaml` writes |
 | `run` | `paths`, optional `vars`, `jobs` | The same JSON report `da --output json run` prints |
 | `session_stop` | `session_id` | Closes every resource and removes the session directory |
+
+When `da mcp` is started with `--model-hook <exe>` (plus optional
+`--model-hook-arg <arg>`), `tools/list` also advertises `select_ref`, `locate`,
+and `judge` backed by the same [External model hooks](#external-model-hooks)
+contract (`tools/call` also accepts per-call `hook` / `hook_args`).
 
 `step` is the only generic step tool: `use` names a registered step, `with`
 holds the arguments a case file nests under that name, and `expect` and `save`

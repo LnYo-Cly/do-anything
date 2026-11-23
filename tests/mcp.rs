@@ -794,3 +794,153 @@ fn a_browser_step_and_a_snapshot_round_trip() {
     assert_eq!(stopped["ok"], true, "{stopped}");
     server.finish();
 }
+
+const MCP_MOCK_HOOK_RS: &str = r#"
+use std::env;
+use std::fs;
+use std::io::{self, Read, Write};
+
+fn main() {
+    let secret = env::var("DA_MCP_TEST_SECRET").unwrap_or_default();
+    let mut stdin_bytes = Vec::new();
+    let _ = io::stdin().read_to_end(&mut stdin_bytes);
+    if let Some(out_path) = env::args().nth(1) {
+        let _ = fs::write(out_path, &stdin_bytes);
+    }
+    let stdin_text = String::from_utf8_lossy(&stdin_bytes);
+    let passed = !stdin_text.contains("\"fail-now\"");
+    let line = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"passed\":{passed},\"rationale\":\"checked {secret}\",\"confidence\":0.9,\"model\":\"mcp-judge-v1\",\"latency_ms\":23,\"usage\":{{\"prompt_tokens\":10}},\"trace_id\":\"tr-{secret}\"}}}}"
+    );
+    let _ = writeln!(io::stdout(), "{line}");
+    let _ = io::stdout().flush();
+}
+"#;
+
+#[cfg(feature = "cli")]
+#[test]
+fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export() {
+    let dir = TempDir::new("mcp-model-hook");
+    let hook_src = dir.write("mcp_mock_hook.rs", MCP_MOCK_HOOK_RS);
+    let hook_bin = dir.path().join(if cfg!(windows) {
+        "mcp_mock_hook.exe"
+    } else {
+        "mcp_mock_hook"
+    });
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let status = Command::new(rustc)
+        .arg(&hook_src)
+        .arg("-O")
+        .arg("-o")
+        .arg(&hook_bin)
+        .status()
+        .expect("compile mcp_mock_hook.rs");
+    assert!(status.success(), "rustc failed for mcp_mock_hook.rs");
+
+    let req_dump = dir.path().join("mcp_hook_stdin.json");
+    let mut child = Command::new(da())
+        .arg("mcp")
+        .arg("--model-hook")
+        .arg(&hook_bin)
+        .arg("--model-hook-arg")
+        .arg(&req_dump)
+        .current_dir(dir.path())
+        .env(SECRET_VARIABLE, SECRET)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start `da mcp --model-hook`");
+    let stdin = child.stdin.take().expect("mcp stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+    let mut server = Server {
+        child,
+        stdin: Some(stdin),
+        stdout,
+        seen: String::new(),
+    };
+    server.initialize();
+
+    let listed = server.request(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "session_start",
+            "step",
+            "snapshot",
+            "select_ref",
+            "locate",
+            "judge",
+            "export",
+            "run",
+            "session_stop"
+        ]
+    );
+
+    let started = payload(&server.call_tool(2, "session_start", json!({})));
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    let step_resp = server.call_tool(
+        3,
+        "step",
+        json!({
+            "session_id": session_id,
+            "use": "cli.run",
+            "with": {
+                "command": da(),
+                "args": ["--version"],
+                "env": {"PROBE": format!("${{env:{SECRET_VARIABLE}}}")}
+            },
+            "expect": [{"path": "$.exit_code", "equals": 0}]
+        }),
+    );
+    assert!(!failed(&step_resp), "{step_resp}");
+
+    let judged = server.call_tool(
+        4,
+        "judge",
+        json!({
+            "session_id": session_id,
+            "rubric": format!("Verify ${{env:{SECRET_VARIABLE}}} run succeeded")
+        }),
+    );
+    assert!(!failed(&judged), "{judged}");
+    let judged_payload = payload(&judged);
+    assert_eq!(judged_payload["passed"], true);
+    assert_eq!(judged_payload["model"], "mcp-judge-v1");
+    assert_eq!(judged_payload["rationale"], "checked ***");
+
+    let hook_stdin = std::fs::read_to_string(&req_dump).expect("hook stdin");
+    assert!(
+        !hook_stdin.contains(SECRET),
+        "MCP judge leaked secret into model hook stdin: {hook_stdin}"
+    );
+
+    let judged_fail = server.call_tool(
+        5,
+        "judge",
+        json!({
+            "session_id": session_id,
+            "rubric": "fail-now"
+        }),
+    );
+    assert!(failed(&judged_fail), "{judged_fail}");
+    assert_eq!(payload(&judged_fail)["passed"], false);
+
+    let exported = payload(&server.call_tool(6, "export", json!({"session_id": session_id})));
+    assert_eq!(exported["exported_steps"], 1, "{exported}");
+    let yaml = exported["yaml"].as_str().unwrap();
+    assert!(!yaml.contains("model.judge"), "{yaml}");
+
+    let stopped = payload(&server.call_tool(7, "session_stop", json!({"session_id": session_id})));
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    assert_no_leak(&server.seen);
+    server.finish();
+}

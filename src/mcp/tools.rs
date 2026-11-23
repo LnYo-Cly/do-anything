@@ -18,13 +18,29 @@ use crate::core::registry::Registry;
 use crate::core::report::RunOutcome;
 use crate::core::secrets::Secrets;
 use crate::session::export::ExportOptions;
-use crate::session::{self, SessionRequest, StepInput};
+use crate::session::model_hook::{DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
+use crate::session::{
+    self, JudgeRequest, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
+};
 
-/// Names of the tools, in the order `tools/list` reports them.
+/// Names of the base tools, in the order `tools/list` reports them without `--model-hook`.
 pub const NAMES: [&str; 6] = [
     "session_start",
     "step",
     "snapshot",
+    "export",
+    "run",
+    "session_stop",
+];
+
+/// Names of all tools exposed when `--model-hook` is configured on `da mcp`.
+pub const ALL_NAMES: [&str; 9] = [
+    "session_start",
+    "step",
+    "snapshot",
+    "select_ref",
+    "locate",
+    "judge",
     "export",
     "run",
     "session_stop",
@@ -38,6 +54,8 @@ pub struct Context<'a> {
     pub sessions_dir: &'a Path,
     /// Idle timeout `session_start` applies, in milliseconds.
     pub idle_timeout_ms: u64,
+    /// Optional server-default model hook configured on `da mcp`.
+    pub model_hook: Option<&'a ModelHookSpec>,
 }
 
 /// The result of one tool call, before redaction and framing.
@@ -71,7 +89,17 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
-                "properties": {},
+                "properties": {
+                    "model_hook": {
+                        "type": "string",
+                        "description": "Optional external JSON-RPC 2.0 model hook executable persisted for `select_ref`, `locate`, and `judge`.",
+                    },
+                    "model_hook_args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional arguments passed to `model_hook`.",
+                    },
+                },
             },
         }),
         json!({
@@ -199,6 +227,79 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
+/// Describes `tools/list`, including `select_ref`, `locate`, and `judge` when
+/// `--model-hook` is configured on `da mcp`.
+pub fn definitions_for(include_model_hooks: bool) -> Vec<Value> {
+    let mut base = definitions();
+    if !include_model_hooks {
+        return base;
+    }
+    let hook_defs = model_hook_definitions();
+    // Insert right after `snapshot` (index 3) so exploration tools stay grouped.
+    base.splice(3..3, hook_defs);
+    base
+}
+
+fn model_hook_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "select_ref",
+            "description": "Invokes the `model/select_ref` JSON-RPC 2.0 hook over the session's active snapshot candidates, verifies the chosen `ref`, and returns its deterministic `synthesized_locator`.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "query"],
+                "properties": {
+                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                    "query": {"type": "string", "description": "Natural-language target description (redacted via `Secrets`)."},
+                    "ref": {"type": "string", "description": "Optional snapshot `ref` to scope candidates within."},
+                    "max_depth": {"type": "integer", "minimum": 1, "description": "Maximum snapshot traversal depth."},
+                    "max_nodes": {"type": "integer", "minimum": 1, "description": "Maximum snapshot nodes."},
+                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
+                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
+                    "act": {"type": "string", "description": "Optional step name (such as `browser.click`) to execute immediately with the selected `ref`."},
+                    "with": {"type": "object", "description": "Optional step arguments merged when `act` is set."},
+                },
+            },
+        }),
+        json!({
+            "name": "locate",
+            "description": "Captures an input-masked PNG screenshot, invokes `model/locate` for `(x, y)` coordinates, and reverse-queries the live DOM/UI tree to return a deterministic `synthesized_locator` (falling back to `at` on `<canvas>`).",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "query"],
+                "properties": {
+                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                    "query": {"type": "string", "description": "Visual grounding query (redacted via `Secrets`)."},
+                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
+                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
+                    "click": {"type": "boolean", "description": "Immediately click the located target and record the step for export."},
+                },
+            },
+        }),
+        json!({
+            "name": "judge",
+            "description": "Invokes `model/judge` over redacted session evidence and returns `{ passed, rationale, model, ... }`; recorded in `steps.jsonl` and omitted from `export`.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "rubric"],
+                "properties": {
+                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                    "rubric": {"type": "string", "description": "Evaluation rubric (redacted via `Secrets`)."},
+                    "evidence": {"description": "Optional custom JSON evidence; defaults to redacted session steps and variables."},
+                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
+                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
+                },
+            },
+        }),
+    ]
+}
+
 /// Runs the tool called `name`.
 ///
 /// `None` means this server has no such tool; an argument problem is a tool
@@ -209,6 +310,9 @@ pub fn call(context: &Context, name: &str, arguments: &Map<String, Value>) -> Op
         "session_start" => session_start(context, arguments),
         "step" => step(context, arguments),
         "snapshot" => snapshot(context, arguments),
+        "select_ref" => select_ref(context, arguments),
+        "locate" => locate(context, arguments),
+        "judge" => judge(context, arguments),
         "export" => export(context, arguments),
         "run" => run(context, arguments),
         "session_stop" => session_stop(context, arguments),
@@ -219,14 +323,20 @@ pub fn call(context: &Context, name: &str, arguments: &Map<String, Value>) -> Op
 
 /// Starts one session and reports the identifier to use from now on.
 fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
-    if let Err(message) = only(arguments, &[]) {
+    if let Err(message) = only(arguments, &["model_hook", "model_hook_args"]) {
         return ToolOutcome::failed(refusal(message));
     }
+    let model_hook = match optional_hook_spec(arguments, "model_hook", "model_hook_args") {
+        Ok(Some(spec)) => Some(spec),
+        Ok(None) => context.model_hook.cloned(),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
     from_response(session::handle(
         SessionRequest::Start {
             sessions_dir: context.sessions_dir.to_path_buf(),
             idle_timeout_ms: context.idle_timeout_ms,
             observe: Vec::new(),
+            model_hook,
         },
         context.registry,
     ))
@@ -323,6 +433,187 @@ fn snapshot(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             max_depth,
             max_nodes,
         },
+        context.registry,
+    ))
+}
+
+/// Invokes `model/select_ref` against the session's active snapshot candidates.
+fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
+    if let Err(message) = only(
+        arguments,
+        &[
+            "session_id",
+            "query",
+            "ref",
+            "max_depth",
+            "max_nodes",
+            "hook",
+            "hook_args",
+            "timeout_ms",
+            "act",
+            "with",
+        ],
+    ) {
+        return ToolOutcome::failed(refusal(message));
+    }
+    let session_id = match text_argument(arguments, "session_id") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let query = match text_argument(arguments, "query") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let scope_ref = match optional_text(arguments, "ref") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let max_depth = match optional_count(arguments, "max_depth") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let max_nodes = match optional_count(arguments, "max_nodes") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let hook_override = match optional_hook_spec(arguments, "hook", "hook_args") {
+        Ok(Some(spec)) => Some(spec),
+        Ok(None) => context.model_hook.cloned(),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let timeout_ms = match optional_timeout_ms(arguments) {
+        Ok(ms) => ms,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let act_name = match optional_text(arguments, "act") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let with_raw = match arguments.get("with") {
+        None | Some(Value::Null) => None,
+        Some(obj @ Value::Object(_)) => Some(obj.to_string()),
+        Some(_) => return ToolOutcome::failed(refusal("`with` must be an object".to_string())),
+    };
+    if with_raw.is_some() && act_name.is_none() {
+        return ToolOutcome::failed(refusal("`with` requires `act`".to_string()));
+    }
+    let act = act_name.map(|action| SelectRefAction {
+        action,
+        with_raw,
+        args: Vec::new(),
+        save: Vec::new(),
+    });
+    let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    from_response(session::handle(
+        SessionRequest::SelectRef(SelectRefRequest {
+            sessions_dir: context.sessions_dir.to_path_buf(),
+            id: session_id,
+            base_directory,
+            query,
+            scope_ref,
+            max_depth,
+            max_nodes,
+            hook_override,
+            timeout_ms,
+            act,
+        }),
+        context.registry,
+    ))
+}
+
+/// Captures an input-masked screenshot and invokes `model/locate`.
+fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
+    if let Err(message) = only(
+        arguments,
+        &[
+            "session_id",
+            "query",
+            "hook",
+            "hook_args",
+            "timeout_ms",
+            "click",
+        ],
+    ) {
+        return ToolOutcome::failed(refusal(message));
+    }
+    let session_id = match text_argument(arguments, "session_id") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let query = match text_argument(arguments, "query") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let hook_override = match optional_hook_spec(arguments, "hook", "hook_args") {
+        Ok(Some(spec)) => Some(spec),
+        Ok(None) => context.model_hook.cloned(),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let timeout_ms = match optional_timeout_ms(arguments) {
+        Ok(ms) => ms,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let click = match optional_flag(arguments, "click") {
+        Ok(flag) => flag.unwrap_or(false),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    from_response(session::handle(
+        SessionRequest::Locate(LocateRequest {
+            sessions_dir: context.sessions_dir.to_path_buf(),
+            id: session_id,
+            base_directory,
+            query,
+            hook_override,
+            timeout_ms,
+            click,
+        }),
+        context.registry,
+    ))
+}
+
+/// Invokes `model/judge` over redacted session evidence.
+fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
+    if let Err(message) = only(
+        arguments,
+        &[
+            "session_id",
+            "rubric",
+            "evidence",
+            "hook",
+            "hook_args",
+            "timeout_ms",
+        ],
+    ) {
+        return ToolOutcome::failed(refusal(message));
+    }
+    let session_id = match text_argument(arguments, "session_id") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let rubric = match text_argument(arguments, "rubric") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let evidence = arguments.get("evidence").filter(|v| !v.is_null()).cloned();
+    let hook_override = match optional_hook_spec(arguments, "hook", "hook_args") {
+        Ok(Some(spec)) => Some(spec),
+        Ok(None) => context.model_hook.cloned(),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let timeout_ms = match optional_timeout_ms(arguments) {
+        Ok(ms) => ms,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    from_response(session::handle(
+        SessionRequest::Judge(JudgeRequest {
+            sessions_dir: context.sessions_dir.to_path_buf(),
+            id: session_id,
+            rubric,
+            evidence,
+            hook_override,
+            timeout_ms,
+        }),
         context.registry,
     ))
 }
@@ -523,6 +814,44 @@ fn optional_flag(arguments: &Map<String, Value>, name: &str) -> Result<Option<bo
     }
 }
 
+fn optional_timeout_ms(arguments: &Map<String, Value>) -> Result<u64, String> {
+    match arguments.get("timeout_ms") {
+        None | Some(Value::Null) => Ok(DEFAULT_HOOK_TIMEOUT_MS),
+        Some(value) => match value.as_u64() {
+            Some(ms) if ms >= 1 => Ok(ms),
+            Some(_) => Err("`timeout_ms` must be at least 1".to_string()),
+            None => Err("`timeout_ms` must be a whole number".to_string()),
+        },
+    }
+}
+
+fn optional_hook_spec(
+    arguments: &Map<String, Value>,
+    cmd_key: &str,
+    args_key: &str,
+) -> Result<Option<ModelHookSpec>, String> {
+    let command = optional_text(arguments, cmd_key)?;
+    let args = match arguments.get(args_key) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(s) = item.as_str() else {
+                    return Err(format!("every entry of `{args_key}` must be a string"));
+                };
+                out.push(s.to_string());
+            }
+            out
+        }
+        Some(_) => return Err(format!("`{args_key}` must be an array of strings")),
+    };
+    match command {
+        Some(command) => Ok(Some(ModelHookSpec { command, args })),
+        None if args.is_empty() => Ok(None),
+        None => Err(format!("`{args_key}` requires `{cmd_key}`")),
+    }
+}
+
 /// The `paths` argument of `run`.
 fn paths_argument(arguments: &Map<String, Value>) -> Result<Vec<PathBuf>, String> {
     let Some(value) = arguments.get("paths") else {
@@ -680,6 +1009,7 @@ mod tests {
             registry,
             sessions_dir: Path::new(".da/sessions"),
             idle_timeout_ms: 60_000,
+            model_hook: None,
         }
     }
 
@@ -693,6 +1023,22 @@ mod tests {
 
         assert_eq!(names, NAMES);
         for definition in &definitions {
+            assert!(
+                definition["description"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+                "every tool needs a description: {definition}"
+            );
+            assert_eq!(definition["inputSchema"]["type"], "object");
+        }
+
+        let with_hooks = definitions_for(true);
+        let hook_names: Vec<&str> = with_hooks
+            .iter()
+            .filter_map(|definition| definition["name"].as_str())
+            .collect();
+        assert_eq!(hook_names, ALL_NAMES);
+        for definition in &with_hooks {
             assert!(
                 definition["description"]
                     .as_str()

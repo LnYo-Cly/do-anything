@@ -22,8 +22,10 @@ use do_anything::drivers;
 use do_anything::exit::ExitCode as DaExitCode;
 use do_anything::report as html_report;
 use do_anything::session::export::ExportOptions;
+use do_anything::session::model_hook::{DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
 use do_anything::session::{
-    self, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR, SessionRequest, StepInput,
+    self, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR, JudgeRequest, LocateRequest,
+    SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
 };
 
 /// An agent-friendly, cross-layer testing tool.
@@ -170,6 +172,16 @@ enum Command {
         /// Idle timeout in milliseconds before sessions are reaped. Defaults to 1800000.
         #[arg(long, value_name = "MS")]
         idle_timeout_ms: Option<u64>,
+        /// Optional external JSON-RPC 2.0 model hook executable exposed to MCP clients.
+        #[arg(long, value_name = "EXECUTABLE")]
+        model_hook: Option<String>,
+        /// Optional argument passed to `--model-hook`. Repeat for more than one.
+        #[arg(
+            long = "model-hook-arg",
+            value_name = "ARG",
+            allow_hyphen_values = true
+        )]
+        model_hook_args: Vec<String>,
     },
     /// Manage persistent interactive sessions for step-by-step exploration.
     Session {
@@ -191,6 +203,16 @@ enum SessionCommand {
         /// Attach a declared observer (`NAME=KIND`, `NAME=KIND:key=val`, or YAML/JSON mapping). Repeat for more than one.
         #[arg(long = "observe", value_name = "SPEC")]
         observe: Vec<String>,
+        /// Configure an external JSON-RPC 2.0 model hook executable for `select-ref`, `locate`, and `judge`.
+        #[arg(long, value_name = "EXECUTABLE")]
+        model_hook: Option<String>,
+        /// Pass an argument to `--model-hook`. Repeat for more than one.
+        #[arg(
+            long = "model-hook-arg",
+            value_name = "ARG",
+            allow_hyphen_values = true
+        )]
+        model_hook_args: Vec<String>,
     },
     /// Execute one step in an existing session.
     Step {
@@ -230,6 +252,84 @@ enum SessionCommand {
         /// Maximum nodes included before truncation.
         #[arg(long, value_name = "N")]
         max_nodes: Option<usize>,
+    },
+    /// Choose a candidate `ref` from the active snapshot using a `model/select_ref` JSON-RPC hook.
+    SelectRef {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// Natural-language target description (redacted via `Secrets`).
+        #[arg(long, value_name = "TEXT")]
+        query: String,
+        /// Optional element reference from a prior snapshot to scope candidates within.
+        #[arg(long = "ref", value_name = "REF")]
+        scope_ref: Option<String>,
+        /// Maximum snapshot traversal depth.
+        #[arg(long, value_name = "N")]
+        max_depth: Option<usize>,
+        /// Maximum snapshot nodes included before truncation.
+        #[arg(long, value_name = "N")]
+        max_nodes: Option<usize>,
+        /// Override the session's model hook executable for this call.
+        #[arg(long, value_name = "EXECUTABLE")]
+        hook: Option<String>,
+        /// Pass an argument to `--hook`. Repeat for more than one.
+        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
+        hook_args: Vec<String>,
+        /// Maximum hook runtime in milliseconds. Defaults to 30000.
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
+        timeout_ms: u64,
+        /// Immediately execute a step (such as `browser.click`) using the selected `ref`.
+        #[arg(long, value_name = "STEP")]
+        act: Option<String>,
+        /// Step arguments mapping as YAML or JSON when `--act` is passed.
+        #[arg(long, value_name = "YAML_OR_JSON")]
+        with: Option<String>,
+        /// Step argument as `KEY=VALUE` when `--act` is passed. Repeat for more than one.
+        #[arg(long = "arg", value_name = "KEY=VALUE", value_parser = parse_var)]
+        args: Vec<(String, String)>,
+        /// Save a value from the `--act` step result as `NAME=JSONPATH`.
+        #[arg(long = "save", value_name = "NAME=JSONPATH", value_parser = parse_var)]
+        save: Vec<(String, String)>,
+    },
+    /// Capture an input-masked screenshot, invoke `model/locate`, and reverse-synthesize a deterministic locator.
+    Locate {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// Visual grounding query (redacted via `Secrets`).
+        #[arg(long, value_name = "TEXT")]
+        query: String,
+        /// Override the session's model hook executable for this call.
+        #[arg(long, value_name = "EXECUTABLE")]
+        hook: Option<String>,
+        /// Pass an argument to `--hook`. Repeat for more than one.
+        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
+        hook_args: Vec<String>,
+        /// Maximum hook runtime in milliseconds. Defaults to 30000.
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
+        timeout_ms: u64,
+        /// Immediately click the located target and record the step for `da session export`.
+        #[arg(long)]
+        click: bool,
+    },
+    /// Invoke `model/judge` over redacted session evidence and exit 1 if `passed` is false.
+    Judge {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// Evaluation rubric (redacted via `Secrets`).
+        #[arg(long, value_name = "TEXT")]
+        rubric: String,
+        /// Custom evidence as YAML or JSON; defaults to redacted session steps and variables.
+        #[arg(long, value_name = "YAML_OR_JSON")]
+        evidence: Option<String>,
+        /// Override the session's model hook executable for this call.
+        #[arg(long, value_name = "EXECUTABLE")]
+        hook: Option<String>,
+        /// Pass an argument to `--hook`. Repeat for more than one.
+        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
+        hook_args: Vec<String>,
+        /// Maximum hook runtime in milliseconds. Defaults to 30000.
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
+        timeout_ms: u64,
     },
     /// Export successful steps as a deterministic, replayable YAML case.
     Export {
@@ -425,14 +525,29 @@ fn main() -> ExitCode {
         Command::Mcp {
             sessions_dir,
             idle_timeout_ms,
-        } => do_anything::mcp::serve(
-            &registry,
-            do_anything::mcp::Options {
-                sessions_dir: sessions_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
-                idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
-            },
-        )
-        .into(),
+            model_hook,
+            model_hook_args,
+        } => {
+            let hook_spec = match build_cli_hook_spec(
+                model_hook,
+                model_hook_args,
+                "--model-hook",
+                "--model-hook-arg",
+            ) {
+                Ok(spec) => spec,
+                Err(message) => return usage_error(&message),
+            };
+            do_anything::mcp::serve(
+                &registry,
+                do_anything::mcp::Options {
+                    sessions_dir: sessions_dir
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
+                    idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
+                    model_hook: hook_spec,
+                },
+            )
+            .into()
+        }
         Command::Session {
             sessions_dir,
             idle_timeout_ms,
@@ -447,6 +562,24 @@ fn main() -> ExitCode {
     }
 }
 
+fn build_cli_hook_spec(
+    command: Option<String>,
+    args: Vec<String>,
+    cmd_flag: &str,
+    arg_flag: &str,
+) -> Result<Option<ModelHookSpec>, String> {
+    match command {
+        Some(cmd) => {
+            if cmd.trim().is_empty() {
+                return Err(format!("`{cmd_flag}` executable path must not be empty"));
+            }
+            Ok(Some(ModelHookSpec { command: cmd, args }))
+        }
+        None if args.is_empty() => Ok(None),
+        None => Err(format!("`{arg_flag}` requires `{cmd_flag} <EXECUTABLE>`")),
+    }
+}
+
 fn run_session(
     format: OutputFormat,
     registry: &Registry,
@@ -458,15 +591,29 @@ fn run_session(
     let mut print_raw_yaml = false;
 
     let request = match action {
-        SessionCommand::Start { observe } => {
+        SessionCommand::Start {
+            observe,
+            model_hook,
+            model_hook_args,
+        } => {
             let parsed_observe = match session::parse_observe_specs(&observe, registry) {
                 Ok(items) => items,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let hook_spec = match build_cli_hook_spec(
+                model_hook,
+                model_hook_args,
+                "--model-hook",
+                "--model-hook-arg",
+            ) {
+                Ok(spec) => spec,
                 Err(message) => return session_usage_error(format, &message),
             };
             SessionRequest::Start {
                 sessions_dir,
                 idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
                 observe: parsed_observe,
+                model_hook: hook_spec,
             }
         }
         SessionCommand::Step {
@@ -504,6 +651,106 @@ fn run_session(
             max_depth,
             max_nodes,
         },
+        SessionCommand::SelectRef {
+            id,
+            query,
+            scope_ref,
+            max_depth,
+            max_nodes,
+            hook,
+            hook_args,
+            timeout_ms,
+            act,
+            with,
+            args,
+            save,
+        } => {
+            let hook_override = match build_cli_hook_spec(hook, hook_args, "--hook", "--hook-arg") {
+                Ok(spec) => spec,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            if (with.is_some() || !args.is_empty() || !save.is_empty()) && act.is_none() {
+                return session_usage_error(
+                    format,
+                    "`--with`, `--arg`, and `--save` on `select-ref` require `--act <STEP>`",
+                );
+            }
+            let act_spec = act.map(|action| SelectRefAction {
+                action,
+                with_raw: with,
+                args,
+                save,
+            });
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            SessionRequest::SelectRef(SelectRefRequest {
+                sessions_dir,
+                id,
+                base_directory,
+                query,
+                scope_ref,
+                max_depth,
+                max_nodes,
+                hook_override,
+                timeout_ms,
+                act: act_spec,
+            })
+        }
+        SessionCommand::Locate {
+            id,
+            query,
+            hook,
+            hook_args,
+            timeout_ms,
+            click,
+        } => {
+            let hook_override = match build_cli_hook_spec(hook, hook_args, "--hook", "--hook-arg") {
+                Ok(spec) => spec,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            SessionRequest::Locate(LocateRequest {
+                sessions_dir,
+                id,
+                base_directory,
+                query,
+                hook_override,
+                timeout_ms,
+                click,
+            })
+        }
+        SessionCommand::Judge {
+            id,
+            rubric,
+            evidence,
+            hook,
+            hook_args,
+            timeout_ms,
+        } => {
+            let hook_override = match build_cli_hook_spec(hook, hook_args, "--hook", "--hook-arg") {
+                Ok(spec) => spec,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let parsed_evidence = match evidence {
+                Some(raw) => match case::parse_json_value(&raw) {
+                    Ok(val) => Some(val),
+                    Err(err) => {
+                        return session_usage_error(
+                            format,
+                            &format!("could not parse `--evidence`: {err}"),
+                        );
+                    }
+                },
+                None => None,
+            };
+            SessionRequest::Judge(JudgeRequest {
+                sessions_dir,
+                id,
+                rubric,
+                evidence: parsed_evidence,
+                hook_override,
+                timeout_ms,
+            })
+        }
         SessionCommand::Export {
             id,
             out,
@@ -535,6 +782,10 @@ fn run_session(
         && let Some(yaml) = &response.raw_yaml
     {
         let _ = write_stdout(yaml);
+    } else if format == OutputFormat::Text
+        && let Some(text) = &response.raw_text
+    {
+        let _ = write_stdout(text);
     } else if format == OutputFormat::Json {
         let _ = write_stdout(&format!("{}\n", response.payload));
     } else {

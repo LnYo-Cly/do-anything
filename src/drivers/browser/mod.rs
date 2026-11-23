@@ -53,7 +53,7 @@ use crate::core::paths;
 use crate::core::registry::{
     Registry, SessionDefinition, StepDefinition, StepError, allow_retry, disallow_retry,
 };
-use crate::core::session::{Evidence, Session, Sessions};
+use crate::core::session::{Evidence, MaskedViewportCapture, Session, Sessions, SynthesizedTarget};
 
 /// Session kind the browser steps share.
 pub const SESSION_KIND: &str = "browser";
@@ -6464,6 +6464,52 @@ impl Session for BrowserSession {
         self.step_metadata.take()
     }
 
+    fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let (width, height) = self
+            .viewport_size(deadline, &mut dialog)
+            .map_err(step_error_text)?;
+        let png = self.capture_masked_png(deadline).map_err(step_error_text)?;
+        Ok(Some(MaskedViewportCapture { png, width, height }))
+    }
+
+    fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let scope = self.scope();
+        let refs = self.refs.clone();
+        let (object_id, _) = {
+            let connection = self.connection_mut().map_err(step_error_text)?;
+            snapshot::resolve_ref_object_id(
+                connection,
+                &scope,
+                &refs,
+                ref_id,
+                deadline,
+                &mut dialog,
+            )
+            .map_err(step_error_text)?
+        };
+        let synth = synthesis::synthesize_for_object(self, &object_id, deadline, &mut dialog)
+            .map_err(step_error_text)?;
+        Ok(Some(SynthesizedTarget {
+            locator: synth.locator,
+            fragile: synth.fragile,
+        }))
+    }
+
+    fn synthesize_at_point(&mut self, x: f64, y: f64) -> Result<Option<SynthesizedTarget>, String> {
+        let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let synth =
+            synthesize_for_point(self, x, y, deadline, &mut dialog).map_err(step_error_text)?;
+        Ok(synth.map(|item| SynthesizedTarget {
+            locator: item.locator,
+            fragile: item.fragile,
+        }))
+    }
+
     fn step_evidence(&mut self) -> Result<Vec<Evidence>, String> {
         if self.connection.is_none() {
             return Ok(Vec::new());
@@ -7798,10 +7844,11 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     if let Some(at) = &args.at {
         check_click_at(&args).map_err(StepError::InvalidArguments)?;
+        let interactive = sessions.is_interactive();
         let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
         let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
         let session = session(sessions)?;
-        return click_at(session, at, deadline, &mut dialog);
+        return click_at(session, at, interactive, deadline, &mut dialog);
     }
     let locator = Locator::from_args(
         &args.css,
@@ -7906,8 +7953,9 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
     if let Some(at) = &args.at {
         check_type_at(&args).map_err(StepError::InvalidArguments)?;
+        let interactive = sessions.is_interactive();
         let session = session(sessions)?;
-        return type_at(session, at, &text, deadline, &mut dialog);
+        return type_at(session, at, &text, interactive, deadline, &mut dialog);
     }
     let target = type_target(&args).map_err(StepError::InvalidArguments)?;
     let session = session(sessions)?;
@@ -8179,15 +8227,100 @@ fn follow_label(
     }
 }
 
+const REVERSE_HIT_TEST_TEMPLATE: &str = r#"(function (x, y, testidAttr) {
+  if (!document || typeof document.elementFromPoint !== 'function') return null;
+  var hit = document.elementFromPoint(x, y);
+  if (!hit || hit.nodeType !== 1) return null;
+  var roles = {
+    button: 1, link: 1, textbox: 1, searchbox: 1, checkbox: 1, radio: 1,
+    switch: 1, combobox: 1, listbox: 1, option: 1, menuitem: 1,
+    menuitemcheckbox: 1, menuitemradio: 1, tab: 1, slider: 1, spinbutton: 1, treeitem: 1
+  };
+  var isInteractive = function (node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = node.tagName ? node.tagName.toLowerCase() : '';
+    if (tag === 'button' || tag === 'select' || tag === 'textarea' || tag === 'summary' || tag === 'option' || tag === 'label') return true;
+    if (tag === 'a' && node.hasAttribute('href')) return true;
+    if (tag === 'input' && String(node.type || 'text').toLowerCase() !== 'hidden') return true;
+    if (node.isContentEditable) return true;
+    var r = (node.getAttribute('role') || '').trim().toLowerCase();
+    return Boolean(r && roles[r]);
+  };
+  var cur = hit;
+  var sawCanvas = false;
+  while (cur && cur.nodeType === 1) {
+    var tag = cur.tagName ? cur.tagName.toLowerCase() : '';
+    if (tag === 'canvas') {
+      sawCanvas = true;
+    } else if (isInteractive(cur)) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+  if (sawCanvas) return null;
+  cur = hit;
+  while (cur && cur.nodeType === 1) {
+    var t = cur.tagName ? cur.tagName.toLowerCase() : '';
+    if (t === 'body' || t === 'html') break;
+    if (testidAttr && cur.hasAttribute && cur.hasAttribute(testidAttr)) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+  return null;
+})(__DA_X__, __DA_Y__, __DA_TESTID_ATTR__)"#;
+
+fn synthesize_for_point(
+    session: &mut BrowserSession,
+    x: f64,
+    y: f64,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Option<synthesis::SynthesizedLocator>, StepError> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+        return Ok(None);
+    }
+    let testid_json = serde_json::to_string(&session.testid_attribute)
+        .unwrap_or_else(|_| "\"data-testid\"".to_string());
+    let expr = REVERSE_HIT_TEST_TEMPLATE
+        .replace("__DA_X__", &x.to_string())
+        .replace("__DA_Y__", &y.to_string())
+        .replace("__DA_TESTID_ATTR__", &testid_json);
+    let scope = session.scope();
+    let remote = {
+        let connection = session.connection_mut()?;
+        page_evaluate_remote(connection, &scope, &expr, deadline, dialog)
+            .map_err(|failure| failure.environment("could not hit-test the page at coordinates"))?
+    };
+    let RemoteResult::Object(object_id) = remote else {
+        return Ok(None);
+    };
+    let synth = synthesis::synthesize_for_object(session, &object_id, deadline, dialog)?;
+    if synth.fragile {
+        Ok(None)
+    } else {
+        Ok(Some(synth))
+    }
+}
+
 /// Clicks explicit viewport coordinates after proving they still describe the
 /// page they were measured on.
 fn click_at(
     session: &mut BrowserSession,
     at: &AtArgs,
+    interactive: bool,
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<Value, StepError> {
     let (width, height) = resolve_coordinates(session, at, deadline, dialog)?;
+    if interactive
+        && let Ok(Some(synth)) = synthesize_for_point(session, at.x, at.y, deadline, dialog)
+    {
+        session.step_metadata = Some(json!({
+            "synthesized_locator": synth.locator,
+            "fragile": synth.fragile,
+        }));
+    }
     dispatch_pointer_click(session, at, deadline, dialog)?;
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
@@ -8197,10 +8330,19 @@ fn type_at(
     session: &mut BrowserSession,
     at: &AtArgs,
     text: &str,
+    interactive: bool,
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<Value, StepError> {
     let (width, height) = resolve_coordinates(session, at, deadline, dialog)?;
+    if interactive
+        && let Ok(Some(synth)) = synthesize_for_point(session, at.x, at.y, deadline, dialog)
+    {
+        session.step_metadata = Some(json!({
+            "synthesized_locator": synth.locator,
+            "fragile": synth.fragile,
+        }));
+    }
     dispatch_pointer_click(session, at, deadline, dialog)?;
     let target = coordinate_target(at);
     session.dispatch(

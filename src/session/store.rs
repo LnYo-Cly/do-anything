@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::core::paths;
 use crate::core::registry::Registry;
 use crate::core::secrets::Secrets;
+use crate::session::model_hook::ModelHookSpec;
 
 pub const STATE_FILE: &str = "state.json";
 pub const STEPS_FILE: &str = "steps.jsonl";
@@ -46,6 +47,8 @@ pub struct SessionState {
     pub env_names: BTreeSet<String>,
     #[serde(default)]
     pub observe: Vec<StoredObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_hook: Option<ModelHookSpec>,
 }
 
 /// One expectation stored in the step log for deterministic YAML export.
@@ -100,6 +103,21 @@ pub struct StepRecord {
     /// Redacted step output JSON (or `null` when the step produced no result).
     #[serde(default)]
     pub result: Option<Value>,
+    /// Model identifier recorded when an external model hook assisted exploration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Model inference or hook latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// Redacted token or compute usage object returned by the model hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+    /// Redacted trace identifier returned by the model hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// Optional calibrated model confidence in `0.0..=1.0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 /// Exclusive non-blocking lock on one session directory.
@@ -216,6 +234,12 @@ pub fn save_state(
     for value in sanitized.vars.values_mut() {
         *value = secrets.redact(value);
     }
+    if let Some(hook) = &mut sanitized.model_hook {
+        hook.command = secrets.redact(&hook.command);
+        for arg in &mut hook.args {
+            *arg = secrets.redact(arg);
+        }
+    }
     let path = session_dir.join(STATE_FILE);
     let json = serde_json::to_string_pretty(&sanitized)
         .map_err(|error| format!("could not serialize session state: {error}"))?;
@@ -273,6 +297,9 @@ pub fn append_step(
         .result
         .as_ref()
         .map(|value| secrets.redact_json(value));
+    sanitized.model = sanitized.model.as_deref().map(|m| secrets.redact(m));
+    sanitized.usage = sanitized.usage.as_ref().map(|u| secrets.redact_json(u));
+    sanitized.trace_id = sanitized.trace_id.as_deref().map(|t| secrets.redact(t));
 
     let path = session_dir.join(STEPS_FILE);
     let mut file = OpenOptions::new()
@@ -557,6 +584,11 @@ mod tests {
             result: Some(serde_json::json!({
                 "body": { "echo": "tok-secret-999" }
             })),
+            model: None,
+            latency_ms: None,
+            usage: None,
+            trace_id: None,
+            confidence: None,
         };
 
         append_step(&dir, &record, &secrets).expect("append_step");

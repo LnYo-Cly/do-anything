@@ -30,6 +30,7 @@ use crate::core::case;
 use crate::core::registry::Registry;
 use crate::core::secrets::Secrets;
 use crate::exit::ExitCode;
+use crate::session::model_hook::ModelHookSpec;
 
 use self::tools::{Context, ToolOutcome};
 
@@ -40,6 +41,8 @@ pub struct Options {
     pub sessions_dir: PathBuf,
     /// Idle timeout `session_start` applies, in milliseconds.
     pub idle_timeout_ms: u64,
+    /// Optional external model hook configured for sessions started by this server.
+    pub model_hook: Option<ModelHookSpec>,
 }
 
 /// JSON-RPC error code for a body that is not JSON.
@@ -331,7 +334,10 @@ impl Server<'_> {
         match method.as_str() {
             "initialize" => Some(success(id, initialize(&params))),
             "ping" => Some(success(id, json!({}))),
-            "tools/list" => Some(success(id, json!({"tools": tools::definitions()}))),
+            "tools/list" => Some(success(
+                id,
+                json!({"tools": tools::definitions_for(self.options.model_hook.is_some())}),
+            )),
             "tools/call" => Some(self.call_tool(id, &params)),
             "notifications/initialized" => {
                 if notification {
@@ -383,18 +389,21 @@ impl Server<'_> {
                 registry: self.registry,
                 sessions_dir: self.options.sessions_dir.as_path(),
                 idle_timeout_ms: self.options.idle_timeout_ms,
+                model_hook: self.options.model_hook.as_ref(),
             };
             tools::call(&context, name, &arguments)
         };
 
         let Some(outcome) = outcome else {
+            let exposed = if self.options.model_hook.is_some() {
+                tools::ALL_NAMES.join(", ")
+            } else {
+                tools::NAMES.join(", ")
+            };
             return self.error(
                 id,
                 INVALID_PARAMS,
-                format!(
-                    "unknown tool `{name}`; this server exposes {}",
-                    tools::NAMES.join(", ")
-                ),
+                format!("unknown tool `{name}`; this server exposes {exposed}"),
             );
         };
         success(id, self.tool_result(outcome))
