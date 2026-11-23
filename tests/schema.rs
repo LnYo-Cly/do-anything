@@ -322,7 +322,6 @@ fn step_definition(name: &str) -> do_anything::core::registry::StepRef<'static> 
     feature = "desktop",
     feature = "fs",
     feature = "http",
-    feature = "log",
     feature = "proc"
 ))]
 fn built_in_registry() -> do_anything::core::registry::Registry {
