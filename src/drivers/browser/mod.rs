@@ -1890,19 +1890,30 @@ var composedContains = function (ancestor, node) {
 static FRAME_HELPERS_JS: LazyLock<String> =
     LazyLock::new(|| format!("{FRAME_GEOMETRY_HELPERS_JS}\n{COMPOSED_HELPERS_JS}"));
 
-/// JavaScript that covers every visible editable field with an opaque box,
-/// including fields inside accessible same-origin and nested iframes.
+/// Builds the JavaScript that covers every visible editable field with an opaque
+/// `#000` box, including fields inside accessible same-origin and nested iframes.
+///
+/// When `mask_cross_origin_frames` is `true` (used by `model/locate`), any visible
+/// `<iframe>` or `<frame>` whose `contentDocument` is inaccessible (`null` or
+/// cross-origin `SecurityError`) is covered across its entire bounding box so raw
+/// pixels inside cross-origin frames can never reach external vision hooks.
 ///
 /// `position: fixed` uses top-level viewport coordinates (`ox + sx * rect.left`,
 /// `oy + sy * rect.top`) so a single overlay at the highest `z-index` covers fields
 /// across nested scaled frames, except in `<frameset>` documents where masks live on
 /// each frame document itself. Fails clearly instead of leaving uncovered pixels if
 /// a frame or root element has a CSS transform that cannot be mapped accurately.
-static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
+fn build_mask_inputs_script(mask_cross_origin_frames: bool) -> String {
     let helpers = FRAME_HELPERS_JS.as_str();
+    let mask_xorigin = if mask_cross_origin_frames {
+        "true"
+    } else {
+        "false"
+    };
     format!(
         r#"(function () {{
 {helpers}
+  var maskCrossOriginFrames = {mask_xorigin};
   var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
   var masks = [];
   var isFrameset = Boolean(document.body && document.body.tagName === 'FRAMESET');
@@ -2004,7 +2015,44 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
       }} catch (e) {{
         childDoc = null;
       }}
-      if (!childDoc) continue;
+      if (!childDoc) {{
+        if (!maskCrossOriginFrames) continue;
+        if (blockedReason) return fail(blockedReason);
+        var xChain = checkTransformChain(frame, doc);
+        if (!xChain.ok) return fail(xChain.reason);
+        var fRect = frame.getBoundingClientRect();
+        if (isFrameset && doc !== document) {{
+          var xFrameHost = measureHostMap(doc);
+          if (!xFrameHost.ok) return fail(xFrameHost.reason);
+          var xfLeft = Math.floor(fRect.left);
+          var xfTop = Math.floor(fRect.top);
+          var xfRight = Math.ceil(fRect.right);
+          var xfBottom = Math.ceil(fRect.bottom);
+          if (!appendMask(doc, xFrameHost, xfLeft, xfTop, xfRight - xfLeft, xfBottom - xfTop)) {{
+            return fail('screenshot mask could not cover cross-origin frame');
+          }}
+          continue;
+        }}
+        var fLeft = ox + sx * fRect.left;
+        var fTop = oy + sy * fRect.top;
+        var fRight = ox + sx * fRect.right;
+        var fBottom = oy + sy * fRect.bottom;
+        if (clip) {{
+          fLeft = Math.max(fLeft, clip.left);
+          fTop = Math.max(fTop, clip.top);
+          fRight = Math.min(fRight, clip.right);
+          fBottom = Math.min(fBottom, clip.bottom);
+        }}
+        if (fRight <= fLeft || fBottom <= fTop) continue;
+        var mLeft = Math.floor(fLeft);
+        var mTop = Math.floor(fTop);
+        var mRight = Math.ceil(fRight);
+        var mBottom = Math.ceil(fBottom);
+        if (!appendMask(document, topHost, mLeft, mTop, mRight - mLeft, mBottom - mTop)) {{
+          return fail('screenshot mask could not cover cross-origin frame');
+        }}
+        continue;
+      }}
       if (blockedReason) {{
         var blockedErr = collectDoc(childDoc, 0, 0, 1, 1, null, blockedReason);
         if (blockedErr) return blockedErr;
@@ -2044,7 +2092,12 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
   return {{ ok: true, count: masks.length }};
 }})()"#
     )
-});
+}
+
+static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| build_mask_inputs_script(false));
+
+static MASK_INPUTS_AND_CROSS_ORIGIN_FRAMES_SCRIPT: LazyLock<String> =
+    LazyLock::new(|| build_mask_inputs_script(true));
 
 /// JavaScript that removes every mask this module added across the top document
 /// and any accessible same-origin frames, including frames inside open shadow
@@ -4770,17 +4823,93 @@ impl BrowserSession {
         Ok(())
     }
 
+    /// Reads the CSS viewport geometry and 1x scale clip for `model/locate` screenshots.
+    fn viewport_capture_clip(
+        &mut self,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<ViewportClip, StepError> {
+        let scope = self.scope();
+        let value = page_evaluate(
+            self.connection_mut()?,
+            &scope,
+            r#"({
+                width: window.innerWidth,
+                height: window.innerHeight,
+                pageX: (window.visualViewport && isFinite(window.visualViewport.pageLeft))
+                    ? window.visualViewport.pageLeft
+                    : (window.scrollX || window.pageXOffset || 0),
+                pageY: (window.visualViewport && isFinite(window.visualViewport.pageTop))
+                    ? window.visualViewport.pageTop
+                    : (window.scrollY || window.pageYOffset || 0),
+                dpr: (isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0)
+                    ? window.devicePixelRatio
+                    : 1
+            })"#,
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| {
+            failure.step("could not read the page viewport", timeout_or_execution)
+        })?;
+        let (Some(width), Some(height)) = (
+            viewport_dimension(&value, "width"),
+            viewport_dimension(&value, "height"),
+        ) else {
+            return Err(StepError::Environment(
+                "the page reported no measurable viewport; wait for the page to finish loading and try again"
+                    .to_string(),
+            ));
+        };
+        let x = value
+            .get("pageX")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let y = value
+            .get("pageY")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let dpr = value
+            .get("dpr")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0);
+        Ok(ViewportClip {
+            x,
+            y,
+            width,
+            height,
+            scale: 1.0 / dpr,
+        })
+    }
+
     /// Covers every editable field, captures a PNG and removes the covers.
     ///
     /// Cleanup runs after a failed capture as well; a browser that has already
     /// gone cannot be cleaned, and then the capture error is the one reported.
     fn capture_masked_png(&mut self, deadline: Deadline) -> Result<Vec<u8>, StepError> {
+        self.capture_masked_png_with_options(deadline, false, None)
+    }
+
+    fn capture_masked_png_with_options(
+        &mut self,
+        deadline: Deadline,
+        mask_cross_origin_frames: bool,
+        clip: Option<ViewportClip>,
+    ) -> Result<Vec<u8>, StepError> {
         let scope = self.scope();
         let mut dialog = DialogContext::fail_fast();
+        let mask_script = if mask_cross_origin_frames {
+            MASK_INPUTS_AND_CROSS_ORIGIN_FRAMES_SCRIPT.as_str()
+        } else {
+            MASK_INPUTS_SCRIPT.as_str()
+        };
         let mask_result = page_evaluate(
             self.connection_mut()?,
             &scope,
-            MASK_INPUTS_SCRIPT.as_str(),
+            mask_script,
             deadline,
             &mut dialog,
         )
@@ -4797,11 +4926,25 @@ impl BrowserSession {
             )));
         }
 
+        let screenshot_params = match clip {
+            Some(clip) => json!({
+                "format": "png",
+                "clip": {
+                    "x": clip.x,
+                    "y": clip.y,
+                    "width": f64::from(clip.width),
+                    "height": f64::from(clip.height),
+                    "scale": clip.scale,
+                },
+                "captureBeyondViewport": false,
+            }),
+            None => json!({ "format": "png" }),
+        };
         let captured = page_call(
             self.connection_mut()?,
             &scope,
             "Page.captureScreenshot",
-            json!({ "format": "png" }),
+            screenshot_params,
             deadline,
             &mut dialog,
         );
@@ -6343,6 +6486,15 @@ fn close_and_dispose_detached_with<P, V, CB, D>(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ViewportClip {
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    scale: f64,
+}
+
 impl Session for BrowserSession {
     fn detach(&mut self) -> Result<Option<Value>, String> {
         // A tab a page action opened after the last step is still reported by
@@ -6467,10 +6619,14 @@ impl Session for BrowserSession {
     fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
         let mut dialog = DialogContext::fail_fast();
-        let (width, height) = self
-            .viewport_size(deadline, &mut dialog)
+        let clip = self
+            .viewport_capture_clip(deadline, &mut dialog)
             .map_err(step_error_text)?;
-        let png = self.capture_masked_png(deadline).map_err(step_error_text)?;
+        let width = clip.width;
+        let height = clip.height;
+        let png = self
+            .capture_masked_png_with_options(deadline, true, Some(clip))
+            .map_err(step_error_text)?;
         Ok(Some(MaskedViewportCapture { png, width, height }))
     }
 
@@ -15183,5 +15339,16 @@ mod navigation_timeout_tests {
         assert_eq!(parsed("600001"), None, "over ten minutes is a typo");
         assert_eq!(parsed("soon"), None);
         assert_eq!(parsed(""), None);
+    }
+
+    #[test]
+    fn mask_inputs_script_toggles_cross_origin_frame_masking() {
+        let standard = super::build_mask_inputs_script(false);
+        assert!(standard.contains("var maskCrossOriginFrames = false;"));
+        assert!(standard.contains("if (!maskCrossOriginFrames) continue;"));
+
+        let locate = super::build_mask_inputs_script(true);
+        assert!(locate.contains("var maskCrossOriginFrames = true;"));
+        assert!(locate.contains("screenshot mask could not cover cross-origin frame"));
     }
 }

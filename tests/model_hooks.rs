@@ -951,7 +951,7 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
             "--hook-arg",
             hang_cfg.to_str().unwrap(),
             "--timeout-ms",
-            "150",
+            "1000",
         ],
         &[],
     );
@@ -1022,7 +1022,7 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
                 command: hook_exe.to_string(),
                 args: vec![hang_noread_cfg.to_string_lossy().into_owned()],
             }),
-            timeout_ms: 150,
+            timeout_ms: 1000,
             click: false,
         }),
         &registry,

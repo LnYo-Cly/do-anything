@@ -3118,13 +3118,23 @@ fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_repla
         return;
     };
 
-    let page_html = r##"<!doctype html>
+    let xorigin_child_html = r##"<!doctype html><html><body style="margin:0;background:#ff00ff"><input id="xpw" type="password" value="Sup3rSecret!" style="position:fixed;left:10px;top:10px;width:180px;height:40px;background:#ff00ff;border:0"></body></html>"##.to_string();
+    let xorigin_server =
+        PageServer::start(BTreeMap::from([("/child".to_string(), xorigin_child_html)]));
+    let xorigin_child_url = xorigin_server.url("/child");
+
+    let same_wrapper_html = format!(
+        r##"<!doctype html><html><body style="margin:0;background:#f4f4f4"><iframe id="inner-xframe" src="{xorigin_child_url}" onload="window.parent.document.getElementById('save-btn').setAttribute('data-nested-xframe-loaded', '1')" style="position:fixed;left:10px;top:10px;width:220px;height:80px;border:0"></iframe></body></html>"##
+    );
+
+    let page_html = format!(
+        r##"<!doctype html>
 <html>
 <head>
   <title>Model Hook Lab</title>
   <style>
-    html, body { margin: 0; padding: 0; background: #f4f4f4; }
-    #pw {
+    html, body {{ margin: 0; padding: 0; background: #f4f4f4; }}
+    #pw {{
       position: fixed;
       left: 20px;
       top: 20px;
@@ -3136,8 +3146,8 @@ fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_repla
       padding: 0;
       margin: 0;
       font-size: 24px;
-    }
-    #save-btn {
+    }}
+    #save-btn {{
       position: fixed;
       left: 20px;
       top: 90px;
@@ -3146,21 +3156,21 @@ fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_repla
       background: rgb(0, 200, 80);
       color: #ffffff;
       border: 0;
-    }
-    #jev-btn {
+    }}
+    #jev-btn {{
       position: fixed;
       left: 220px;
       top: 90px;
       width: 160px;
       height: 44px;
-    }
-    #board {
+    }}
+    #board {{
       position: fixed;
       left: 20px;
       top: 160px;
       background: #224488;
       display: block;
-    }
+    }}
   </style>
 </head>
 <body>
@@ -3169,20 +3179,25 @@ fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_repla
   <button id="save-btn" data-testid="save-btn" onclick="document.getElementById('log').textContent += '[btn]';">Save Action</button>
   <button id="jev-btn" onclick="document.getElementById('log').textContent += '[jev]';">Jev Target</button>
   <canvas id="board" width="200" height="100"></canvas>
+  <iframe id="xorigin-frame" src="{xorigin_child_url}" onload="document.getElementById('save-btn').setAttribute('data-xframe-loaded', '1')" style="position:fixed;left:420px;top:160px;width:220px;height:80px;border:0"></iframe>
+  <iframe id="nested-same-frame" src="/same-wrapper" style="position:fixed;left:420px;top:260px;width:240px;height:100px;border:0"></iframe>
   <p id="log" style="position:fixed;left:420px;top:90px;"></p>
   <script>
-    document.getElementById('board').addEventListener('click', function (ev) {
+    document.getElementById('board').addEventListener('click', function (ev) {{
       var r = this.getBoundingClientRect();
       var ox = Math.round(ev.clientX - r.left);
       var oy = Math.round(ev.clientY - r.top);
       document.getElementById('log').textContent += '[canvas:' + ox + ',' + oy + ']';
-    });
+    }});
   </script>
 </body>
 </html>"##
-        .to_string();
+    );
 
-    let server = PageServer::start(BTreeMap::from([("/model-lab".to_string(), page_html)]));
+    let server = PageServer::start(BTreeMap::from([
+        ("/model-lab".to_string(), page_html),
+        ("/same-wrapper".to_string(), same_wrapper_html),
+    ]));
     let dir = TempDir::new("browser-model-hooks");
     let hook_bin = compile_browser_mock_hook(dir.path());
     let hook_str = hook_bin.to_str().unwrap();
@@ -3213,7 +3228,7 @@ fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_repla
     let id = started["session_id"].as_str().unwrap().to_string();
     let session_dir = dir.path().join(started["dir"].as_str().unwrap());
 
-    // 2. Open page and type secret password into `#pw`.
+    // 2. Open page at explicit 1280x720, wait for cross-origin iframes, and type secret password into `#pw`.
     let open = json_stdout(&run_env(&[
         "session",
         "step",
@@ -3221,9 +3236,22 @@ fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_repla
         "browser.open",
         "--arg",
         &format!("url={}", server.url("/model-lab")),
+        "--arg",
+        "width=1280",
+        "--arg",
+        "height=720",
     ]));
     assert_eq!(open["ok"], true, "{open}");
-    let tree = open["snapshot"]["tree"].as_array().unwrap();
+    let wait_frames = json_stdout(&run_env(&[
+        "session",
+        "step",
+        &id,
+        "browser.wait",
+        "--arg",
+        "css=#save-btn[data-xframe-loaded='1'][data-nested-xframe-loaded='1']",
+    ]));
+    assert_eq!(wait_frames["ok"], true, "{wait_frames}");
+    let tree = wait_frames["snapshot"]["tree"].as_array().unwrap();
     let pw_ref = find_ref_by_role_and_name(tree, "textbox", "Password").expect("pw ref");
 
     let mut type_cmd = Command::new(da());
@@ -3325,13 +3353,23 @@ fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_repla
         "locate stdin leaked secret!"
     );
     let loc_req_val: Value = serde_json::from_str(loc_stdin_raw.trim()).unwrap();
+    let vw = loc_req_val["params"]["viewport"]["width"]
+        .as_u64()
+        .expect("viewport.width");
+    let vh = loc_req_val["params"]["viewport"]["height"]
+        .as_u64()
+        .expect("viewport.height");
     let img_b64 = loc_req_val["params"]["image_base64"]
         .as_str()
         .expect("image_base64 string")
         .to_string();
 
     // Verify actual rendered pixels of `image_base64` via headless Chrome `<canvas>`:
-    // password input box `(20..200, 20..60)` MUST be solid `#000000`, while `#save-btn` `(100, 112)` stays green!
+    // - PNG matches `viewport` 1-to-1 (`img.width === vw && img.height === vh`)
+    // - `#pw` `(30..190, 25..55)` MUST be solid `#000000`
+    // - direct cross-origin `<iframe>` `(440..620, 175..225)` MUST be solid `#000000`
+    // - nested same-origin -> cross-origin `<iframe>` `(450..630, 285..335)` MUST be solid `#000000`
+    // - `#save-btn` `(20..180, 90..134)` stays green without font-glyph false negatives!
     let pixel_check_html = format!(
         r##"<!doctype html><html><body>
 <p id="px">pending</p>
@@ -3343,18 +3381,38 @@ img.onload = function () {{
   c.height = img.height;
   var ctx = c.getContext('2d');
   ctx.drawImage(img, 0, 0);
-  var scale = img.width / 1280;
-  var nonBlackInPw = 0;
-  for (var x = 30; x <= 190; x += 10) {{
-    for (var y = 25; y <= 55; y += 6) {{
-      var d = ctx.getImageData(Math.round(x * scale), Math.round(y * scale), 1, 1).data;
-      if (d[0] !== 0 || d[1] !== 0 || d[2] !== 0 || d[3] !== 255) nonBlackInPw++;
+  var scaleX = img.width / {vw};
+  var scaleY = img.height / {vh};
+  var countNonBlack = function (x0, x1, dx, y0, y1, dy) {{
+    var bad = 0;
+    for (var x = x0; x <= x1; x += dx) {{
+      for (var y = y0; y <= y1; y += dy) {{
+        var d = ctx.getImageData(Math.round(x * scaleX), Math.round(y * scaleY), 1, 1).data;
+        if (d[0] !== 0 || d[1] !== 0 || d[2] !== 0 || d[3] !== 255) bad++;
+      }}
+    }}
+    return bad;
+  }};
+  var nonBlackInPw = countNonBlack(30, 190, 10, 25, 55, 6);
+  var nonBlackInXOrigin = countNonBlack(440, 620, 15, 175, 225, 10);
+  var nonBlackInNestedXOrigin = countNonBlack(450, 630, 15, 285, 335, 10);
+  var corner = ctx.getImageData(Math.round(26 * scaleX), Math.round(96 * scaleY), 1, 1).data;
+  var greenCount = 0;
+  for (var bx = 25; bx <= 175; bx += 10) {{
+    for (var by = 95; by <= 128; by += 6) {{
+      var bd = ctx.getImageData(Math.round(bx * scaleX), Math.round(by * scaleY), 1, 1).data;
+      if (bd[1] > 150 && bd[0] < 40) greenCount++;
     }}
   }}
-  var btn = ctx.getImageData(Math.round(100 * scale), Math.round(112 * scale), 1, 1).data;
+  var btnGreen = (corner[1] > 150 && corner[0] < 40) && greenCount > 20;
+  var oneToOne = (img.width === {vw} && img.height === {vh});
   var el = document.getElementById('px');
   el.textContent =
-    'pw_non_black=' + nonBlackInPw + ';btn_green=' + (btn[1] > 150 && btn[0] < 40);
+    '1x=' + oneToOne +
+    ';pw_non_black=' + nonBlackInPw +
+    ';xorigin_non_black=' + nonBlackInXOrigin +
+    ';nested_xorigin_non_black=' + nonBlackInNestedXOrigin +
+    ';btn_green=' + btnGreen;
   el.setAttribute('data-ready', '1');
 }};
 img.src = 'data:image/png;base64,{img_b64}';
@@ -3364,7 +3422,7 @@ img.src = 'data:image/png;base64,{img_b64}';
     let px_case = dir.write(
         "verify-mask.yaml",
         &format!(
-            "name: Verify locate screenshot mask\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.wait:\n      css: \"#px[data-ready='1']\"\n  - browser.read:\n      css: \"#px\"\n    expect:\n      - path: $.text\n        equals: \"pw_non_black=0;btn_green=true\"\n",
+            "name: Verify locate screenshot mask\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.wait:\n      css: \"#px[data-ready='1']\"\n  - browser.read:\n      css: \"#px\"\n    expect:\n      - path: $.text\n        equals: \"1x=true;pw_non_black=0;xorigin_non_black=0;nested_xorigin_non_black=0;btn_green=true\"\n",
             px_server.url("/px")
         ),
     );

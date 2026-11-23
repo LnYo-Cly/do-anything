@@ -847,13 +847,17 @@ Three atomic methods are standardized:
 
 Boundary and replay guarantees:
 
-- **Input masking & secret scrubbing**: `model/locate` always captures through
-  the session's input-masked screenshot path (editable fields and password inputs
-  covered with solid black `#000` before capture). Every outgoing `query`,
-  `rubric`, `candidates`, `snapshot`, and `evidence` payload is scrubbed through
-  `Secrets` before reaching the hook's stdin, and every incoming `rationale`,
-  `model`, `usage`, `trace_id`, and stderr diagnostic is scrubbed before being
-  printed or persisted.
+- **Input masking & secret scrubbing**: `model/locate` always captures a 1:1
+  CSS-viewport PNG through the session's input-masked screenshot path: every
+  accessible `<input>`, `<textarea>`, `<select>`, and `[contenteditable]` field —
+  plus the entire bounding rectangle of any cross-origin `<iframe>` or `<frame>`
+  (including cross-origin frames nested inside same-origin frames) — is covered
+  with solid black `#000000` before capture so cross-origin password fields can
+  never leak to external vision hooks. Every outgoing `query`, `rubric`,
+  `candidates`, `snapshot`, and `evidence` payload is scrubbed through `Secrets`
+  before reaching the hook's stdin, and every incoming `rationale`, `model`,
+  `usage`, `trace_id`, and stderr diagnostic is scrubbed before being printed or
+  persisted.
 - **Audit trail & model-free `da run`**: `.da/sessions/<id>/steps.jsonl` records
   `model`, `latency_ms`, `usage`, `trace_id`, and `confidence` on hook-assisted
   entries. `da session export` omits `model.select_ref`, `model.locate`, and
