@@ -2,18 +2,22 @@ use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use do_anything::compare as run_compare;
 use do_anything::core::bundle::{self, FailureBundles};
 use do_anything::core::case::{self, CaseError, LoadedCase};
 use do_anything::core::events::EventBus;
 use do_anything::core::filter::Filters;
 use do_anything::core::output::{self, Format};
 use do_anything::core::registry::Registry;
+use do_anything::core::repeat::{RepeatOutcome, RepeatReport};
 use do_anything::core::report::RunOutcome;
 use do_anything::core::runner;
 use do_anything::core::schema;
 use do_anything::core::secrets::Secrets;
+use do_anything::core::strength::{self, StrengthCheck};
 use do_anything::drivers;
 use do_anything::exit::ExitCode as DaExitCode;
 use do_anything::report as html_report;
@@ -96,6 +100,18 @@ enum Command {
         /// Runs up to N cases at the same time. Defaults to 1.
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_jobs)]
         jobs: usize,
+        /// Executes each selected case N times to classify flaky cases. Defaults to 1.
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_repeat)]
+        repeat: usize,
+    },
+    /// Compare two recorded evidence directories and classify regressions.
+    Compare {
+        /// Baseline directory written by `da run --record`.
+        #[arg(value_name = "BASELINE_DIR")]
+        baseline_dir: PathBuf,
+        /// Candidate directory written by `da run --record`.
+        #[arg(value_name = "CANDIDATE_DIR")]
+        candidate_dir: PathBuf,
     },
     /// Render a recorded evidence directory as one static HTML file.
     Report {
@@ -121,6 +137,27 @@ enum Command {
         /// later file overrides an earlier one.
         #[arg(long = "vars-file", value_name = "FILE")]
         vars_files: Vec<PathBuf>,
+        /// Baseline case file or directory to guard against Goodhart assertion weakening.
+        #[arg(long, value_name = "PATH")]
+        against: Option<PathBuf>,
+        /// Explicitly acknowledge assertion weakening with a non-empty reason.
+        #[arg(long, value_name = "REASON")]
+        allow_weaken: Option<String>,
+        /// Active project filter when checking classification exclusions with `--against`.
+        #[arg(long = "project", value_name = "NAME")]
+        projects: Vec<String>,
+        /// Active suite filter when checking classification exclusions with `--against`.
+        #[arg(long = "suite", value_name = "NAME")]
+        suites: Vec<String>,
+        /// Active layer filter when checking classification exclusions with `--against`.
+        #[arg(long = "layer", value_name = "NAME")]
+        layers: Vec<String>,
+        /// Active tag filter when checking tag exclusions with `--against`.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// Active skip-tag filter when checking tag exclusions with `--against`.
+        #[arg(long = "skip-tag", value_name = "TAG")]
+        skip_tags: Vec<String>,
     },
     /// Print the JSON Schema for the case file format.
     Schema,
@@ -249,6 +286,19 @@ fn parse_jobs(text: &str) -> Result<usize, String> {
     }
 }
 
+/// Reads the `--repeat` count, refusing zero so every repeat run executes at least once.
+fn parse_repeat(text: &str) -> Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(0) => Err(
+            "a run needs `--repeat` of at least 1; write `--repeat 1` for a single run".to_string(),
+        ),
+        Ok(repeat) => Ok(repeat),
+        Err(_) => Err(format!(
+            "`{text}` is not a valid repeat count; write `--repeat N` with N at least 1"
+        )),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -277,6 +327,7 @@ fn main() -> ExitCode {
             record,
             trace_steps,
             jobs,
+            repeat,
         } => {
             let sources = match VarSources::load(&vars_files, &vars) {
                 Ok(sources) => sources,
@@ -308,9 +359,14 @@ fn main() -> ExitCode {
                     record,
                     trace_steps,
                     jobs,
+                    repeat,
                 },
             )
         }
+        Command::Compare {
+            baseline_dir,
+            candidate_dir,
+        } => compare(default_output, &baseline_dir, &candidate_dir),
         Command::Report {
             directory,
             output_file,
@@ -320,12 +376,49 @@ fn main() -> ExitCode {
             paths,
             vars,
             vars_files,
+            against,
+            allow_weaken,
+            projects,
+            suites,
+            layers,
+            tags,
+            skip_tags,
         } => {
+            if let Some(reason) = &allow_weaken {
+                if reason.trim().is_empty() {
+                    return lint_usage_error(
+                        default_output,
+                        "`--allow-weaken` requires a non-empty reason explaining the intentional contract change",
+                    );
+                }
+                if against.is_none() {
+                    return lint_usage_error(
+                        default_output,
+                        "`--allow-weaken` requires `--against <PATH>`",
+                    );
+                }
+            }
             let sources = match VarSources::load(&vars_files, &vars) {
                 Ok(sources) => sources,
                 Err(message) => return usage_error(&message),
             };
-            lint(&paths, default_output, &registry, &sources)
+            lint(
+                &registry,
+                LintOptions {
+                    paths,
+                    format: default_output,
+                    sources,
+                    against,
+                    allow_weaken,
+                    filters: Filters {
+                        project: projects,
+                        suite: suites,
+                        layer: layers,
+                        tag: tags,
+                        skip_tag: skip_tags,
+                    },
+                },
+            )
         }
         Command::Schema => print_schema(&registry, default_output),
         #[cfg(feature = "mcp")]
@@ -639,18 +732,167 @@ struct RunOptions {
     record: Option<PathBuf>,
     trace_steps: bool,
     jobs: usize,
+    repeat: usize,
 }
 
 fn run(format: OutputFormat, registry: &Registry, options: RunOptions) -> ExitCode {
+    if options.repeat <= 1 {
+        let mut secrets = Secrets::new();
+        let outcome = execute(registry, &options, &mut secrets);
+        let rendered = output::render(&outcome, format.into(), &secrets);
+        // A write error must not replace the run's exit code. The common case is a
+        // reader that exits early, such as `head` or `jq`; there is usually nowhere
+        // left to report the failure either.
+        let _ = write_stdout(&rendered.stdout);
+        let _ = write_stderr(&rendered.stderr);
+        return outcome.exit_code().into();
+    }
+
     let mut secrets = Secrets::new();
-    let outcome = execute(registry, &options, &mut secrets);
-    let rendered = output::render(&outcome, format.into(), &secrets);
-    // A write error must not replace the run's exit code. The common case is a
-    // reader that exits early, such as `head` or `jq`; there is usually nowhere
-    // left to report the failure either.
+    let mut outcome = execute_repeat(registry, &options, &mut secrets);
+    if let (Some(record_dir), RepeatOutcome::Completed(_)) = (&options.record, &outcome) {
+        let summary_value = output::repeat_json(&outcome, &secrets);
+        if let Err(message) = write_repeat_summary(record_dir, &summary_value)
+            && let RepeatOutcome::Completed(report) = &mut outcome
+        {
+            report.bundle_errors.push(message);
+        }
+    }
+    let rendered = output::render_repeat(&outcome, format.into(), &secrets);
     let _ = write_stdout(&rendered.stdout);
     let _ = write_stderr(&rendered.stderr);
     outcome.exit_code().into()
+}
+
+fn write_repeat_summary(
+    record_dir: &std::path::Path,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    std::fs::create_dir_all(record_dir).map_err(|error| {
+        format!(
+            "could not create `{}`: {error}",
+            do_anything::core::paths::display(record_dir)
+        )
+    })?;
+    let summary_path = record_dir.join("repeat-summary.json");
+    let text = serde_json::to_string_pretty(value).map_err(|error| {
+        format!(
+            "could not serialize `{}`: {error}",
+            do_anything::core::paths::display(&summary_path)
+        )
+    })?;
+    std::fs::write(&summary_path, format!("{text}\n")).map_err(|error| {
+        format!(
+            "could not write `{}`: {error}",
+            do_anything::core::paths::display(&summary_path)
+        )
+    })
+}
+
+fn execute_repeat(
+    registry: &Registry,
+    options: &RunOptions,
+    secrets: &mut Secrets,
+) -> RepeatOutcome {
+    let LoadedCases { cases, errors, .. } = load_cases(&options.paths, &options.sources, secrets);
+    if !errors.is_empty() {
+        return RepeatOutcome::Rejected {
+            repeat_count: options.repeat,
+            errors,
+        };
+    }
+
+    let started = Instant::now();
+    let mut attempt_reports = Vec::with_capacity(options.repeat);
+
+    for attempt in 1..=options.repeat {
+        let mut bundles = if options.no_bundle {
+            None
+        } else {
+            Some(FailureBundles::new(
+                options
+                    .bundle_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(bundle::DEFAULT_DIRECTORY)),
+            ))
+        };
+        let attempt_record_dir = options
+            .record
+            .as_ref()
+            .map(|root| root.join(format!("attempt-{attempt}")));
+        let mut record = attempt_record_dir.clone().map(FailureBundles::record);
+
+        let bus = EventBus::new();
+        let outcome = runner::run_with(
+            &cases,
+            registry,
+            &bus,
+            runner::RecordWriters {
+                failures: bundles.as_mut(),
+                record: record.as_mut(),
+                trace_steps: options.trace_steps,
+            },
+            &options.filters,
+            secrets,
+            options.jobs,
+        );
+
+        match outcome {
+            RunOutcome::Rejected { errors } => {
+                return RepeatOutcome::Rejected {
+                    repeat_count: options.repeat,
+                    errors,
+                };
+            }
+            RunOutcome::NoMatch { message } => {
+                return RepeatOutcome::NoMatch {
+                    repeat_count: options.repeat,
+                    message,
+                };
+            }
+            RunOutcome::Completed(report) => {
+                if let Some(dir) = &attempt_record_dir
+                    && report.cases.is_empty()
+                {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                attempt_reports.push(report);
+            }
+        }
+    }
+
+    RepeatOutcome::Completed(RepeatReport::from_attempts(
+        options.repeat,
+        attempt_reports,
+        started.elapsed(),
+        Vec::new(),
+    ))
+}
+
+fn compare(
+    format: OutputFormat,
+    baseline_dir: &std::path::Path,
+    candidate_dir: &std::path::Path,
+) -> ExitCode {
+    match run_compare::compare(baseline_dir, candidate_dir) {
+        Ok(report) => {
+            let rendered = output::render_compare(&report, format.into());
+            let _ = write_stdout(&rendered.stdout);
+            let _ = write_stderr(&rendered.stderr);
+            if report.is_ok() {
+                DaExitCode::Success.into()
+            } else {
+                DaExitCode::TestFailure.into()
+            }
+        }
+        Err(error) => {
+            let rendered =
+                output::render_compare_error(error.kind(), error.message(), format.into());
+            let _ = write_stdout(&rendered.stdout);
+            let _ = write_stderr(&rendered.stderr);
+            error.exit_code().into()
+        }
+    }
 }
 
 /// Renders one recorded directory and reports where it was written.
@@ -712,35 +954,79 @@ fn execute(registry: &Registry, options: &RunOptions, secrets: &mut Secrets) -> 
     )
 }
 
+struct LintOptions {
+    paths: Vec<PathBuf>,
+    format: OutputFormat,
+    sources: VarSources,
+    against: Option<PathBuf>,
+    allow_weaken: Option<String>,
+    filters: Filters,
+}
+
+fn lint_usage_error(format: OutputFormat, message: &str) -> ExitCode {
+    if format == OutputFormat::Json {
+        let err = serde_json::json!({
+            "ok": false,
+            "error": { "kind": "usage", "message": message }
+        });
+        let _ = write_stdout(&format!("{err}\n"));
+    }
+    let _ = write_stderr(&format!("error: {message}\n"));
+    DaExitCode::Usage.into()
+}
+
 /// Validates the cases without running them.
 ///
 /// It shares discovery, loading and [`runner::preflight`] with `da run`, so the
 /// two commands cannot disagree about which cases are valid. Unlike a run, it
 /// keeps going after the first bad file and reports every problem at once.
-fn lint(
-    paths: &[PathBuf],
-    format: OutputFormat,
-    registry: &Registry,
-    sources: &VarSources,
-) -> ExitCode {
+fn lint(registry: &Registry, options: LintOptions) -> ExitCode {
     let mut secrets = Secrets::new();
     let LoadedCases {
         files,
         cases,
-        errors,
-        ..
-    } = load_cases(paths, sources, &mut secrets);
-    let mut errors = errors;
+        mut errors,
+    } = load_cases(&options.paths, &options.sources, &mut secrets);
     errors.extend(runner::preflight(&cases, registry, &mut secrets));
     let warnings = runner::preflight_warnings(&cases, registry, &mut secrets);
+
+    let mut strength_findings = Vec::new();
+    if let Some(against_path) = &options.against {
+        let baseline_inputs = std::slice::from_ref(against_path);
+        let LoadedCases {
+            cases: baseline_cases,
+            errors: baseline_errors,
+            ..
+        } = load_cases(baseline_inputs, &options.sources, &mut secrets);
+        errors.extend(baseline_errors);
+        errors.extend(runner::preflight(&baseline_cases, registry, &mut secrets));
+
+        if errors.is_empty() {
+            strength_findings = strength::compare_strength(
+                &StrengthCheck {
+                    baseline_inputs,
+                    baseline_cases: &baseline_cases,
+                    candidate_inputs: &options.paths,
+                    candidate_cases: &cases,
+                    registry,
+                    filters: &options.filters,
+                    acknowledged: options.allow_weaken.is_some(),
+                },
+                &mut secrets,
+            );
+        }
+    }
 
     let report = output::LintReport {
         files: files.len(),
         errors,
         warnings,
         cases: cases.iter().map(output::LintCase::new).collect(),
+        against: options.against,
+        strength_findings,
+        acknowledged_reason: options.allow_weaken,
     };
-    let rendered = output::render_lint(&report, format.into(), &secrets);
+    let rendered = output::render_lint(&report, options.format.into(), &secrets);
     let _ = write_stdout(&rendered.stdout);
     let _ = write_stderr(&rendered.stderr);
 

@@ -787,3 +787,298 @@ fn a_coordinate_step_lints_with_a_fragility_warning() {
         "an invalid step must not also warn: {value}"
     );
 }
+
+#[test]
+fn allow_weaken_rejects_empty_whitespace_or_missing_against_with_exit_two() {
+    let dir = TempDir::new("lint-allow-weaken-usage");
+    let base = dir.write("base.yaml", "name: A\nsteps:\n  - unknown.step: {}\n");
+    let cand = dir.write("cand.yaml", "name: A\nsteps:\n  - unknown.step: {}\n");
+
+    let empty = run_da(&[
+        "lint",
+        path_str(&cand),
+        "--against",
+        path_str(&base),
+        "--allow-weaken",
+        "",
+    ]);
+    assert_eq!(exit_code(&empty), Some(2), "stderr: {}", stderr(&empty));
+    assert!(stderr(&empty).contains("--allow-weaken"));
+
+    let blank = run_da(&[
+        "--output",
+        "json",
+        "lint",
+        path_str(&cand),
+        "--against",
+        path_str(&base),
+        "--allow-weaken",
+        "   ",
+    ]);
+    assert_eq!(exit_code(&blank), Some(2));
+    let val = json_stdout(&blank);
+    assert_eq!(val["ok"], false);
+    assert_eq!(val["error"]["kind"], "usage");
+
+    let without_against = run_da(&["lint", path_str(&cand), "--allow-weaken", "valid reason"]);
+    assert_eq!(exit_code(&without_against), Some(2));
+    assert!(stderr(&without_against).contains("--against"));
+}
+
+#[cfg(all(feature = "cli", feature = "http"))]
+#[test]
+fn against_catches_every_goodhart_weakening_category_and_honors_allow_weaken() {
+    let dir = TempDir::new("lint-against-goodhart");
+    let base_dir = dir.path().join("baseline");
+    let cand_dir = dir.path().join("candidate");
+    std::fs::create_dir_all(&base_dir).expect("base dir");
+    std::fs::create_dir_all(&cand_dir).expect("cand dir");
+
+    // 1. Deleted case: present in baseline, absent in candidate.
+    std::fs::write(
+        base_dir.join("deleted_case.yaml"),
+        "name: Must keep\ntags: [smoke]\nsteps:\n  - cli.run:\n      command: da\n",
+    )
+    .expect("deleted_case");
+
+    // 2. Deleted step, deleted expect, matcher weakenings, added optional: true,
+    // widened retry.timeout_ms, and added skip-tag exclusion.
+    std::fs::write(
+        base_dir.join("api_flow.yaml"),
+        "name: API contract\ntags: [smoke]\nsteps:\n  - cli.run:\n      command: da\n  - http.request:\n      url: http://127.0.0.1:8080/health\n    retry:\n      timeout_ms: 500\n      until:\n        - path: $.status\n          equals: 200\n    expect:\n      - path: $.body.role\n        equals: admin\n      - path: $.body.note\n        contains: order created\n      - path: $.body.token\n        exists: true\n      - path: $.body.audit\n        equals: recorded\n",
+    )
+    .expect("base api_flow");
+
+    std::fs::write(
+        cand_dir.join("api_flow.yaml"),
+        "name: API contract\ntags: [smoke, quarantined]\nsteps:\n  - http.request:\n      url: http://127.0.0.1:8080/health\n    optional: true\n    retry:\n      timeout_ms: 3000\n      until:\n        - path: $.status\n          not_equals: 500\n    expect:\n      - path: $.body.role\n        contains: adm\n      - path: $.body.note\n        exists: true\n      - path: $.body.token\n        exists: false\n",
+    )
+    .expect("cand api_flow");
+
+    let text_out = run_da(&[
+        "lint",
+        path_str(&cand_dir),
+        "--against",
+        path_str(&base_dir),
+        "--skip-tag",
+        "quarantined",
+    ]);
+    assert_eq!(
+        exit_code(&text_out),
+        Some(3),
+        "stdout: {}\nstderr: {}",
+        stdout(&text_out),
+        stderr(&text_out)
+    );
+    assert!(
+        stdout(&text_out).contains("strength reductions"),
+        "got: {}",
+        stdout(&text_out)
+    );
+
+    let json_out = run_da(&[
+        "--output",
+        "json",
+        "lint",
+        path_str(&cand_dir),
+        "--against",
+        path_str(&base_dir),
+        "--skip-tag",
+        "quarantined",
+    ]);
+    assert_eq!(exit_code(&json_out), Some(3));
+    let val = json_stdout(&json_out);
+    assert_eq!(val["ok"], false);
+    let findings = val["strength_findings"]
+        .as_array()
+        .expect("strength_findings array");
+    let kinds: Vec<&str> = findings
+        .iter()
+        .map(|f| f["kind"].as_str().expect("kind"))
+        .collect();
+    for expected_kind in [
+        "case_deleted",
+        "step_deleted",
+        "assertion_deleted",
+        "matcher_weakened",
+        "optional_added",
+        "retry_timeout_widened",
+        "filter_excluded",
+    ] {
+        assert!(
+            kinds.contains(&expected_kind),
+            "missing `{expected_kind}` in {findings:?}"
+        );
+    }
+
+    // With `--allow-weaken <non-empty-reason>`, findings become acknowledged warnings and exit 0.
+    let ack_json = run_da(&[
+        "--output",
+        "json",
+        "lint",
+        path_str(&cand_dir),
+        "--against",
+        path_str(&base_dir),
+        "--skip-tag",
+        "quarantined",
+        "--allow-weaken",
+        "intentional spec update",
+    ]);
+    assert_eq!(
+        exit_code(&ack_json),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&ack_json),
+        stderr(&ack_json)
+    );
+    let ack_val = json_stdout(&ack_json);
+    assert_eq!(ack_val["ok"], true);
+    assert_eq!(ack_val["acknowledged_reason"], "intentional spec update");
+    assert!(
+        ack_val["strength_findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["acknowledged"] == true)
+    );
+    assert!(
+        ack_val["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["acknowledged_reason"] == "intentional spec update")
+    );
+
+    let ack_text = run_da(&[
+        "lint",
+        path_str(&cand_dir),
+        "--against",
+        path_str(&base_dir),
+        "--skip-tag",
+        "quarantined",
+        "--allow-weaken",
+        "intentional spec update",
+    ]);
+    assert_eq!(exit_code(&ack_text), Some(0));
+    assert!(stderr(&ack_text).contains("acknowledged: intentional spec update"));
+
+    // `--allow-weaken` never masks real syntax or schema errors!
+    std::fs::write(
+        cand_dir.join("broken.yaml"),
+        "name: Broken\nnaem: typo\nsteps: []\n",
+    )
+    .expect("broken");
+    let broken_ack = run_da(&[
+        "lint",
+        path_str(&cand_dir),
+        "--against",
+        path_str(&base_dir),
+        "--allow-weaken",
+        "intentional spec update",
+    ]);
+    assert_eq!(exit_code(&broken_ack), Some(3));
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn against_pairs_single_files_directly_and_accepts_strengthened_cases() {
+    let dir = TempDir::new("lint-against-single-file");
+    let base = dir.write(
+        "old_name.yaml",
+        "name: Check version\nsteps:\n  - cli.run:\n      command: da\n    expect:\n      - path: $.exit_code\n        equals: 0\n",
+    );
+    // Legitimately inserts an earlier setup step and adds a second assertion.
+    let stronger = dir.write(
+        "new_name.yaml",
+        "name: Check version\nsteps:\n  - cli.run:\n      command: da\n      args: [\"--help\"]\n  - cli.run:\n      command: da\n    expect:\n      - path: $.exit_code\n        equals: 0\n      - path: $.stderr\n        exists: true\n",
+    );
+
+    let ok_out = run_da(&[
+        "--output",
+        "json",
+        "lint",
+        path_str(&stronger),
+        "--against",
+        path_str(&base),
+    ]);
+    assert_eq!(exit_code(&ok_out), Some(0), "stderr: {}", stderr(&ok_out));
+    let val = json_stdout(&ok_out);
+    assert_eq!(val["ok"], true);
+    assert_eq!(val["strength_findings"], serde_json::json!([]));
+
+    // Weakening the single file is caught even though filenames differ.
+    let weaker = dir.write(
+        "weaker_name.yaml",
+        "name: Check version\nsteps:\n  - cli.run:\n      command: da\n    expect:\n      - path: $.exit_code\n        exists: true\n",
+    );
+    let fail_out = run_da(&[
+        "--output",
+        "json",
+        "lint",
+        path_str(&weaker),
+        "--against",
+        path_str(&base),
+    ]);
+    assert_eq!(exit_code(&fail_out), Some(3));
+    let fail_val = json_stdout(&fail_out);
+    assert_eq!(fail_val["strength_findings"][0]["kind"], "matcher_weakened");
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn against_catches_replacing_deterministic_locator_with_explicit_coordinates() {
+    let dir = TempDir::new("lint-against-coords");
+    let baseline = dir.write(
+        "locator.yaml",
+        "name: Save note\nsteps:\n  - browser.open:\n      url: http://127.0.0.1:1/\n  - browser.click:\n      testid: save-btn\n",
+    );
+    let candidate = dir.write(
+        "coords.yaml",
+        "name: Save note\nsteps:\n  - browser.open:\n      url: http://127.0.0.1:1/\n  - browser.click:\n      at: { x: 100, y: 50 }\n",
+    );
+
+    let out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "lint",
+            path_str(&candidate),
+            "--against",
+            path_str(&baseline),
+        ],
+    );
+    assert_eq!(
+        exit_code(&out),
+        Some(3),
+        "stdout: {}\nstderr: {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let val = json_stdout(&out);
+    assert_eq!(val["ok"], false);
+    assert!(
+        val["strength_findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "fragile_warning_added"),
+        "got: {val}"
+    );
+
+    let ack = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "lint",
+            path_str(&candidate),
+            "--against",
+            path_str(&baseline),
+            "--allow-weaken",
+            "canvas widget has no DOM node",
+        ],
+    );
+    assert_eq!(exit_code(&ack), Some(0));
+    assert_eq!(json_stdout(&ack)["ok"], true);
+}

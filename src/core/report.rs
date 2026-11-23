@@ -227,6 +227,11 @@ impl RunReport {
         summary
     }
 
+    /// Collects every non-skipped problem kind recorded across cases and steps.
+    pub(crate) fn all_problem_kinds(&self) -> Vec<ProblemKind> {
+        self.problem_kinds()
+    }
+
     fn problem_kinds(&self) -> Vec<ProblemKind> {
         let mut kinds = Vec::new();
         for case in &self.cases {

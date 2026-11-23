@@ -116,6 +116,59 @@ da report evidence/            # writes evidence/report.html
 da report .da/failures/<run>   # or a single failure run
 ```
 
+## RSI loop: verify a repair, not just a green run
+
+When you edit the program or its cases and need to prove the edit did not
+regress or weaken the suite, use the three RSI gates. They are deterministic and
+need no model or network call.
+
+```sh
+# A trusted starting point: every case recorded, case files copied aside.
+da run cases/ --record baseline-evidence/
+cp -r cases/ baseline-cases/
+
+# 1. Static Goodhart guard: parses both sides, executes nothing.
+da lint cases/ --against baseline-cases/
+
+# 2. Execute the candidate and record every case, passing and failing.
+da run cases/ --record candidate-evidence/
+
+# 3. Regression diff over the records; case positions may shift freely.
+da compare baseline-evidence/ candidate-evidence/
+```
+
+`da lint --against` exits 3 for a deleted case, step or assertion; a weakened
+matcher (`equals` to `contains`/`exists`, `contains` to `exists`); an added
+`optional: true`; a widened `retry.timeout_ms`; a locator replaced with `at`
+coordinates; or a case that active filters now exclude. Do not silence it by
+editing the baseline. For a genuinely intentional spec change, pass
+`--allow-weaken "the reason"` and say why in the delivery notes.
+
+`da compare` matches cases by recorded `(case_file, case_name)`, not by the
+`{position}-{safe_name}` directory prefix, and reports `regressed`, `fixed`,
+`still_failing`, `still_passing`, `added` and `removed`, step and assertion
+deltas, durations and `case_changed`. It exits 1 only when a case regressed; a
+deleted case is left to `da lint --against`.
+
+When a failure may be a flake, classify it before repairing it:
+
+```sh
+da run cases/suspicious.yaml --repeat 3
+```
+
+`--repeat N` runs every selected case N times and classifies each as
+`stable_pass` (N/N passed), `stable_fail` (0/N) or `flaky` (1..N-1). It exits 0
+only when every case is `stable_pass`; otherwise the worst exit code across
+attempts wins (3, then 4, then 5, then 1). `--repeat N --record evidence/`
+writes `attempt-1`, `attempt-2`, ... and `repeat-summary.json`, so
+`da compare attempt-1/ attempt-2/` shows what changed between attempts.
+
+Route the result by exit code: 2 fix the command line; 3 fix the case at the
+reported line (or record an intentional `--allow-weaken` reason); 4 fix the
+environment; 5 reproduce with `--repeat` before touching a timeout; 1 use
+`da compare` to separate a new regression from an old failure, and `--repeat` to
+separate a deterministic failure from a flake. Never weaken `src/` or a test to
+turn a gate green.
 ## On a phone
 
 `android.*` drives one Android device over `adb`, in a build that enables the
