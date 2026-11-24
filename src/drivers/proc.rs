@@ -12,7 +12,7 @@
 //! [`Session::evidence`] so failure bundles hold redacted `proc/` logs and
 //! zero child or grandchild processes leak.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 #[cfg(not(windows))]
@@ -979,25 +979,100 @@ impl Session for ProcSession {
                 append_evidence(&mut entry.1, &stderr);
             }
         }
-        let single_default = logs.len() == 1 && logs.contains_key(DEFAULT_NAME);
-        let mut files = Vec::new();
-        for (name, (stdout, stderr)) in logs {
-            let (out_name, err_name) = if single_default {
-                ("stdout.log".to_string(), "stderr.log".to_string())
-            } else {
-                (format!("{name}-stdout.log"), format!("{name}-stderr.log"))
-            };
-            files.push(
-                Evidence::text(out_name, stdout)
-                    .map_err(|error| format!("could not attach stdout evidence: {error}"))?,
-            );
-            files.push(
-                Evidence::text(err_name, stderr)
-                    .map_err(|error| format!("could not attach stderr evidence: {error}"))?,
-            );
+        for (name, proc) in &self.processes {
+            if !logs.contains_key(name) {
+                let (stdout, stderr) = proc.snapshot_evidence();
+                let entry = logs.entry(name.clone()).or_default();
+                append_evidence(&mut entry.0, &stdout);
+                append_evidence(&mut entry.1, &stderr);
+            }
+        }
+
+        if logs.len() == 1
+            && let Some((stdout, stderr)) = logs.remove(DEFAULT_NAME)
+        {
+            return Ok(Vec::from(build_evidence_pair(
+                "stdout.log".to_string(),
+                stdout,
+                "stderr.log".to_string(),
+                stderr,
+            )?));
+        }
+
+        let ordered_names = ordered_log_names(&self.order, &logs);
+        let stems = allocate_evidence_stems(&ordered_names);
+        let mut files = Vec::with_capacity(ordered_names.len() * 2);
+        for (name, stem) in ordered_names.into_iter().zip(stems) {
+            if let Some((stdout, stderr)) = logs.remove(&name) {
+                files.extend(build_evidence_pair(
+                    format!("{stem}-stdout.log"),
+                    stdout,
+                    format!("{stem}-stderr.log"),
+                    stderr,
+                )?);
+            }
         }
         Ok(files)
     }
+}
+
+fn build_evidence_pair(
+    out_name: String,
+    stdout: String,
+    err_name: String,
+    stderr: String,
+) -> Result<[Evidence; 2], String> {
+    let out = Evidence::text(out_name, stdout)
+        .map_err(|error| format!("could not attach stdout evidence: {error}"))?;
+    let err = Evidence::text(err_name, stderr)
+        .map_err(|error| format!("could not attach stderr evidence: {error}"))?;
+    Ok([out, err])
+}
+
+fn ordered_log_names(order: &[String], logs: &BTreeMap<String, (String, String)>) -> Vec<String> {
+    let mut ordered = Vec::with_capacity(logs.len());
+    let mut seen = BTreeSet::new();
+    for name in order {
+        if logs.contains_key(name) && seen.insert(name.clone()) {
+            ordered.push(name.clone());
+        }
+    }
+    for name in logs.keys() {
+        if seen.insert(name.clone()) {
+            ordered.push(name.clone());
+        }
+    }
+    ordered
+}
+
+fn allocate_evidence_stems(ordered_names: &[String]) -> Vec<String> {
+    // Block every original name's lowercase stem upfront so a disambiguated
+    // suffix (`<name>-2`) never steals another process's exact name.
+    let mut reserved_lower: BTreeSet<String> = ordered_names
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let mut claimed_lower: BTreeSet<String> = BTreeSet::new();
+    let mut stems = Vec::with_capacity(ordered_names.len());
+
+    for name in ordered_names {
+        let lower = name.to_ascii_lowercase();
+        let stem = if claimed_lower.insert(lower) {
+            name.clone()
+        } else {
+            let mut n = 2_usize;
+            loop {
+                let candidate = format!("{name}-{n}");
+                if reserved_lower.insert(candidate.to_ascii_lowercase()) {
+                    break candidate;
+                }
+                n += 1;
+            }
+        };
+        stems.push(stem);
+    }
+
+    stems
 }
 
 fn append_evidence(destination: &mut String, part: &str) {
@@ -1589,5 +1664,115 @@ mod tests {
         let ps_out = "  6625  6624 Z+\n  7001  7000 S\n";
         assert!(ps_output_pgid_members(ps_out, 6624, 9999).is_empty());
         assert_eq!(ps_output_pgid_members(ps_out, 7000, 9999), vec![7001]);
+    }
+
+    #[test]
+    fn evidence_disambiguates_case_colliding_names_without_stealing_siblings() {
+        let mut session = ProcSession {
+            processes: BTreeMap::new(),
+            order: vec!["A".to_string(), "a".to_string()],
+            retired: vec![
+                RetiredLogs {
+                    name: "A".to_string(),
+                    stdout: "out-A".to_string(),
+                    stderr: "err-A".to_string(),
+                },
+                RetiredLogs {
+                    name: "a".to_string(),
+                    stdout: "out-a".to_string(),
+                    stderr: "err-a".to_string(),
+                },
+                RetiredLogs {
+                    name: "a-2".to_string(),
+                    stdout: "out-a2".to_string(),
+                    stderr: "err-a2".to_string(),
+                },
+            ],
+        };
+
+        let files = session.evidence().expect("evidence must build");
+        let got: Vec<(&str, &str)> = files
+            .iter()
+            .map(|file| {
+                let text = match file.content() {
+                    crate::core::session::EvidenceContent::Text(text) => text.as_str(),
+                    crate::core::session::EvidenceContent::Bytes(_) => {
+                        panic!("expected text log")
+                    }
+                };
+                (file.name(), text)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("A-stdout.log", "out-A"),
+                ("A-stderr.log", "err-A"),
+                ("a-3-stdout.log", "out-a"),
+                ("a-3-stderr.log", "err-a"),
+                ("a-2-stdout.log", "out-a2"),
+                ("a-2-stderr.log", "err-a2"),
+            ]
+        );
+
+        // Start order (`a` before `A`) determines which sibling keeps its exact name.
+        session.order = vec!["a".to_string(), "A".to_string()];
+        let reordered = session.evidence().expect("reordered evidence must build");
+        let reordered_names: Vec<&str> = reordered.iter().map(Evidence::name).collect();
+        assert_eq!(
+            reordered_names,
+            vec![
+                "a-stdout.log",
+                "a-stderr.log",
+                "A-3-stdout.log",
+                "A-3-stderr.log",
+                "a-2-stdout.log",
+                "a-2-stderr.log",
+            ]
+        );
+
+        // Sole `default` keeps `stdout.log` / `stderr.log`, while adding a
+        // case-colliding sibling disambiguates both with `-stdout`/`-stderr`.
+        let mut sole_default = ProcSession {
+            processes: BTreeMap::new(),
+            order: vec![DEFAULT_NAME.to_string()],
+            retired: vec![RetiredLogs {
+                name: DEFAULT_NAME.to_string(),
+                stdout: "default-out".to_string(),
+                stderr: "default-err".to_string(),
+            }],
+        };
+        let default_evidence = sole_default.evidence().expect("default evidence");
+        let default_names: Vec<&str> = default_evidence.iter().map(Evidence::name).collect();
+        assert_eq!(default_names, vec!["stdout.log", "stderr.log"]);
+
+        sole_default.retired.push(RetiredLogs {
+            name: "DEFAULT".to_string(),
+            stdout: "upper-out".to_string(),
+            stderr: "upper-err".to_string(),
+        });
+        let mixed_default: Vec<String> = sole_default
+            .evidence()
+            .expect("mixed default evidence")
+            .into_iter()
+            .map(|file| file.name().to_string())
+            .collect();
+        assert_eq!(
+            mixed_default,
+            vec![
+                "default-stdout.log",
+                "default-stderr.log",
+                "DEFAULT-2-stdout.log",
+                "DEFAULT-2-stderr.log",
+            ]
+        );
+
+        let chained = allocate_evidence_stems(&[
+            "A".to_string(),
+            "a".to_string(),
+            "a-2".to_string(),
+            "A-2".to_string(),
+        ]);
+        assert_eq!(chained, vec!["A", "a-3", "a-2", "A-2-2"]);
     }
 }

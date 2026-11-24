@@ -1974,8 +1974,9 @@ steps:
 - **Redacted failure evidence:** when a case fails or `--record` is enabled, the
   session attaches `proc/stdout.log` and `proc/stderr.log` (or
   `proc/<name>-stdout.log` and `proc/<name>-stderr.log` when named or when
-  multiple processes ran in the case), automatically redacted with `${env:NAME}`
-  secrets.
+  multiple processes ran in the case, disambiguated as
+  `<name>-<n>-stdout.log` / `<name>-<n>-stderr.log` when names differ only in
+  ASCII case), automatically redacted with `${env:NAME}` secrets.
 
 ### `db.query`
 

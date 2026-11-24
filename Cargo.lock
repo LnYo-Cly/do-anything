@@ -1912,7 +1912,7 @@ checksum = "e3655b18489c90df24f2c401ac65f908b17210e59cf676127f79890f67f3e30e"
 dependencies = [
  "indexmap",
  "nix",
- "windows",
+ "windows 0.62.2",
 ]
 
 [[package]]

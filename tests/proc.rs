@@ -1570,3 +1570,140 @@ steps:
         "report.json leaked a secret prefix: {report_json:?}"
     );
 }
+
+#[test]
+fn failure_bundle_keeps_distinct_logs_for_case_colliding_process_names() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-case-collision");
+    let bundles = dir.path().join("bundles");
+
+    let case = dir.write(
+        "case-collision.yaml",
+        &format!(
+            r#"
+name: Case-colliding process names preserve separate logs in failure bundle
+steps:
+  - proc.start:
+      name: A
+      command: '{helper}'
+      args: ["repl"]
+      ready_pattern: "REPL_READY"
+      ready_timeout_ms: 5000
+  - proc.send:
+      name: A
+      input: "ECHO PROC_UPPER_A_OUT\nERR PROC_UPPER_A_ERR\n"
+  - proc.wait_output:
+      name: A
+      pattern: "PROC_UPPER_A_OUT"
+      stream: stdout
+      timeout_ms: 5000
+  - proc.wait_output:
+      name: A
+      pattern: "PROC_UPPER_A_ERR"
+      stream: stderr
+      timeout_ms: 5000
+  - proc.start:
+      name: a
+      command: '{helper}'
+      args: ["repl"]
+      ready_pattern: "REPL_READY"
+      ready_timeout_ms: 5000
+  - proc.send:
+      name: a
+      input: "ECHO PROC_LOWER_a_OUT\nERR PROC_LOWER_a_ERR\n"
+  - proc.wait_output:
+      name: a
+      pattern: "PROC_LOWER_a_OUT"
+      stream: stdout
+      timeout_ms: 5000
+  - proc.wait_output:
+      name: a
+      pattern: "PROC_LOWER_a_ERR"
+      stream: stderr
+      timeout_ms: 5000
+  - proc.wait_output:
+      name: a
+      pattern: "NEVER_EMITTED_TOKEN"
+      timeout_ms: 200
+"#,
+            helper = helper.display(),
+        ),
+    );
+
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["error"]["kind"], "timeout", "{report}");
+    let bundle_dir = PathBuf::from(
+        report["cases"][0]["bundle"]
+            .as_str()
+            .expect("timed out step must write a failure bundle"),
+    );
+
+    let proc_dir = bundle_dir.join("proc");
+    let mut entries: Vec<String> = fs::read_dir(&proc_dir)
+        .expect("proc/ evidence directory must exist")
+        .map(|entry| {
+            entry
+                .expect("dir entry must read")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            "A-stderr.log",
+            "A-stdout.log",
+            "a-2-stderr.log",
+            "a-2-stdout.log",
+        ],
+        "expected distinct case-collision-safe evidence files, got {entries:?}"
+    );
+
+    let upper_out =
+        fs::read_to_string(proc_dir.join("A-stdout.log")).expect("A-stdout.log must exist");
+    let upper_err =
+        fs::read_to_string(proc_dir.join("A-stderr.log")).expect("A-stderr.log must exist");
+    let lower_out =
+        fs::read_to_string(proc_dir.join("a-2-stdout.log")).expect("a-2-stdout.log must exist");
+    let lower_err =
+        fs::read_to_string(proc_dir.join("a-2-stderr.log")).expect("a-2-stderr.log must exist");
+
+    assert!(
+        upper_out.contains("PROC_UPPER_A_OUT") && !upper_out.contains("PROC_LOWER_a_OUT"),
+        "A-stdout.log unexpected: {upper_out:?}"
+    );
+    assert!(
+        upper_err.contains("PROC_UPPER_A_ERR") && !upper_err.contains("PROC_LOWER_a_ERR"),
+        "A-stderr.log unexpected: {upper_err:?}"
+    );
+    assert!(
+        lower_out.contains("PROC_LOWER_a_OUT") && !lower_out.contains("PROC_UPPER_A_OUT"),
+        "a-2-stdout.log unexpected: {lower_out:?}"
+    );
+    assert!(
+        lower_err.contains("PROC_LOWER_a_ERR") && !lower_err.contains("PROC_UPPER_A_ERR"),
+        "a-2-stderr.log unexpected: {lower_err:?}"
+    );
+}
