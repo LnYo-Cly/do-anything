@@ -9786,6 +9786,617 @@ steps:
 }
 
 #[test]
+fn browser_drag_mixed_at_and_locator_fails_closed_when_locator_scrolls_container() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![
+        (
+            "/mixed-container-drag",
+            r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  html, body { margin: 0; overflow: hidden; height: 100%; font-family: sans-serif; position: relative; }
+  .item { position: absolute; width: 82px; height: 40px; border: 1px solid #333; display: flex; align-items: center; justify-content: center; user-select: none; box-sizing: border-box; }
+  #panel { position: absolute; left: 20px; top: 20px; width: 300px; height: 220px; overflow: auto; border: 1px solid #333; }
+  #src { left: 39px; top: 54px; height: 50px; background: #cde; }
+  #h-dst { left: 700px; top: 54px; background: #fdd; }
+  #near-src { left: 150px; top: 700px; width: 90px; background: #edc; }
+  #dst { left: 39px; top: 700px; background: #dfd; }
+  #shadow-host { position: absolute; left: 20px; top: 252px; width: 300px; height: 185px; }
+  #drag-frame { position: absolute; left: 335px; top: 20px; width: 280px; height: 220px; border: 1px solid #333; }
+  #doc-scroll-frame { position: absolute; left: 335px; top: 252px; width: 280px; height: 185px; border: 1px solid #333; }
+  #mouse-log { position: fixed; right: 4px; bottom: 4px; font-size: 11px; }
+</style></head>
+<body>
+  <div id="panel">
+    <div id="src" class="item" draggable="true">Src</div>
+    <div id="h-dst" class="item">HDst</div>
+    <div id="near-src" class="item" draggable="true">NearSrc</div>
+    <div id="dst" class="item">Dst</div>
+  </div>
+  <div id="shadow-host"></div>
+  <iframe id="drag-frame" src="/mixed-container-frame"></iframe>
+  <iframe id="doc-scroll-frame" src="/mixed-doc-frame"></iframe>
+  <div id="mouse-log"></div>
+  <script>
+    const logEl = document.getElementById('mouse-log');
+    window.__recordMouse = function record(ev) {
+      logEl.textContent += (logEl.textContent ? ';' : '') + ev;
+      fetch('/mouse-event?ev=' + encodeURIComponent(ev)).catch(() => {});
+    };
+    window.addEventListener('mousedown', e => {
+      const path = e.composedPath ? e.composedPath() : [e.target];
+      const hit = path[0];
+      const id = (hit && hit.id) ? hit.id : (hit && hit.tagName ? hit.tagName : 'none');
+      window.__recordMouse('down=' + id);
+    }, true);
+    window.addEventListener('mouseup', e => {
+      const path = e.composedPath ? e.composedPath() : [e.target];
+      const hit = path[0];
+      const id = (hit && hit.id) ? hit.id : (hit && hit.tagName ? hit.tagName : 'none');
+      window.__recordMouse('up=' + id);
+    }, true);
+    for (const id of ['src', 'near-src']) {
+      document.getElementById(id).addEventListener('dragstart', e => {
+        e.dataTransfer.setData('text/plain', id);
+        window.__recordMouse('dragstart=' + id);
+      });
+    }
+    const dst = document.getElementById('dst');
+    dst.addEventListener('dragenter', e => e.preventDefault());
+    dst.addEventListener('dragover', e => e.preventDefault());
+    dst.addEventListener('drop', e => {
+      e.preventDefault();
+      window.__recordMouse('drop=' + dst.id + '(' + e.dataTransfer.getData('text/plain') + ')');
+    });
+
+    const sr = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
+    sr.innerHTML = `<style>
+      .sitem { position: absolute; width: 82px; height: 40px; border: 1px solid #333; box-sizing: border-box; user-select: none; }
+      #shadow-panel { position: relative; width: 300px; height: 185px; overflow: auto; border: 1px solid #333; }
+      #s-src { left: 39px; top: 38px; height: 50px; background: #cde; }
+      #s-dst { left: 39px; top: 650px; background: #dfd; }
+    </style>
+    <div id="shadow-panel">
+      <div id="s-src" class="sitem" draggable="true">SSrc</div>
+      <div id="s-dst" class="sitem">SDst</div>
+    </div>`;
+    sr.getElementById('s-src').addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', 's-src');
+    });
+    sr.getElementById('s-dst').addEventListener('dragenter', e => e.preventDefault());
+    sr.getElementById('s-dst').addEventListener('dragover', e => e.preventDefault());
+    sr.getElementById('s-dst').addEventListener('drop', e => {
+      e.preventDefault();
+      window.__recordMouse('drop=s-dst(' + e.dataTransfer.getData('text/plain') + ')');
+    });
+  </script>
+</body>
+</html>"##,
+        ),
+        (
+            "/mixed-container-frame",
+            r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; overflow: hidden; height: 220px; font-family: sans-serif; }
+  .fitem { position: absolute; width: 80px; height: 40px; border: 1px solid #333; box-sizing: border-box; user-select: none; }
+  #f-panel { position: relative; width: 280px; height: 220px; overflow: auto; }
+  #f-src { left: 40px; top: 45px; height: 50px; background: #cde; }
+  #f-dst { left: 40px; top: 650px; background: #dfd; }
+</style></head>
+<body>
+  <div id="f-panel">
+    <div id="f-src" class="fitem" draggable="true">FSrc</div>
+    <div id="f-dst" class="fitem">FDst</div>
+  </div>
+  <script>
+    window.addEventListener('mousedown', e => {
+      const id = (e.target && e.target.id) ? e.target.id : (e.target ? e.target.tagName : 'none');
+      window.top.__recordMouse('fdown=' + id);
+    }, true);
+    window.addEventListener('mouseup', e => {
+      const id = (e.target && e.target.id) ? e.target.id : (e.target ? e.target.tagName : 'none');
+      window.top.__recordMouse('fup=' + id);
+    }, true);
+    document.getElementById('f-src').addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', 'f-src');
+    });
+    const fdst = document.getElementById('f-dst');
+    fdst.addEventListener('dragenter', e => e.preventDefault());
+    fdst.addEventListener('dragover', e => e.preventDefault());
+    fdst.addEventListener('drop', e => {
+      e.preventDefault();
+      window.top.__recordMouse('fdrop=' + fdst.id + '(' + e.dataTransfer.getData('text/plain') + ')');
+    });
+  </script>
+</body>
+</html>"##,
+        ),
+        (
+            "/mixed-doc-frame",
+            r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; height: 900px; font-family: sans-serif; position: relative; }
+  .dfitem { position: absolute; width: 80px; height: 40px; border: 1px solid #333; box-sizing: border-box; user-select: none; }
+  #df-src { left: 40px; top: 45px; height: 50px; background: #cde; }
+  #df-dst { left: 40px; top: 650px; background: #dfd; }
+</style></head>
+<body>
+  <div id="df-src" class="dfitem" draggable="true">DFSrc</div>
+  <div id="df-dst" class="dfitem">DFDst</div>
+  <script>
+    window.addEventListener('mousedown', e => {
+      const id = (e.target && e.target.id) ? e.target.id : (e.target ? e.target.tagName : 'none');
+      window.top.__recordMouse('dfdown=' + id);
+    }, true);
+    window.addEventListener('mouseup', e => {
+      const id = (e.target && e.target.id) ? e.target.id : (e.target ? e.target.tagName : 'none');
+      window.top.__recordMouse('dfup=' + id);
+    }, true);
+  </script>
+</body>
+</html>"##,
+        ),
+    ]);
+
+    let dir = TempDir::new("browser-mixed-container-drag");
+    let probe = dir.write(
+        "probe-vp.yaml",
+        &format!(
+            r##"name: probe viewport
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.hover:
+      at: {{ x: 10, y: 10 }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let probe_out = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&probe), "--no-bundle"],
+    );
+    assert_eq!(exit_code(&probe_out), Some(0), "{}", stdout(&probe_out));
+    let vp = &json_stdout(&probe_out)["cases"][0]["steps"][1]["result"]["viewport"];
+    let vw = vp["width"].as_u64().expect("viewport width");
+    let vh = vp["height"].as_u64().expect("viewport height");
+
+    // 1. Exact F-3 repro: non-scrollable body, `#panel` (`overflow:auto`) has `#src` at (100,100)
+    // and `#dst` at the bottom. `from.at` + `to.css: "#dst"` scrolls `#panel` and MUST fail closed
+    // as Execution (exit code 1, `kind: "execution"`) with ZERO mouse events (no `down=DIV`).
+    cu.clear_hits();
+    let mixed_from_at = dir.write(
+        "container-from-at.yaml",
+        &format!(
+            r##"name: mixed from.at to.css in inner overflow panel
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.drag:
+      from: {{ at: {{ x: 100, y: 100, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#dst" }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let bundles = dir.path().join("container-bundles");
+    let fail_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&mixed_from_at),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(
+        exit_code(&fail_out),
+        Some(1),
+        "mixed at+locator inner container scroll must fail closed as TestFailure (1): stdout={}\nstderr={}",
+        stdout(&fail_out),
+        stderr(&fail_out)
+    );
+    let fail_json = json_stdout(&fail_out);
+    assert_eq!(
+        fail_json["cases"][0]["steps"][1]["error"]["kind"],
+        json!("execution"),
+        "mixed container scroll error kind must be execution: {fail_json}"
+    );
+    let err_msg = case_error(&fail_json);
+    assert!(
+        err_msg.contains("panel") && err_msg.contains("browser.scroll"),
+        "error must name scroll container and remediation: {err_msg}"
+    );
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire before inner container mixed drag fails closed, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+    let bundle = PathBuf::from(fail_json["cases"][0]["bundle"].as_str().expect("bundle"));
+    let dom_html = fs::read_to_string(bundle.join("browser/dom.html")).expect("bundle dom.html");
+    assert!(
+        dom_html.contains("<div id=\"mouse-log\"></div>"),
+        "DOM mouse log must remain completely empty (no down=DIV!): {dom_html}"
+    );
+
+    // 2. Reverse mixed direction (`from: { css: "#dst" }`, `to: { at: { x: 100, y: 100 } }`)
+    // also scrolls `#panel` and MUST fail closed with ZERO mouse events.
+    cu.clear_hits();
+    let mixed_to_at = dir.write(
+        "container-to-at.yaml",
+        &format!(
+            r##"name: mixed from.css to.at in inner overflow panel
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.drag:
+      from: {{ css: "#dst" }}
+      to: {{ at: {{ x: 100, y: 100, viewport: {{ width: {vw}, height: {vh} }} }} }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let fail2_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&mixed_to_at),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&fail2_out), Some(1), "{}", stdout(&fail2_out));
+    let fail2_json = json_stdout(&fail2_out);
+    assert_eq!(
+        fail2_json["cases"][0]["steps"][1]["error"]["kind"],
+        json!("execution"),
+        "{fail2_json}"
+    );
+    let err2 = case_error(&fail2_json);
+    assert!(
+        err2.contains("panel") && err2.contains("browser.scroll"),
+        "reverse container error must name #panel and browser.scroll: {err2}"
+    );
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire on reverse container mixed drag failure, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+
+    // 2b. Horizontal scroll inside `#panel` (`from.at` + `to.css: "#h-dst"`) also fails closed
+    // with ZERO mouse events.
+    cu.clear_hits();
+    let horiz_mixed = dir.write(
+        "container-horiz-mixed.yaml",
+        &format!(
+            r##"name: mixed drag with horizontal inner overflow scroll
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.drag:
+      from: {{ at: {{ x: 100, y: 100, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#h-dst" }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let horiz_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&horiz_mixed),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&horiz_out), Some(1), "{}", stdout(&horiz_out));
+    let horiz_json = json_stdout(&horiz_out);
+    assert_eq!(
+        horiz_json["cases"][0]["steps"][1]["error"]["kind"],
+        json!("execution"),
+        "{horiz_json}"
+    );
+    assert!(
+        case_error(&horiz_json).contains("panel"),
+        "horizontal scroll failure must name #panel: {horiz_json}"
+    );
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire on horizontal container mixed drag failure, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+
+    // 3. Mixed `at` + locator inside an open Shadow DOM scroll container (`#shadow-panel`)
+    // MUST fail closed with ZERO mouse events.
+    cu.clear_hits();
+    let shadow_mixed = dir.write(
+        "container-shadow-mixed.yaml",
+        &format!(
+            r##"name: mixed drag inside open shadow scroll container
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.drag:
+      from: {{ at: {{ x: 100, y: 315, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#s-dst" }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let shadow_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&shadow_mixed),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&shadow_out), Some(1), "{}", stdout(&shadow_out));
+    let shadow_json = json_stdout(&shadow_out);
+    assert_eq!(
+        shadow_json["cases"][0]["steps"][1]["error"]["kind"],
+        json!("execution"),
+        "{shadow_json}"
+    );
+    assert!(
+        case_error(&shadow_json).contains("shadow-panel"),
+        "shadow scroll failure must name #shadow-panel: {shadow_json}"
+    );
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire on shadow container mixed drag failure, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+
+    // 4. Mixed `at` + locator inside a same-origin iframe scroll container (`#f-panel`)
+    // MUST fail closed with ZERO mouse events.
+    cu.clear_hits();
+    let frame_mixed = dir.write(
+        "container-frame-mixed.yaml",
+        &format!(
+            r##"name: mixed drag inside same-origin iframe scroll container
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.drag:
+      from: {{ at: {{ x: 416, y: 91, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#f-dst", within: {{ css: "#drag-frame" }} }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let frame_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&frame_mixed),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&frame_out), Some(1), "{}", stdout(&frame_out));
+    let frame_json = json_stdout(&frame_out);
+    assert_eq!(
+        frame_json["cases"][0]["steps"][1]["error"]["kind"],
+        json!("execution"),
+        "{frame_json}"
+    );
+    assert!(
+        case_error(&frame_json).contains("f-panel"),
+        "iframe scroll failure must name #f-panel: {frame_json}"
+    );
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire on iframe container mixed drag failure, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+
+    // 4b. Mixed `at` + locator scrolling a same-origin iframe's own document (`#doc-scroll-frame`)
+    // MUST fail closed naming `#doc-scroll-frame` with ZERO mouse events.
+    cu.clear_hits();
+    let doc_frame_mixed = dir.write(
+        "container-doc-frame-mixed.yaml",
+        &format!(
+            r##"name: mixed drag scrolling same-origin iframe document
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.drag:
+      from: {{ at: {{ x: 416, y: 323, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#df-dst", within: {{ css: "#doc-scroll-frame" }} }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let doc_frame_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&doc_frame_mixed),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&doc_frame_out),
+        Some(1),
+        "{}",
+        stdout(&doc_frame_out)
+    );
+    let doc_frame_json = json_stdout(&doc_frame_out);
+    assert_eq!(
+        doc_frame_json["cases"][0]["steps"][1]["error"]["kind"],
+        json!("execution"),
+        "{doc_frame_json}"
+    );
+    assert!(
+        case_error(&doc_frame_json).contains("doc-scroll-frame"),
+        "iframe document scroll failure must name #doc-scroll-frame: {doc_frame_json}"
+    );
+    assert!(
+        cu.hits_matching("/mouse-event").is_empty(),
+        "zero mouse events may fire on iframe document mixed drag failure, got: {:?}",
+        cu.hits_matching("/mouse-event")
+    );
+
+    // 5. Locating both `#src` and `#dst` inside `#panel` succeeds cleanly (`down=src`, `drop=dst(src)`).
+    cu.clear_hits();
+    let both_located = dir.write(
+        "container-both-located.yaml",
+        &format!(
+            r##"name: locate both src and dst inside inner overflow panel
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.drag:
+      from: {{ css: "#src" }}
+      to: {{ css: "#dst" }}
+  - browser.read:
+      css: "#mouse-log"
+    expect:
+      - path: $.text
+        contains: "down=src"
+      - path: $.text
+        contains: "drop=dst(src)"
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let both_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&both_located),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&both_out),
+        Some(0),
+        "located drag inside inner container must succeed: stdout={}\nstderr={}",
+        stdout(&both_out),
+        stderr(&both_out)
+    );
+
+    // 6. Scrolling `#panel` first with `browser.scroll`, then running mixed `at` (#near-src) + `#dst` succeeds!
+    let coord_probe = dir.write(
+        "container-scroll-probe.yaml",
+        &format!(
+            r##"name: probe near-src coordinates after scrolling panel
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.scroll:
+      css: "#dst"
+      into_view: true
+  - browser.drag:
+      from: {{ css: "#near-src" }}
+      to: {{ css: "#dst" }}
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let cp_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&coord_probe),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(exit_code(&cp_out), Some(0), "{}", stdout(&cp_out));
+    let cp_json = json_stdout(&cp_out);
+    let near_x = cp_json["cases"][0]["steps"][2]["result"]["from"]["x"]
+        .as_f64()
+        .expect("near_x")
+        .round() as i64;
+    let near_y = cp_json["cases"][0]["steps"][2]["result"]["from"]["y"]
+        .as_f64()
+        .expect("near_y")
+        .round() as i64;
+
+    cu.clear_hits();
+    let scroll_then_mixed = dir.write(
+        "container-scroll-then-mixed.yaml",
+        &format!(
+            r##"name: scroll container first then mixed drag
+steps:
+  - browser.open:
+      url: "{}"
+      width: 640
+      height: 560
+  - browser.scroll:
+      css: "#dst"
+      into_view: true
+  - browser.drag:
+      from: {{ at: {{ x: {near_x}, y: {near_y}, viewport: {{ width: {vw}, height: {vh} }} }} }}
+      to: {{ css: "#dst" }}
+  - browser.read:
+      css: "#mouse-log"
+    expect:
+      - path: $.text
+        contains: "down=near-src"
+      - path: $.text
+        contains: "drop=dst(near-src)"
+"##,
+            cu.url("/mixed-container-drag")
+        ),
+    );
+    let stm_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&scroll_then_mixed),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&stm_out),
+        Some(0),
+        "scrolling container first then mixed drag must succeed: stdout={}\nstderr={}",
+        stdout(&stm_out),
+        stderr(&stm_out)
+    );
+}
+
+#[test]
 fn browser_clipboard_rejects_connected_and_headed_browsers_as_environment() {
     let server = TestServer::start();
     let Some(_guard) = chrome_test(&server) else {
@@ -10046,6 +10657,158 @@ fn browser_clipboard_rejects_connected_and_headed_browsers_as_environment() {
             }
         }
     }
+}
+
+#[test]
+fn browser_clipboard_closed_tab_fails_fast_as_environment_error() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let cu = CuServer::start(vec![(
+        "/clip-closed-tab",
+        r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Clip Closed Tab</title></head>
+<body><div id="ready">alive</div></body>
+</html>"##,
+    )]);
+
+    let dir = TempDir::new("browser-clipboard-closed-tab");
+    let start_out = run_da_in(dir.path(), &["--output", "json", "session", "start"]);
+    assert_eq!(exit_code(&start_out), Some(0), "{}", stdout(&start_out));
+    let session_id = json_stdout(&start_out)["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let open_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &session_id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", cu.url("/clip-closed-tab")),
+        ],
+    );
+    assert_eq!(exit_code(&open_out), Some(0), "{}", stdout(&open_out));
+
+    // Sanity check: while the isolated headless tab is alive, `browser.set_clipboard` succeeds.
+    let alive_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &session_id,
+            "browser.set_clipboard",
+            "--arg",
+            "text=alive",
+        ],
+    );
+    assert_eq!(exit_code(&alive_out), Some(0), "{}", stdout(&alive_out));
+
+    // Read the DevTools port of the `da`-launched headless Chrome, open a keepalive tab so the
+    // browser process stays alive, then close the owned tab via `/json/close/{id}`.
+    let state_path = dir
+        .path()
+        .join(".da")
+        .join("sessions")
+        .join(&session_id)
+        .join("state.json");
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read session state.json"))
+            .expect("parse session state.json");
+    let port = state["handles"]["browser"]["port"]
+        .as_u64()
+        .expect("browser handle port") as u16;
+    let _ = http_request(port, "PUT", "/json/new?about:blank").expect("open keepalive tab");
+
+    let (_, list_body) = http_request(port, "GET", "/json/list").expect("list tabs");
+    let tabs: Value = serde_json::from_str(&list_body).expect("parse /json/list");
+    let owned_tab_id = tabs
+        .as_array()
+        .expect("tab list array")
+        .iter()
+        .find(|t| {
+            t["url"]
+                .as_str()
+                .is_some_and(|u| u.contains("/clip-closed-tab"))
+        })
+        .and_then(|t| t["id"].as_str())
+        .expect("find owned /clip-closed-tab target id")
+        .to_string();
+    let _ = http_request(port, "GET", &format!("/json/close/{owned_tab_id}"));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let (_, cur_body) = http_request(port, "GET", "/json/list").unwrap_or((0, "[]".into()));
+        let cur: Value = serde_json::from_str(&cur_body).unwrap_or_else(|_| json!([]));
+        if !cur
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|t| t["id"].as_str() == Some(owned_tab_id.as_str()))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let secret = "closed-tab-clip-secret-424242";
+    let set_closed = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &session_id,
+            "browser.set_clipboard",
+            "--arg",
+            "text=${env:DA_CLOSED_CLIP_SECRET}",
+        ],
+        &[("DA_CLOSED_CLIP_SECRET", secret.to_string())],
+    );
+    assert_eq!(
+        exit_code(&set_closed),
+        Some(4),
+        "browser.set_clipboard on closed real tab must fail with ExitCode::Environment (4): stdout={}\nstderr={}",
+        stdout(&set_closed),
+        stderr(&set_closed)
+    );
+    assert!(
+        !stdout(&set_closed).contains(secret) && !stderr(&set_closed).contains(secret),
+        "closed-tab set_clipboard must not leak secret!\nstdout={}\nstderr={}",
+        stdout(&set_closed),
+        stderr(&set_closed)
+    );
+
+    let read_closed = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "session",
+            "step",
+            &session_id,
+            "browser.read_clipboard",
+        ],
+    );
+    assert_eq!(
+        exit_code(&read_closed),
+        Some(4),
+        "browser.read_clipboard on closed real tab must fail with ExitCode::Environment (4): stdout={}\nstderr={}",
+        stdout(&read_closed),
+        stderr(&read_closed)
+    );
+
+    let _ = run_da_in(dir.path(), &["session", "stop", &session_id]);
 }
 
 #[test]
