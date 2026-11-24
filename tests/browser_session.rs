@@ -2510,3 +2510,503 @@ fn session_export_preserves_saved_var_in_set_cookies_and_refuses_inline_secrets(
     assert!(combined.contains("browser.set_cookies"), "{combined}");
     let _ = run_da_in(dir.path(), &["session", "stop", &id2]);
 }
+
+fn run_da_env(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Output {
+    let mut cmd = Command::new(da());
+    cmd.current_dir(dir).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("failed to run da with env")
+}
+
+fn devtools_http_get_or_post(port: u16, method: &str, path: &str) -> String {
+    use std::io::Read;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect devtools");
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let req =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).expect("write request");
+    let mut bytes = Vec::new();
+    let _ = stream.read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    text.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default()
+}
+
+#[test]
+fn session_computer_use_scroll_hover_drag_export_replay_and_optional_skip() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let html = r##"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { margin: 0; font-family: sans-serif; height: 2000px; }
+  #hover-btn { margin: 16px; padding: 8px 16px; }
+  #hover-tip { display: none; }
+  #hover-wrap:hover #hover-tip { display: inline; }
+  .dnd { display: flex; gap: 32px; margin: 16px; }
+  #card { width: 100px; height: 48px; border: 1px solid #333; }
+  #bin { width: 120px; height: 48px; border: 1px dashed #333; }
+  #box { margin: 16px; width: 200px; height: 80px; overflow: auto; border: 1px solid #666; }
+  #box-in { height: 400px; }
+  #far-cta { position: absolute; left: 40px; top: 1300px; }
+</style></head>
+<body>
+  <div id="hover-wrap">
+    <button id="hover-btn">Inspect Menu</button>
+    <span id="hover-tip">Hover Revealed</span>
+  </div>
+  <div class="dnd">
+    <button id="card" draggable="true">Drag Card</button>
+    <div id="bin" role="region" aria-label="Drop Bin">Drop Here</div>
+  </div>
+  <div id="box" role="region" aria-label="Scroll Panel"><div id="box-in">Inside</div></div>
+  <button id="far-cta" onclick="document.getElementById('status').textContent = 'cta-clicked'">Far Action</button>
+  <div id="status">init</div>
+  <script>
+    const card = document.getElementById('card');
+    const bin = document.getElementById('bin');
+    card.addEventListener('dragstart', e => e.dataTransfer.setData('text/plain', 'session-card'));
+    bin.addEventListener('dragover', e => e.preventDefault());
+    bin.addEventListener('drop', e => {
+      e.preventDefault();
+      document.getElementById('status').textContent =
+        e.dataTransfer.getData('text/plain') + ':scroll=' + Math.round(document.getElementById('box').scrollTop);
+    });
+  </script>
+</body>
+</html>"##;
+
+    let server = PageServer::start(BTreeMap::from([("/cu".to_string(), html.to_string())]));
+    let dir = TempDir::new("session-cu-export");
+    let started = run_da_in(dir.path(), &["session", "start"]);
+    assert_eq!(started.status.code(), Some(0), "{:?}", started);
+    let id = json_stdout(&started)["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/cu")),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{:?}", open);
+    let tree = json_stdout(&open)["snapshot"]["tree"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    let hover_ref = find_ref_by_role_and_name(&tree, "button", "Inspect Menu").expect("hover ref");
+    let s_hover = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        &format!("browser.hover:\n  ref: {hover_ref}\n"),
+    );
+    assert_eq!(s_hover.status.code(), Some(0), "{:?}", s_hover);
+
+    let after_hover_tree = json_stdout(&s_hover)["snapshot"]["tree"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let panel_ref =
+        find_ref_by_role_and_name(&after_hover_tree, "region", "Scroll Panel").expect("panel ref");
+    let s_scroll_box = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        &format!("browser.scroll:\n  ref: {panel_ref}\n  delta_y: 120\n"),
+    );
+    assert_eq!(s_scroll_box.status.code(), Some(0), "{:?}", s_scroll_box);
+
+    let after_scroll_tree = json_stdout(&s_scroll_box)["snapshot"]["tree"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let card_ref =
+        find_ref_by_role_and_name(&after_scroll_tree, "button", "Drag Card").expect("card ref");
+    let bin_ref =
+        find_ref_by_role_and_name(&after_scroll_tree, "region", "Drop Bin").expect("bin ref");
+    let s_drag = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        &format!("browser.drag:\n  from:\n    ref: {card_ref}\n  to:\n    ref: {bin_ref}\n"),
+    );
+    assert_eq!(
+        s_drag.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&s_drag.stdout),
+        String::from_utf8_lossy(&s_drag.stderr)
+    );
+
+    // Optional failed drag referencing one live ref and one missing ref must NOT leak raw `ref:` into export.
+    let after_drag_tree = json_stdout(&s_drag)["snapshot"]["tree"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let card_ref2 =
+        find_ref_by_role_and_name(&after_drag_tree, "button", "Drag Card").expect("card ref 2");
+    let s_opt_drag = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        &format!(
+            "browser.drag:\n  from:\n    ref: {card_ref2}\n  to:\n    ref: e99999\noptional: true\n"
+        ),
+    );
+    assert_eq!(s_opt_drag.status.code(), Some(0), "{:?}", s_opt_drag);
+
+    let after_opt_tree = json_stdout(&s_opt_drag)["snapshot"]["tree"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let far_ref =
+        find_ref_by_role_and_name(&after_opt_tree, "button", "Far Action").expect("far ref");
+    let s_scroll_view = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        &format!("browser.scroll:\n  ref: {far_ref}\n  into_view: true\n"),
+    );
+    assert_eq!(s_scroll_view.status.code(), Some(0), "{:?}", s_scroll_view);
+
+    let s_coord_hover = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.hover:\n  at:\n    x: 40\n    y: 40\n",
+    );
+    assert_eq!(s_coord_hover.status.code(), Some(0), "{:?}", s_coord_hover);
+
+    let exported = dir.path().join("cu-replay.yaml");
+    let exp = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "export",
+            &id,
+            "-o",
+            exported.to_str().unwrap(),
+            "--name",
+            "CU Session Export",
+        ],
+    );
+    assert_eq!(
+        exp.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&exp.stdout),
+        String::from_utf8_lossy(&exp.stderr)
+    );
+
+    let yaml = fs::read_to_string(&exported).expect("read exported yaml");
+    assert!(
+        !yaml.contains("ref:"),
+        "exported YAML must not contain raw refs:\n{yaml}"
+    );
+    assert!(
+        yaml.contains("browser.drag")
+            && yaml.contains("browser.hover")
+            && yaml.contains("browser.scroll")
+            && yaml.contains("viewport:"),
+        "exported YAML must include synthesized CU steps and pinned viewport:\n{yaml}"
+    );
+
+    let lint = run_da_in(dir.path(), &["lint", exported.to_str().unwrap()]);
+    assert_eq!(
+        lint.status.code(),
+        Some(0),
+        "lint failed:\n{}",
+        String::from_utf8_lossy(&lint.stdout)
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{:?}", stop);
+
+    let replay = run_da_in(
+        dir.path(),
+        &["run", exported.to_str().unwrap(), "--no-bundle"],
+    );
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "replay failed:\n{}",
+        String::from_utf8_lossy(&replay.stdout)
+    );
+}
+
+#[test]
+fn session_clipboard_redacts_env_secret_in_logs_state_and_export() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let server = PageServer::start(BTreeMap::from([(
+        "/clip-session".to_string(),
+        r##"<!doctype html>
+<html>
+<body>
+  <button id="check" onclick="navigator.clipboard.readText().then(t => document.getElementById('len').textContent = 'len:' + String(t.length))">Check</button>
+  <div id="len">len:0</div>
+</body>
+</html>"##
+            .to_string(),
+    )]));
+    let dir = TempDir::new("session-clip-secrets");
+    let secret = "session-clip-secret-4242";
+    let envs = [("DA_SESSION_CLIP_SECRET", secret.to_string())];
+
+    let started = run_da_in(dir.path(), &["session", "start"]);
+    assert_eq!(started.status.code(), Some(0));
+    let id = json_stdout(&started)["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/clip-session")),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0));
+
+    let set_step = run_da_env(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.set_clipboard",
+            "--arg",
+            "text=${env:DA_SESSION_CLIP_SECRET}",
+        ],
+        &envs,
+    );
+    assert_eq!(set_step.status.code(), Some(0), "{:?}", set_step);
+
+    // Verify browser received real 24-character string, not `***`.
+    let read_len = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.click:\n  css: \"#check\"\n",
+    );
+    assert_eq!(read_len.status.code(), Some(0), "{:?}", read_len);
+    let wait_len = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.wait:\n  text: \"len:24\"\n",
+    );
+    assert_eq!(wait_len.status.code(), Some(0), "{:?}", wait_len);
+
+    // Reading & saving clipboard must redact across stdout, steps.jsonl, and state.json.
+    let mut read_cmd = Command::new(da());
+    read_cmd
+        .current_dir(dir.path())
+        .args(["session", "step", &id])
+        .env("DA_SESSION_CLIP_SECRET", secret)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = read_cmd.spawn().expect("spawn");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"browser.read_clipboard: {}\nsave:\n  saved_clip: $.text\n")
+        .unwrap();
+    let saved_out = child.wait_with_output().expect("wait");
+    assert_eq!(saved_out.status.code(), Some(0), "{:?}", saved_out);
+    let stdout_text = String::from_utf8_lossy(&saved_out.stdout);
+    assert!(
+        !stdout_text.contains(secret),
+        "raw clipboard secret leaked to session stdout: {stdout_text}"
+    );
+    let saved_json = json_stdout(&saved_out);
+    assert_eq!(saved_json["step"]["result"]["text"], json!("***"));
+
+    let exported = dir.path().join("clip-export.yaml");
+    let exp = run_da_in(
+        dir.path(),
+        &["session", "export", &id, "-o", exported.to_str().unwrap()],
+    );
+    assert_eq!(exp.status.code(), Some(0), "{:?}", exp);
+    let exp_yaml = fs::read_to_string(&exported).expect("export yaml");
+    assert!(
+        exp_yaml.contains("${env:DA_SESSION_CLIP_SECRET}") && !exp_yaml.contains(secret),
+        "exported YAML must keep env placeholder and redact secret:\n{exp_yaml}"
+    );
+
+    let session_dir = dir.path().join(".da/sessions").join(&id);
+    for file_name in ["steps.jsonl", "state.json"] {
+        let p = session_dir.join(file_name);
+        let contents = fs::read_to_string(&p).expect("read session artifact");
+        assert!(
+            !contents.contains(secret),
+            "raw clipboard secret leaked into {}:\n{}",
+            p.display(),
+            contents
+        );
+    }
+
+    let _ = run_da_in(dir.path(), &["session", "stop", &id]);
+}
+
+#[test]
+fn session_connect_closed_tab_fails_fast_as_environment_and_preserves_user_tab() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let server = PageServer::start(BTreeMap::from([
+        (
+            "/user".to_string(),
+            "<!doctype html><html><title>User Tab</title><body><div id='user-ok'>alive</div></body></html>"
+                .to_string(),
+        ),
+        (
+            "/owned".to_string(),
+            "<!doctype html><html><title>Owned Tab</title><body><button id='target'>Act</button></body></html>"
+                .to_string(),
+        ),
+    ]));
+    let dir = TempDir::new("session-connect-closed-tab");
+
+    // Host browser session simulating the user's open Chrome with an existing `/user` tab.
+    let s1 = run_da_in(dir.path(), &["session", "start"]);
+    assert_eq!(s1.status.code(), Some(0));
+    let id1 = json_stdout(&s1)["session_id"].as_str().unwrap().to_string();
+    let open1 = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id1,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/user")),
+        ],
+    );
+    assert_eq!(open1.status.code(), Some(0), "{:?}", open1);
+    let (port, _) = read_browser_handle(&dir.path().join(".da/sessions").join(&id1));
+
+    // Second session connects to that Chrome and opens its own `/owned` tab.
+    let s2 = run_da_in(dir.path(), &["session", "start"]);
+    assert_eq!(s2.status.code(), Some(0));
+    let id2 = json_stdout(&s2)["session_id"].as_str().unwrap().to_string();
+    let open2 = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id2],
+        &format!(
+            "browser.open:\n  connect: \"http://127.0.0.1:{port}\"\n  url: \"{}\"\n",
+            server.url("/owned")
+        ),
+    );
+    assert_eq!(open2.status.code(), Some(0), "{:?}", open2);
+    let tree2 = json_stdout(&open2)["snapshot"]["tree"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let target_ref = find_ref_by_role_and_name(&tree2, "button", "Act").expect("Act ref");
+
+    // While `/owned` is still alive, connected sessions must reject clipboard steps
+    // with exit code 4 (Environment) so external/host clipboard state is never touched.
+    for (clip_label, clip_yaml) in [
+        (
+            "connect-set-clip",
+            "browser.set_clipboard:\n  text: \"probe\"\n",
+        ),
+        ("connect-read-clip", "browser.read_clipboard: {}\n"),
+    ] {
+        let rejected = run_da_stdin(dir.path(), &["session", "step", &id2], clip_yaml);
+        assert_eq!(
+            rejected.status.code(),
+            Some(4),
+            "{clip_label} in connected session must return Environment exit 4, got stdout={}\nstderr={}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+
+    // Externally close ONLY the `/owned` tab via DevTools HTTP endpoint.
+    let tabs: Value = serde_json::from_str(&devtools_http_get_or_post(port, "GET", "/json/list"))
+        .expect("list tabs");
+    let owned_tab_id = tabs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["url"].as_str().is_some_and(|u| u.contains("/owned")))
+        .and_then(|t| t["id"].as_str())
+        .expect("find owned tab id");
+    let _ = devtools_http_get_or_post(port, "GET", &format!("/json/close/{owned_tab_id}"));
+
+    // Poll briefly until Chrome actually removes `/owned` from `/json/list`.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let cur: Value =
+            serde_json::from_str(&devtools_http_get_or_post(port, "GET", "/json/list"))
+                .unwrap_or_else(|_| json!([]));
+        if !cur
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|t| t["id"].as_str() == Some(owned_tab_id))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    // Running Computer Use steps against the externally closed tab must fail fast with exit code 4 (Environment).
+    for (label, stdin_yaml) in [
+        (
+            "scroll-ref",
+            format!("browser.scroll:\n  ref: {target_ref}\n"),
+        ),
+        (
+            "hover-ref",
+            format!("browser.hover:\n  ref: {target_ref}\n"),
+        ),
+        (
+            "drag-ref",
+            format!(
+                "browser.drag:\n  from: {{ ref: {target_ref} }}\n  to: {{ ref: {target_ref} }}\n"
+            ),
+        ),
+    ] {
+        let failed = run_da_stdin(dir.path(), &["session", "step", &id2], &stdin_yaml);
+        assert_eq!(
+            failed.status.code(),
+            Some(4),
+            "{label} on externally closed owned tab must return Environment exit 4, got stdout={}\nstderr={}",
+            String::from_utf8_lossy(&failed.stdout),
+            String::from_utf8_lossy(&failed.stderr)
+        );
+    }
+
+    // Cleanup s2; user's `/user` tab in s1 must still be alive and readable!
+    let _ = run_da_in(dir.path(), &["session", "stop", &id2]);
+    let check_user = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id1],
+        "browser.read:\n  css: \"#user-ok\"\nexpect:\n  - path: $.text\n    equals: \"alive\"\n",
+    );
+    assert_eq!(
+        check_user.status.code(),
+        Some(0),
+        "user tab must remain untouched after owned tab death and stop: {:?}",
+        check_user
+    );
+    let _ = run_da_in(dir.path(), &["session", "stop", &id1]);
+}

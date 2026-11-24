@@ -59,7 +59,7 @@ use crate::core::session::{Evidence, Session, Sessions};
 pub const SESSION_KIND: &str = "browser";
 
 /// Step names, in the order they are registered.
-pub const STEP_NAMES: [&str; 11] = [
+pub const STEP_NAMES: [&str; 16] = [
     "browser.open",
     "browser.click",
     "browser.type",
@@ -71,6 +71,11 @@ pub const STEP_NAMES: [&str; 11] = [
     "browser.set_cookies",
     "browser.save_state",
     "browser.switch_tab",
+    "browser.scroll",
+    "browser.hover",
+    "browser.drag",
+    "browser.set_clipboard",
+    "browser.read_clipboard",
 ];
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -109,6 +114,11 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
         set_cookies_step()?,
         save_state_step()?,
         switch_tab_step()?,
+        scroll_step()?,
+        hover_step()?,
+        drag_step()?,
+        set_clipboard_step()?,
+        read_clipboard_step()?,
     ] {
         registry.register(definition)?;
     }
@@ -123,6 +133,9 @@ pub fn register(registry: &mut Registry) -> Result<(), String> {
     registry.register_session_validator("browser.upload", validate_upload_session)?;
     registry.register_session_validator("browser.wait", validate_wait_session)?;
     registry.register_session_validator("browser.read", validate_read_session)?;
+    registry.register_session_validator("browser.scroll", validate_scroll_session)?;
+    registry.register_session_validator("browser.hover", validate_hover_session)?;
+    registry.register_session_validator("browser.drag", validate_drag_session)?;
     registry.register_arg_redactor("browser.set_cookies", redact_set_cookies_args)?;
     Ok(())
 }
@@ -179,6 +192,189 @@ fn switch_tab_step() -> Result<StepDefinition, String> {
     )?;
     string_property(&mut definition.args_schema, "url_contains");
     string_property(&mut definition.args_schema, "title_contains");
+    Ok(definition)
+}
+
+/// Builds `browser.scroll`, which scrolls the viewport, a container, an `at`
+/// wheel target, or brings a uniquely matched element into view.
+fn scroll_step() -> Result<StepDefinition, String> {
+    let mut definition = step::<ScrollArgs>(
+        STEP_NAMES[11],
+        "Scrolls the viewport, an explicit coordinate target (`at`), or a uniquely matched container by `delta_x`/`delta_y`, or scrolls a matched element into view (`into_view: true`).",
+        validate_scroll,
+        run_scroll,
+    )?;
+    apply_locator_schema(&mut definition.args_schema, STEP_NAMES[11]);
+    number_property(&mut definition.args_schema, "delta_x");
+    number_property(&mut definition.args_schema, "delta_y");
+    if let Some(properties) = definition
+        .args_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert("at".to_string(), at_schema_value());
+        properties.insert(
+            "into_view".to_string(),
+            json!({
+                "description": "Scroll the uniquely matched target element into view; cannot be combined with `delta_x`, `delta_y`, or `at`.",
+                "type": "boolean",
+                "const": true,
+            }),
+        );
+    }
+    apply_dialog_schema(&mut definition.args_schema);
+
+    let non_locator_forbidden = [
+        json!({"required": ["css"]}),
+        json!({"required": ["xpath"]}),
+        json!({"required": ["text"]}),
+        json!({"required": ["role"]}),
+        json!({"required": ["testid"]}),
+        json!({"required": ["within"]}),
+        json!({"required": ["nth"]}),
+        json!({"required": ["name"]}),
+        json!({"required": ["into_view"]}),
+    ];
+    let mut viewport_forbidden = non_locator_forbidden.to_vec();
+    viewport_forbidden.push(json!({"required": ["at"]}));
+
+    let delta_required = json!({
+        "anyOf": [
+            { "required": ["delta_x"] },
+            { "required": ["delta_y"] }
+        ]
+    });
+    let mut branches = vec![
+        json!({
+            "allOf": [delta_required],
+            "not": { "anyOf": viewport_forbidden },
+        }),
+        json!({
+            "allOf": [
+                { "required": ["at"] },
+                delta_required,
+            ],
+            "not": { "anyOf": non_locator_forbidden },
+        }),
+    ];
+    for locator_key in ["css", "xpath", "text", "role", "testid"] {
+        branches.push(json!({
+            "required": [locator_key],
+            "not": {
+                "anyOf": [
+                    { "required": ["at"] },
+                    {
+                        "allOf": [
+                            { "required": ["into_view"] },
+                            delta_required,
+                        ]
+                    }
+                ]
+            }
+        }));
+    }
+    if let Value::Object(entries) = &mut definition.args_schema {
+        entries.insert("oneOf".to_string(), Value::Array(branches));
+    }
+    definition.lint_warnings = coordinate_lint_warnings;
+    Ok(definition)
+}
+
+/// Builds `browser.hover`, which moves the pointer onto the actionable target.
+fn hover_step() -> Result<StepDefinition, String> {
+    let mut definition = locator_step::<HoverArgs>(
+        STEP_NAMES[12],
+        "Moves the pointer onto the element the locator names (or explicit viewport coordinates `at`), triggering hover styles and pointer/mouse enter events.",
+        validate_hover,
+        run_hover,
+    )?;
+    apply_dialog_schema(&mut definition.args_schema);
+    apply_at_schema(&mut definition.args_schema, at_branch(&[]));
+    definition.lint_warnings = coordinate_lint_warnings;
+    Ok(definition)
+}
+
+/// Self-contained JSON Schema for one endpoint (`from` or `to`) of `browser.drag`.
+fn drag_endpoint_schema(step_name: &str, side: &str) -> Value {
+    json!({
+        "description": format!("Drag {side} target: either one uniquely matched element locator or explicit `at` viewport coordinates."),
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "css": { "type": "string" },
+            "xpath": { "type": "string" },
+            "text": { "type": "string" },
+            "role": { "type": "string" },
+            "name": { "type": "string" },
+            "testid": { "type": "string", "minLength": 1 },
+            "within": within_schema(&format!("{step_name}:{side}")),
+            "nth": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+            },
+            "at": at_schema_value(),
+        },
+        "oneOf": [
+            { "required": ["css"], "not": { "required": ["at"] } },
+            { "required": ["xpath"], "not": { "required": ["at"] } },
+            { "required": ["text"], "not": { "required": ["at"] } },
+            { "required": ["role"], "not": { "required": ["at"] } },
+            { "required": ["testid"], "not": { "required": ["at"] } },
+            at_branch(&[])
+        ],
+        "dependentRequired": {
+            "name": ["role"]
+        }
+    })
+}
+
+/// Builds `browser.drag`, which drags from `from` to `to`.
+fn drag_step() -> Result<StepDefinition, String> {
+    let mut definition = step::<DragArgs>(
+        STEP_NAMES[13],
+        "Drags from `from` to `to` (each a uniquely matched element locator or explicit `at` viewport coordinates), firing real pointer and HTML5 drag events.",
+        validate_drag,
+        run_drag,
+    )?;
+    if let Value::Object(entries) = &mut definition.args_schema {
+        entries.remove("$defs");
+    }
+    if let Some(properties) = definition
+        .args_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "from".to_string(),
+            drag_endpoint_schema(STEP_NAMES[13], "from"),
+        );
+        properties.insert("to".to_string(), drag_endpoint_schema(STEP_NAMES[13], "to"));
+    }
+    apply_dialog_schema(&mut definition.args_schema);
+    definition.lint_warnings = drag_lint_warnings;
+    Ok(definition)
+}
+
+/// Builds `browser.set_clipboard`, writing text into the browser-scoped clipboard.
+fn set_clipboard_step() -> Result<StepDefinition, String> {
+    step::<SetClipboardArgs>(
+        STEP_NAMES[14],
+        "Writes `text` to the browser-scoped clipboard in an isolated `headless: true` browser without touching the host OS clipboard, returning `{ \"characters\": ... }`.",
+        validate_set_clipboard,
+        run_set_clipboard,
+    )
+}
+
+/// Builds `browser.read_clipboard`, reading text from the browser-scoped clipboard.
+fn read_clipboard_step() -> Result<StepDefinition, String> {
+    let mut definition = step::<ReadClipboardArgs>(
+        STEP_NAMES[15],
+        "Reads `{ \"text\": ... }` from the browser-scoped clipboard in an isolated `headless: true` browser; safe to pair with `retry`.",
+        validate_read_clipboard,
+        run_read_clipboard,
+    )?;
+    definition.check_retry = allow_retry;
     Ok(definition)
 }
 
@@ -635,6 +831,19 @@ fn integer_property(schema: &mut Value, field: &str) {
         return;
     };
     property.insert("type".to_string(), json!("integer"));
+}
+
+/// Makes one optional property a number in the emitted schema.
+fn number_property(schema: &mut Value, field: &str) {
+    let Some(property) = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut(field))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    property.insert("type".to_string(), json!("number"));
 }
 
 /// Requires exactly one of `fields` to be present.
@@ -1180,6 +1389,174 @@ struct SwitchTabArgs {
     timeout_ms: u64,
 }
 
+/// Arguments of `browser.scroll`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ScrollArgs {
+    /// CSS selector of the target container or element.
+    #[serde(default)]
+    css: Option<String>,
+    /// XPath expression of the target container or element.
+    #[serde(default)]
+    xpath: Option<String>,
+    /// Visible text of the target container or element.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the target container or element.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the target; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
+    /// Test id attribute value of the target container or element.
+    #[serde(default)]
+    testid: Option<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
+    /// Explicit viewport coordinates to dispatch the wheel scroll at. Cannot be combined with a locator or `into_view`.
+    #[serde(default)]
+    at: Option<AtArgs>,
+    /// Horizontal scroll delta in CSS pixels (positive scrolls right, negative scrolls left).
+    #[serde(default)]
+    delta_x: Option<f64>,
+    /// Vertical scroll delta in CSS pixels (positive scrolls down, negative scrolls up).
+    #[serde(default)]
+    delta_y: Option<f64>,
+    /// Scroll the uniquely matched target element into view; cannot be combined with `delta_x`, `delta_y`, or `at`.
+    #[serde(default)]
+    into_view: Option<bool>,
+    /// How long to wait for the target element, in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+    /// How to respond if scrolling opens a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
+}
+
+/// Arguments of `browser.hover`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HoverArgs {
+    /// CSS selector of the element.
+    #[serde(default)]
+    css: Option<String>,
+    /// XPath expression of the element.
+    #[serde(default)]
+    xpath: Option<String>,
+    /// Visible text of the element, with whitespace normalized.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the element, for example `button`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
+    /// Test id attribute value of the element.
+    #[serde(default)]
+    testid: Option<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
+    /// Explicit viewport coordinates to hover at. Cannot be combined with a locator.
+    #[serde(default)]
+    at: Option<AtArgs>,
+    /// How long to wait for the element, in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+    /// How to respond if hovering opens a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
+}
+
+/// One endpoint (`from` or `to`) of `browser.drag`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DragEndpointArgs {
+    /// CSS selector of the endpoint element.
+    #[serde(default)]
+    css: Option<String>,
+    /// XPath expression of the endpoint element.
+    #[serde(default)]
+    xpath: Option<String>,
+    /// Visible text of the endpoint element, with whitespace normalized.
+    #[serde(default)]
+    text: Option<String>,
+    /// Accessibility role of the endpoint element.
+    #[serde(default)]
+    role: Option<String>,
+    /// Accessibility name of the endpoint element; only meaningful with `role`.
+    #[serde(default)]
+    name: Option<String>,
+    /// Test id attribute value of the endpoint element.
+    #[serde(default)]
+    testid: Option<String>,
+    /// Container locator to narrow the search to a uniquely matched element.
+    #[serde(default)]
+    within: Option<Box<WithinArgs>>,
+    /// Zero-based index when the locator matches more than one element.
+    #[schemars(extend("minimum" = 0))]
+    #[serde(default)]
+    nth: Option<u64>,
+    /// Explicit viewport coordinates of the endpoint. Cannot be combined with a locator.
+    #[serde(default)]
+    at: Option<AtArgs>,
+    /// Interactive session element reference, only allowed inside `da session`.
+    #[serde(rename = "ref", default)]
+    #[schemars(skip)]
+    ref_id: Option<String>,
+}
+
+/// Arguments of `browser.drag`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DragArgs {
+    /// Start endpoint (`css`, `xpath`, `text`, `role`, `testid`, or `at`).
+    from: DragEndpointArgs,
+    /// Destination endpoint (`css`, `xpath`, `text`, `role`, `testid`, or `at`).
+    to: DragEndpointArgs,
+    /// How long to wait for endpoints, in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+    /// How to respond if dragging opens a JavaScript dialog.
+    #[serde(default)]
+    dialog: Option<DialogArg>,
+}
+
+/// Arguments of `browser.set_clipboard`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetClipboardArgs {
+    /// Plain text to write into the browser-scoped clipboard (supports `${env:NAME}` secrets).
+    text: String,
+    /// How long to wait for the clipboard write, in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
+/// Arguments of `browser.read_clipboard`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadClipboardArgs {
+    /// How long to wait for the clipboard read, in milliseconds. Defaults to 5000.
+    #[schemars(extend("minimum" = 1))]
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
 fn default_headless() -> bool {
     true
 }
@@ -1405,6 +1782,40 @@ var frameTransform = function (frame) {
     contentRight: fr.right - sx * (borderRight + padRight),
     contentBottom: fr.bottom - sy * (borderBottom + padBottom)
   };
+};
+var mapLocalPointToViewport = function (el, lx, ly) {
+  var frames = collectEnclosingFrames(el);
+  if (!frames) return { ok: false, reason: 'cross-origin or detached enclosing frame' };
+  var curX = lx;
+  var curY = ly;
+  for (var i = frames.length - 1; i >= 0; i--) {
+    var f = frames[i];
+    var fDoc = f.ownerDocument || document;
+    var fWin = fDoc.defaultView || window;
+    var fb = frameTransform(f);
+    if (!fb.ok) return { ok: false, reason: fb.reason };
+    var px = fb.ox + fb.sx * curX;
+    var py = fb.oy + fb.sy * curY;
+    var fVw = fWin.innerWidth || (fDoc.documentElement && fDoc.documentElement.clientWidth) || 0;
+    var fVh = fWin.innerHeight || (fDoc.documentElement && fDoc.documentElement.clientHeight) || 0;
+    if (px < 0 || px >= fVw || py < 0 || py >= fVh) {
+      f.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      fb = frameTransform(f);
+      if (!fb.ok) return { ok: false, reason: fb.reason };
+      px = fb.ox + fb.sx * curX;
+      py = fb.oy + fb.sy * curY;
+      if (px < 0 || px >= fVw || py < 0 || py >= fVh) {
+        fWin.scrollBy(px - fVw / 2, py - fVh / 2);
+        fb = frameTransform(f);
+        if (!fb.ok) return { ok: false, reason: fb.reason };
+        px = fb.ox + fb.sx * curX;
+        py = fb.oy + fb.sy * curY;
+      }
+    }
+    curX = px;
+    curY = py;
+  }
+  return { ok: true, x: curX, y: curY };
 };
 "#;
 
@@ -2633,6 +3044,11 @@ struct BrowserSession {
     step_metadata: Option<Value>,
     /// Whether a browser step ran during the current interactive command.
     snapshot_pending: bool,
+    /// Page session id that already has `Emulation.setFocusEmulationEnabled(true)` set.
+    clipboard_focus_page: Option<String>,
+    /// Origins granted clipboard access during this session so `da session` can
+    /// restore permissions and focus emulation across detached CLI commands.
+    clipboard_origins: Vec<String>,
 }
 
 /// One element resolved from a target, held as a CDP DOM `objectId`.
@@ -2721,6 +3137,8 @@ impl BrowserSession {
             refs: snapshot::RefStore::default(),
             step_metadata: None,
             snapshot_pending: false,
+            clipboard_focus_page: None,
+            clipboard_origins: Vec::new(),
         })
     }
 
@@ -2760,6 +3178,8 @@ impl BrowserSession {
             refs: snapshot::RefStore::default(),
             step_metadata: None,
             snapshot_pending: false,
+            clipboard_focus_page: None,
+            clipboard_origins: Vec::new(),
         })
     }
 
@@ -2816,6 +3236,24 @@ impl BrowserSession {
         let mut tabs = tabs::Tabs::restored(&target_id, &parsed.tabs);
         tabs.enable_discovery(&mut connection, deadline)?;
         tabs.refresh(&mut connection, deadline)?;
+        let mut clipboard_focus_page = None;
+        if parsed.connect.is_none() && parsed.headless && !parsed.clipboard_origins.is_empty() {
+            let scope = PageScope {
+                target_id: tabs.current().to_string(),
+                session_id: page.clone(),
+            };
+            let mut dialog = DialogContext::fail_fast();
+            for origin in &parsed.clipboard_origins {
+                grant_clipboard_permissions(&mut connection, &scope, origin, deadline, &mut dialog)
+                    .map_err(|failure| {
+                        failure.describe("could not restore browser clipboard permissions")
+                    })?;
+            }
+            enable_focus_emulation(&mut connection, &scope, deadline, &mut dialog).map_err(
+                |failure| failure.describe("could not restore focus emulation for clipboard"),
+            )?;
+            clipboard_focus_page = Some(page.clone());
+        }
         let network = network::NetworkState::new(&page);
         Ok(Self {
             connection: Some(connection),
@@ -2835,6 +3273,8 @@ impl BrowserSession {
             refs: parsed.refs,
             step_metadata: None,
             snapshot_pending: false,
+            clipboard_focus_page,
+            clipboard_origins: parsed.clipboard_origins,
         })
     }
 
@@ -3525,11 +3965,37 @@ impl BrowserSession {
     ) -> Result<ActionableTarget, StepError> {
         let target_desc = format!("ref `{ref_id}`");
         let object_id = self.resolve_and_synthesize_ref(ref_id, deadline, dialog)?;
+        self.wait_located_actionable(&target_desc, object_id, deadline, dialog)
+    }
+
+    /// Resolves `ref_id` for one endpoint of `browser.drag`, returning its actionable
+    /// target together with the synthesized locator and fragility flag without overwriting `step_metadata`.
+    fn resolve_drag_ref_actionable(
+        &mut self,
+        ref_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<(ActionableTarget, Value, bool), StepError> {
+        let target_desc = format!("ref `{ref_id}`");
+        let (object_id, locator, fragile) =
+            self.resolve_ref_synthesized(ref_id, deadline, dialog)?;
+        let actionable = self.wait_located_actionable(&target_desc, object_id, deadline, dialog)?;
+        Ok((actionable, locator, fragile))
+    }
+
+    /// Waits for an already-resolved element `object_id` to become actionable within `deadline`.
+    fn wait_located_actionable(
+        &mut self,
+        target_desc: &str,
+        object_id: String,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<ActionableTarget, StepError> {
         let mut previous_rect: Option<ElementRect> = None;
         let mut last_reason = PendingReason::Hidden;
         loop {
             match self.inspect_actionable_once(
-                &target_desc,
+                target_desc,
                 object_id.clone(),
                 &mut previous_rect,
                 deadline,
@@ -3539,16 +4005,32 @@ impl BrowserSession {
                 Ok(Err(reason)) => {
                     last_reason = reason;
                     if deadline.passed() {
-                        return Err(pending_timeout_error(&target_desc, last_reason, deadline));
+                        return Err(pending_timeout_error(target_desc, last_reason, deadline));
                     }
                     std::thread::sleep(POLL_INTERVAL);
                 }
                 Err(LocateError::Timeout) => {
-                    return Err(pending_timeout_error(&target_desc, last_reason, deadline));
+                    return Err(pending_timeout_error(target_desc, last_reason, deadline));
                 }
                 Err(LocateError::Step(err)) => return Err(err),
             }
         }
+    }
+
+    fn resolve_ref_synthesized(
+        &mut self,
+        ref_id: &str,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<(String, Value, bool), StepError> {
+        let scope = self.scope();
+        let refs = self.refs.clone();
+        let (object_id, _) = {
+            let connection = self.connection_mut()?;
+            snapshot::resolve_ref_object_id(connection, &scope, &refs, ref_id, deadline, dialog)?
+        };
+        let synth = synthesis::synthesize_for_object(self, &object_id, deadline, dialog)?;
+        Ok((synth.object_id, synth.locator, synth.fragile))
     }
 
     fn resolve_and_synthesize_ref(
@@ -3557,19 +4039,14 @@ impl BrowserSession {
         deadline: Deadline,
         dialog: &mut DialogContext,
     ) -> Result<String, StepError> {
-        let scope = self.scope();
-        let refs = self.refs.clone();
-        let (object_id, _) = {
-            let connection = self.connection_mut()?;
-            snapshot::resolve_ref_object_id(connection, &scope, &refs, ref_id, deadline, dialog)?
-        };
-        let synth = synthesis::synthesize_for_object(self, &object_id, deadline, dialog)?;
+        let (object_id, locator, fragile) =
+            self.resolve_ref_synthesized(ref_id, deadline, dialog)?;
         self.step_metadata = Some(json!({
             "ref": ref_id,
-            "synthesized_locator": synth.locator,
-            "fragile": synth.fragile,
+            "synthesized_locator": locator,
+            "fragile": fragile,
         }));
-        Ok(synth.object_id)
+        Ok(object_id)
     }
 
     /// Shared polling loop for `locate_target` and `locate_actionable_target`.
@@ -4271,6 +4748,28 @@ impl BrowserSession {
         }
     }
 
+    /// Fails fast with `StepError::Environment` when the current owned tab is
+    /// already closed or a queued target/session termination event arrived.
+    fn ensure_target_ready(&self) -> Result<(), StepError> {
+        let Some(connection) = &self.connection else {
+            return Err(Self::no_connection_error());
+        };
+        if !self.tabs.is_current_alive() {
+            return Err(StepError::Environment(format!(
+                "the browser tab `{}` is already closed; open or switch to an active tab before running another step",
+                self.tabs.current()
+            )));
+        }
+        let scope = self.scope();
+        if connection.has_queued_matching(|event| scope.is_terminal(event)) {
+            return Err(StepError::Environment(format!(
+                "the browser target `{}` is no longer active (session or target already detached or destroyed)",
+                self.tabs.current()
+            )));
+        }
+        Ok(())
+    }
+
     /// Covers every editable field, captures a PNG and removes the covers.
     ///
     /// Cleanup runs after a failed capture as well; a browser that has already
@@ -4719,13 +5218,18 @@ struct PageFailure(Box<PageFailureDetail>);
 
 impl PageFailure {
     /// The underlying CDP error that ended the wait.
-    fn error(&self) -> &CdpError {
+    pub(super) fn error(&self) -> &CdpError {
         &self.0.error
     }
 
-    /// Whether a terminal target/session event ended the wait.
-    fn is_death(&self) -> bool {
-        matches!(self.0.error, CdpError::Aborted { .. })
+    /// Whether a terminal target/session event, dead socket, or dead-target CDP
+    /// error ended the wait.
+    pub(super) fn is_death(&self) -> bool {
+        match &self.0.error {
+            CdpError::Aborted { .. } | CdpError::Transport(_) => true,
+            CdpError::Method { message, .. } => is_target_death_method_message(message),
+            _ => false,
+        }
     }
 
     /// Whether the deadline passed before an answer arrived.
@@ -4762,12 +5266,23 @@ impl PageFailure {
 
     /// The step error for a failure the page caused: always an environment error,
     /// except an unhandled JavaScript dialog which is an execution error.
-    fn environment(self, prefix: &str) -> StepError {
+    pub(super) fn environment(self, prefix: &str) -> StepError {
         if let CdpError::Dialog(opened) = &self.0.error {
             return StepError::Execution(format_dialog_error(prefix, opened));
         }
         StepError::Environment(self.describe(prefix))
     }
+}
+
+/// Whether a CDP protocol error message proves the page target or CDP session is gone.
+fn is_target_death_method_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("session with given id not found")
+        || lower.contains("no target with given id")
+        || lower.contains("target closed")
+        || lower.contains("target has been closed")
+        || lower.contains("target crashed")
+        || lower.contains("not attached to an active page")
 }
 
 /// Formats an unhandled JavaScript dialog failure with type, message, and guidance.
@@ -4857,6 +5372,29 @@ fn page_call(
         .map_err(|error| scope.failure(connection, error))
 }
 
+/// Sends one browser-domain CDP command (`Browser.*`) while still watching for
+/// terminal target/session events and unhandled JavaScript dialogs on `scope`.
+fn browser_call(
+    connection: &mut Connection,
+    scope: &PageScope,
+    method: &str,
+    params: Value,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
+    connection
+        .call_until_with_dialog(
+            method,
+            params,
+            None,
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
+        .map_err(|error| scope.failure(connection, error))
+}
+
 /// Evaluates one expression on the page session.
 fn page_evaluate(
     connection: &mut Connection,
@@ -4870,6 +5408,28 @@ fn page_evaluate(
         .evaluate(
             &scope.session_id,
             expression,
+            deadline,
+            |event| scope.is_terminal(event),
+            Some(watch),
+        )
+        .map_err(|error| scope.failure(connection, error))
+}
+
+/// Evaluates one async expression on the page session (`awaitPromise: true`).
+fn page_evaluate_async(
+    connection: &mut Connection,
+    scope: &PageScope,
+    expression: &str,
+    user_gesture: bool,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, PageFailure> {
+    let watch = dialog.watch(&scope.session_id);
+    connection
+        .evaluate_async(
+            &scope.session_id,
+            expression,
+            user_gesture,
             deadline,
             |event| scope.is_terminal(event),
             Some(watch),
@@ -5484,6 +6044,9 @@ struct DetachedBrowserHandle {
     /// only `target_id`.
     #[serde(default)]
     tabs: Vec<String>,
+    /// Origins granted clipboard permissions in this session, re-applied across `da session` reattach.
+    #[serde(default)]
+    clipboard_origins: Vec<String>,
 }
 
 /// The tabs a handle lists, as one entry per owned target.
@@ -5841,6 +6404,7 @@ impl Session for BrowserSession {
             refs: self.refs.clone(),
             pending_local_storage_scripts: self.pending_local_storage_scripts.clone(),
             tabs: self.tabs.ids(),
+            clipboard_origins: self.clipboard_origins.clone(),
         };
         serde_json::to_value(handle)
             .map(Some)
@@ -5868,6 +6432,7 @@ impl Session for BrowserSession {
         max_depth: Option<usize>,
         max_nodes: Option<usize>,
     ) -> Result<Option<Value>, String> {
+        self.ensure_target_ready().map_err(step_error_text)?;
         let scope = self.scope();
         let existing_refs = self.refs.clone();
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
@@ -6732,6 +7297,242 @@ fn validate_switch_tab(args: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn check_scroll_deltas(delta_x: Option<f64>, delta_y: Option<f64>) -> Result<(bool, bool), String> {
+    for (name, val) in [("delta_x", delta_x), ("delta_y", delta_y)] {
+        if let Some(v) = val
+            && !v.is_finite()
+        {
+            return Err(format!(
+                "invalid arguments: `{name}` must be a finite number"
+            ));
+        }
+    }
+    let has_delta = delta_x.is_some() || delta_y.is_some();
+    let nonzero = delta_x.is_some_and(|v| v != 0.0) || delta_y.is_some_and(|v| v != 0.0);
+    if has_delta && !nonzero {
+        return Err(
+            "invalid arguments: `delta_x` or `delta_y` must be non-zero when scrolling by delta"
+                .to_string(),
+        );
+    }
+    Ok((has_delta, nonzero))
+}
+
+fn has_scroll_locator_field(args: &ScrollArgs) -> bool {
+    args.css.is_some()
+        || args.xpath.is_some()
+        || args.text.is_some()
+        || args.role.is_some()
+        || args.name.is_some()
+        || args.testid.is_some()
+        || args.within.is_some()
+        || args.nth.is_some()
+}
+
+fn validate_scroll(args: &Value) -> Result<(), String> {
+    let parsed: ScrollArgs = parse_for_validate(args)?;
+    check_timeout(parsed.timeout_ms)?;
+    let (has_delta, nonzero_delta) = check_scroll_deltas(parsed.delta_x, parsed.delta_y)?;
+    if parsed.into_view == Some(false) {
+        return Err(
+            "invalid arguments: `into_view` only accepts `true`; omit it to scroll by delta"
+                .to_string(),
+        );
+    }
+    if let Some(at) = &parsed.at {
+        check_at(
+            at,
+            &[
+                ("css", parsed.css.is_some()),
+                ("xpath", parsed.xpath.is_some()),
+                ("text", parsed.text.is_some()),
+                ("role", parsed.role.is_some()),
+                ("testid", parsed.testid.is_some()),
+                ("name", parsed.name.is_some()),
+                ("within", parsed.within.is_some()),
+                ("nth", parsed.nth.is_some()),
+                ("into_view", parsed.into_view.is_some()),
+            ],
+        )?;
+        if !has_delta || !nonzero_delta {
+            return Err(
+                "invalid arguments: `browser.scroll` with `at` requires a non-zero `delta_x` or `delta_y`"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if has_scroll_locator_field(&parsed) {
+        let locator = Locator::from_args(
+            &parsed.css,
+            &parsed.xpath,
+            &parsed.text,
+            &parsed.role,
+            &parsed.name,
+            &parsed.testid,
+        )?;
+        let _ = ElementTarget::from_parts(locator, parsed.within.as_deref(), parsed.nth)?;
+        if parsed.into_view == Some(true) && has_delta {
+            return Err(
+                "invalid arguments: `browser.scroll` cannot combine `into_view: true` with `delta_x` or `delta_y`"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if parsed.into_view.is_some() {
+        return Err(
+            "invalid arguments: `into_view` requires a target locator (`css`, `xpath`, `text`, `role`, or `testid`)"
+                .to_string(),
+        );
+    }
+    if !has_delta || !nonzero_delta {
+        return Err(
+            "invalid arguments: `browser.scroll` requires `delta_x` or `delta_y`, or a target locator"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_hover(args: &Value) -> Result<(), String> {
+    let parsed: HoverArgs = parse_for_validate(args)?;
+    check_timeout(parsed.timeout_ms)?;
+    if let Some(at) = &parsed.at {
+        return check_at(
+            at,
+            &[
+                ("css", parsed.css.is_some()),
+                ("xpath", parsed.xpath.is_some()),
+                ("text", parsed.text.is_some()),
+                ("role", parsed.role.is_some()),
+                ("testid", parsed.testid.is_some()),
+                ("name", parsed.name.is_some()),
+                ("within", parsed.within.is_some()),
+                ("nth", parsed.nth.is_some()),
+            ],
+        );
+    }
+    let locator = Locator::from_args(
+        &parsed.css,
+        &parsed.xpath,
+        &parsed.text,
+        &parsed.role,
+        &parsed.name,
+        &parsed.testid,
+    )?;
+    let _ = ElementTarget::from_parts(locator, parsed.within.as_deref(), parsed.nth)?;
+    Ok(())
+}
+
+fn validate_drag_endpoint(
+    endpoint: &DragEndpointArgs,
+    side: &str,
+    allow_ref: bool,
+) -> Result<(), String> {
+    if let Some(ref_id) = &endpoint.ref_id {
+        if !allow_ref {
+            return Err(format!(
+                "invalid arguments: `{side}.ref` is only available inside `da session`"
+            ));
+        }
+        check_ref_id(ref_id).map_err(|err| format!("{side}: {err}"))?;
+        for (field, present) in [
+            ("css", endpoint.css.is_some()),
+            ("xpath", endpoint.xpath.is_some()),
+            ("text", endpoint.text.is_some()),
+            ("role", endpoint.role.is_some()),
+            ("testid", endpoint.testid.is_some()),
+            ("name", endpoint.name.is_some()),
+            ("within", endpoint.within.is_some()),
+            ("nth", endpoint.nth.is_some()),
+            ("at", endpoint.at.is_some()),
+        ] {
+            if present {
+                return Err(format!(
+                    "invalid arguments: `{side}.ref` cannot be combined with `{side}.{field}`"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if let Some(at) = &endpoint.at {
+        return check_at(
+            at,
+            &[
+                ("css", endpoint.css.is_some()),
+                ("xpath", endpoint.xpath.is_some()),
+                ("text", endpoint.text.is_some()),
+                ("role", endpoint.role.is_some()),
+                ("testid", endpoint.testid.is_some()),
+                ("name", endpoint.name.is_some()),
+                ("within", endpoint.within.is_some()),
+                ("nth", endpoint.nth.is_some()),
+            ],
+        )
+        .map_err(|err| format!("{side}: {err}"));
+    }
+    let locator = Locator::from_args(
+        &endpoint.css,
+        &endpoint.xpath,
+        &endpoint.text,
+        &endpoint.role,
+        &endpoint.name,
+        &endpoint.testid,
+    )
+    .map_err(|err| format!("{side}: {err}"))?;
+    let _ = ElementTarget::from_parts(locator, endpoint.within.as_deref(), endpoint.nth)
+        .map_err(|err| format!("{side}: {err}"))?;
+    Ok(())
+}
+
+fn validate_drag(args: &Value) -> Result<(), String> {
+    let parsed: DragArgs = parse_for_validate(args)?;
+    check_timeout(parsed.timeout_ms)?;
+    validate_drag_endpoint(&parsed.from, "from", false)?;
+    validate_drag_endpoint(&parsed.to, "to", false)?;
+    Ok(())
+}
+
+fn drag_lint_warnings(args: &Value) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for side in ["from", "to"] {
+        if let Some(endpoint) = args.get(side) {
+            for warning in coordinate_lint_warnings(endpoint) {
+                warnings.push(format!("`{side}` {warning}"));
+            }
+        }
+    }
+    warnings
+}
+
+fn validate_set_clipboard(args: &Value) -> Result<(), String> {
+    let parsed: SetClipboardArgs = parse_for_validate(args)?;
+    check_timeout(parsed.timeout_ms)?;
+    Ok(())
+}
+
+fn validate_read_clipboard(args: &Value) -> Result<(), String> {
+    let parsed: ReadClipboardArgs = parse_for_validate(args)?;
+    check_timeout(parsed.timeout_ms)?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefScrollArgs {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    #[serde(default)]
+    delta_x: Option<f64>,
+    #[serde(default)]
+    delta_y: Option<f64>,
+    #[serde(default)]
+    into_view: Option<bool>,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RefClickWaitArgs {
@@ -6851,8 +7652,55 @@ fn validate_read_session(args: &Value) -> Result<(), String> {
     validate_read(args)
 }
 
-/// Returns the case's browser session or explains how to open one.
-fn session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
+fn validate_scroll_session(args: &Value) -> Result<(), String> {
+    if has_ref_field(args) {
+        let parsed: RefScrollArgs = parse_for_validate(args)?;
+        check_ref_id(&parsed.ref_id)?;
+        check_timeout(parsed.timeout_ms)?;
+        let (has_delta, _) = check_scroll_deltas(parsed.delta_x, parsed.delta_y)?;
+        if parsed.into_view == Some(false) {
+            return Err(
+                "invalid arguments: `into_view` only accepts `true`; omit it to scroll by delta"
+                    .to_string(),
+            );
+        }
+        if parsed.into_view == Some(true) && has_delta {
+            return Err(
+                "invalid arguments: `browser.scroll` cannot combine `into_view: true` with `delta_x` or `delta_y`"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    validate_scroll(args)
+}
+
+fn validate_hover_session(args: &Value) -> Result<(), String> {
+    if has_ref_field(args) {
+        let parsed: RefClickWaitArgs = parse_for_validate(args)?;
+        check_ref_id(&parsed.ref_id)?;
+        return check_timeout(parsed.timeout_ms);
+    }
+    validate_hover(args)
+}
+
+fn validate_drag_session(args: &Value) -> Result<(), String> {
+    let parsed: DragArgs = parse_for_validate(args)?;
+    check_timeout(parsed.timeout_ms)?;
+    validate_drag_endpoint(&parsed.from, "from", true)?;
+    validate_drag_endpoint(&parsed.to, "to", true)?;
+    if (parsed.from.ref_id.is_some() || parsed.to.ref_id.is_some()) && parsed.dialog.is_some() {
+        return Err(
+            "invalid arguments: `dialog` cannot be combined with `from.ref` or `to.ref` in `da session`"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Returns the raw open `BrowserSession` without verifying current tab liveness
+/// (used by `browser.switch_tab` when recovering away from a closed tab).
+fn raw_session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
     let browser = sessions
         .get::<BrowserSession>(SESSION_KIND)
         .map_err(StepError::Execution)?
@@ -6862,6 +7710,14 @@ fn session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
             )
         })?;
     browser.snapshot_pending = true;
+    Ok(browser)
+}
+
+/// Returns the case's browser session after ensuring its current tab target is
+/// alive and not already terminated by a queued event.
+fn session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
+    let browser = raw_session(sessions)?;
+    browser.ensure_target_ready()?;
     Ok(browser)
 }
 
@@ -6896,6 +7752,7 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         .map_err(StepError::Environment)?;
     if existing {
         session.ensure_same_options(&args, connect.as_ref())?;
+        session.ensure_target_ready()?;
         if let Some(attribute) = &args.testid_attribute {
             session.testid_attribute = attribute.clone();
         }
@@ -8097,8 +8954,1370 @@ fn run_switch_tab(args: &Value, sessions: &mut Sessions) -> Result<Value, StepEr
         index: args.index,
     };
     let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
-    let session = session(sessions)?;
+    let session = raw_session(sessions)?;
     session.switch_tab(&selector, deadline)
+}
+
+/// Waits two animation frames so scroll / wheel layout effects settle.
+fn flush_scroll_frames(
+    session: &mut BrowserSession,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(), StepError> {
+    let scope = session.scope();
+    let connection = session.connection_mut()?;
+    page_evaluate_async(
+        connection,
+        &scope,
+        "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+        false,
+        deadline,
+        dialog,
+    )
+    .map(|_| ())
+    .map_err(|failure| failure.step("could not settle scroll state", timeout_or_execution))
+}
+
+/// JavaScript capturing the current scroll offsets across the top document,
+/// accessible same-origin iframes, open shadow roots, and scrollable elements.
+const SCROLL_SNAPSHOT_SCRIPT: &str = r#"(function () {
+  var entries = [];
+  var visitedDocs = [];
+  var num = function (v) {
+    var n = Number(v);
+    return isFinite(n) ? n : 0;
+  };
+  var nodeId = function (el) {
+    if (!el || typeof el.getAttribute !== 'function') return '';
+    var raw = el.getAttribute('id');
+    return raw ? String(raw) : '';
+  };
+  var describeNode = function (el) {
+    if (!el || el.nodeType !== 1) return 'element';
+    var tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+    var id = nodeId(el);
+    if (id) return tag + '#' + id;
+    var tid = typeof el.getAttribute === 'function' ? el.getAttribute('data-testid') : '';
+    if (tid) return tag + '[data-testid=' + JSON.stringify(String(tid)) + ']';
+    var cls = '';
+    if (typeof el.className === 'string' && el.className.trim()) {
+      var parts = el.className.trim().split(/\s+/).slice(0, 2);
+      if (parts.length > 0) cls = '.' + parts.join('.');
+    }
+    return tag + cls;
+  };
+  var canScrollAxis = function (overflow) {
+    return overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay' || overflow === 'hidden';
+  };
+  var walkRoot = function (root, doc, win, keyPrefix, scopeParts) {
+    if (!root) return;
+    var kids = root.children;
+    if (!kids) return;
+    var idCounts = Object.create(null);
+    var tagCounts = Object.create(null);
+    var se = doc.scrollingElement;
+    for (var i = 0; i < kids.length; i++) {
+      var child = kids[i];
+      var cid = nodeId(child);
+      var seg;
+      if (cid) {
+        var cIdx = idCounts[cid] || 0;
+        idCounts[cid] = cIdx + 1;
+        seg = '#' + cid + (cIdx > 0 ? '[' + cIdx + ']' : '');
+      } else {
+        var cTag = child.tagName ? child.tagName.toLowerCase() : 'el';
+        var tIdx = tagCounts[cTag] || 0;
+        tagCounts[cTag] = tIdx + 1;
+        seg = cTag + '[' + tIdx + ']';
+      }
+      var childKey = keyPrefix + '/' + seg;
+      if (child !== se) {
+        var sx = num(child.scrollLeft);
+        var sy = num(child.scrollTop);
+        var sh = num(child.scrollHeight);
+        var ch = num(child.clientHeight);
+        var sw = num(child.scrollWidth);
+        var cw = num(child.clientWidth);
+        var track = sx !== 0 || sy !== 0;
+        if (!track && (sh > ch || sw > cw)) {
+          var cs = win ? win.getComputedStyle(child) : null;
+          if (cs && (
+            (sh > ch && canScrollAxis(cs.overflowY)) ||
+            (sw > cw && canScrollAxis(cs.overflowX))
+          )) {
+            track = true;
+          }
+        }
+        if (track) {
+          var label = describeNode(child);
+          if (scopeParts.length > 0) {
+            label += ' (in ' + scopeParts.join(' > ') + ')';
+          }
+          entries.push({
+            key: childKey,
+            label: label,
+            x: sx,
+            y: sy
+          });
+        }
+      }
+      if (child.shadowRoot) {
+        var nextScope = scopeParts.concat(['shadow root of ' + describeNode(child)]);
+        walkRoot(child.shadowRoot, doc, win, childKey + '/::shadow', nextScope);
+      }
+      var tag = child.tagName ? child.tagName.toUpperCase() : '';
+      if (tag === 'IFRAME' || tag === 'FRAME') {
+        var subDoc = null;
+        try {
+          subDoc = child.contentDocument;
+        } catch (e) {
+          subDoc = null;
+        }
+        if (subDoc && visitedDocs.indexOf(subDoc) === -1) {
+          var frameScope = scopeParts.concat([describeNode(child)]);
+          walkDoc(subDoc, childKey + '/::frame', frameScope);
+        }
+      }
+      walkRoot(child, doc, win, childKey, scopeParts);
+    }
+  };
+  var walkDoc = function (doc, docKey, scopeParts) {
+    if (!doc || visitedDocs.indexOf(doc) !== -1) return;
+    visitedDocs.push(doc);
+    var win = doc.defaultView || null;
+    var se = doc.scrollingElement;
+    var vx = num(win && typeof win.scrollX === 'number' ? win.scrollX : (se ? se.scrollLeft : 0));
+    var vy = num(win && typeof win.scrollY === 'number' ? win.scrollY : (se ? se.scrollTop : 0));
+    entries.push({
+      key: docKey,
+      label: scopeParts.length === 0 ? 'the page' : scopeParts.join(' > '),
+      x: vx,
+      y: vy
+    });
+    if (doc.documentElement) {
+      walkRoot(doc.documentElement, doc, win, docKey, scopeParts);
+    }
+  };
+  walkDoc(document, 'doc', []);
+  return entries;
+})()"#;
+
+/// One scroll container entry captured by [`SCROLL_SNAPSHOT_SCRIPT`].
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct ScrollEntry {
+    key: String,
+    label: String,
+    x: f64,
+    y: f64,
+}
+
+/// Snapshot of scroll offsets across the page, same-origin iframes, and open shadow roots.
+#[derive(Clone, Debug, PartialEq)]
+struct ScrollSnapshot {
+    entries: Vec<ScrollEntry>,
+}
+
+/// One container whose scroll offset moved beyond the subpixel tolerance.
+#[derive(Clone, Debug, PartialEq)]
+struct ScrollChange {
+    label: String,
+    from: (f64, f64),
+    to: (f64, f64),
+}
+
+/// Captures scroll offsets across the top document, accessible iframes,
+/// open shadow roots, and scrollable ancestor containers.
+fn read_drag_scroll_snapshot(
+    session: &mut BrowserSession,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<ScrollSnapshot, StepError> {
+    let scope = session.scope();
+    let value = page_evaluate(
+        session.connection_mut()?,
+        &scope,
+        SCROLL_SNAPSHOT_SCRIPT,
+        deadline,
+        dialog,
+    )
+    .map_err(|failure| failure.step("could not read the scroll state", timeout_or_execution))?;
+    let entries: Vec<ScrollEntry> = serde_json::from_value(value).map_err(|error| {
+        StepError::Environment(format!(
+            "the browser returned an invalid scroll snapshot: {error}"
+        ))
+    })?;
+    Ok(ScrollSnapshot { entries })
+}
+
+/// Returns every scroll container whose `(x, y)` moved by more than `0.5` px
+/// between `before` and `after`.
+fn diff_scroll_snapshots(before: &ScrollSnapshot, after: &ScrollSnapshot) -> Vec<ScrollChange> {
+    let before_map: BTreeMap<&str, &ScrollEntry> = before
+        .entries
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry))
+        .collect();
+    let mut changes = Vec::new();
+    for entry in &after.entries {
+        let from = before_map
+            .get(entry.key.as_str())
+            .map_or((0.0, 0.0), |prev| (prev.x, prev.y));
+        let to = (entry.x, entry.y);
+        if (to.0 - from.0).abs() > 0.5 || (to.1 - from.1).abs() > 0.5 {
+            changes.push(ScrollChange {
+                label: entry.label.clone(),
+                from,
+                to,
+            });
+        }
+    }
+    changes
+}
+
+/// Formats the fail-closed error when resolving one endpoint of a mixed `at` +
+/// locator drag scrolled the page or an inner container.
+fn format_mixed_drag_scroll_error(
+    from_desc: &str,
+    to_desc: &str,
+    resolved_desc: &str,
+    at_side: &str,
+    changes: &[ScrollChange],
+) -> String {
+    let details: Vec<String> = changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{} from ({}, {}) to ({}, {})",
+                change.label,
+                coordinate_number(change.from.0),
+                coordinate_number(change.from.1),
+                coordinate_number(change.to.0),
+                coordinate_number(change.to.1),
+            )
+        })
+        .collect();
+    format!(
+        "cannot drag from {from_desc} to {to_desc}: resolving {resolved_desc} scrolled {}, invalidating the fixed `{at_side}.at` viewport coordinates; scroll first with `browser.scroll` or use deterministic locators for both endpoints",
+        details.join(" and "),
+    )
+}
+
+/// Fails closed when resolving one endpoint of a mixed `at` + located drag
+/// scrolled the page or any container between `before` and `after`.
+fn check_mixed_drag_scroll(
+    from_desc: &str,
+    to_desc: &str,
+    resolved_desc: &str,
+    at_side: &str,
+    before: Option<&ScrollSnapshot>,
+    after: Option<&ScrollSnapshot>,
+) -> Result<(), StepError> {
+    if let (Some(before), Some(after)) = (before, after) {
+        let changes = diff_scroll_snapshots(before, after);
+        if !changes.is_empty() {
+            return Err(StepError::Execution(format_mixed_drag_scroll_error(
+                from_desc,
+                to_desc,
+                resolved_desc,
+                at_side,
+                &changes,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_window_scroll(
+    session: &mut BrowserSession,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(f64, f64), StepError> {
+    let scope = session.scope();
+    let value = page_evaluate(
+        session.connection_mut()?,
+        &scope,
+        "({ x: window.scrollX || 0, y: window.scrollY || 0 })",
+        deadline,
+        dialog,
+    )
+    .map_err(|failure| {
+        failure.step(
+            "could not read the window scroll position",
+            timeout_or_execution,
+        )
+    })?;
+    let sx = value.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+    let sy = value.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    Ok((sx, sy))
+}
+
+fn dispatch_mouse_move(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    action: &str,
+    point: (f64, f64),
+    buttons: u64,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(), StepError> {
+    let mut params = json!({
+        "type": "mouseMoved",
+        "x": point.0,
+        "y": point.1,
+        "buttons": buttons,
+    });
+    if buttons != 0 {
+        params["button"] = json!("left");
+    }
+    session.dispatch(
+        target_desc,
+        "Input.dispatchMouseEvent",
+        params,
+        action,
+        deadline,
+        dialog,
+    )
+}
+
+/// Scrolls any enclosing same-origin frames into view when the local point `(px, py)`
+/// lies outside that frame's viewport. `collectEnclosingFrames` returns
+/// `[outermost, ..., innermost]`, so local coordinates transform outward from
+/// `frames.length - 1` down to `0` (matching `mapLocalPointToViewport`).
+const SCROLL_ENCLOSING_FRAMES_JS: &str = r#"var scrollEnclosingFrames = function (target, px, py) {
+  var frames = collectEnclosingFrames(target);
+  if (!frames) return;
+  var curX = px;
+  var curY = py;
+  for (var i = frames.length - 1; i >= 0; i--) {
+    var f = frames[i];
+    var fDoc = f.ownerDocument || document;
+    var fWin = fDoc.defaultView || window;
+    var fb = frameTransform(f);
+    if (!fb || !fb.ok) return;
+    var nextX = fb.ox + fb.sx * curX;
+    var nextY = fb.oy + fb.sy * curY;
+    var fVw = fWin.innerWidth || (fDoc.documentElement && fDoc.documentElement.clientWidth) || 0;
+    var fVh = fWin.innerHeight || (fDoc.documentElement && fDoc.documentElement.clientHeight) || 0;
+    if (nextX < 0 || nextX >= fVw || nextY < 0 || nextY >= fVh) {
+      f.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      var fbAfter = frameTransform(f);
+      if (fbAfter && fbAfter.ok) {
+        nextX = fbAfter.ox + fbAfter.sx * curX;
+        nextY = fbAfter.oy + fbAfter.sy * curY;
+      }
+      if (nextX < 0 || nextX >= fVw || nextY < 0 || nextY >= fVh) {
+        fWin.scrollBy(nextX - fVw / 2, nextY - fVh / 2);
+        var fbScrolled = frameTransform(f);
+        if (fbScrolled && fbScrolled.ok) {
+          nextX = fbScrolled.ox + fbScrolled.sx * curX;
+          nextY = fbScrolled.oy + fbScrolled.sy * curY;
+        }
+      }
+    }
+    curX = nextX;
+    curY = nextY;
+  }
+};"#;
+
+fn scroll_located(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    located: Located,
+    delta_x: Option<f64>,
+    delta_y: Option<f64>,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
+    let helpers = FRAME_HELPERS_JS.as_str();
+    let frame_scroll_helper = SCROLL_ENCLOSING_FRAMES_JS;
+    if delta_x.is_none() && delta_y.is_none() {
+        let into_view_fn = format!(
+            r#"{helpers}
+{frame_scroll_helper}
+if (!el || !el.isConnected) return {{ ok: false }};
+el.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }});
+var rect = el.getBoundingClientRect();
+scrollEnclosingFrames(el, rect.left + rect.width / 2, rect.top + rect.height / 2);
+return {{ ok: true }};"#
+        );
+        let outcome = session.run_on(
+            target_desc,
+            &located,
+            &into_view_fn,
+            "scroll into view",
+            deadline,
+            dialog,
+        )?;
+        if !outcome.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(StepError::Execution(format!(
+                "{target_desc} became detached before scrolling into view"
+            )));
+        }
+        flush_scroll_frames(session, deadline, dialog)?;
+        let (sx, sy) = read_window_scroll(session, deadline, dialog)?;
+        return Ok(attach_dialog(
+            json!({
+                "scrolled": true,
+                "into_view": true,
+                "scroll_x": coordinate_number(sx),
+                "scroll_y": coordinate_number(sy),
+            }),
+            dialog,
+        ));
+    }
+
+    let dx = delta_x.unwrap_or(0.0);
+    let dy = delta_y.unwrap_or(0.0);
+    let container_fn = format!(
+        r#"{helpers}
+{frame_scroll_helper}
+if (!el || !el.isConnected) return {{ status: 'detached' }};
+var doc = el.ownerDocument || document;
+var win = doc.defaultView || window;
+var cs = win.getComputedStyle(el);
+var isRoot = el === doc.documentElement || el === doc.body;
+var canScrollY = (cs.overflowY === 'auto' || cs.overflowY === 'scroll' || cs.overflowY === 'overlay') && el.scrollHeight > el.clientHeight;
+var canScrollX = (cs.overflowX === 'auto' || cs.overflowX === 'scroll' || cs.overflowX === 'overlay') && el.scrollWidth > el.clientWidth;
+if (isRoot || canScrollX || canScrollY) {{
+  if (isRoot) {{
+    win.scrollBy({{ left: {dx}, top: {dy}, behavior: 'instant' }});
+  }} else if (typeof el.scrollBy === 'function') {{
+    el.scrollBy({{ left: {dx}, top: {dy}, behavior: 'instant' }});
+  }} else {{
+    el.scrollLeft += {dx};
+    el.scrollTop += {dy};
+  }}
+  return {{
+    status: 'scrolled',
+    scroll_left: Number(el.scrollLeft || 0),
+    scroll_top: Number(el.scrollTop || 0),
+  }};
+}}
+var clipVisibleRect = function (target) {{
+  var r = target.getBoundingClientRect();
+  var vW = win.innerWidth || (doc.documentElement && doc.documentElement.clientWidth) || 0;
+  var vH = win.innerHeight || (doc.documentElement && doc.documentElement.clientHeight) || 0;
+  var left = Math.max(0, r.left), top = Math.max(0, r.top);
+  var right = Math.min(vW, r.right), bottom = Math.min(vH, r.bottom);
+  var isFixed = cs.position === 'fixed';
+  var anc = target.parentElement || (target.getRootNode && target.getRootNode().host) || null;
+  while (anc && anc !== doc.documentElement && anc !== doc.body) {{
+    var acs = win.getComputedStyle(anc);
+    var clipsFixed = acs.transform !== 'none' || acs.filter !== 'none' || acs.perspective !== 'none' || (acs.contain && acs.contain !== 'none');
+    if (isFixed && clipsFixed) isFixed = false;
+    if (!isFixed) {{
+      var ox = acs.overflowX, oy = acs.overflowY;
+      if (ox !== 'visible' || oy !== 'visible') {{
+        var ar = anc.getBoundingClientRect();
+        if (ox !== 'visible') {{
+          var aLeft = ar.left + (anc.clientLeft || 0);
+          var aW = typeof anc.clientWidth === 'number' ? anc.clientWidth : ar.width;
+          left = Math.max(left, aLeft);
+          right = Math.min(right, aLeft + aW);
+        }}
+        if (oy !== 'visible') {{
+          var aTop = ar.top + (anc.clientTop || 0);
+          var aH = typeof anc.clientHeight === 'number' ? anc.clientHeight : ar.height;
+          top = Math.max(top, aTop);
+          bottom = Math.min(bottom, aTop + aH);
+        }}
+      }}
+    }}
+    if (acs.position === 'fixed') isFixed = true;
+    anc = anc.parentElement || (anc.getRootNode && anc.getRootNode().host) || null;
+  }}
+  return {{ rect: r, left: left, top: top, right: right, bottom: bottom }};
+}};
+var vis = clipVisibleRect(el);
+if (vis.left >= vis.right || vis.top >= vis.bottom) {{
+  el.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }});
+  vis = clipVisibleRect(el);
+}}
+var cx = vis.left < vis.right ? (vis.left + vis.right) / 2 : vis.rect.left + vis.rect.width / 2;
+var cy = vis.top < vis.bottom ? (vis.top + vis.bottom) / 2 : vis.rect.top + vis.rect.height / 2;
+scrollEnclosingFrames(el, cx, cy);
+var mapped = mapLocalPointToViewport(el, cx, cy);
+if (!mapped || !mapped.ok) return {{ status: 'unmappable', reason: mapped ? mapped.reason : 'could not map target' }};
+return {{ status: 'wheel', x: mapped.x, y: mapped.y }};"#
+    );
+    let outcome = session.run_on(
+        target_desc,
+        &located,
+        &container_fn,
+        "scroll",
+        deadline,
+        dialog,
+    )?;
+    match outcome.get("status").and_then(Value::as_str) {
+        Some("scrolled") => {
+            flush_scroll_frames(session, deadline, dialog)?;
+            let (sx, sy) = read_window_scroll(session, deadline, dialog)?;
+            let left = outcome
+                .get("scroll_left")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let top = outcome
+                .get("scroll_top")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            Ok(attach_dialog(
+                json!({
+                    "scrolled": true,
+                    "scroll_left": coordinate_number(left),
+                    "scroll_top": coordinate_number(top),
+                    "scroll_x": coordinate_number(sx),
+                    "scroll_y": coordinate_number(sy),
+                }),
+                dialog,
+            ))
+        }
+        Some("wheel") => {
+            let x = outcome.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+            let y = outcome.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+            dispatch_mouse_move(session, target_desc, "scroll", (x, y), 0, deadline, dialog)?;
+            session.dispatch(
+                target_desc,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseWheel",
+                    "x": x,
+                    "y": y,
+                    "deltaX": dx,
+                    "deltaY": dy,
+                }),
+                "scroll",
+                deadline,
+                dialog,
+            )?;
+            flush_scroll_frames(session, deadline, dialog)?;
+            let (sx, sy) = read_window_scroll(session, deadline, dialog)?;
+            Ok(attach_dialog(
+                json!({
+                    "scrolled": true,
+                    "scroll_x": coordinate_number(sx),
+                    "scroll_y": coordinate_number(sy),
+                }),
+                dialog,
+            ))
+        }
+        Some("unmappable") => Err(StepError::Execution(format!(
+            "could not scroll {target_desc}: {}",
+            outcome
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("transform could not be mapped")
+        ))),
+        _ => Err(StepError::Execution(format!(
+            "{target_desc} became detached before scrolling"
+        ))),
+    }
+}
+
+fn run_scroll(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    if has_ref_field(args) {
+        if !sessions.is_interactive() {
+            return Err(StepError::InvalidArguments(
+                "invalid arguments: `ref` is only available inside `da session`".to_string(),
+            ));
+        }
+        validate_scroll_session(args).map_err(StepError::InvalidArguments)?;
+        let parsed: RefScrollArgs = parse(args)?;
+        let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+        let mut dialog = DialogContext::fail_fast();
+        let session = session(sessions)?;
+        let target_desc = format!("ref `{}`", parsed.ref_id);
+        let located = session.locate_ref_visible(&parsed.ref_id, deadline, &mut dialog)?;
+        return scroll_located(
+            session,
+            &target_desc,
+            located,
+            parsed.delta_x,
+            parsed.delta_y,
+            deadline,
+            &mut dialog,
+        );
+    }
+
+    validate_scroll(args).map_err(StepError::InvalidArguments)?;
+    let args: ScrollArgs = parse(args)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
+
+    if let Some(at) = &args.at {
+        let session = session(sessions)?;
+        let (width, height) = resolve_coordinates(session, at, deadline, &mut dialog)?;
+        let target_desc = coordinate_target(at);
+        let dx = args.delta_x.unwrap_or(0.0);
+        let dy = args.delta_y.unwrap_or(0.0);
+        dispatch_mouse_move(
+            session,
+            &target_desc,
+            "scroll",
+            (at.x, at.y),
+            0,
+            deadline,
+            &mut dialog,
+        )?;
+        session.dispatch(
+            &target_desc,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseWheel",
+                "x": at.x,
+                "y": at.y,
+                "deltaX": dx,
+                "deltaY": dy,
+            }),
+            "scroll",
+            deadline,
+            &mut dialog,
+        )?;
+        flush_scroll_frames(session, deadline, &mut dialog)?;
+        let (sx, sy) = read_window_scroll(session, deadline, &mut dialog)?;
+        let mut result = coordinate_result(at, width, height);
+        result["scrolled"] = json!(true);
+        result["scroll_x"] = coordinate_number(sx);
+        result["scroll_y"] = coordinate_number(sy);
+        return Ok(attach_dialog(result, &mut dialog));
+    }
+
+    if has_scroll_locator_field(&args) {
+        let locator = Locator::from_args(
+            &args.css,
+            &args.xpath,
+            &args.text,
+            &args.role,
+            &args.name,
+            &args.testid,
+        )
+        .map_err(StepError::InvalidArguments)?;
+        let target = ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
+            .map_err(StepError::InvalidArguments)?;
+        let session = session(sessions)?;
+        let target_desc = target.describe_with(&session.testid_attribute);
+        let located = session.locate_target(&target, deadline, &mut dialog)?;
+        return scroll_located(
+            session,
+            &target_desc,
+            located,
+            args.delta_x,
+            args.delta_y,
+            deadline,
+            &mut dialog,
+        );
+    }
+
+    let dx = args.delta_x.unwrap_or(0.0);
+    let dy = args.delta_y.unwrap_or(0.0);
+    let session = session(sessions)?;
+    {
+        let scope = session.scope();
+        let connection = session.connection_mut()?;
+        page_evaluate(
+            connection,
+            &scope,
+            &format!("window.scrollBy({{ left: {dx}, top: {dy}, behavior: 'instant' }})"),
+            deadline,
+            &mut dialog,
+        )
+        .map_err(|failure| failure.step("could not scroll the viewport", timeout_or_execution))?;
+    }
+    flush_scroll_frames(session, deadline, &mut dialog)?;
+    let (sx, sy) = read_window_scroll(session, deadline, &mut dialog)?;
+    Ok(attach_dialog(
+        json!({
+            "scrolled": true,
+            "scroll_x": coordinate_number(sx),
+            "scroll_y": coordinate_number(sy),
+        }),
+        &mut dialog,
+    ))
+}
+
+fn hover_actionable(
+    session: &mut BrowserSession,
+    target_desc: &str,
+    actionable: ActionableTarget,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Value, StepError> {
+    let located = actionable.located;
+    dispatch_mouse_move(
+        session,
+        target_desc,
+        "hover",
+        (actionable.x, actionable.y),
+        0,
+        deadline,
+        dialog,
+    )?;
+    flush_scroll_frames(session, deadline, dialog)?;
+    let text = match session.run_on(
+        target_desc,
+        &located,
+        TEXT_BODY,
+        "read the text of",
+        deadline,
+        dialog,
+    ) {
+        Ok(value) => value.as_str().map(str::to_string),
+        Err(error) if dialog.is_fail_fast_triggered() => return Err(error),
+        Err(_) => None,
+    };
+    let mut result = json!({ "hovered": true });
+    if let Some(text) = text
+        && !text.trim().is_empty()
+    {
+        result["text"] = json!(text.trim());
+    }
+    Ok(attach_dialog(result, dialog))
+}
+
+fn run_hover(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    if has_ref_field(args) {
+        if !sessions.is_interactive() {
+            return Err(StepError::InvalidArguments(
+                "invalid arguments: `ref` is only available inside `da session`".to_string(),
+            ));
+        }
+        validate_hover_session(args).map_err(StepError::InvalidArguments)?;
+        let parsed: RefClickWaitArgs = parse(args)?;
+        let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+        let mut dialog = DialogContext::fail_fast();
+        let session = session(sessions)?;
+        let target_desc = format!("ref `{}`", parsed.ref_id);
+        let actionable = session.locate_ref_actionable(&parsed.ref_id, deadline, &mut dialog)?;
+        return hover_actionable(session, &target_desc, actionable, deadline, &mut dialog);
+    }
+
+    validate_hover(args).map_err(StepError::InvalidArguments)?;
+    let args: HoverArgs = parse(args)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
+    if let Some(at) = &args.at {
+        let session = session(sessions)?;
+        let (width, height) = resolve_coordinates(session, at, deadline, &mut dialog)?;
+        let target_desc = coordinate_target(at);
+        dispatch_mouse_move(
+            session,
+            &target_desc,
+            "hover",
+            (at.x, at.y),
+            0,
+            deadline,
+            &mut dialog,
+        )?;
+        flush_scroll_frames(session, deadline, &mut dialog)?;
+        let mut result = coordinate_result(at, width, height);
+        result["hovered"] = json!(true);
+        return Ok(attach_dialog(result, &mut dialog));
+    }
+
+    let locator = Locator::from_args(
+        &args.css,
+        &args.xpath,
+        &args.text,
+        &args.role,
+        &args.name,
+        &args.testid,
+    )
+    .map_err(StepError::InvalidArguments)?;
+    let target = ElementTarget::from_parts(locator, args.within.as_deref(), args.nth)
+        .map_err(StepError::InvalidArguments)?;
+    let session = session(sessions)?;
+    let target_desc = target.describe_with(&session.testid_attribute);
+    let actionable = session.locate_actionable_target(&target, deadline, &mut dialog)?;
+    hover_actionable(session, &target_desc, actionable, deadline, &mut dialog)
+}
+
+#[derive(Default)]
+struct DragEndpointSynth {
+    locator: Option<Value>,
+    ref_id: Option<String>,
+    fragile: bool,
+    viewport: Option<(u32, u32)>,
+}
+
+struct ResolvedDragEndpoint {
+    desc: String,
+    located: Option<Located>,
+    x: f64,
+    y: f64,
+    synth: DragEndpointSynth,
+}
+
+fn update_drag_metadata(
+    session: &mut BrowserSession,
+    from: &DragEndpointSynth,
+    to: &DragEndpointSynth,
+) {
+    let has_any = from.ref_id.is_some()
+        || to.ref_id.is_some()
+        || from.viewport.is_some()
+        || to.viewport.is_some();
+    if !has_any {
+        return;
+    }
+    let mut synth = serde_json::Map::new();
+    if let Some(ref_id) = &from.ref_id {
+        synth.insert("from_ref".to_string(), json!(ref_id));
+    }
+    if let Some(locator) = &from.locator {
+        synth.insert("from".to_string(), locator.clone());
+        synth.insert("from_fragile".to_string(), json!(from.fragile));
+    }
+    if let Some(ref_id) = &to.ref_id {
+        synth.insert("to_ref".to_string(), json!(ref_id));
+    }
+    if let Some(locator) = &to.locator {
+        synth.insert("to".to_string(), locator.clone());
+        synth.insert("to_fragile".to_string(), json!(to.fragile));
+    }
+    if let Some((w, h)) = from.viewport.or(to.viewport) {
+        synth.insert("viewport".to_string(), json!({ "width": w, "height": h }));
+    }
+    let combined_ref = match (&from.ref_id, &to.ref_id) {
+        (Some(a), Some(b)) => Some(format!("{a}/{b}")),
+        (Some(a), None) => Some(a.clone()),
+        (None, Some(b)) => Some(b.clone()),
+        (None, None) => None,
+    };
+    let mut meta = serde_json::Map::new();
+    if let Some(r) = combined_ref {
+        meta.insert("ref".to_string(), json!(r));
+    }
+    meta.insert("fragile".to_string(), json!(from.fragile || to.fragile));
+    meta.insert("synthesized_locator".to_string(), Value::Object(synth));
+    session.step_metadata = Some(Value::Object(meta));
+}
+
+fn resolve_drag_endpoint(
+    session: &mut BrowserSession,
+    endpoint: &DragEndpointArgs,
+    side: &str,
+    interactive: bool,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<ResolvedDragEndpoint, StepError> {
+    if let Some(ref_id) = &endpoint.ref_id {
+        if !interactive {
+            return Err(StepError::InvalidArguments(format!(
+                "invalid arguments: `{side}.ref` is only available inside `da session`"
+            )));
+        }
+        let desc = format!("{side} ref `{ref_id}`");
+        let (actionable, locator, fragile) =
+            session.resolve_drag_ref_actionable(ref_id, deadline, dialog)?;
+        return Ok(ResolvedDragEndpoint {
+            desc,
+            located: Some(actionable.located),
+            x: actionable.x,
+            y: actionable.y,
+            synth: DragEndpointSynth {
+                locator: Some(locator),
+                ref_id: Some(ref_id.clone()),
+                fragile,
+                viewport: None,
+            },
+        });
+    }
+    if let Some(at) = &endpoint.at {
+        let (width, height) = resolve_coordinates(session, at, deadline, dialog)?;
+        return Ok(ResolvedDragEndpoint {
+            desc: format!("{side} {}", coordinate_target(at)),
+            located: None,
+            x: at.x,
+            y: at.y,
+            synth: DragEndpointSynth {
+                viewport: Some((width, height)),
+                ..DragEndpointSynth::default()
+            },
+        });
+    }
+    let locator = Locator::from_args(
+        &endpoint.css,
+        &endpoint.xpath,
+        &endpoint.text,
+        &endpoint.role,
+        &endpoint.name,
+        &endpoint.testid,
+    )
+    .map_err(|err| StepError::InvalidArguments(format!("{side}: {err}")))?;
+    let target = ElementTarget::from_parts(locator, endpoint.within.as_deref(), endpoint.nth)
+        .map_err(|err| StepError::InvalidArguments(format!("{side}: {err}")))?;
+    let desc = format!("{side} {}", target.describe_with(&session.testid_attribute));
+    let actionable = session.locate_actionable_target(&target, deadline, dialog)?;
+    Ok(ResolvedDragEndpoint {
+        desc,
+        located: Some(actionable.located),
+        x: actionable.x,
+        y: actionable.y,
+        synth: DragEndpointSynth::default(),
+    })
+}
+
+fn poll_drag_intercepted(session: &mut BrowserSession) -> Result<Option<Value>, StepError> {
+    let connection = session.connection_mut()?;
+    let _ = connection.poll_messages();
+    match connection.take_queued_method("Input.dragIntercepted") {
+        Some(event) => Ok(Some(event)),
+        None => {
+            std::thread::sleep(Duration::from_millis(12));
+            let _ = connection.poll_messages();
+            Ok(connection.take_queued_method("Input.dragIntercepted"))
+        }
+    }
+}
+
+fn dispatch_drag_gesture(
+    session: &mut BrowserSession,
+    from: &ResolvedDragEndpoint,
+    to: &mut ResolvedDragEndpoint,
+    mid_drag_to: Option<Located>,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(), StepError> {
+    session.dispatch(
+        &from.desc,
+        "Input.setInterceptDrags",
+        json!({ "enabled": true }),
+        "enable drag interception for",
+        deadline,
+        dialog,
+    )?;
+
+    let inner_result: Result<(), StepError> = (|| {
+        dispatch_mouse_move(
+            session,
+            &from.desc,
+            "drag",
+            (from.x, from.y),
+            0,
+            deadline,
+            dialog,
+        )?;
+        session.dispatch(
+            &from.desc,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mousePressed",
+                "x": from.x,
+                "y": from.y,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+            }),
+            "press",
+            deadline,
+            dialog,
+        )?;
+
+        let mut intercepted = None;
+        if let Some(to_loc) = mid_drag_to {
+            // Kick off pointer motion across Chromium's drag threshold while `from`
+            // is still under the pointer, then bring the offscreen target into view.
+            let nudge_y = if from.y > 24.0 {
+                from.y - 12.0
+            } else {
+                from.y + 12.0
+            };
+            const INIT_STEPS: u32 = 3;
+            for step in 1..=INIT_STEPS {
+                let ratio = f64::from(step) / f64::from(INIT_STEPS);
+                let yi = from.y + (nudge_y - from.y) * ratio;
+                dispatch_mouse_move(
+                    session,
+                    &from.desc,
+                    "drag",
+                    (from.x, yi),
+                    1,
+                    deadline,
+                    dialog,
+                )?;
+                std::thread::sleep(Duration::from_millis(6));
+            }
+            intercepted = poll_drag_intercepted(session)?;
+
+            let refreshed_to =
+                session.wait_located_actionable(&to.desc, to_loc.0, deadline, dialog)?;
+            to.x = refreshed_to.x;
+            to.y = refreshed_to.y;
+
+            const REM_STEPS: u32 = 7;
+            for step in 1..=REM_STEPS {
+                let ratio = f64::from(step) / f64::from(REM_STEPS);
+                let xi = from.x + (to.x - from.x) * ratio;
+                let yi = nudge_y + (to.y - nudge_y) * ratio;
+                dispatch_mouse_move(session, &to.desc, "drag", (xi, yi), 1, deadline, dialog)?;
+                std::thread::sleep(Duration::from_millis(6));
+            }
+        } else {
+            const DRAG_STEPS: u32 = 10;
+            for step in 1..=DRAG_STEPS {
+                let ratio = f64::from(step) / f64::from(DRAG_STEPS);
+                let xi = from.x + (to.x - from.x) * ratio;
+                let yi = from.y + (to.y - from.y) * ratio;
+                dispatch_mouse_move(session, &to.desc, "drag", (xi, yi), 1, deadline, dialog)?;
+                std::thread::sleep(Duration::from_millis(6));
+            }
+        }
+
+        if intercepted.is_none() {
+            intercepted = poll_drag_intercepted(session)?;
+        }
+
+        if let Some(event) = intercepted {
+            let data = event
+                .pointer("/params/data")
+                .cloned()
+                .unwrap_or_else(|| json!({ "items": [], "dragOperationsMask": 1 }));
+            for event_type in ["dragEnter", "dragOver", "drop"] {
+                session.dispatch(
+                    &to.desc,
+                    "Input.dispatchDragEvent",
+                    json!({
+                        "type": event_type,
+                        "x": to.x,
+                        "y": to.y,
+                        "data": data,
+                    }),
+                    event_type,
+                    deadline,
+                    dialog,
+                )?;
+            }
+        }
+
+        session.dispatch(
+            &to.desc,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseReleased",
+                "x": to.x,
+                "y": to.y,
+                "button": "left",
+                "buttons": 0,
+                "clickCount": 1,
+            }),
+            "release",
+            deadline,
+            dialog,
+        )?;
+        Ok(())
+    })();
+
+    let disable_result = session.dispatch(
+        &to.desc,
+        "Input.setInterceptDrags",
+        json!({ "enabled": false }),
+        "disable drag interception after",
+        deadline,
+        dialog,
+    );
+    inner_result?;
+    disable_result
+}
+
+fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let interactive = sessions.is_interactive();
+    let parsed: DragArgs = parse(args)?;
+    check_timeout(parsed.timeout_ms).map_err(StepError::InvalidArguments)?;
+    validate_drag_endpoint(&parsed.from, "from", interactive)
+        .map_err(StepError::InvalidArguments)?;
+    validate_drag_endpoint(&parsed.to, "to", interactive).map_err(StepError::InvalidArguments)?;
+
+    let deadline = Deadline::after(Duration::from_millis(parsed.timeout_ms));
+    let has_ref = parsed.from.ref_id.is_some() || parsed.to.ref_id.is_some();
+    let mut dialog = if interactive && has_ref {
+        DialogContext::fail_fast()
+    } else {
+        DialogContext::from_arg(parsed.dialog.as_ref())
+    };
+    let session = session(sessions)?;
+
+    let from_is_located = parsed.from.at.is_none();
+    let to_is_located = parsed.to.at.is_none();
+    let scroll_before_from = if from_is_located && !to_is_located {
+        Some(read_drag_scroll_snapshot(session, deadline, &mut dialog)?)
+    } else {
+        None
+    };
+
+    let mut from = resolve_drag_endpoint(
+        session,
+        &parsed.from,
+        "from",
+        interactive,
+        deadline,
+        &mut dialog,
+    )?;
+    let empty_to = DragEndpointSynth::default();
+    if interactive {
+        update_drag_metadata(session, &from.synth, &empty_to);
+    }
+    let scroll_after_from = if from_is_located ^ to_is_located {
+        Some(read_drag_scroll_snapshot(session, deadline, &mut dialog)?)
+    } else {
+        None
+    };
+
+    let mut to = resolve_drag_endpoint(
+        session,
+        &parsed.to,
+        "to",
+        interactive,
+        deadline,
+        &mut dialog,
+    )?;
+    if interactive {
+        update_drag_metadata(session, &from.synth, &to.synth);
+    }
+    let scroll_after_to = if to_is_located {
+        Some(read_drag_scroll_snapshot(session, deadline, &mut dialog)?)
+    } else {
+        None
+    };
+
+    // Guard mixed `at` + located drags: if resolving the located endpoint scrolled
+    // the page or any container (including shadow roots or same-origin iframes),
+    // the fixed viewport `at` coordinates no longer point at the same page content.
+    // Fail closed before dispatching any mouse events.
+    if from.located.is_none() && to.located.is_some() {
+        check_mixed_drag_scroll(
+            &from.desc,
+            &to.desc,
+            &to.desc,
+            "from",
+            scroll_after_from.as_ref(),
+            scroll_after_to.as_ref(),
+        )?;
+    }
+    if from.located.is_some() && to.located.is_none() {
+        check_mixed_drag_scroll(
+            &from.desc,
+            &to.desc,
+            &from.desc,
+            "to",
+            scroll_before_from.as_ref(),
+            scroll_after_from.as_ref(),
+        )?;
+    }
+
+    // Re-inspect `from` if resolving `to` may have scrolled the page or a container.
+    // When `from` and `to` cannot fit in the viewport or container simultaneously,
+    // bring `from` into view for `mousePressed` and defer bringing `to` back into
+    // view until mid-drag.
+    let mut mid_drag_to = None;
+    if let (Some(from_loc), Some(to_loc)) = (from.located.take(), to.located.take()) {
+        let refreshed_from =
+            session.wait_located_actionable(&from.desc, from_loc.0, deadline, &mut dialog)?;
+        let moved =
+            (refreshed_from.x - from.x).abs() > 0.5 || (refreshed_from.y - from.y).abs() > 0.5;
+        from.x = refreshed_from.x;
+        from.y = refreshed_from.y;
+        let scroll_after_refresh = read_drag_scroll_snapshot(session, deadline, &mut dialog)?;
+        let scrolled = scroll_after_to
+            .as_ref()
+            .is_some_and(|before| !diff_scroll_snapshots(before, &scroll_after_refresh).is_empty());
+        if scrolled {
+            mid_drag_to = Some(to_loc);
+        } else if moved {
+            let refreshed_to =
+                session.wait_located_actionable(&to.desc, to_loc.0, deadline, &mut dialog)?;
+            to.x = refreshed_to.x;
+            to.y = refreshed_to.y;
+        }
+    }
+
+    dispatch_drag_gesture(session, &from, &mut to, mid_drag_to, deadline, &mut dialog)?;
+
+    let mut result = json!({
+        "dragged": true,
+        "from": { "x": coordinate_number(from.x), "y": coordinate_number(from.y) },
+        "to": { "x": coordinate_number(to.x), "y": coordinate_number(to.y) },
+    });
+    if let Some((w, h)) = from.synth.viewport.or(to.synth.viewport) {
+        result["viewport"] = json!({ "width": w, "height": h });
+    }
+    Ok(attach_dialog(result, &mut dialog))
+}
+
+fn grant_clipboard_permissions(
+    connection: &mut Connection,
+    scope: &PageScope,
+    origin: &str,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(), PageFailure> {
+    let mut perm_params = json!({
+        "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"],
+    });
+    if !origin.is_empty() && origin != "null" {
+        perm_params["origin"] = json!(origin);
+    }
+    browser_call(
+        connection,
+        scope,
+        "Browser.grantPermissions",
+        perm_params,
+        deadline,
+        dialog,
+    )
+    .map(|_| ())
+}
+
+fn enable_focus_emulation(
+    connection: &mut Connection,
+    scope: &PageScope,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(), PageFailure> {
+    page_call(
+        connection,
+        scope,
+        "Emulation.setFocusEmulationEnabled",
+        json!({ "enabled": true }),
+        deadline,
+        dialog,
+    )
+    .map(|_| ())
+}
+
+fn ensure_clipboard_isolated(session: &BrowserSession, step_name: &str) -> Result<(), StepError> {
+    if session.connect.is_some() || matches!(session.origin, Some(Origin::Connected)) {
+        let endpoint = session.connect.as_deref().unwrap_or("external browser");
+        return Err(StepError::Environment(format!(
+            "`{step_name}` cannot run on a connected external browser (`connect: {endpoint}`): `browser.set_clipboard` and `browser.read_clipboard` require an isolated `da`-launched `headless: true` browser so secrets and host OS clipboard contents never cross the session boundary"
+        )));
+    }
+    if !session.headless {
+        return Err(StepError::Environment(format!(
+            "`{step_name}` cannot run with `headless: false`: headed browsers back `navigator.clipboard` onto the host OS clipboard; `browser.set_clipboard` and `browser.read_clipboard` require an isolated `da`-launched `headless: true` browser so secrets and host OS clipboard contents never cross the session boundary"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_clipboard_ready(
+    session: &mut BrowserSession,
+    step_name: &str,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<(), StepError> {
+    ensure_clipboard_isolated(session, step_name)?;
+    let scope = session.scope();
+    let info = {
+        let connection = session.connection_mut()?;
+        page_evaluate(
+            connection,
+            &scope,
+            "(() => ({ hasClipboard: Boolean(window.navigator && navigator.clipboard), origin: String(window.location && window.location.origin ? window.location.origin : ''), href: String(window.location && window.location.href ? window.location.href : '') }))()",
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| failure.step("could not inspect clipboard availability", timeout_or_execution))?
+    };
+    let has_clipboard = info
+        .get("hasClipboard")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !has_clipboard {
+        let href = info
+            .get("href")
+            .and_then(Value::as_str)
+            .unwrap_or("about:blank");
+        return Err(StepError::Execution(format!(
+            "clipboard access is unavailable on `{href}`: `navigator.clipboard` requires a secure context (`http://127.0.0.1`, `http://localhost`, `https://`, or `file://`)"
+        )));
+    }
+    let origin = info.get("origin").and_then(Value::as_str).unwrap_or("");
+    {
+        let connection = session.connection_mut()?;
+        grant_clipboard_permissions(connection, &scope, origin, deadline, dialog).map_err(
+            |failure| {
+                failure.step(
+                    "could not grant browser clipboard permissions",
+                    timeout_or_execution,
+                )
+            },
+        )?;
+    }
+    if !session
+        .clipboard_origins
+        .iter()
+        .any(|known| known == origin)
+        && session.clipboard_origins.len() < tabs::MAX_TABS
+    {
+        session.clipboard_origins.push(origin.to_string());
+    }
+    if session.clipboard_focus_page.as_deref() != Some(session.page.as_str()) {
+        {
+            let connection = session.connection_mut()?;
+            enable_focus_emulation(connection, &scope, deadline, dialog).map_err(|failure| {
+                failure.step(
+                    "could not enable focus emulation for browser clipboard access",
+                    timeout_or_execution,
+                )
+            })?;
+        }
+        session.clipboard_focus_page = Some(session.page.clone());
+    }
+    Ok(())
+}
+
+fn run_set_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let args: SetClipboardArgs = parse(args)?;
+    check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::fail_fast();
+    let session = session(sessions)?;
+    ensure_clipboard_ready(session, STEP_NAMES[14], deadline, &mut dialog)?;
+
+    let encoded_text = serde_json::to_string(&args.text).map_err(|error| {
+        StepError::InvalidArguments(format!("could not encode clipboard text: {error}"))
+    })?;
+    let script = format!(
+        "(async () => {{ await navigator.clipboard.writeText({encoded_text}); return true; }})()"
+    );
+    let scope = session.scope();
+    let connection = session.connection_mut()?;
+    page_evaluate_async(connection, &scope, &script, true, deadline, &mut dialog).map_err(
+        |failure| {
+            failure.step(
+                "could not write text to the browser clipboard",
+                timeout_or_execution,
+            )
+        },
+    )?;
+    Ok(json!({ "characters": args.text.chars().count() }))
+}
+
+fn run_read_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+    let args: ReadClipboardArgs = parse(args)?;
+    check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
+    let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
+    let mut dialog = DialogContext::fail_fast();
+    let session = session(sessions)?;
+    ensure_clipboard_ready(session, STEP_NAMES[15], deadline, &mut dialog)?;
+
+    let scope = session.scope();
+    let connection = session.connection_mut()?;
+    let value = page_evaluate_async(
+        connection,
+        &scope,
+        "(async () => String(await navigator.clipboard.readText()))()",
+        true,
+        deadline,
+        &mut dialog,
+    )
+    .map_err(|failure| {
+        failure.step(
+            "could not read text from the browser clipboard",
+            timeout_or_execution,
+        )
+    })?;
+    let text = value.as_str().unwrap_or_default().to_string();
+    Ok(json!({ "text": text }))
 }
 
 #[cfg(test)]
@@ -8167,7 +10386,7 @@ mod tests {
     #[test]
     fn only_read_and_wait_allow_retry() {
         let within_args = json!({ "css": "#status", "within": { "css": "#embed" } });
-        for name in ["browser.read", "browser.wait"] {
+        for name in ["browser.read", "browser.wait", "browser.read_clipboard"] {
             let def = definition(name);
             for args in [json!({}), within_args.clone()] {
                 assert!(
@@ -8186,6 +10405,10 @@ mod tests {
             "browser.set_cookies",
             "browser.save_state",
             "browser.switch_tab",
+            "browser.scroll",
+            "browser.hover",
+            "browser.drag",
+            "browser.set_clipboard",
         ] {
             let def = definition(name);
             for args in [json!({}), within_args.clone()] {
@@ -8195,6 +10418,67 @@ mod tests {
                 assert!(error.contains("cannot use `retry`"), "{name}: {error}");
             }
         }
+    }
+
+    #[test]
+    fn drag_lint_warnings_report_bare_coordinates_on_both_endpoints() {
+        let def = definition("browser.drag");
+        let both_bare = (def.lint_warnings)(&json!({
+            "from": { "at": { "x": 10, "y": 20 } },
+            "to": { "at": { "x": 50, "y": 60 } },
+        }));
+        assert_eq!(both_bare.len(), 4, "{both_bare:?}");
+        assert!(both_bare[0].starts_with("`from` ") && both_bare[2].starts_with("`to` "));
+
+        let pinned = (def.lint_warnings)(&json!({
+            "from": { "at": { "x": 10, "y": 20, "viewport": { "width": 1280, "height": 720 } } },
+            "to": { "css": "#drop" },
+        }));
+        assert_eq!(pinned.len(), 1, "{pinned:?}");
+    }
+
+    #[test]
+    fn page_failure_treats_closed_target_method_and_transport_as_death() {
+        let scope = PageScope {
+            target_id: "t-1".to_string(),
+            session_id: "s-1".to_string(),
+        };
+        for error in [
+            CdpError::Transport("socket closed".to_string()),
+            CdpError::Method {
+                method: "Runtime.evaluate".to_string(),
+                message: "Session with given id not found.".to_string(),
+            },
+            CdpError::Method {
+                method: "Runtime.evaluate".to_string(),
+                message: "No target with given id found".to_string(),
+            },
+        ] {
+            let failure = PageFailure(Box::new(PageFailureDetail {
+                error,
+                events: Vec::new(),
+                scope: scope.clone(),
+            }));
+            assert!(failure.is_death());
+            assert!(matches!(
+                failure.step("failed", execution_error),
+                StepError::Environment(_)
+            ));
+        }
+
+        let ordinary = PageFailure(Box::new(PageFailureDetail {
+            error: CdpError::Method {
+                method: "DOM.resolveNode".to_string(),
+                message: "Could not find node with given id".to_string(),
+            },
+            events: Vec::new(),
+            scope,
+        }));
+        assert!(!ordinary.is_death());
+        assert!(matches!(
+            ordinary.step("failed", execution_error),
+            StepError::Execution(_)
+        ));
     }
 
     #[test]
@@ -10271,6 +12555,8 @@ mod tests {
             refs: snapshot::RefStore::default(),
             step_metadata: None,
             snapshot_pending: false,
+            clipboard_focus_page: None,
+            clipboard_origins: Vec::new(),
         }
     }
 
@@ -11660,6 +13946,7 @@ mod tests {
             refs: snapshot::RefStore::default(),
             pending_local_storage_scripts: Vec::new(),
             tabs: Vec::new(),
+            clipboard_origins: Vec::new(),
         };
 
         assert!(matches!(
@@ -11731,6 +14018,7 @@ mod tests {
             refs: snapshot::RefStore::default(),
             pending_local_storage_scripts: Vec::new(),
             tabs: Vec::new(),
+            clipboard_origins: Vec::new(),
         };
 
         assert!(matches!(
@@ -12523,6 +14811,215 @@ mod tests {
             resolved_scrubbed["local_storage"]["http://127.0.0.1"]["var_tok"],
             "***"
         );
+    }
+
+    #[test]
+    fn clipboard_steps_reject_connected_and_headed_sessions_before_cdp_calls() {
+        for (mode_label, connect, headless, expected_hint) in [
+            (
+                "connected",
+                Some("http://127.0.0.1:9222".to_string()),
+                true,
+                "connected external browser",
+            ),
+            ("headed", None, false, "headless: false"),
+        ] {
+            for (step_label, is_set) in [("set_clipboard", true), ("read_clipboard", false)] {
+                let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+                    // No clipboard CDP call may arrive before the session drops.
+                    if let Ok(msg) = socket.read() {
+                        assert!(
+                            msg.is_close(),
+                            "unexpected CDP message on rejected clipboard step: {msg:?}"
+                        );
+                    }
+                });
+                let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+                    .expect("must connect to mock CDP");
+                let mut sess = mock_session(conn, "target-1", "session-1");
+                sess.origin = None;
+                sess.connect = connect.clone();
+                sess.headless = headless;
+
+                let mut sessions = Sessions::new();
+                sessions
+                    .get_or_create(SESSION_KIND, || Ok(sess))
+                    .expect("store mock session");
+                let err = if is_set {
+                    run_set_clipboard(&json!({ "text": "secret" }), &mut sessions)
+                        .expect_err("must reject clipboard write")
+                } else {
+                    run_read_clipboard(&json!({}), &mut sessions)
+                        .expect_err("must reject clipboard read")
+                };
+                drop(sessions);
+                server.join().expect("mock CDP thread must join");
+
+                match err {
+                    StepError::Environment(msg) => {
+                        assert!(
+                            msg.contains(expected_hint) && msg.contains("headless: true"),
+                            "{mode_label}/{step_label} error must explain boundary: {msg}"
+                        );
+                    }
+                    other => panic!(
+                        "{mode_label}/{step_label} must fail as StepError::Environment, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_steps_map_closed_tab_on_headless_launched_session_to_environment() {
+        for (step_label, is_set) in [("set_clipboard", true), ("read_clipboard", false)] {
+            let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+                let cmd = read_cdp_request(&mut socket);
+                assert_eq!(cmd["method"], "Runtime.evaluate");
+                let reply = json!({
+                    "id": cmd["id"],
+                    "error": { "code": -32001, "message": "Session with given id not found." }
+                });
+                socket
+                    .send(tungstenite::Message::text(reply.to_string()))
+                    .expect("send -32001 error");
+            });
+            let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+                .expect("must connect to mock CDP");
+            let mut sess = mock_session(conn, "target-1", "session-1");
+            sess.origin = None;
+            sess.connect = None;
+            sess.headless = true;
+
+            let mut sessions = Sessions::new();
+            sessions
+                .get_or_create(SESSION_KIND, || Ok(sess))
+                .expect("store mock session");
+            let err = if is_set {
+                run_set_clipboard(&json!({ "text": "abc" }), &mut sessions)
+                    .expect_err("closed tab must fail")
+            } else {
+                run_read_clipboard(&json!({}), &mut sessions).expect_err("closed tab must fail")
+            };
+            drop(sessions);
+            server.join().expect("mock CDP thread must join");
+
+            assert!(
+                matches!(err, StepError::Environment(_)),
+                "{step_label} on dead headless tab must fail as Environment, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_scroll_snapshots_detects_container_and_page_changes_beyond_tolerance() {
+        let before = ScrollSnapshot {
+            entries: vec![
+                ScrollEntry {
+                    key: "doc".to_string(),
+                    label: "the page".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#panel".to_string(),
+                    label: "div#panel".to_string(),
+                    x: 0.0,
+                    y: 120.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#shadow-host/::shadow/#shadow-panel".to_string(),
+                    label: "div#shadow-panel (in shadow root of div#shadow-host)".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+            ],
+        };
+        let after = ScrollSnapshot {
+            entries: vec![
+                ScrollEntry {
+                    key: "doc".to_string(),
+                    label: "the page".to_string(),
+                    x: 0.25,
+                    y: 0.4,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#panel".to_string(),
+                    label: "div#panel".to_string(),
+                    x: 0.0,
+                    y: 520.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#shadow-host/::shadow/#shadow-panel".to_string(),
+                    label: "div#shadow-panel (in shadow root of div#shadow-host)".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#dynamic-pane".to_string(),
+                    label: "div#dynamic-pane".to_string(),
+                    x: 40.0,
+                    y: 0.0,
+                },
+            ],
+        };
+
+        let changes = diff_scroll_snapshots(&before, &after);
+        assert_eq!(
+            changes,
+            vec![
+                ScrollChange {
+                    label: "div#panel".to_string(),
+                    from: (0.0, 120.0),
+                    to: (0.0, 520.0),
+                },
+                ScrollChange {
+                    label: "div#dynamic-pane".to_string(),
+                    from: (0.0, 0.0),
+                    to: (40.0, 0.0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn format_mixed_drag_scroll_error_names_page_and_inner_containers() {
+        let page_only = format_mixed_drag_scroll_error(
+            "from coordinates (10, 20)",
+            "to CSS selector `#dst`",
+            "to CSS selector `#dst`",
+            "from",
+            &[ScrollChange {
+                label: "the page".to_string(),
+                from: (0.0, 0.0),
+                to: (0.0, 1280.0),
+            }],
+        );
+        assert!(page_only.contains("scrolled the page from (0, 0) to (0, 1280)"));
+        assert!(page_only.contains("invalidating the fixed `from.at` viewport coordinates"));
+        assert!(page_only.contains("browser.scroll"));
+
+        let container_and_page = format_mixed_drag_scroll_error(
+            "from CSS selector `#dst`",
+            "to coordinates (100, 100)",
+            "from CSS selector `#dst`",
+            "to",
+            &[
+                ScrollChange {
+                    label: "the page".to_string(),
+                    from: (0.0, 0.0),
+                    to: (0.0, 29.0),
+                },
+                ScrollChange {
+                    label: "div#panel".to_string(),
+                    from: (0.0, 0.0),
+                    to: (0.0, 520.0),
+                },
+            ],
+        );
+        assert!(container_and_page.contains("scrolled the page from (0, 0) to (0, 29)"));
+        assert!(container_and_page.contains("div#panel from (0, 0) to (0, 520)"));
+        assert!(container_and_page.contains("invalidating the fixed `to.at` viewport coordinates"));
     }
 }
 
