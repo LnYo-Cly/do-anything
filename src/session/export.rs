@@ -3,6 +3,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::core::case;
+use crate::session::model_hook::{STEP_ACTION_JUDGE, STEP_ACTION_LOCATE, STEP_ACTION_SELECT_REF};
 use crate::session::store::{StepRecord, StoredObservation};
 
 /// Options controlling how a session is exported to YAML.
@@ -42,6 +43,17 @@ pub fn export_session(
     let mut fragile = Vec::new();
 
     for record in records {
+        if matches!(
+            record.action.as_str(),
+            STEP_ACTION_SELECT_REF | STEP_ACTION_LOCATE | STEP_ACTION_JUDGE
+        ) {
+            skipped_steps.push(json!({
+                "index": record.index,
+                "action": record.action,
+                "reason": "exploration-only model hook diagnostic",
+            }));
+            continue;
+        }
         let exportable_skipped =
             record.optional && record.status == "skipped" && !has_unresolved_refs(record);
         if record.status != "passed" && !exportable_skipped {
@@ -642,6 +654,11 @@ mod tests {
             started_at_ms: 1,
             duration_ms: 1,
             result: None,
+            model: None,
+            latency_ms: None,
+            usage: None,
+            trace_id: None,
+            confidence: None,
         }
     }
 

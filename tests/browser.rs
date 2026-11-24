@@ -10916,3 +10916,162 @@ fn computer_use_mock_closed_tab_fails_fast_as_environment_error() {
         );
     }
 }
+
+#[test]
+fn screenshot_and_failure_evidence_cover_top_layer_modals_and_popovers() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-mask-top-layer");
+    let url = server.url("/browser/mask-top-layer");
+    let secret = "top-layer-s3cr3t-91";
+
+    let case = dir.write(
+        "mask-top-layer.yaml",
+        &format!(
+            r##"name: screenshot and failure evidence mask top-layer modal dialog and popover
+steps:
+  - browser.open:
+      url: "{url}"
+      width: 1280
+      height: 720
+  - browser.wait:
+      css: "#modal-btn[data-frame-loaded='1']"
+  - browser.type:
+      css: "#modal-pw"
+      text: "${{env:DA_TOP_LAYER_SECRET}}"
+  - browser.screenshot:
+      path: shots/top-layer.png
+  - browser.wait:
+      css: "#modal-dlg:modal"
+  - browser.wait:
+      css: "#top-pop:popover-open"
+  - browser.read:
+      css: "#top-layer-report"
+    expect:
+      - path: $.text
+        equals: "force-failure-bundle"
+"##
+        ),
+    );
+    let bundles = dir.path().join("failures");
+    let output = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_TOP_LAYER_SECRET", secret.to_string())],
+    );
+    assert_eq!(
+        exit_code(&output),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let raw_stdout = stdout(&output);
+    assert!(
+        !raw_stdout.contains(secret),
+        "secret leaked in JSON output: {raw_stdout}"
+    );
+    let value = json_stdout(&output);
+    let steps = value["cases"][0]["steps"].as_array().expect("steps");
+    assert_eq!(steps[3]["status"], "passed", "screenshot step: {value}");
+    assert_eq!(steps[4]["status"], "passed", "modal still open: {value}");
+    assert_eq!(steps[5]["status"], "passed", "popover still open: {value}");
+
+    let explicit_png = fs::read(dir.path().join("shots/top-layer.png")).expect("explicit PNG");
+    assert!(is_png(&explicit_png), "explicit screenshot must be PNG");
+    let bundle_dir = PathBuf::from(
+        value["cases"][0]["bundle"]
+            .as_str()
+            .expect("failed case must emit failure bundle"),
+    );
+    let bundle_png =
+        fs::read(bundle_dir.join("browser/screenshot.png")).expect("failure screenshot PNG");
+    assert!(is_png(&bundle_png), "failure screenshot must be PNG");
+    let report_json = fs::read_to_string(bundle_dir.join("report.json")).expect("report.json");
+    assert!(
+        !report_json.contains(secret),
+        "secret leaked in report.json"
+    );
+
+    let explicit_b64 = support::base64_encode(&explicit_png);
+    let bundle_b64 = support::base64_encode(&bundle_png);
+    let inspect_case_steps: Vec<String> =
+        [("explicit", explicit_b64), ("failure_bundle", bundle_b64)]
+            .into_iter()
+            .map(|(label, png_b64)| {
+                let inspect_html = format!(
+                    r##"<!doctype html><html><body>
+<p id="px-report">pending</p>
+<script>
+var img = new Image();
+img.onload = function () {{
+  var c = document.createElement('canvas');
+  c.width = img.width;
+  c.height = img.height;
+  var ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  var data = ctx.getImageData(0, 0, c.width, c.height).data;
+  var magenta = 0;
+  var green = 0;
+  for (var i = 0; i < data.length; i += 4) {{
+    if (data[i] > 180 && data[i + 1] < 60 && data[i + 2] > 180) magenta++;
+    if (data[i + 1] > 150 && data[i] < 40 && data[i + 2] < 120) green++;
+  }}
+  var el = document.getElementById('px-report');
+  el.textContent = '{label}:magenta=' + magenta + ',btn_green=' + (green > 500);
+  el.setAttribute('data-ready', '1');
+}};
+img.src = 'data:image/png;base64,{png_b64}';
+</script></body></html>"##
+                );
+                let inspect_url = format!(
+                    "data:text/html;base64,{}",
+                    support::base64_encode(inspect_html.as_bytes())
+                );
+                format!(
+                    r##"  - browser.open:
+      url: "{inspect_url}"
+  - browser.wait:
+      css: "#px-report[data-ready='1']"
+  - browser.read:
+      css: "#px-report"
+    expect:
+      - path: $.text
+        equals: "{label}:magenta=0,btn_green=true""##
+                )
+            })
+            .collect();
+    let inspect_case = dir.write(
+        "inspect-top-layer.yaml",
+        &format!(
+            "name: verify top-layer pixels\nsteps:\n{}\n",
+            inspect_case_steps.join("\n")
+        ),
+    );
+    let inspect_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&inspect_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&inspect_out),
+        Some(0),
+        "top-layer pixel inspection failed: stdout={}\nstderr={}",
+        stdout(&inspect_out),
+        stderr(&inspect_out)
+    );
+}

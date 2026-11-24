@@ -181,6 +181,51 @@ pub trait Session: Send + AsAny {
     fn local_only_reason(&self) -> Option<String> {
         None
     }
+
+    /// Captures an input-masked PNG frame and its logical `{ width, height }`
+    /// bounds for interactive visual locating.
+    ///
+    /// Sessions without a visual surface return `Ok(None)`.
+    fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        Ok(None)
+    }
+
+    /// Synthesizes a stable target descriptor for a snapshot `ref` without
+    /// executing a step on it.
+    fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        let _ = ref_id;
+        Ok(None)
+    }
+
+    /// Reverse-queries the live session tree at `(x, y)` to synthesize a stable
+    /// target descriptor when an addressable element occupies that point.
+    ///
+    /// Returns `Ok(None)` when the point lands on an opaque surface without an
+    /// addressable element or when the session does not support point lookup.
+    fn synthesize_at_point(&mut self, x: f64, y: f64) -> Result<Option<SynthesizedTarget>, String> {
+        let _ = (x, y);
+        Ok(None)
+    }
+}
+
+/// An input-masked PNG frame and logical dimensions captured from a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskedViewportCapture {
+    /// Input-masked PNG bytes (`image/png`).
+    pub png: Vec<u8>,
+    /// Logical surface width in pixels.
+    pub width: u32,
+    /// Logical surface height in pixels.
+    pub height: u32,
+}
+
+/// A deterministic target descriptor synthesized from a live session element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthesizedTarget {
+    /// Target fields (such as `role`/`name` or `testid`) valid in a case file.
+    pub locator: Value,
+    /// Whether the target relies on a structural path fallback.
+    pub fragile: bool,
 }
 
 /// Handles returned when open sessions detach at the end of an interactive
@@ -448,6 +493,56 @@ impl Sessions {
             }
         }
         out
+    }
+
+    /// Captures an input-masked PNG and surface dimensions from the first open
+    /// session that exposes a visual surface.
+    pub fn collect_masked_viewport_capture(
+        &mut self,
+    ) -> Result<Option<(String, MaskedViewportCapture)>, String> {
+        for entry in &mut self.entries {
+            if let Some(capture) = entry.session.masked_viewport_capture()? {
+                return Ok(Some((entry.kind.to_string(), capture)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Synthesizes a stable target descriptor for `ref_id` from the open
+    /// session of `session_kind` (or the first open session that answers).
+    pub fn synthesize_ref(
+        &mut self,
+        session_kind: Option<&str>,
+        ref_id: &str,
+    ) -> Result<Option<(String, SynthesizedTarget)>, String> {
+        for entry in &mut self.entries {
+            if session_kind.is_some_and(|expected| entry.kind != expected) {
+                continue;
+            }
+            if let Some(target) = entry.session.synthesize_ref(ref_id)? {
+                return Ok(Some((entry.kind.to_string(), target)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Reverse-queries `(x, y)` on the open session of `session_kind` (or the
+    /// first open session that answers) to synthesize a stable target descriptor.
+    pub fn synthesize_at_point(
+        &mut self,
+        session_kind: Option<&str>,
+        x: f64,
+        y: f64,
+    ) -> Result<Option<(String, SynthesizedTarget)>, String> {
+        for entry in &mut self.entries {
+            if session_kind.is_some_and(|expected| entry.kind != expected) {
+                continue;
+            }
+            if let Some(target) = entry.session.synthesize_at_point(x, y)? {
+                return Ok(Some((entry.kind.to_string(), target)));
+            }
+        }
+        Ok(None)
     }
 }
 

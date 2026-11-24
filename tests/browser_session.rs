@@ -3010,3 +3010,946 @@ fn session_connect_closed_tab_fails_fast_as_environment_and_preserves_user_tab()
     );
     let _ = run_da_in(dir.path(), &["session", "stop", &id1]);
 }
+
+const BROWSER_MOCK_HOOK_RS: &str = r#"
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io::{self, Read, Write};
+
+fn parse_kv(text: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn main() {
+    let cfg_path = env::args().nth(1).expect("cfg path");
+    let cfg = parse_kv(&fs::read_to_string(&cfg_path).expect("read cfg"));
+    let mut stdin_bytes = Vec::new();
+    let _ = io::stdin().read_to_end(&mut stdin_bytes);
+    let stdin_text = String::from_utf8_lossy(&stdin_bytes).into_owned();
+    if let Some(req_file) = cfg.get("request_file") {
+        let _ = fs::write(req_file, &stdin_bytes);
+    }
+    let model = cfg.get("model").map(String::as_str).unwrap_or("mock-vlm-1");
+    let latency = cfg.get("latency_ms").map(String::as_str).unwrap_or("42");
+    let trace_id = cfg.get("trace_id").map(String::as_str).unwrap_or("tr-browser-1");
+
+    let result = if stdin_text.contains("\"model/select_ref\"") {
+        let r = cfg.get("select_ref").map(String::as_str).unwrap_or("e1");
+        format!(
+            "{{\"ref\":{},\"confidence\":0.95,\"model\":{},\"latency_ms\":{latency},\"usage\":{{\"prompt_tokens\":40,\"completion_tokens\":2}},\"trace_id\":{}}}",
+            json_escape(r),
+            json_escape(model),
+            json_escape(trace_id),
+        )
+    } else if stdin_text.contains("\"model/locate\"") {
+        let x = cfg.get("locate_x").map(String::as_str).unwrap_or("100");
+        let y = cfg.get("locate_y").map(String::as_str).unwrap_or("112");
+        format!(
+            "{{\"x\":{x},\"y\":{y},\"confidence\":0.92,\"model\":{},\"latency_ms\":{latency},\"usage\":{{\"prompt_tokens\":320,\"completion_tokens\":6}},\"trace_id\":{}}}",
+            json_escape(model),
+            json_escape(trace_id),
+        )
+    } else {
+        let passed = cfg.get("judge_passed").map(String::as_str).unwrap_or("true");
+        let rationale = cfg.get("judge_rationale").map(String::as_str).unwrap_or("verified");
+        format!(
+            "{{\"passed\":{passed},\"rationale\":{},\"confidence\":0.97,\"model\":{},\"latency_ms\":{latency},\"usage\":{{\"prompt_tokens\":90,\"completion_tokens\":12}},\"trace_id\":{}}}",
+            json_escape(rationale),
+            json_escape(model),
+            json_escape(trace_id),
+        )
+    };
+    let _ = writeln!(io::stdout(), "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{result}}}");
+    let _ = io::stdout().flush();
+}
+"#;
+
+fn compile_browser_mock_hook(dir: &Path) -> PathBuf {
+    let src = dir.join("browser_mock_hook.rs");
+    fs::write(&src, BROWSER_MOCK_HOOK_RS).expect("write browser_mock_hook.rs");
+    let out = dir.join(if cfg!(windows) {
+        "browser_mock_hook.exe"
+    } else {
+        "browser_mock_hook"
+    });
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let status = Command::new(rustc)
+        .arg(&src)
+        .arg("-O")
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .expect("compile browser_mock_hook.rs");
+    assert!(status.success(), "rustc failed for browser_mock_hook.rs");
+    out
+}
+
+#[test]
+fn browser_model_hooks_select_ref_locate_masked_pixels_canvas_fallback_and_replay() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+
+    let xorigin_child_html = r##"<!doctype html><html><body style="margin:0;background:#ff00ff"><input id="xpw" type="password" value="Sup3rSecret!" style="position:fixed;left:10px;top:10px;width:180px;height:40px;background:#ff00ff;border:0"></body></html>"##.to_string();
+    let xorigin_server =
+        PageServer::start(BTreeMap::from([("/child".to_string(), xorigin_child_html)]));
+    let xorigin_child_url = xorigin_server.url("/child");
+
+    let same_wrapper_html = format!(
+        r##"<!doctype html><html><body style="margin:0;background:#f4f4f4"><iframe id="inner-xframe" src="{xorigin_child_url}" onload="window.parent.document.getElementById('save-btn').setAttribute('data-nested-xframe-loaded', '1')" style="position:fixed;left:10px;top:10px;width:220px;height:80px;border:0"></iframe></body></html>"##
+    );
+
+    let page_html = format!(
+        r##"<!doctype html>
+<html>
+<head>
+  <title>Model Hook Lab</title>
+  <style>
+    html, body {{ margin: 0; padding: 0; background: #f4f4f4; }}
+    #pw {{
+      position: fixed;
+      left: 20px;
+      top: 20px;
+      width: 180px;
+      height: 40px;
+      background: #ffffff;
+      color: #ff0000;
+      border: 0;
+      padding: 0;
+      margin: 0;
+      font-size: 24px;
+    }}
+    #save-btn {{
+      position: fixed;
+      left: 20px;
+      top: 90px;
+      width: 160px;
+      height: 44px;
+      background: rgb(0, 200, 80);
+      color: #ffffff;
+      border: 0;
+    }}
+    #jev-btn {{
+      position: fixed;
+      left: 220px;
+      top: 90px;
+      width: 160px;
+      height: 44px;
+    }}
+    #board {{
+      position: fixed;
+      left: 20px;
+      top: 160px;
+      background: #224488;
+      display: block;
+    }}
+  </style>
+</head>
+<body>
+  <label for="pw" style="position:fixed;left:420px;top:20px;">Password</label>
+  <input id="pw" type="password" />
+  <button id="save-btn" data-testid="save-btn" onclick="document.getElementById('log').textContent += '[btn]';">Save Action</button>
+  <button id="jev-btn" onclick="document.getElementById('log').textContent += '[jev]';">Jev Target</button>
+  <canvas id="board" width="200" height="100"></canvas>
+  <iframe id="xorigin-frame" src="{xorigin_child_url}" onload="document.getElementById('save-btn').setAttribute('data-xframe-loaded', '1')" style="position:fixed;left:420px;top:160px;width:220px;height:80px;border:0"></iframe>
+  <iframe id="nested-same-frame" src="/same-wrapper" style="position:fixed;left:420px;top:260px;width:240px;height:100px;border:0"></iframe>
+  <p id="log" style="position:fixed;left:420px;top:90px;"></p>
+  <script>
+    document.getElementById('board').addEventListener('click', function (ev) {{
+      var r = this.getBoundingClientRect();
+      var ox = Math.round(ev.clientX - r.left);
+      var oy = Math.round(ev.clientY - r.top);
+      document.getElementById('log').textContent += '[canvas:' + ox + ',' + oy + ']';
+    }});
+  </script>
+</body>
+</html>"##
+    );
+
+    let server = PageServer::start(BTreeMap::from([
+        ("/model-lab".to_string(), page_html),
+        ("/same-wrapper".to_string(), same_wrapper_html),
+    ]));
+    let dir = TempDir::new("browser-model-hooks");
+    let hook_bin = compile_browser_mock_hook(dir.path());
+    let hook_str = hook_bin.to_str().unwrap();
+    let req_file = dir.path().join("hook_req.json");
+    let cfg_path = dir.path().join("hook.cfg");
+    fs::write(&cfg_path, format!("request_file={}\n", req_file.display())).unwrap();
+    let cfg_str = cfg_path.to_str().unwrap();
+    let secret = "Sup3rS3cr3tPw999!";
+
+    let run_env = |args: &[&str]| -> Output {
+        Command::new(da())
+            .current_dir(dir.path())
+            .args(args)
+            .env("DA_BROWSER_HOOK_SECRET", secret)
+            .output()
+            .expect("run da")
+    };
+
+    // 1. Start session with `--model-hook`.
+    let started = json_stdout(&run_env(&[
+        "session",
+        "start",
+        "--model-hook",
+        hook_str,
+        "--model-hook-arg",
+        cfg_str,
+    ]));
+    let id = started["session_id"].as_str().unwrap().to_string();
+    let session_dir = dir.path().join(started["dir"].as_str().unwrap());
+
+    // 2. Open page at explicit 1280x720, wait for cross-origin iframes, and type secret password into `#pw`.
+    let open = json_stdout(&run_env(&[
+        "session",
+        "step",
+        &id,
+        "browser.open",
+        "--arg",
+        &format!("url={}", server.url("/model-lab")),
+        "--arg",
+        "width=1280",
+        "--arg",
+        "height=720",
+    ]));
+    assert_eq!(open["ok"], true, "{open}");
+    let wait_frames = json_stdout(&run_env(&[
+        "session",
+        "step",
+        &id,
+        "browser.wait",
+        "--arg",
+        "css=#save-btn[data-xframe-loaded='1'][data-nested-xframe-loaded='1']",
+    ]));
+    assert_eq!(wait_frames["ok"], true, "{wait_frames}");
+    let tree = wait_frames["snapshot"]["tree"].as_array().unwrap();
+    let pw_ref = find_ref_by_role_and_name(tree, "textbox", "Password").expect("pw ref");
+
+    let mut type_cmd = Command::new(da());
+    type_cmd
+        .current_dir(dir.path())
+        .args(["session", "step", &id, "-f", "-"])
+        .env("DA_BROWSER_HOOK_SECRET", secret)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = type_cmd.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            format!(
+                "browser.type:\n  ref: {pw_ref}\n  text: \"${{env:DA_BROWSER_HOOK_SECRET}}\"\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let typed_out = child.wait_with_output().unwrap();
+    assert_eq!(typed_out.status.code(), Some(0), "{typed_out:?}");
+    let typed_json = json_stdout(&typed_out);
+    let tree2 = typed_json["snapshot"]["tree"].as_array().unwrap();
+    let jev_ref = find_ref_by_role_and_name(tree2, "button", "Jev Target").expect("jev ref");
+
+    // 3. `select-ref` picks `jev_ref`, scrubs secret from query, and subsequent `browser.click` acts on it.
+    fs::write(
+        &cfg_path,
+        format!(
+            "request_file={}\nselect_ref={jev_ref}\nmodel=jev-0.2b\nlatency_ms=12\ntrace_id=tr-jev-1\n",
+            req_file.display()
+        ),
+    )
+    .unwrap();
+    let sel_out = run_env(&[
+        "session",
+        "select-ref",
+        &id,
+        "--query",
+        "Select Jev Target for ${env:DA_BROWSER_HOOK_SECRET}",
+    ]);
+    assert_eq!(sel_out.status.code(), Some(0), "{sel_out:?}");
+    let sel_json = json_stdout(&sel_out);
+    assert_eq!(sel_json["ref"], jev_ref);
+    assert_eq!(
+        sel_json["synthesized_locator"],
+        json!({ "role": "button", "name": "Jev Target" })
+    );
+    let sel_stdin = fs::read_to_string(&req_file).unwrap();
+    assert!(
+        !sel_stdin.contains(secret),
+        "select_ref stdin leaked secret!"
+    );
+
+    let click_jev = run_env(&[
+        "session",
+        "step",
+        &id,
+        "browser.click",
+        "--arg",
+        &format!("ref={jev_ref}"),
+    ]);
+    assert_eq!(click_jev.status.code(), Some(0), "{click_jev:?}");
+
+    // 4. `locate` on HTML button `#save-btn` at `(100, 112)` with `--click`:
+    //    - captures input-masked PNG (password field blacked out, button visible!),
+    //    - reverse-synthesizes `{ "testid": "save-btn" }` (`0` lint warnings!).
+    fs::write(
+        &cfg_path,
+        format!(
+            "request_file={}\nlocate_x=100\nlocate_y=112\nmodel=ui-tars-1.5-7b\nlatency_ms=1821\ntrace_id=tr-vlm-btn\n",
+            req_file.display()
+        ),
+    )
+    .unwrap();
+    let loc_btn_out = run_env(&[
+        "session",
+        "locate",
+        &id,
+        "--query",
+        "Click Save Action with ${env:DA_BROWSER_HOOK_SECRET}",
+        "--click",
+    ]);
+    assert_eq!(loc_btn_out.status.code(), Some(0), "{loc_btn_out:?}");
+    let loc_btn_json = json_stdout(&loc_btn_out);
+    assert_eq!(
+        loc_btn_json["synthesized_locator"],
+        json!({ "testid": "save-btn" }),
+        "{loc_btn_json}"
+    );
+    assert_eq!(loc_btn_json["fragile"], false, "{loc_btn_json}");
+
+    let loc_stdin_raw = fs::read_to_string(&req_file).unwrap();
+    assert!(
+        !loc_stdin_raw.contains(secret),
+        "locate stdin leaked secret!"
+    );
+    let loc_req_val: Value = serde_json::from_str(loc_stdin_raw.trim()).unwrap();
+    let vw = loc_req_val["params"]["viewport"]["width"]
+        .as_u64()
+        .expect("viewport.width");
+    let vh = loc_req_val["params"]["viewport"]["height"]
+        .as_u64()
+        .expect("viewport.height");
+    let img_b64 = loc_req_val["params"]["image_base64"]
+        .as_str()
+        .expect("image_base64 string")
+        .to_string();
+
+    // Verify actual rendered pixels of `image_base64` via headless Chrome `<canvas>`:
+    // - PNG matches `viewport` 1-to-1 (`img.width === vw && img.height === vh`)
+    // - `#pw` `(30..190, 25..55)` MUST be solid `#000000`
+    // - direct cross-origin `<iframe>` `(440..620, 175..225)` MUST be solid `#000000`
+    // - nested same-origin -> cross-origin `<iframe>` `(450..630, 285..335)` MUST be solid `#000000`
+    // - `#save-btn` `(20..180, 90..134)` stays green without font-glyph false negatives!
+    let pixel_check_html = format!(
+        r##"<!doctype html><html><body>
+<p id="px">pending</p>
+<script>
+var img = new Image();
+img.onload = function () {{
+  var c = document.createElement('canvas');
+  c.width = img.width;
+  c.height = img.height;
+  var ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  var scaleX = img.width / {vw};
+  var scaleY = img.height / {vh};
+  var countNonBlack = function (x0, x1, dx, y0, y1, dy) {{
+    var bad = 0;
+    for (var x = x0; x <= x1; x += dx) {{
+      for (var y = y0; y <= y1; y += dy) {{
+        var d = ctx.getImageData(Math.round(x * scaleX), Math.round(y * scaleY), 1, 1).data;
+        if (d[0] !== 0 || d[1] !== 0 || d[2] !== 0 || d[3] !== 255) bad++;
+      }}
+    }}
+    return bad;
+  }};
+  var nonBlackInPw = countNonBlack(30, 190, 10, 25, 55, 6);
+  var nonBlackInXOrigin = countNonBlack(440, 620, 15, 175, 225, 10);
+  var nonBlackInNestedXOrigin = countNonBlack(450, 630, 15, 285, 335, 10);
+  var corner = ctx.getImageData(Math.round(26 * scaleX), Math.round(96 * scaleY), 1, 1).data;
+  var greenCount = 0;
+  for (var bx = 25; bx <= 175; bx += 10) {{
+    for (var by = 95; by <= 128; by += 6) {{
+      var bd = ctx.getImageData(Math.round(bx * scaleX), Math.round(by * scaleY), 1, 1).data;
+      if (bd[1] > 150 && bd[0] < 40) greenCount++;
+    }}
+  }}
+  var btnGreen = (corner[1] > 150 && corner[0] < 40) && greenCount > 20;
+  var oneToOne = (img.width === {vw} && img.height === {vh});
+  var el = document.getElementById('px');
+  el.textContent =
+    '1x=' + oneToOne +
+    ';pw_non_black=' + nonBlackInPw +
+    ';xorigin_non_black=' + nonBlackInXOrigin +
+    ';nested_xorigin_non_black=' + nonBlackInNestedXOrigin +
+    ';btn_green=' + btnGreen;
+  el.setAttribute('data-ready', '1');
+}};
+img.src = 'data:image/png;base64,{img_b64}';
+</script></body></html>"##
+    );
+    let px_server = PageServer::start(BTreeMap::from([("/px".to_string(), pixel_check_html)]));
+    let px_case = dir.write(
+        "verify-mask.yaml",
+        &format!(
+            "name: Verify locate screenshot mask\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.wait:\n      css: \"#px[data-ready='1']\"\n  - browser.read:\n      css: \"#px\"\n    expect:\n      - path: $.text\n        equals: \"1x=true;pw_non_black=0;xorigin_non_black=0;nested_xorigin_non_black=0;btn_green=true\"\n",
+            px_server.url("/px")
+        ),
+    );
+    let px_run = run_da_in(
+        dir.path(),
+        &["run", px_case.to_str().unwrap(), "--no-bundle"],
+    );
+    assert_eq!(
+        px_run.status.code(),
+        Some(0),
+        "password pixels were not masked in model/locate screenshot: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&px_run.stdout),
+        String::from_utf8_lossy(&px_run.stderr)
+    );
+
+    // 5. `judge` records redacted rationale & audit fields in `steps.jsonl`.
+    fs::write(
+        &cfg_path,
+        format!(
+            "request_file={}\njudge_passed=true\njudge_rationale=Buttons clicked cleanly without leaking {secret}\nmodel=vllm-judge\nlatency_ms=310\ntrace_id=tr-{secret}\n",
+            req_file.display()
+        ),
+    )
+    .unwrap();
+    let judge_out = run_env(&[
+        "session",
+        "judge",
+        &id,
+        "--rubric",
+        "Confirm both buttons appended markers",
+    ]);
+    assert_eq!(judge_out.status.code(), Some(0), "{judge_out:?}");
+
+    // Assert log state `[jev][btn]` and export deterministic button-only case -> 0 lint warnings!
+    let read1 = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.read:\n  css: \"#log\"\nexpect:\n  - path: $.text\n    equals: \"[jev][btn]\"\n",
+    );
+    assert_eq!(read1.status.code(), Some(0), "{read1:?}");
+
+    let btn_case = dir.path().join("btn-deterministic.yaml");
+    let exp_btn = json_stdout(&run_env(&[
+        "session",
+        "export",
+        &id,
+        "-o",
+        btn_case.to_str().unwrap(),
+        "--name",
+        "Deterministic button flow",
+    ]));
+    assert_eq!(
+        exp_btn["fragile"].as_array().unwrap().len(),
+        0,
+        "HTML button locate must produce 0 fragile steps: {exp_btn}"
+    );
+    let lint_btn = run_env(&["--output", "json", "lint", btn_case.to_str().unwrap()]);
+    assert_eq!(lint_btn.status.code(), Some(0), "{lint_btn:?}");
+    let lint_btn_json = json_stdout(&lint_btn);
+    assert_eq!(
+        lint_btn_json["warnings"].as_array().map_or(0, |w| w.len()),
+        0,
+        "expected 0 da lint warnings for reverse-synthesized HTML button: {lint_btn_json}"
+    );
+
+    // 6. `locate` on opaque `<canvas>` (`#board` at `(120, 210)`, offset `(100, 50)`) -> falls back to `at:` + coordinate lint warning!
+    fs::write(
+        &cfg_path,
+        format!(
+            "request_file={}\nlocate_x=120\nlocate_y=210\nmodel=ui-tars-1.5-7b\nlatency_ms=1900\ntrace_id=tr-vlm-canvas\n",
+            req_file.display()
+        ),
+    )
+    .unwrap();
+    let loc_canvas_out = run_env(&[
+        "session",
+        "locate",
+        &id,
+        "--query",
+        "Click canvas board at offset 100,50",
+        "--click",
+    ]);
+    assert_eq!(loc_canvas_out.status.code(), Some(0), "{loc_canvas_out:?}");
+    let loc_canvas_json = json_stdout(&loc_canvas_out);
+    assert_eq!(loc_canvas_json["synthesized_locator"], Value::Null);
+    assert_eq!(loc_canvas_json["fragile"], true);
+
+    let read2 = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.read:\n  css: \"#log\"\nexpect:\n  - path: $.text\n    equals: \"[jev][btn][canvas:100,50]\"\n",
+    );
+    assert_eq!(read2.status.code(), Some(0), "{read2:?}");
+
+    let canvas_case = dir.path().join("canvas-fallback.yaml");
+    let exp_canvas = json_stdout(&run_env(&[
+        "session",
+        "export",
+        &id,
+        "-o",
+        canvas_case.to_str().unwrap(),
+        "--name",
+        "Canvas fallback flow",
+    ]));
+    assert_eq!(
+        exp_canvas["fragile"].as_array().unwrap().len(),
+        1,
+        "{exp_canvas}"
+    );
+    assert_eq!(
+        exp_canvas["fragile"][0]["reason"], "explicit_coordinates",
+        "{exp_canvas}"
+    );
+
+    let lint_canvas = run_env(&["--output", "json", "lint", canvas_case.to_str().unwrap()]);
+    assert_eq!(lint_canvas.status.code(), Some(0), "{lint_canvas:?}");
+    let lint_canvas_json = json_stdout(&lint_canvas);
+    assert_eq!(
+        lint_canvas_json["warnings"]
+            .as_array()
+            .map_or(0, |w| w.len()),
+        1,
+        "expected 1 coordinate lint warning on canvas fallback: {lint_canvas_json}"
+    );
+
+    // Check `steps.jsonl`: zero secret leakage anywhere and audit metadata present!
+    let mut sess_files = Vec::new();
+    collect_files(&session_dir, &mut sess_files);
+    for f in &sess_files {
+        let txt = fs::read_to_string(f).unwrap();
+        assert!(
+            !txt.contains(secret),
+            "session file {} leaked secret!",
+            f.display()
+        );
+    }
+    let steps_txt = fs::read_to_string(session_dir.join("steps.jsonl")).unwrap();
+    assert!(steps_txt.contains("\"jev-0.2b\""));
+    assert!(steps_txt.contains("\"ui-tars-1.5-7b\""));
+    assert!(steps_txt.contains("\"vllm-judge\""));
+
+    // 7. Stop session, delete mock hook binary so NO model process exists, and replay BOTH cases deterministically!
+    let stop = run_env(&["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+    fs::remove_file(&hook_bin).expect("delete mock hook executable before replay");
+
+    let replay_btn = run_env(&["run", btn_case.to_str().unwrap(), "--no-bundle"]);
+    assert_eq!(
+        replay_btn.status.code(),
+        Some(0),
+        "btn replay failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&replay_btn.stdout),
+        String::from_utf8_lossy(&replay_btn.stderr)
+    );
+
+    let replay_canvas = run_env(&["run", canvas_case.to_str().unwrap(), "--no-bundle"]);
+    assert_eq!(
+        replay_canvas.status.code(),
+        Some(0),
+        "canvas replay failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&replay_canvas.stdout),
+        String::from_utf8_lossy(&replay_canvas.stderr)
+    );
+}
+
+#[test]
+fn browser_locate_masks_top_layer_modals_popovers_and_frames() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+
+    let xorigin_child_html = r##"<!doctype html><html><body style="margin:0;background:#ff00ff"><input id="xpw" type="password" value="Sup3rSecret!" style="position:fixed;left:10px;top:10px;width:180px;height:40px;background:#ff00ff;border:0"></body></html>"##.to_string();
+    let xorigin_server = PageServer::start(BTreeMap::from([(
+        "/xorigin".to_string(),
+        xorigin_child_html,
+    )]));
+    let xorigin_url = xorigin_server.url("/xorigin");
+
+    let same_in_dlg_html = r##"<!doctype html><html><body style="margin:0;background:#eeeeee"><input id="same-pw" type="password" value="SameInDlg!" style="position:fixed;left:10px;top:10px;width:180px;height:40px;background:#ff00ff;color:#ff00ff;border:0;padding:0;margin:0"></body></html>"##.to_string();
+
+    let page_html = format!(
+        r##"<!doctype html>
+<html>
+<head>
+  <title>Top Layer Mask Lab</title>
+  <style>
+    html, body {{ margin: 0; padding: 0; background: #f4f4f4; }}
+    ::backdrop {{ background: rgba(0, 160, 0, 0.2); }}
+    #bg-pw {{
+      position: fixed;
+      left: 40px;
+      top: 40px;
+      width: 260px;
+      height: 60px;
+      background: #ff00ff;
+      color: #ff00ff;
+      border: 0;
+      padding: 0;
+      margin: 0;
+    }}
+    #d {{
+      position: fixed;
+      left: 40px;
+      top: 40px;
+      width: 540px;
+      height: 340px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: #ffffff;
+    }}
+    #dlg-btn {{
+      position: fixed;
+      left: 80px;
+      top: 50px;
+      width: 160px;
+      height: 40px;
+      background: rgb(0, 200, 80);
+      color: #ffffff;
+      border: 0;
+      padding: 0;
+      margin: 0;
+    }}
+    #pw {{
+      position: fixed;
+      left: 60px;
+      top: 110px;
+      width: 180px;
+      height: 40px;
+      background: #ff00ff;
+      color: #ff00ff;
+      border: 0;
+      padding: 0;
+      margin: 0;
+      font-size: 20px;
+    }}
+    #dlg-shadow-host {{
+      position: fixed;
+      left: 60px;
+      top: 170px;
+      width: 180px;
+      height: 40px;
+    }}
+    #dlg-same {{
+      position: fixed;
+      left: 60px;
+      top: 230px;
+      width: 220px;
+      height: 60px;
+      border: 0;
+    }}
+    #dlg-xorigin {{
+      position: fixed;
+      left: 310px;
+      top: 110px;
+      width: 220px;
+      height: 80px;
+      border: 0;
+    }}
+    #pop {{
+      position: fixed;
+      left: 640px;
+      top: 40px;
+      width: 300px;
+      height: 180px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: #ffffff;
+    }}
+    #pop-pw {{
+      position: fixed;
+      left: 660px;
+      top: 60px;
+      width: 200px;
+      height: 44px;
+      background: #ff00ff;
+      color: #ff00ff;
+      border: 0;
+      padding: 0;
+      margin: 0;
+    }}
+  </style>
+</head>
+<body>
+  <input id="bg-pw" type="password" value="BgSecret!" />
+  <dialog id="d">
+    <button id="dlg-btn" type="button" onclick="document.getElementById('dlg-status').textContent = 'clicked';">Confirm Modal</button>
+    <input id="pw" type="password" value="Sup3rSecret!" />
+    <div id="dlg-shadow-host"></div>
+    <iframe id="dlg-same" src="/dlg-same" onload="document.getElementById('dlg-btn').setAttribute('data-same-loaded', '1')"></iframe>
+    <iframe id="dlg-xorigin" src="{xorigin_url}" onload="document.getElementById('dlg-btn').setAttribute('data-xorigin-loaded', '1')"></iframe>
+    <p id="dlg-status" style="position:fixed;left:310px;top:50px;margin:0;">idle</p>
+  </dialog>
+  <div id="pop" popover="auto">
+    <input id="pop-pw" type="password" value="PopSecret!" />
+  </div>
+  <p id="top-layer-state" style="position:fixed;left:40px;top:420px;">pending</p>
+  <script>
+    var shadow = document.getElementById('dlg-shadow-host').attachShadow({{ mode: 'open' }});
+    var shadowPw = document.createElement('input');
+    shadowPw.id = 'dlg-shadow-pw';
+    shadowPw.type = 'password';
+    shadowPw.value = 'ShadowInDlg!';
+    shadowPw.style.cssText = 'display:block;width:180px;height:40px;background:#ff00ff;color:#ff00ff;border:0;padding:0;margin:0;';
+    shadow.appendChild(shadowPw);
+
+    var d = document.getElementById('d');
+    var p = document.getElementById('pop');
+    d.showModal();
+    p.showPopover();
+    window.recordTopLayerState = function () {{
+      return 'dialog_open=' + d.open +
+        ';dialog_modal=' + d.matches(':modal') +
+        ';popover_open=' + p.matches(':popover-open') +
+        ';status=' + document.getElementById('dlg-status').textContent;
+    }};
+  </script>
+</body>
+</html>"##
+    );
+
+    let server = PageServer::start(BTreeMap::from([
+        ("/top-layer".to_string(), page_html),
+        ("/dlg-same".to_string(), same_in_dlg_html),
+    ]));
+    let dir = TempDir::new("browser-top-layer-locate");
+    let hook_bin = compile_browser_mock_hook(dir.path());
+    let hook_str = hook_bin.to_str().unwrap();
+    let req_file = dir.path().join("hook_req.json");
+    let cfg_path = dir.path().join("hook.cfg");
+    fs::write(
+        &cfg_path,
+        format!(
+            "request_file={}\nlocate_x=150\nlocate_y=130\nmodel=ui-tars-1.5-7b\nlatency_ms=42\ntrace_id=tr-top-layer\n",
+            req_file.display()
+        ),
+    )
+    .unwrap();
+    let cfg_str = cfg_path.to_str().unwrap();
+
+    let started = json_stdout(&run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "start",
+            "--model-hook",
+            hook_str,
+            "--model-hook-arg",
+            cfg_str,
+        ],
+    ));
+    let id = started["session_id"].as_str().unwrap().to_string();
+
+    let open = json_stdout(&run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={}", server.url("/top-layer")),
+            "--arg",
+            "width=1280",
+            "--arg",
+            "height=720",
+        ],
+    ));
+    assert_eq!(open["ok"], true, "{open}");
+
+    let wait_ready = json_stdout(&run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.wait",
+            "--arg",
+            "css=#dlg-btn[data-same-loaded='1'][data-xorigin-loaded='1']",
+        ],
+    ));
+    assert_eq!(wait_ready["ok"], true, "{wait_ready}");
+
+    // Locate the password input inside `<dialog>.showModal()` -> hit-testing must
+    // still resolve `{"css":"#pw"}` after mask cleanup while masking every top-layer pixel!
+    let loc_pw = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "locate",
+            &id,
+            "--query",
+            "Locate password field inside modal dialog",
+        ],
+    );
+    assert_eq!(loc_pw.status.code(), Some(0), "{loc_pw:?}");
+    let loc_pw_json = json_stdout(&loc_pw);
+    assert_eq!(
+        loc_pw_json["synthesized_locator"],
+        json!({ "css": "#pw" }),
+        "expected hit-testing to synthesize #pw inside modal dialog: {loc_pw_json}"
+    );
+    assert_eq!(loc_pw_json["fragile"], false, "{loc_pw_json}");
+
+    let loc_req_raw = fs::read_to_string(&req_file).unwrap();
+    let loc_req_val: Value = serde_json::from_str(loc_req_raw.trim()).unwrap();
+    let vw = loc_req_val["params"]["viewport"]["width"].as_u64().unwrap();
+    let vh = loc_req_val["params"]["viewport"]["height"]
+        .as_u64()
+        .unwrap();
+    let img_b64 = loc_req_val["params"]["image_base64"].as_str().unwrap();
+
+    // Immediately after `locate` mask cleanup, BOTH `<dialog>:modal` and `[popover="auto"]:popover-open`
+    // must still be open (and `#dlg-btn` remains clickable afterward; note clicking outside a
+    // `popover="auto"` light-dismisses the popover per HTML spec).
+    let verify_modal_pop = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.wait:\n  css: \"#d:modal\"\n",
+    );
+    assert_eq!(
+        verify_modal_pop.status.code(),
+        Some(0),
+        "dialog must still be :modal after locate: {verify_modal_pop:?}"
+    );
+    let verify_pop_open = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.wait:\n  css: \"#pop:popover-open\"\n",
+    );
+    assert_eq!(
+        verify_pop_open.status.code(),
+        Some(0),
+        "popover must still be :popover-open after locate: {verify_pop_open:?}"
+    );
+
+    let click_btn = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.click:\n  css: \"#dlg-btn\"\n",
+    );
+    assert_eq!(click_btn.status.code(), Some(0), "{click_btn:?}");
+
+    let verify_state = run_da_stdin(
+        dir.path(),
+        &["session", "step", &id],
+        "browser.read:\n  css: \"#d[open]:modal #dlg-status\"\nexpect:\n  - path: $.text\n    equals: \"clicked\"\n",
+    );
+    assert_eq!(verify_state.status.code(), Some(0), "{verify_state:?}");
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+
+    // Verify rendered PNG pixels via real Chrome `<canvas>`:
+    // - `#pw` in modal `<dialog>`: `(70..230, 118..142)` -> solid `#000000`
+    // - `#dlg-shadow-pw` in shadow root inside `<dialog>`: `(70..230, 178..202)` -> solid `#000000`
+    // - `#same-pw` in same-origin iframe inside `<dialog>`: `(78..242, 248..272)` -> solid `#000000`
+    // - `#dlg-xorigin` cross-origin iframe inside `<dialog>`: `(320..520, 120..180)` -> solid `#000000`
+    // - `#pop-pw` in `<div popover="auto">`: `(670..850, 68..96)` -> solid `#000000`
+    // - `#dlg-btn` `(90..230, 58..82)` stays green even though `#bg-pw` sits behind it!
+    let pixel_check_html = format!(
+        r##"<!doctype html><html><body>
+<p id="px">pending</p>
+<script>
+var img = new Image();
+img.onload = function () {{
+  var c = document.createElement('canvas');
+  c.width = img.width;
+  c.height = img.height;
+  var ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  var scaleX = img.width / {vw};
+  var scaleY = img.height / {vh};
+  var countNonBlack = function (x0, x1, dx, y0, y1, dy) {{
+    var bad = 0;
+    for (var x = x0; x <= x1; x += dx) {{
+      for (var y = y0; y <= y1; y += dy) {{
+        var d = ctx.getImageData(Math.round(x * scaleX), Math.round(y * scaleY), 1, 1).data;
+        if (d[0] !== 0 || d[1] !== 0 || d[2] !== 0 || d[3] !== 255) bad++;
+      }}
+    }}
+    return bad;
+  }};
+  var pwBad = countNonBlack(70, 230, 10, 118, 142, 6);
+  var shadowBad = countNonBlack(70, 230, 10, 178, 202, 6);
+  var sameBad = countNonBlack(78, 242, 12, 248, 272, 6);
+  var xoriginBad = countNonBlack(320, 520, 15, 120, 180, 10);
+  var popBad = countNonBlack(670, 850, 12, 68, 96, 6);
+  var greenCount = 0;
+  for (var bx = 90; bx <= 230; bx += 10) {{
+    for (var by = 58; by <= 82; by += 6) {{
+      var bd = ctx.getImageData(Math.round(bx * scaleX), Math.round(by * scaleY), 1, 1).data;
+      if (bd[1] > 150 && bd[0] < 40) greenCount++;
+    }}
+  }}
+  var el = document.getElementById('px');
+  el.textContent =
+    '1x=' + (img.width === {vw} && img.height === {vh}) +
+    ';pw=' + pwBad +
+    ';shadow=' + shadowBad +
+    ';same=' + sameBad +
+    ';xorigin=' + xoriginBad +
+    ';pop=' + popBad +
+    ';btn_green=' + (greenCount > 20);
+  el.setAttribute('data-ready', '1');
+}};
+img.src = 'data:image/png;base64,{img_b64}';
+</script></body></html>"##
+    );
+    let px_server = PageServer::start(BTreeMap::from([("/px".to_string(), pixel_check_html)]));
+    let px_case = dir.write(
+        "verify-top-layer-mask.yaml",
+        &format!(
+            "name: Verify top-layer locate mask\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.wait:\n      css: \"#px[data-ready='1']\"\n  - browser.read:\n      css: \"#px\"\n    expect:\n      - path: $.text\n        equals: \"1x=true;pw=0;shadow=0;same=0;xorigin=0;pop=0;btn_green=true\"\n",
+            px_server.url("/px")
+        ),
+    );
+    let px_run = run_da_in(
+        dir.path(),
+        &["run", px_case.to_str().unwrap(), "--no-bundle"],
+    );
+    assert_eq!(
+        px_run.status.code(),
+        Some(0),
+        "top-layer pixels were not masked properly: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&px_run.stdout),
+        String::from_utf8_lossy(&px_run.stderr)
+    );
+}

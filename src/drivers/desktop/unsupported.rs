@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::core::registry::StepError;
-use crate::core::session::Evidence;
+use crate::core::session::{Evidence, MaskedViewportCapture, SynthesizedTarget};
 
 use super::{AttachArgs, ClickButton, DesktopLocator, DesktopPoint, LaunchArgs, WaitState};
 
@@ -136,6 +136,22 @@ impl DesktopBackend {
 
     pub fn take_step_metadata(&mut self) -> Option<Value> {
         None
+    }
+
+    pub fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        Err(UNSUPPORTED_PLATFORM_ERROR.to_string())
+    }
+
+    pub fn synthesize_ref(&mut self, _ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        Err(UNSUPPORTED_PLATFORM_ERROR.to_string())
+    }
+
+    pub fn synthesize_at_point(
+        &mut self,
+        _x: f64,
+        _y: f64,
+    ) -> Result<Option<SynthesizedTarget>, String> {
+        Err(UNSUPPORTED_PLATFORM_ERROR.to_string())
     }
 
     pub fn detach(&mut self) -> Result<Option<Value>, String> {

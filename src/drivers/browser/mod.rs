@@ -53,7 +53,7 @@ use crate::core::paths;
 use crate::core::registry::{
     Registry, SessionDefinition, StepDefinition, StepError, allow_retry, disallow_retry,
 };
-use crate::core::session::{Evidence, Session, Sessions};
+use crate::core::session::{Evidence, MaskedViewportCapture, Session, Sessions, SynthesizedTarget};
 
 /// Session kind the browser steps share.
 pub const SESSION_KIND: &str = "browser";
@@ -1657,60 +1657,72 @@ var areEnclosingFramesVisible = function (frames) {
   }
   return true;
 };
-var checkAxisAlignedTransform = function (node, win) {
-  if (win.SVGElement && node instanceof win.SVGElement) {
-    return { ok: false, reason: 'SVG ancestor transforms cannot be mapped to viewport coordinates' };
-  }
+var isTopLayerElement = function (node) {
+  if (!node || node.nodeType !== 1 || typeof node.matches !== 'function') return false;
+  try {
+    if (node.matches(':modal, :popover-open, :fullscreen')) return true;
+  } catch (e) {}
+  try {
+    if (node.matches(':-webkit-full-screen')) return true;
+  } catch (e) {}
+  return false;
+};
+var checkAxisAlignedTransform = function (node, win, zoomOnly) {
   var cs = win.getComputedStyle(node);
   var sx = 1;
   var sy = 1;
-  if (cs.transform && cs.transform !== 'none') {
-    var m = null;
-    try {
-      m = new (win.DOMMatrix || DOMMatrix)(cs.transform);
-    } catch (e) {
-      return { ok: false, reason: 'CSS transform `' + cs.transform + '` could not be parsed' };
+  if (!zoomOnly) {
+    if (win.SVGElement && node instanceof win.SVGElement) {
+      return { ok: false, reason: 'SVG ancestor transforms cannot be mapped to viewport coordinates' };
     }
-    if (!m.is2D || !isFinite(m.a) || !isFinite(m.b) || !isFinite(m.c) || !isFinite(m.d) || !isFinite(m.e) || !isFinite(m.f)) {
-      return { ok: false, reason: '3D CSS transform `' + cs.transform + '` cannot be mapped as a 2D viewport coordinate' };
+    if (cs.transform && cs.transform !== 'none') {
+      var m = null;
+      try {
+        m = new (win.DOMMatrix || DOMMatrix)(cs.transform);
+      } catch (e) {
+        return { ok: false, reason: 'CSS transform `' + cs.transform + '` could not be parsed' };
+      }
+      if (!m.is2D || !isFinite(m.a) || !isFinite(m.b) || !isFinite(m.c) || !isFinite(m.d) || !isFinite(m.e) || !isFinite(m.f)) {
+        return { ok: false, reason: '3D CSS transform `' + cs.transform + '` cannot be mapped as a 2D viewport coordinate' };
+      }
+      if (Math.abs(m.b) > 1e-6 || Math.abs(m.c) > 1e-6) {
+        return { ok: false, reason: 'rotated or skewed CSS transform `' + cs.transform + '` cannot be mapped to axis-aligned viewport coordinates' };
+      }
+      if (m.a <= 0 || m.d <= 0) {
+        return { ok: false, reason: 'non-positive or reflected CSS transform `' + cs.transform + '` cannot be mapped' };
+      }
+      sx *= m.a;
+      sy *= m.d;
     }
-    if (Math.abs(m.b) > 1e-6 || Math.abs(m.c) > 1e-6) {
-      return { ok: false, reason: 'rotated or skewed CSS transform `' + cs.transform + '` cannot be mapped to axis-aligned viewport coordinates' };
-    }
-    if (m.a <= 0 || m.d <= 0) {
-      return { ok: false, reason: 'non-positive or reflected CSS transform `' + cs.transform + '` cannot be mapped' };
-    }
-    sx *= m.a;
-    sy *= m.d;
-  }
-  if (cs.rotate && cs.rotate !== 'none') {
-    var rm = String(cs.rotate).trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(deg|rad|grad|turn)$/i);
-    if (!rm || !isFinite(parseFloat(rm[1])) || Math.abs(parseFloat(rm[1])) > 1e-6) {
-      return { ok: false, reason: 'CSS `rotate: ' + cs.rotate + '` cannot be mapped to axis-aligned viewport coordinates' };
-    }
-  }
-  if (cs.scale && cs.scale !== 'none') {
-    var sp = String(cs.scale).trim().split(/\s+/);
-    var s0 = Number(sp[0]);
-    var s1 = sp.length > 1 ? Number(sp[1]) : s0;
-    var s2 = sp.length > 2 ? Number(sp[2]) : 1;
-    if (sp.length > 3 || !isFinite(s0) || !isFinite(s1) || !isFinite(s2) || s0 <= 0 || s1 <= 0 || Math.abs(s2 - 1) > 1e-6) {
-      return { ok: false, reason: 'CSS `scale: ' + cs.scale + '` cannot be mapped to 2D viewport coordinates' };
-    }
-    sx *= s0;
-    sy *= s1;
-  }
-  if (cs.translate && cs.translate !== 'none') {
-    var tp = String(cs.translate).trim().split(/\s+/);
-    if (tp.length > 2) {
-      var tz = parseFloat(tp[2]);
-      if (!isFinite(tz) || Math.abs(tz) > 1e-6) {
-        return { ok: false, reason: '3D CSS `translate: ' + cs.translate + '` cannot be mapped' };
+    if (cs.rotate && cs.rotate !== 'none') {
+      var rm = String(cs.rotate).trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(deg|rad|grad|turn)$/i);
+      if (!rm || !isFinite(parseFloat(rm[1])) || Math.abs(parseFloat(rm[1])) > 1e-6) {
+        return { ok: false, reason: 'CSS `rotate: ' + cs.rotate + '` cannot be mapped to axis-aligned viewport coordinates' };
       }
     }
-  }
-  if (cs.offsetPath && cs.offsetPath !== 'none') {
-    return { ok: false, reason: 'CSS `offset-path` transform cannot be mapped' };
+    if (cs.scale && cs.scale !== 'none') {
+      var sp = String(cs.scale).trim().split(/\s+/);
+      var s0 = Number(sp[0]);
+      var s1 = sp.length > 1 ? Number(sp[1]) : s0;
+      var s2 = sp.length > 2 ? Number(sp[2]) : 1;
+      if (sp.length > 3 || !isFinite(s0) || !isFinite(s1) || !isFinite(s2) || s0 <= 0 || s1 <= 0 || Math.abs(s2 - 1) > 1e-6) {
+        return { ok: false, reason: 'CSS `scale: ' + cs.scale + '` cannot be mapped to 2D viewport coordinates' };
+      }
+      sx *= s0;
+      sy *= s1;
+    }
+    if (cs.translate && cs.translate !== 'none') {
+      var tp = String(cs.translate).trim().split(/\s+/);
+      if (tp.length > 2) {
+        var tz = parseFloat(tp[2]);
+        if (!isFinite(tz) || Math.abs(tz) > 1e-6) {
+          return { ok: false, reason: '3D CSS `translate: ' + cs.translate + '` cannot be mapped' };
+        }
+      }
+    }
+    if (cs.offsetPath && cs.offsetPath !== 'none') {
+      return { ok: false, reason: 'CSS `offset-path` transform cannot be mapped' };
+    }
   }
   if (cs.zoom && cs.zoom !== 'normal') {
     var zm = parseFloat(cs.zoom);
@@ -1728,11 +1740,15 @@ var checkTransformChain = function (startNode, doc) {
   var sx = 1;
   var sy = 1;
   var cur = startNode;
+  var crossedTopLayer = false;
   while (cur && cur.nodeType === 1) {
-    var step = checkAxisAlignedTransform(cur, win);
+    var step = checkAxisAlignedTransform(cur, win, crossedTopLayer);
     if (!step.ok) return step;
     sx *= step.sx;
     sy *= step.sy;
+    // Top-layer elements use the initial containing block and escape ancestor
+    // CSS transforms, while CSS `zoom` still inherits across the tree.
+    if (isTopLayerElement(cur)) crossedTopLayer = true;
     cur = cur.parentElement || (cur.parentNode && cur.parentNode.host) || null;
   }
   return { ok: true, sx: sx, sy: sy };
@@ -1890,27 +1906,60 @@ var composedContains = function (ancestor, node) {
 static FRAME_HELPERS_JS: LazyLock<String> =
     LazyLock::new(|| format!("{FRAME_GEOMETRY_HELPERS_JS}\n{COMPOSED_HELPERS_JS}"));
 
-/// JavaScript that covers every visible editable field with an opaque box,
-/// including fields inside accessible same-origin and nested iframes.
+/// Builds the JavaScript that covers every visible editable field with an opaque
+/// `#000` box, including fields inside open shadow roots, accessible same-origin
+/// and nested iframes, and browser top-layer elements (`:modal`, `:popover-open`,
+/// `:fullscreen`).
 ///
-/// `position: fixed` uses top-level viewport coordinates (`ox + sx * rect.left`,
-/// `oy + sy * rect.top`) so a single overlay at the highest `z-index` covers fields
-/// across nested scaled frames, except in `<frameset>` documents where masks live on
-/// each frame document itself. Fails clearly instead of leaving uncovered pixels if
-/// a frame or root element has a CSS transform that cannot be mapped accurately.
-static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
+/// When `mask_cross_origin_frames` is `true` (used by `model/locate`), any visible
+/// `<iframe>` or `<frame>` whose `contentDocument` is inaccessible (`null` or
+/// cross-origin `SecurityError`) is covered across its entire bounding box so raw
+/// pixels inside cross-origin frames can never reach external vision hooks.
+///
+/// Normal-flow targets use `position: fixed` masks on `document.documentElement`
+/// at the highest `z-index` (or on each `<frame>` document in `<frameset>` pages).
+/// Targets in or inside a top-layer element use a `popover="manual"` mask layer
+/// opened after existing top-layer entries so modal `<dialog>`s, popovers, and
+/// fullscreen elements cannot paint over `#000` masks, while normal-flow masks
+/// stay behind open top-layer dialogs. Fails clearly instead of leaving uncovered
+/// pixels if a frame, root element, or top-layer host cannot be mapped accurately.
+fn build_mask_inputs_script(mask_cross_origin_frames: bool) -> String {
     let helpers = FRAME_HELPERS_JS.as_str();
+    let mask_xorigin = if mask_cross_origin_frames {
+        "true"
+    } else {
+        "false"
+    };
     format!(
         r#"(function () {{
 {helpers}
+  var maskCrossOriginFrames = {mask_xorigin};
   var skipped = ['button', 'submit', 'reset', 'checkbox', 'radio', 'image', 'hidden', 'range', 'color'];
   var masks = [];
+  var cleanupNodes = [];
+  var topLayers = [];
   var isFrameset = Boolean(document.body && document.body.tagName === 'FRAMESET');
   var fail = function (reason) {{
-    for (var m = 0; m < masks.length; m++) {{
-      masks[m].remove();
+    for (var m = 0; m < cleanupNodes.length; m++) {{
+      cleanupNodes[m].remove();
     }}
     return {{ ok: false, reason: reason }};
+  }};
+  var createHtmlEl = function (hostDoc, tag) {{
+    return typeof hostDoc.createElementNS === 'function'
+      ? hostDoc.createElementNS('http://www.w3.org/1999/xhtml', tag)
+      : hostDoc.createElement(tag);
+  }};
+  var measureProbeMap = function (hostDoc, parent, collapsedReason) {{
+    var probe = createHtmlEl(hostDoc, 'div');
+    probe.style.cssText = 'position:fixed!important;inset:auto!important;right:auto!important;bottom:auto!important;box-sizing:border-box!important;left:0px!important;top:0px!important;width:100px!important;height:100px!important;border:0!important;padding:0!important;margin:0!important;visibility:hidden!important;pointer-events:none!important;';
+    parent.appendChild(probe);
+    var pr = probe.getBoundingClientRect();
+    probe.remove();
+    if (!isFinite(pr.width) || !isFinite(pr.height) || pr.width <= 0 || pr.height <= 0) {{
+      return {{ ok: false, reason: collapsedReason }};
+    }}
+    return {{ ok: true, ox: pr.left, oy: pr.top, sx: pr.width / 100, sy: pr.height / 100 }};
   }};
   var measureHostMap = function (hostDoc) {{
     var root = hostDoc && hostDoc.documentElement;
@@ -1927,28 +1976,72 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     if (!rootMoved) {{
       return {{ ok: true, ox: 0, oy: 0, sx: 1, sy: 1 }};
     }}
-    var probe = hostDoc.createElement('div');
-    probe.style.cssText = 'position:fixed;box-sizing:border-box;left:0px;top:0px;width:100px;height:100px;border:0;padding:0;margin:0;visibility:hidden;pointer-events:none;';
-    root.appendChild(probe);
-    var pr = probe.getBoundingClientRect();
-    probe.remove();
-    if (!isFinite(pr.width) || !isFinite(pr.height) || pr.width <= 0 || pr.height <= 0) {{
-      return {{ ok: false, reason: 'document root has collapsed transform geometry' }};
+    return measureProbeMap(hostDoc, root, 'document root has collapsed transform geometry');
+  }};
+  var ensureTopLayer = function (hostDoc) {{
+    for (var i = 0; i < topLayers.length; i++) {{
+      if (topLayers[i].doc === hostDoc) return topLayers[i].entry;
     }}
-    return {{ ok: true, ox: pr.left, oy: pr.top, sx: pr.width / 100, sy: pr.height / 100 }};
+    var root = hostDoc && hostDoc.documentElement;
+    if (!root) {{
+      var missing = {{ ok: false, reason: 'document root element is missing' }};
+      topLayers.push({{ doc: hostDoc, entry: missing }});
+      return missing;
+    }}
+    try {{
+      var st = createHtmlEl(hostDoc, 'style');
+      st.setAttribute('data-da-screenshot-mask-style', '');
+      st.textContent = '[data-da-screenshot-mask-layer]::backdrop{{display:none!important;background:transparent!important;opacity:0!important;}}';
+      (hostDoc.head || root).appendChild(st);
+      cleanupNodes.push(st);
+    }} catch (e) {{}}
+    var layer = createHtmlEl(hostDoc, 'div');
+    layer.setAttribute('data-da-screenshot-mask-layer', '');
+    layer.setAttribute('popover', 'manual');
+    layer.style.cssText = 'position:fixed!important;inset:auto!important;left:0px!important;top:0px!important;right:auto!important;bottom:auto!important;width:0px!important;height:0px!important;min-width:0!important;min-height:0!important;max-width:none!important;max-height:none!important;border:0!important;padding:0!important;margin:0!important;overflow:visible!important;background:transparent!important;transform:none!important;rotate:none!important;scale:none!important;translate:none!important;clip-path:none!important;filter:none!important;contain:none!important;opacity:1!important;visibility:visible!important;pointer-events:none!important;z-index:2147483647!important;';
+    root.appendChild(layer);
+    cleanupNodes.push(layer);
+    var opened = false;
+    try {{
+      if (typeof layer.showPopover === 'function') {{
+        layer.showPopover();
+        layer.style.setProperty('display', 'block', 'important');
+        opened = typeof layer.matches === 'function' && layer.matches(':popover-open');
+      }}
+    }} catch (e) {{
+      opened = false;
+    }}
+    if (!opened) {{
+      var failed = {{ ok: false, reason: 'screenshot mask could not enter the browser top layer' }};
+      topLayers.push({{ doc: hostDoc, entry: failed }});
+      return failed;
+    }}
+    var map = measureProbeMap(hostDoc, layer, 'top-layer mask container has collapsed geometry');
+    var entry = map.ok ? {{ ok: true, layer: layer, map: map }} : map;
+    topLayers.push({{ doc: hostDoc, entry: entry }});
+    return entry;
+  }};
+  var hasTopLayerAncestor = function (node) {{
+    var cur = node;
+    while (cur) {{
+      if (cur.nodeType === 1 && isTopLayerElement(cur)) return true;
+      cur = cur.parentElement || (cur.parentNode && cur.parentNode.host) || null;
+    }}
+    return false;
   }};
   var topHost = isFrameset ? {{ ok: true, ox: 0, oy: 0, sx: 1, sy: 1 }} : measureHostMap(document);
-  var appendMask = function (hostDoc, hostMap, left, top, width, height) {{
-    if (!hostDoc || !hostDoc.documentElement || width <= 0 || height <= 0) return true;
+  var appendMask = function (hostDoc, parent, hostMap, left, top, width, height) {{
+    if (!hostDoc || !parent || width <= 0 || height <= 0) return true;
     var cssLeft = (left - hostMap.ox) / hostMap.sx;
     var cssTop = (top - hostMap.oy) / hostMap.sy;
     var cssW = width / hostMap.sx;
     var cssH = height / hostMap.sy;
-    var mask = hostDoc.createElement('div');
+    var mask = createHtmlEl(hostDoc, 'div');
     mask.setAttribute('data-da-screenshot-mask', '');
-    mask.style.cssText = 'position:fixed;box-sizing:border-box;left:' + cssLeft + 'px;top:' + cssTop + 'px;width:' + cssW + 'px;height:' + cssH + 'px;background:#000;opacity:1;border:0;padding:0;margin:0;z-index:2147483647;pointer-events:none;';
-    hostDoc.documentElement.appendChild(mask);
+    mask.style.cssText = 'position:fixed!important;inset:auto!important;right:auto!important;bottom:auto!important;box-sizing:border-box!important;display:block!important;visibility:visible!important;left:' + cssLeft + 'px!important;top:' + cssTop + 'px!important;width:' + cssW + 'px!important;height:' + cssH + 'px!important;min-width:0!important;min-height:0!important;max-width:none!important;max-height:none!important;background:#000!important;opacity:1!important;border:0!important;padding:0!important;margin:0!important;transform:none!important;clip-path:none!important;filter:none!important;contain:none!important;z-index:2147483647!important;pointer-events:none!important;';
+    parent.appendChild(mask);
     masks.push(mask);
+    cleanupNodes.push(mask);
     var mr = mask.getBoundingClientRect();
     if (!isFinite(mr.width) || mr.width <= 0 || !isFinite(mr.height) || mr.height <= 0 ||
         mr.left > left + 1 || mr.top > top + 1 ||
@@ -1957,7 +2050,44 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     }}
     return true;
   }};
-  var collectDoc = function (doc, ox, oy, sx, sy, clip, blockedReason) {{
+  var coverRect = function (doc, target, rect, ox, oy, sx, sy, clip, parentInTopLayer, frameBlocked, coverErrMsg) {{
+    if (frameBlocked) return fail(frameBlocked);
+    var useTopLayer = parentInTopLayer || hasTopLayerAncestor(target);
+    var inChildFrameDoc = isFrameset && doc !== document;
+    var hostDoc = inChildFrameDoc ? doc : document;
+    var left = inChildFrameDoc ? rect.left : ox + sx * rect.left;
+    var top = inChildFrameDoc ? rect.top : oy + sy * rect.top;
+    var right = inChildFrameDoc ? rect.right : ox + sx * rect.right;
+    var bottom = inChildFrameDoc ? rect.bottom : oy + sy * rect.bottom;
+    if (!inChildFrameDoc && clip) {{
+      left = Math.max(left, clip.left);
+      top = Math.max(top, clip.top);
+      right = Math.min(right, clip.right);
+      bottom = Math.min(bottom, clip.bottom);
+    }}
+    if (right <= left || bottom <= top) return null;
+    left = Math.floor(left);
+    top = Math.floor(top);
+    right = Math.ceil(right);
+    bottom = Math.ceil(bottom);
+    var parent;
+    var hostMap;
+    if (useTopLayer) {{
+      var layerEntry = ensureTopLayer(hostDoc);
+      if (!layerEntry.ok) return fail(layerEntry.reason);
+      parent = layerEntry.layer;
+      hostMap = layerEntry.map;
+    }} else {{
+      hostMap = hostDoc === document ? topHost : measureHostMap(hostDoc);
+      if (!hostMap.ok) return fail(hostMap.reason);
+      parent = hostDoc.documentElement;
+    }}
+    if (!appendMask(hostDoc, parent, hostMap, left, top, right - left, bottom - top)) {{
+      return fail(coverErrMsg);
+    }}
+    return null;
+  }};
+  var collectDoc = function (doc, ox, oy, sx, sy, clip, parentInTopLayer, frameBlocked) {{
     var win = doc.defaultView || window;
     var all = collectDeepElements(doc);
     for (var i = 0; i < all.length; i++) {{
@@ -1968,34 +2098,11 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
       if (!field && !el.isContentEditable) continue;
       if (tag === 'INPUT' && skipped.indexOf((el.type || 'text').toLowerCase()) !== -1) continue;
       if (!isBoxVisible(el, win)) continue;
-      if (blockedReason) return fail(blockedReason);
-      var rect = el.getBoundingClientRect();
-      if (isFrameset && doc !== document) {{
-        var frameHost = measureHostMap(doc);
-        if (!frameHost.ok) return fail(frameHost.reason);
-        if (!appendMask(doc, frameHost, rect.left, rect.top, rect.width, rect.height)) {{
-          return fail('screenshot mask could not cover transformed field');
-        }}
-        continue;
-      }}
-      var left = ox + sx * rect.left;
-      var top = oy + sy * rect.top;
-      var right = ox + sx * rect.right;
-      var bottom = oy + sy * rect.bottom;
-      if (clip) {{
-        left = Math.max(left, clip.left);
-        top = Math.max(top, clip.top);
-        right = Math.min(right, clip.right);
-        bottom = Math.min(bottom, clip.bottom);
-      }}
-      if (right <= left || bottom <= top) continue;
-      if (!appendMask(document, topHost, left, top, right - left, bottom - top)) {{
-        return fail('screenshot mask could not cover transformed field');
-      }}
+      var fieldErr = coverRect(doc, el, el.getBoundingClientRect(), ox, oy, sx, sy, clip, parentInTopLayer, frameBlocked, 'screenshot mask could not cover transformed field');
+      if (fieldErr) return fieldErr;
     }}
-    var frames = collectDeepElements(doc);
-    for (var j = 0; j < frames.length; j++) {{
-      var frame = frames[j];
+    for (var j = 0; j < all.length; j++) {{
+      var frame = all[j];
       if (frame.nodeType !== 1 || !frame.matches('iframe, frame')) continue;
       if (!isBoxVisible(frame, win)) continue;
       var childDoc = null;
@@ -2004,15 +2111,23 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
       }} catch (e) {{
         childDoc = null;
       }}
-      if (!childDoc) continue;
-      if (blockedReason) {{
-        var blockedErr = collectDoc(childDoc, 0, 0, 1, 1, null, blockedReason);
+      if (!childDoc) {{
+        if (!maskCrossOriginFrames) continue;
+        var xChain = checkTransformChain(frame, doc);
+        if (!xChain.ok) return fail(xChain.reason);
+        var xErr = coverRect(doc, frame, frame.getBoundingClientRect(), ox, oy, sx, sy, clip, parentInTopLayer, frameBlocked, 'screenshot mask could not cover cross-origin frame');
+        if (xErr) return xErr;
+        continue;
+      }}
+      var childInTopLayer = !isFrameset && (parentInTopLayer || hasTopLayerAncestor(frame));
+      if (frameBlocked) {{
+        var blockedErr = collectDoc(childDoc, 0, 0, 1, 1, null, childInTopLayer, frameBlocked);
         if (blockedErr) return blockedErr;
         continue;
       }}
       var fTr = frameTransform(frame);
       if (!fTr.ok) {{
-        var trErr = collectDoc(childDoc, 0, 0, 1, 1, null, fTr.reason);
+        var trErr = collectDoc(childDoc, 0, 0, 1, 1, null, childInTopLayer, fTr.reason);
         if (trErr) return trErr;
         continue;
       }}
@@ -2033,22 +2148,26 @@ static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
         nextClip.bottom = Math.min(nextClip.bottom, clip.bottom);
       }}
       if (nextClip.right <= nextClip.left || nextClip.bottom <= nextClip.top) continue;
-      var childErr = collectDoc(childDoc, childOx, childOy, childSx, childSy, nextClip, null);
+      var childErr = collectDoc(childDoc, childOx, childOy, childSx, childSy, nextClip, childInTopLayer, null);
       if (childErr) return childErr;
     }}
     return null;
   }};
-  var rootBlocked = topHost.ok ? null : topHost.reason;
-  var err = collectDoc(document, 0, 0, 1, 1, null, rootBlocked);
+  var err = collectDoc(document, 0, 0, 1, 1, null, false, null);
   if (err) return err;
   return {{ ok: true, count: masks.length }};
 }})()"#
     )
-});
+}
 
-/// JavaScript that removes every mask this module added across the top document
-/// and any accessible same-origin frames, including frames inside open shadow
-/// roots.
+static MASK_INPUTS_SCRIPT: LazyLock<String> = LazyLock::new(|| build_mask_inputs_script(false));
+
+static MASK_INPUTS_AND_CROSS_ORIGIN_FRAMES_SCRIPT: LazyLock<String> =
+    LazyLock::new(|| build_mask_inputs_script(true));
+
+/// JavaScript that removes every mask, top-layer mask host, and helper style
+/// this module added across the top document and any accessible same-origin
+/// frames, including elements inside open shadow roots.
 static REMOVE_MASKS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"(function () {{
@@ -2057,9 +2176,13 @@ static REMOVE_MASKS_SCRIPT: LazyLock<String> = LazyLock::new(|| {
   var cleanDoc = function (doc) {{
     var all = collectDeepElements(doc);
     for (var i = 0; i < all.length; i++) {{
-      if (all[i].hasAttribute('data-da-screenshot-mask')) {{
-        all[i].remove();
+      var node = all[i];
+      if (node.hasAttribute('data-da-screenshot-mask')) {{
+        node.remove();
         removed++;
+      }} else if (node.hasAttribute('data-da-screenshot-mask-layer') ||
+                 node.hasAttribute('data-da-screenshot-mask-style')) {{
+        node.remove();
       }}
     }}
     for (var j = 0; j < all.length; j++) {{
@@ -4770,17 +4893,93 @@ impl BrowserSession {
         Ok(())
     }
 
+    /// Reads the CSS viewport geometry and 1x scale clip for `model/locate` screenshots.
+    fn viewport_capture_clip(
+        &mut self,
+        deadline: Deadline,
+        dialog: &mut DialogContext,
+    ) -> Result<ViewportClip, StepError> {
+        let scope = self.scope();
+        let value = page_evaluate(
+            self.connection_mut()?,
+            &scope,
+            r#"({
+                width: window.innerWidth,
+                height: window.innerHeight,
+                pageX: (window.visualViewport && isFinite(window.visualViewport.pageLeft))
+                    ? window.visualViewport.pageLeft
+                    : (window.scrollX || window.pageXOffset || 0),
+                pageY: (window.visualViewport && isFinite(window.visualViewport.pageTop))
+                    ? window.visualViewport.pageTop
+                    : (window.scrollY || window.pageYOffset || 0),
+                dpr: (isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0)
+                    ? window.devicePixelRatio
+                    : 1
+            })"#,
+            deadline,
+            dialog,
+        )
+        .map_err(|failure| {
+            failure.step("could not read the page viewport", timeout_or_execution)
+        })?;
+        let (Some(width), Some(height)) = (
+            viewport_dimension(&value, "width"),
+            viewport_dimension(&value, "height"),
+        ) else {
+            return Err(StepError::Environment(
+                "the page reported no measurable viewport; wait for the page to finish loading and try again"
+                    .to_string(),
+            ));
+        };
+        let x = value
+            .get("pageX")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let y = value
+            .get("pageY")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let dpr = value
+            .get("dpr")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0);
+        Ok(ViewportClip {
+            x,
+            y,
+            width,
+            height,
+            scale: 1.0 / dpr,
+        })
+    }
+
     /// Covers every editable field, captures a PNG and removes the covers.
     ///
     /// Cleanup runs after a failed capture as well; a browser that has already
     /// gone cannot be cleaned, and then the capture error is the one reported.
     fn capture_masked_png(&mut self, deadline: Deadline) -> Result<Vec<u8>, StepError> {
+        self.capture_masked_png_with_options(deadline, false, None)
+    }
+
+    fn capture_masked_png_with_options(
+        &mut self,
+        deadline: Deadline,
+        mask_cross_origin_frames: bool,
+        clip: Option<ViewportClip>,
+    ) -> Result<Vec<u8>, StepError> {
         let scope = self.scope();
         let mut dialog = DialogContext::fail_fast();
+        let mask_script = if mask_cross_origin_frames {
+            MASK_INPUTS_AND_CROSS_ORIGIN_FRAMES_SCRIPT.as_str()
+        } else {
+            MASK_INPUTS_SCRIPT.as_str()
+        };
         let mask_result = page_evaluate(
             self.connection_mut()?,
             &scope,
-            MASK_INPUTS_SCRIPT.as_str(),
+            mask_script,
             deadline,
             &mut dialog,
         )
@@ -4797,11 +4996,25 @@ impl BrowserSession {
             )));
         }
 
+        let screenshot_params = match clip {
+            Some(clip) => json!({
+                "format": "png",
+                "clip": {
+                    "x": clip.x,
+                    "y": clip.y,
+                    "width": f64::from(clip.width),
+                    "height": f64::from(clip.height),
+                    "scale": clip.scale,
+                },
+                "captureBeyondViewport": false,
+            }),
+            None => json!({ "format": "png" }),
+        };
         let captured = page_call(
             self.connection_mut()?,
             &scope,
             "Page.captureScreenshot",
-            json!({ "format": "png" }),
+            screenshot_params,
             deadline,
             &mut dialog,
         );
@@ -6343,6 +6556,15 @@ fn close_and_dispose_detached_with<P, V, CB, D>(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ViewportClip {
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    scale: f64,
+}
+
 impl Session for BrowserSession {
     fn detach(&mut self) -> Result<Option<Value>, String> {
         // A tab a page action opened after the last step is still reported by
@@ -6462,6 +6684,56 @@ impl Session for BrowserSession {
 
     fn take_step_metadata(&mut self) -> Option<Value> {
         self.step_metadata.take()
+    }
+
+    fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let clip = self
+            .viewport_capture_clip(deadline, &mut dialog)
+            .map_err(step_error_text)?;
+        let width = clip.width;
+        let height = clip.height;
+        let png = self
+            .capture_masked_png_with_options(deadline, true, Some(clip))
+            .map_err(step_error_text)?;
+        Ok(Some(MaskedViewportCapture { png, width, height }))
+    }
+
+    fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let scope = self.scope();
+        let refs = self.refs.clone();
+        let (object_id, _) = {
+            let connection = self.connection_mut().map_err(step_error_text)?;
+            snapshot::resolve_ref_object_id(
+                connection,
+                &scope,
+                &refs,
+                ref_id,
+                deadline,
+                &mut dialog,
+            )
+            .map_err(step_error_text)?
+        };
+        let synth = synthesis::synthesize_for_object(self, &object_id, deadline, &mut dialog)
+            .map_err(step_error_text)?;
+        Ok(Some(SynthesizedTarget {
+            locator: synth.locator,
+            fragile: synth.fragile,
+        }))
+    }
+
+    fn synthesize_at_point(&mut self, x: f64, y: f64) -> Result<Option<SynthesizedTarget>, String> {
+        let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let synth =
+            synthesize_for_point(self, x, y, deadline, &mut dialog).map_err(step_error_text)?;
+        Ok(synth.map(|item| SynthesizedTarget {
+            locator: item.locator,
+            fragile: item.fragile,
+        }))
     }
 
     fn step_evidence(&mut self) -> Result<Vec<Evidence>, String> {
@@ -7798,10 +8070,11 @@ fn run_click(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
     if let Some(at) = &args.at {
         check_click_at(&args).map_err(StepError::InvalidArguments)?;
+        let interactive = sessions.is_interactive();
         let deadline = Deadline::after(Duration::from_millis(args.timeout_ms));
         let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
         let session = session(sessions)?;
-        return click_at(session, at, deadline, &mut dialog);
+        return click_at(session, at, interactive, deadline, &mut dialog);
     }
     let locator = Locator::from_args(
         &args.css,
@@ -7906,8 +8179,9 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let mut dialog = DialogContext::from_arg(args.dialog.as_ref());
     if let Some(at) = &args.at {
         check_type_at(&args).map_err(StepError::InvalidArguments)?;
+        let interactive = sessions.is_interactive();
         let session = session(sessions)?;
-        return type_at(session, at, &text, deadline, &mut dialog);
+        return type_at(session, at, &text, interactive, deadline, &mut dialog);
     }
     let target = type_target(&args).map_err(StepError::InvalidArguments)?;
     let session = session(sessions)?;
@@ -8179,15 +8453,100 @@ fn follow_label(
     }
 }
 
+const REVERSE_HIT_TEST_TEMPLATE: &str = r#"(function (x, y, testidAttr) {
+  if (!document || typeof document.elementFromPoint !== 'function') return null;
+  var hit = document.elementFromPoint(x, y);
+  if (!hit || hit.nodeType !== 1) return null;
+  var roles = {
+    button: 1, link: 1, textbox: 1, searchbox: 1, checkbox: 1, radio: 1,
+    switch: 1, combobox: 1, listbox: 1, option: 1, menuitem: 1,
+    menuitemcheckbox: 1, menuitemradio: 1, tab: 1, slider: 1, spinbutton: 1, treeitem: 1
+  };
+  var isInteractive = function (node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = node.tagName ? node.tagName.toLowerCase() : '';
+    if (tag === 'button' || tag === 'select' || tag === 'textarea' || tag === 'summary' || tag === 'option' || tag === 'label') return true;
+    if (tag === 'a' && node.hasAttribute('href')) return true;
+    if (tag === 'input' && String(node.type || 'text').toLowerCase() !== 'hidden') return true;
+    if (node.isContentEditable) return true;
+    var r = (node.getAttribute('role') || '').trim().toLowerCase();
+    return Boolean(r && roles[r]);
+  };
+  var cur = hit;
+  var sawCanvas = false;
+  while (cur && cur.nodeType === 1) {
+    var tag = cur.tagName ? cur.tagName.toLowerCase() : '';
+    if (tag === 'canvas') {
+      sawCanvas = true;
+    } else if (isInteractive(cur)) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+  if (sawCanvas) return null;
+  cur = hit;
+  while (cur && cur.nodeType === 1) {
+    var t = cur.tagName ? cur.tagName.toLowerCase() : '';
+    if (t === 'body' || t === 'html') break;
+    if (testidAttr && cur.hasAttribute && cur.hasAttribute(testidAttr)) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+  return null;
+})(__DA_X__, __DA_Y__, __DA_TESTID_ATTR__)"#;
+
+fn synthesize_for_point(
+    session: &mut BrowserSession,
+    x: f64,
+    y: f64,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<Option<synthesis::SynthesizedLocator>, StepError> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+        return Ok(None);
+    }
+    let testid_json = serde_json::to_string(&session.testid_attribute)
+        .unwrap_or_else(|_| "\"data-testid\"".to_string());
+    let expr = REVERSE_HIT_TEST_TEMPLATE
+        .replace("__DA_X__", &x.to_string())
+        .replace("__DA_Y__", &y.to_string())
+        .replace("__DA_TESTID_ATTR__", &testid_json);
+    let scope = session.scope();
+    let remote = {
+        let connection = session.connection_mut()?;
+        page_evaluate_remote(connection, &scope, &expr, deadline, dialog)
+            .map_err(|failure| failure.environment("could not hit-test the page at coordinates"))?
+    };
+    let RemoteResult::Object(object_id) = remote else {
+        return Ok(None);
+    };
+    let synth = synthesis::synthesize_for_object(session, &object_id, deadline, dialog)?;
+    if synth.fragile {
+        Ok(None)
+    } else {
+        Ok(Some(synth))
+    }
+}
+
 /// Clicks explicit viewport coordinates after proving they still describe the
 /// page they were measured on.
 fn click_at(
     session: &mut BrowserSession,
     at: &AtArgs,
+    interactive: bool,
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<Value, StepError> {
     let (width, height) = resolve_coordinates(session, at, deadline, dialog)?;
+    if interactive
+        && let Ok(Some(synth)) = synthesize_for_point(session, at.x, at.y, deadline, dialog)
+    {
+        session.step_metadata = Some(json!({
+            "synthesized_locator": synth.locator,
+            "fragile": synth.fragile,
+        }));
+    }
     dispatch_pointer_click(session, at, deadline, dialog)?;
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
@@ -8197,10 +8556,19 @@ fn type_at(
     session: &mut BrowserSession,
     at: &AtArgs,
     text: &str,
+    interactive: bool,
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<Value, StepError> {
     let (width, height) = resolve_coordinates(session, at, deadline, dialog)?;
+    if interactive
+        && let Ok(Some(synth)) = synthesize_for_point(session, at.x, at.y, deadline, dialog)
+    {
+        session.step_metadata = Some(json!({
+            "synthesized_locator": synth.locator,
+            "fragile": synth.fragile,
+        }));
+    }
     dispatch_pointer_click(session, at, deadline, dialog)?;
     let target = coordinate_target(at);
     session.dispatch(
@@ -15041,5 +15409,24 @@ mod navigation_timeout_tests {
         assert_eq!(parsed("600001"), None, "over ten minutes is a typo");
         assert_eq!(parsed("soon"), None);
         assert_eq!(parsed(""), None);
+    }
+
+    #[test]
+    fn mask_inputs_script_toggles_cross_origin_frame_masking() {
+        let standard = super::build_mask_inputs_script(false);
+        assert!(standard.contains("var maskCrossOriginFrames = false;"));
+        assert!(standard.contains("if (!maskCrossOriginFrames) continue;"));
+        assert!(standard.contains(":modal, :popover-open, :fullscreen"));
+        assert!(standard.contains("data-da-screenshot-mask-layer"));
+        assert!(standard.contains("showPopover"));
+
+        let locate = super::build_mask_inputs_script(true);
+        assert!(locate.contains("var maskCrossOriginFrames = true;"));
+        assert!(locate.contains("screenshot mask could not cover cross-origin frame"));
+        assert!(locate.contains("ensureTopLayer"));
+
+        let cleanup = super::REMOVE_MASKS_SCRIPT.as_str();
+        assert!(cleanup.contains("data-da-screenshot-mask-layer"));
+        assert!(cleanup.contains("data-da-screenshot-mask-style"));
     }
 }

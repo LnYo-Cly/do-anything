@@ -61,12 +61,27 @@ between commands and prints JSON by default.
      endpoints) are a last resort for `<canvas>` or WebGL surfaces that have no
      accessibility node; `da lint` warns on every `at` step, and `da session
      export` pins the observed `viewport` automatically.
+   - When an accessibility tree is dense, an opaque `<canvas>` has no DOM
+     nodes, or you have a local Jev/VLM/vLLM JSON-RPC adapter (`da session
+     start --model-hook <exe>` or per-call `--hook <exe>`):
+     - `da session select-ref <id> --query "Save button" --act browser.click`
+       asks `model/select_ref` to pick a snapshot `ref` and synthesizes its
+       deterministic locator;
+     - `da session locate <id> --query "Chart node" --click` sends an
+       input-masked PNG + `viewport` to `model/locate`, reverse-synthesizes a
+       deterministic locator when an HTML/UIA control is hit (`0` lint warnings),
+       and falls back to viewport-checked `at: { x, y, viewport }` only on
+       opaque `<canvas>`;
+     - `da session judge <id> --rubric "No error banner"` runs an exploration-time
+       `model/judge` check over `Secrets`-redacted evidence (recorded in
+       `steps.jsonl`, never exported to YAML).
 3. `da session export <id> -o cases/flow.yaml --name "Create a note"` writes a
-   deterministic case; transient refs (including both endpoints of
-   `browser.drag` and `browser.scroll`/`browser.hover` targets) compile into
-   verified locators against the live page. `da session stop <id>` closes the
-   session (`da session list` shows open sessions; idle ones are reaped after
-   30 minutes).
+   100% deterministic, model-free case; transient refs (including both endpoints
+   of `browser.drag` and `browser.scroll`/`browser.hover` targets) and
+   model-located control hits compile into verified locators against the live
+   page, and `model.*` diagnostic entries are omitted. `da session stop <id>`
+   closes the session (`da session list` shows open sessions; idle ones are
+   reaped after 30 minutes).
 4. Edit the exported YAML to add the other layers, then `da lint cases/flow.yaml`
    and `da run cases/flow.yaml`. That is the replay: it must pass with no session
    and no `ref` left in the file.

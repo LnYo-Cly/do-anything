@@ -30,7 +30,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value as ZValue};
 
 use crate::core::paths;
 use crate::core::registry::StepError;
-use crate::core::session::Evidence;
+use crate::core::session::{Evidence, MaskedViewportCapture, SynthesizedTarget};
 
 use super::shared::{
     BoundsRect, DEFAULT_SNAPSHOT_MAX_DEPTH, DEFAULT_SNAPSHOT_MAX_NODES, KeyModifier,
@@ -39,8 +39,9 @@ use super::shared::{
     check_window_point_bounds, click_button_name, encode_rgba_png, is_unix_pid_alive,
     mask_tree_inputs, missing_target_timeout, node_summary, parse_uia_key_expr,
     resolve_command_and_cwd, resolve_node_in_tree, reverse_lookup_in_tree,
-    spawn_unix_desktop_child, step_error_message, synthesize_locator, terminate_unix_child,
-    terminate_unix_detached_pid, verify_unix_reattach_identity, wait_state_name, write_png_private,
+    spawn_unix_desktop_child, step_error_message, synthesize_at_point_in_tree, synthesize_locator,
+    synthesize_ref_in_tree, terminate_unix_child, terminate_unix_detached_pid,
+    verify_unix_reattach_identity, wait_state_name, write_png_private,
 };
 use super::{
     AttachArgs, ClickButton, DesktopLocator, DesktopPoint, DesktopRole, LaunchArgs, WaitState,
@@ -738,6 +739,35 @@ impl DesktopBackend {
             true,
         )
         .map(Some)
+    }
+
+    pub fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        let _lock =
+            acquire_desktop_input_lock(5_000).map_err(|e| step_error_message(&e).to_string())?;
+        let live = self
+            .ensure_and_collect_tree()
+            .map_err(|e| step_error_message(&e).to_string())?;
+        let (png, width, height, _) = capture_x11_window_png(self.pid, self.hwnd, &live.data, true)
+            .map_err(|e| step_error_message(&e).to_string())?;
+        Ok(Some(MaskedViewportCapture { png, width, height }))
+    }
+
+    pub fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        let live = self
+            .ensure_and_collect_tree()
+            .map_err(|e| step_error_message(&e).to_string())?;
+        synthesize_ref_in_tree(&live.data, ref_id, &self.refs)
+    }
+
+    pub fn synthesize_at_point(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> Result<Option<SynthesizedTarget>, String> {
+        let live = self
+            .ensure_and_collect_tree()
+            .map_err(|e| step_error_message(&e).to_string())?;
+        Ok(synthesize_at_point_in_tree(&live.data, x, y))
     }
 
     pub fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
