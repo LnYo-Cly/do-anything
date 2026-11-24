@@ -199,6 +199,27 @@ steps:
   - android.input_text: { text: "50" }
 ```
 
+## On a desktop app
+
+`desktop.*` drives native GUI windows on Windows (UI Automation), Linux (AT-SPI2
+over D-Bus + X11/XTEST), and macOS (`AXUIElement` + `CGEvent` + `screencapture`)
+in a build that enables `--features desktop`:
+
+```sh
+cargo build --features desktop
+# Headless Linux CI: xvfb-run -a dbus-run-session -- da run cases/desktop.yaml
+```
+
+Explore with `da session start` → `desktop.launch` (or `desktop.attach`, which
+marks the run `local_only: true` and never kills the external process) →
+`da session snapshot <id>` (`e1`, `e2`, … refs) → `desktop.click` / `desktop.type`
+/ `desktop.press` / `desktop.wait` / `desktop.read` / `desktop.screenshot` →
+`da session export <id>`. `Edit` and password fields are masked solid black in
+screenshots by default (`mask_inputs: true`). On macOS, grant **Accessibility**
+and **Screen Recording** permissions to the terminal/runner; on Linux, pure
+Wayland supports semantic AT-SPI2 steps while screenshots, `desktop.press`, and
+`at:` coordinates require X11, XWayland, or `xvfb-run`.
+
 ## Guardrails
 
 - **No secrets in cases.** Write `${env:NAME}` for a token, password or
@@ -222,5 +243,6 @@ steps:
   browser you started with a debug port instead.
 
 Details are in `docs/guide.md`: [sessions](../../docs/guide.md#interactive-sessions-da-session),
-[browser steps](../../docs/guide.md#browser-steps), [failure bundles](../../docs/guide.md#failure-bundles),
-[secrets](../../docs/guide.md#secrets), [exit codes](../../docs/guide.md#exit-codes).
+[browser steps](../../docs/guide.md#browser-steps), [desktop steps](../../docs/guide.md#desktop-steps),
+[failure bundles](../../docs/guide.md#failure-bundles), [secrets](../../docs/guide.md#secrets),
+[exit codes](../../docs/guide.md#exit-codes).

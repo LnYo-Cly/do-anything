@@ -1,7 +1,7 @@
-//! Non-Windows stub backend for `desktop.*` steps.
+//! Fallback stub backend for `desktop.*` steps on unsupported target OSes.
 //!
-//! Keeps `--features desktop` building and schema-testing cleanly on macOS and
-//! Linux until native AT-SPI / Accessibility backends land in `#88`.
+//! Keeps `--features desktop` building and schema-testing cleanly outside
+//! Windows, Linux, and macOS.
 
 use std::path::Path;
 
@@ -12,13 +12,14 @@ use crate::core::session::Evidence;
 
 use super::{AttachArgs, ClickButton, DesktopLocator, DesktopPoint, LaunchArgs, WaitState};
 
-pub const UNSUPPORTED_PLATFORM_ERROR: &str = "desktop.* is currently implemented on Windows (#84); macOS and Linux backends are tracked in #88";
+pub const UNSUPPORTED_PLATFORM_ERROR: &str =
+    "desktop.* is only supported on Windows, Linux, and macOS";
 
-/// Placeholder desktop backend for non-Windows targets.
+/// Placeholder desktop backend for targets other than Windows, Linux, and macOS.
 pub struct DesktopBackend;
 
 impl DesktopBackend {
-    /// Rejects `desktop.launch` with an explicit environment error naming `#88`.
+    /// Rejects `desktop.launch` with an explicit environment error.
     pub fn launch(
         _args: &LaunchArgs,
         _base_dir: &Path,
@@ -29,14 +30,14 @@ impl DesktopBackend {
         ))
     }
 
-    /// Rejects `desktop.attach` with an explicit environment error naming `#88`.
+    /// Rejects `desktop.attach` with an explicit environment error.
     pub fn attach(_args: &AttachArgs) -> Result<(Self, Value), StepError> {
         Err(StepError::Environment(
             UNSUPPORTED_PLATFORM_ERROR.to_string(),
         ))
     }
 
-    /// Rejects persisted desktop handle reattachment on non-Windows hosts.
+    /// Rejects persisted desktop handle reattachment on unsupported hosts.
     pub fn reattach(_handle: &Value) -> Result<Self, String> {
         Err(UNSUPPORTED_PLATFORM_ERROR.to_string())
     }
