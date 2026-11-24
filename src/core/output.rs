@@ -10,10 +10,12 @@ use serde_json::{Map, Value, json};
 use crate::core::assert::AssertionReport;
 use crate::core::case::{CaseError, CaseWarning, LoadedCase};
 use crate::core::paths;
+use crate::core::repeat::{RepeatOutcome, RepeatReport};
 use crate::core::report::{
     CaseReport, CaseStatus, Problem, RunOutcome, StepReport, StepStatus, Summary,
 };
 use crate::core::secrets::Secrets;
+use crate::core::strength::StrengthFinding;
 
 /// How results are rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +116,12 @@ pub struct LintReport {
     /// Every case that parsed, so a reader can discover the classification
     /// values without running anything.
     pub cases: Vec<LintCase>,
+    /// Optional baseline path when `--against` was supplied.
+    pub against: Option<PathBuf>,
+    /// Assertion-strength reductions found relative to `against`.
+    pub strength_findings: Vec<StrengthFinding>,
+    /// Non-empty reason supplied via `--allow-weaken`, when given.
+    pub acknowledged_reason: Option<String>,
 }
 
 /// One parsed case of a lint report.
@@ -148,9 +156,11 @@ impl LintCase {
 }
 
 impl LintReport {
-    /// Whether every checked case would pass the runner's preflight.
+    /// Whether every checked case would pass the runner's preflight and any
+    /// active `--against` strength gate.
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
+            && (self.strength_findings.is_empty() || self.acknowledged_reason.is_some())
     }
 }
 
@@ -178,26 +188,56 @@ fn text_lint(report: &LintReport, secrets: &Secrets) -> Rendered {
             error.message
         ));
     }
-    let summary = if report.warnings.is_empty() {
-        format!(
-            "Checked {} {}: {} {}.\n",
-            report.files,
-            noun(report.files, "file", "files"),
-            report.errors.len(),
-            noun(report.errors.len(), "error", "errors"),
-        )
+    if report.acknowledged_reason.is_none() {
+        for finding in &report.strength_findings {
+            stdout.push_str(&format!(
+                "{}: strength [{}]: {}\n",
+                paths::display(&finding.file),
+                finding.kind,
+                finding.message
+            ));
+        }
+    }
+    let total_warnings = if report.acknowledged_reason.is_some() {
+        report.warnings.len() + report.strength_findings.len()
     } else {
-        format!(
-            "Checked {} {}: {} {}, {} {}.\n",
-            report.files,
-            noun(report.files, "file", "files"),
-            report.errors.len(),
-            noun(report.errors.len(), "error", "errors"),
-            report.warnings.len(),
-            noun(report.warnings.len(), "warning", "warnings"),
-        )
+        report.warnings.len()
     };
-    stdout.push_str(&summary);
+    let unacknowledged_strength = if report.acknowledged_reason.is_none() {
+        report.strength_findings.len()
+    } else {
+        0
+    };
+
+    let mut counts = format!(
+        "{} {}",
+        report.errors.len(),
+        noun(report.errors.len(), "error", "errors")
+    );
+    if total_warnings > 0 {
+        counts.push_str(&format!(
+            ", {} {}",
+            total_warnings,
+            noun(total_warnings, "warning", "warnings")
+        ));
+    }
+    if unacknowledged_strength > 0 {
+        counts.push_str(&format!(
+            ", {} {}",
+            unacknowledged_strength,
+            noun(
+                unacknowledged_strength,
+                "strength reduction",
+                "strength reductions"
+            )
+        ));
+    }
+    stdout.push_str(&format!(
+        "Checked {} {}: {counts}.\n",
+        report.files,
+        noun(report.files, "file", "files"),
+    ));
+
     // Warnings leave the process on standard error, leaving standard output as
     // the result a caller reads. They still name file and location so a reader
     // can find the step that triggered them.
@@ -208,6 +248,16 @@ fn text_lint(report: &LintReport, secrets: &Secrets) -> Rendered {
             paths::display(&warning.file),
             warning.message
         ));
+    }
+    if let Some(reason) = &report.acknowledged_reason {
+        for finding in &report.strength_findings {
+            stderr.push_str(&format!(
+                "{}: warning [acknowledged: {reason}] [{}]: {}\n",
+                paths::display(&finding.file),
+                finding.kind,
+                finding.message
+            ));
+        }
     }
     Rendered {
         stdout: secrets.redact(&stdout),
@@ -244,24 +294,68 @@ fn json_lint(report: &LintReport) -> Value {
             })
             .collect::<Vec<Value>>(),
     });
+    let mut warning_items: Vec<Value> = report
+        .warnings
+        .iter()
+        .map(|warning| {
+            json!({
+                "file": paths::display(&warning.file),
+                "message": warning.message,
+            })
+        })
+        .collect();
+    if let Some(reason) = &report.acknowledged_reason {
+        for finding in &report.strength_findings {
+            warning_items.push(json!({
+                "file": paths::display(&finding.file),
+                "baseline_file": paths::display(&finding.baseline_file),
+                "case_name": finding.case_name,
+                "kind": finding.kind,
+                "message": finding.message,
+                "acknowledged": true,
+                "acknowledged_reason": reason,
+            }));
+        }
+    }
     // No warnings means no `warnings` key: a case that never warned keeps
     // exactly the object earlier releases wrote.
-    if !report.warnings.is_empty()
+    if !warning_items.is_empty()
         && let Some(entries) = value.as_object_mut()
     {
+        entries.insert("warnings".to_string(), Value::Array(warning_items));
+    }
+    if let Some(against) = &report.against
+        && let Some(entries) = value.as_object_mut()
+    {
+        entries.insert("against".to_string(), json!(paths::display(against)));
         entries.insert(
-            "warnings".to_string(),
-            report
-                .warnings
-                .iter()
-                .map(|warning| {
-                    json!({
-                        "file": paths::display(&warning.file),
-                        "message": warning.message,
+            "strength_findings".to_string(),
+            Value::Array(
+                report
+                    .strength_findings
+                    .iter()
+                    .map(|finding| {
+                        let mut item = Map::new();
+                        item.insert("file".to_string(), json!(paths::display(&finding.file)));
+                        item.insert(
+                            "baseline_file".to_string(),
+                            json!(paths::display(&finding.baseline_file)),
+                        );
+                        item.insert("case_name".to_string(), json!(finding.case_name));
+                        item.insert("kind".to_string(), json!(finding.kind));
+                        item.insert("message".to_string(), json!(finding.message));
+                        item.insert("acknowledged".to_string(), json!(finding.acknowledged));
+                        if let Some(reason) = &report.acknowledged_reason {
+                            item.insert("acknowledged_reason".to_string(), json!(reason));
+                        }
+                        Value::Object(item)
                     })
-                })
-                .collect(),
+                    .collect(),
+            ),
         );
+        if let Some(reason) = &report.acknowledged_reason {
+            entries.insert("acknowledged_reason".to_string(), json!(reason));
+        }
     }
     value
 }
@@ -611,6 +705,686 @@ fn problem_value(problem: &Problem) -> Value {
 
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Classification of one case between a baseline and candidate `--record` run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareClassification {
+    /// Passed in baseline and failed, errored, or timed out in candidate.
+    Regressed,
+    /// Failed, errored, or timed out in baseline and passed in candidate.
+    Fixed,
+    /// Did not pass in either baseline or candidate.
+    StillFailing,
+    /// Passed in both baseline and candidate.
+    StillPassing,
+    /// Absent in baseline and present in candidate.
+    Added,
+    /// Present in baseline and absent in candidate.
+    Removed,
+}
+
+impl CompareClassification {
+    /// Machine-readable string used in JSON output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Regressed => "regressed",
+            Self::Fixed => "fixed",
+            Self::StillFailing => "still_failing",
+            Self::StillPassing => "still_passing",
+            Self::Added => "added",
+            Self::Removed => "removed",
+        }
+    }
+
+    /// Uppercase prefix used in human-readable text output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Regressed => "REGRESSED",
+            Self::Fixed => "FIXED",
+            Self::StillFailing => "STILL_FAILING",
+            Self::StillPassing => "STILL_PASSING",
+            Self::Added => "ADDED",
+            Self::Removed => "REMOVED",
+        }
+    }
+}
+
+/// Step status counts for one recorded case execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepCounts {
+    /// Total steps across `steps` and `finally`.
+    pub total: usize,
+    /// Steps with `"passed"` status.
+    pub passed: usize,
+    /// Steps with `"failed"` status.
+    pub failed: usize,
+    /// Steps with `"error"` status.
+    pub errored: usize,
+    /// Steps with `"skipped"` status.
+    pub skipped: usize,
+}
+
+/// Assertion outcome counts for one recorded case or step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssertionCounts {
+    /// Total evaluated assertions.
+    pub total: usize,
+    /// Assertions that passed.
+    pub passed: usize,
+    /// Assertions that failed.
+    pub failed: usize,
+}
+
+/// Per-step difference between baseline and candidate executions of a case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepDiff {
+    /// `"steps"` or `"finally"`.
+    pub phase: &'static str,
+    /// 1-based step number within `phase`.
+    pub step_number: usize,
+    /// Step name in baseline, when the step existed there.
+    pub baseline_name: Option<String>,
+    /// Step name in candidate, when the step existed there.
+    pub candidate_name: Option<String>,
+    /// Step status in baseline, when present.
+    pub baseline_status: Option<String>,
+    /// Step status in candidate, when present.
+    pub candidate_status: Option<String>,
+    /// Step duration in baseline (`ms`), when present.
+    pub baseline_duration_ms: Option<u64>,
+    /// Step duration in candidate (`ms`), when present.
+    pub candidate_duration_ms: Option<u64>,
+    /// Signed candidate minus baseline step duration (`ms`), when both exist.
+    pub duration_delta_ms: Option<i64>,
+    /// Assertion counts in baseline for this step.
+    pub baseline_assertions: Option<AssertionCounts>,
+    /// Assertion counts in candidate for this step.
+    pub candidate_assertions: Option<AssertionCounts>,
+    /// Candidate step error message, when present.
+    pub candidate_error: Option<String>,
+}
+
+/// Comparison result for one paired, added, or removed case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseComparison {
+    /// Normalized `/` case file path.
+    pub case_file: String,
+    /// Case name.
+    pub case_name: String,
+    /// Outcome transition classification.
+    pub classification: CompareClassification,
+    /// Baseline status (`"passed"`, `"failed"`, `"error"`, `"timeout"`), when present.
+    pub baseline_status: Option<String>,
+    /// Candidate status, when present.
+    pub candidate_status: Option<String>,
+    /// Baseline bundle directory path, when present.
+    pub baseline_bundle: Option<PathBuf>,
+    /// Candidate bundle directory path, when present.
+    pub candidate_bundle: Option<PathBuf>,
+    /// Baseline `case_sha256` from `meta.json`, when present.
+    pub baseline_sha256: Option<String>,
+    /// Candidate `case_sha256` from `meta.json`, when present.
+    pub candidate_sha256: Option<String>,
+    /// `true` when paired `case_sha256` digests both exist and differ.
+    pub case_changed: bool,
+    /// Baseline case duration in milliseconds, when present.
+    pub baseline_duration_ms: Option<u64>,
+    /// Candidate case duration in milliseconds, when present.
+    pub candidate_duration_ms: Option<u64>,
+    /// Signed candidate minus baseline duration (`ms`), when paired.
+    pub duration_delta_ms: Option<i64>,
+    /// Baseline step counts, when present.
+    pub baseline_steps: Option<StepCounts>,
+    /// Candidate step counts, when present.
+    pub candidate_steps: Option<StepCounts>,
+    /// Baseline assertion counts, when present.
+    pub baseline_assertions: Option<AssertionCounts>,
+    /// Candidate assertion counts, when present.
+    pub candidate_assertions: Option<AssertionCounts>,
+    /// Individual steps whose presence, name, status, or assertion counts changed.
+    pub step_diffs: Vec<StepDiff>,
+}
+
+/// Aggregate summary of a `da compare` invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompareSummary {
+    /// Total compared cases (paired + added + removed).
+    pub total: usize,
+    /// Cases classified as `regressed`.
+    pub regressed: usize,
+    /// Cases classified as `fixed`.
+    pub fixed: usize,
+    /// Cases classified as `still_failing`.
+    pub still_failing: usize,
+    /// Cases classified as `still_passing`.
+    pub still_passing: usize,
+    /// Cases classified as `added`.
+    pub added: usize,
+    /// Cases classified as `removed`.
+    pub removed: usize,
+    /// Paired cases whose `case_sha256` changed.
+    pub case_changed: usize,
+    /// Sum of baseline case durations (`ms`).
+    pub baseline_duration_ms: u64,
+    /// Sum of candidate case durations (`ms`).
+    pub candidate_duration_ms: u64,
+    /// Signed candidate minus baseline total duration (`ms`).
+    pub duration_delta_ms: i64,
+}
+
+/// Complete comparison between two `--record` directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompareReport {
+    /// Baseline record directory.
+    pub baseline_dir: PathBuf,
+    /// Candidate record directory.
+    pub candidate_dir: PathBuf,
+    /// Aggregate classification counts.
+    pub summary: CompareSummary,
+    /// Deterministic per-case comparisons.
+    pub cases: Vec<CaseComparison>,
+}
+
+impl CompareReport {
+    /// Returns `true` when zero cases regressed.
+    pub fn is_ok(&self) -> bool {
+        self.summary.regressed == 0
+    }
+}
+
+/// Renders a completed `da compare` report.
+pub fn render_compare(report: &CompareReport, format: Format) -> Rendered {
+    match format {
+        Format::Json => Rendered {
+            stdout: format!("{}\n", json_compare(report)),
+            stderr: String::new(),
+        },
+        Format::Text => Rendered {
+            stdout: text_compare(report),
+            stderr: String::new(),
+        },
+    }
+}
+
+/// Renders an input/validation error from `da compare` in text or JSON mode.
+pub fn render_compare_error(kind: &'static str, message: &str, format: Format) -> Rendered {
+    match format {
+        Format::Json => Rendered {
+            stdout: format!(
+                "{}\n",
+                json!({
+                    "ok": false,
+                    "error": {
+                        "kind": kind,
+                        "message": message,
+                    }
+                })
+            ),
+            stderr: format!("error: {message}\n"),
+        },
+        Format::Text => Rendered {
+            stdout: String::new(),
+            stderr: format!("error: {message}\n"),
+        },
+    }
+}
+
+fn text_compare(report: &CompareReport) -> String {
+    let mut stdout = String::new();
+    for case in &report.cases {
+        let transition = match (&case.baseline_status, &case.candidate_status) {
+            (Some(base), Some(cand)) => format!("{base} -> {cand}"),
+            (None, Some(cand)) => format!("none -> {cand}"),
+            (Some(base), None) => format!("{base} -> none"),
+            (None, None) => "none -> none".to_string(),
+        };
+        let mut notes = Vec::new();
+        if let Some(delta) = case.duration_delta_ms {
+            notes.push(format!("{delta:+} ms"));
+        } else if let Some(cand_ms) = case.candidate_duration_ms {
+            notes.push(format!("{cand_ms} ms"));
+        } else if let Some(base_ms) = case.baseline_duration_ms {
+            notes.push(format!("{base_ms} ms"));
+        }
+        if case.case_changed {
+            notes.push("case_changed".to_string());
+        }
+        let suffix = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
+        };
+        stdout.push_str(&format!(
+            "{} {} [{}] {transition}{suffix}\n",
+            case.classification.label(),
+            case.case_file,
+            case.case_name
+        ));
+        for diff in &case.step_diffs {
+            let phase_prefix = if diff.phase == "finally" {
+                "finally step"
+            } else {
+                "step"
+            };
+            let name = diff
+                .candidate_name
+                .as_deref()
+                .or(diff.baseline_name.as_deref())
+                .unwrap_or("step");
+            let base_status = diff.baseline_status.as_deref().unwrap_or("absent");
+            let cand_status = diff.candidate_status.as_deref().unwrap_or("absent");
+            let mut line = format!(
+                "  {phase_prefix} {} {name}: {base_status} -> {cand_status}",
+                diff.step_number
+            );
+            if let (Some(ba), Some(ca)) = (diff.baseline_assertions, diff.candidate_assertions)
+                && (ba != ca)
+            {
+                line.push_str(&format!(
+                    " (assertions {}/{} -> {}/{})",
+                    ba.passed, ba.total, ca.passed, ca.total
+                ));
+            }
+            if let Some(err) = &diff.candidate_error {
+                line.push_str(": ");
+                line.push_str(err);
+            }
+            line.push('\n');
+            stdout.push_str(&line);
+        }
+        if matches!(
+            case.classification,
+            CompareClassification::Regressed | CompareClassification::StillFailing
+        ) && let Some(bundle) = &case.candidate_bundle
+        {
+            stdout.push_str(&format!("  candidate bundle: {}\n", paths::display(bundle)));
+        }
+    }
+
+    let s = &report.summary;
+    stdout.push_str(&format!(
+        "Summary: {} {} ({} regressed, {} fixed, {} still_failing, {} still_passing, {} added, {} removed, {} case_changed), {:+} ms\n",
+        s.total,
+        noun(s.total, "case", "cases"),
+        s.regressed,
+        s.fixed,
+        s.still_failing,
+        s.still_passing,
+        s.added,
+        s.removed,
+        s.case_changed,
+        s.duration_delta_ms,
+    ));
+    stdout
+}
+
+fn json_compare(report: &CompareReport) -> Value {
+    let s = &report.summary;
+    json!({
+        "ok": report.is_ok(),
+        "baseline_dir": paths::display(&report.baseline_dir),
+        "candidate_dir": paths::display(&report.candidate_dir),
+        "summary": {
+            "total": s.total,
+            "regressed": s.regressed,
+            "fixed": s.fixed,
+            "still_failing": s.still_failing,
+            "still_passing": s.still_passing,
+            "added": s.added,
+            "removed": s.removed,
+            "case_changed": s.case_changed,
+            "baseline_duration_ms": s.baseline_duration_ms,
+            "candidate_duration_ms": s.candidate_duration_ms,
+            "duration_delta_ms": s.duration_delta_ms,
+        },
+        "cases": report.cases.iter().map(case_comparison_value).collect::<Vec<Value>>(),
+    })
+}
+
+fn case_comparison_value(case: &CaseComparison) -> Value {
+    let steps_delta = match (case.baseline_steps, case.candidate_steps) {
+        (Some(b), Some(c)) => json!({
+            "total": signed_usize_delta(b.total, c.total),
+            "passed": signed_usize_delta(b.passed, c.passed),
+            "failed": signed_usize_delta(b.failed, c.failed),
+            "errored": signed_usize_delta(b.errored, c.errored),
+            "skipped": signed_usize_delta(b.skipped, c.skipped),
+        }),
+        _ => Value::Null,
+    };
+    let assertions_delta = match (case.baseline_assertions, case.candidate_assertions) {
+        (Some(b), Some(c)) => json!({
+            "total": signed_usize_delta(b.total, c.total),
+            "passed": signed_usize_delta(b.passed, c.passed),
+            "failed": signed_usize_delta(b.failed, c.failed),
+        }),
+        _ => Value::Null,
+    };
+
+    json!({
+        "case_file": case.case_file,
+        "case_name": case.case_name,
+        "classification": case.classification.as_str(),
+        "baseline_status": case.baseline_status,
+        "candidate_status": case.candidate_status,
+        "baseline_bundle": case.baseline_bundle.as_ref().map(|p| paths::display(p)),
+        "candidate_bundle": case.candidate_bundle.as_ref().map(|p| paths::display(p)),
+        "baseline_sha256": case.baseline_sha256,
+        "candidate_sha256": case.candidate_sha256,
+        "case_changed": case.case_changed,
+        "baseline_duration_ms": case.baseline_duration_ms,
+        "candidate_duration_ms": case.candidate_duration_ms,
+        "duration_delta_ms": case.duration_delta_ms,
+        "steps": {
+            "baseline": case.baseline_steps.map(step_counts_value),
+            "candidate": case.candidate_steps.map(step_counts_value),
+            "delta": steps_delta,
+            "diffs": case.step_diffs.iter().map(step_diff_value).collect::<Vec<Value>>(),
+        },
+        "assertions": {
+            "baseline": case.baseline_assertions.map(assertion_counts_value),
+            "candidate": case.candidate_assertions.map(assertion_counts_value),
+            "delta": assertions_delta,
+        },
+    })
+}
+
+fn step_counts_value(counts: StepCounts) -> Value {
+    json!({
+        "total": counts.total,
+        "passed": counts.passed,
+        "failed": counts.failed,
+        "errored": counts.errored,
+        "skipped": counts.skipped,
+    })
+}
+
+fn assertion_counts_value(counts: AssertionCounts) -> Value {
+    json!({
+        "total": counts.total,
+        "passed": counts.passed,
+        "failed": counts.failed,
+    })
+}
+
+fn step_diff_value(diff: &StepDiff) -> Value {
+    json!({
+        "phase": diff.phase,
+        "step_number": diff.step_number,
+        "baseline_name": diff.baseline_name,
+        "candidate_name": diff.candidate_name,
+        "baseline_status": diff.baseline_status,
+        "candidate_status": diff.candidate_status,
+        "baseline_duration_ms": diff.baseline_duration_ms,
+        "candidate_duration_ms": diff.candidate_duration_ms,
+        "duration_delta_ms": diff.duration_delta_ms,
+        "baseline_assertions": diff.baseline_assertions.map(assertion_counts_value),
+        "candidate_assertions": diff.candidate_assertions.map(assertion_counts_value),
+        "candidate_error": diff.candidate_error,
+    })
+}
+
+fn signed_usize_delta(before: usize, after: usize) -> i64 {
+    let diff = i128::from(u64::try_from(after).unwrap_or(u64::MAX))
+        - i128::from(u64::try_from(before).unwrap_or(u64::MAX));
+    i64::try_from(diff).unwrap_or(if diff < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// Builds the redacted JSON value for a `da run --repeat N` (`N > 1`) outcome.
+pub fn repeat_json(outcome: &RepeatOutcome, secrets: &Secrets) -> Value {
+    secrets.redact_json(&raw_repeat_json(outcome))
+}
+
+/// Renders a `da run --repeat N` (`N > 1`) outcome in text or JSON format.
+pub fn render_repeat(outcome: &RepeatOutcome, format: Format, secrets: &Secrets) -> Rendered {
+    match format {
+        Format::Json => Rendered {
+            stdout: format!("{}\n", repeat_json(outcome, secrets)),
+            stderr: match outcome {
+                RepeatOutcome::Completed(report) => secrets.redact(&repeat_bundle_errors(report)),
+                RepeatOutcome::Rejected { .. } => String::new(),
+                RepeatOutcome::NoMatch { message, .. } => {
+                    format!("error: {}\n", secrets.redact(message))
+                }
+            },
+        },
+        Format::Text => text_repeat(outcome, secrets),
+    }
+}
+
+fn repeat_bundle_errors(report: &RepeatReport) -> String {
+    let mut stderr = String::new();
+    for error in &report.bundle_errors {
+        stderr.push_str(&format!("error: {error}\n"));
+    }
+    stderr
+}
+
+fn text_repeat(outcome: &RepeatOutcome, secrets: &Secrets) -> Rendered {
+    let report = match outcome {
+        RepeatOutcome::Completed(report) => report,
+        RepeatOutcome::NoMatch { message, .. } => {
+            return Rendered {
+                stdout: String::new(),
+                stderr: format!("error: {}\n", secrets.redact(message)),
+            };
+        }
+        RepeatOutcome::Rejected { errors, .. } => {
+            let mut stderr = String::new();
+            for error in errors {
+                stderr.push_str(&format!(
+                    "error: {}: {}\n",
+                    paths::display(&error.file),
+                    error.message
+                ));
+            }
+            return Rendered {
+                stdout: String::new(),
+                stderr: secrets.redact(&stderr),
+            };
+        }
+    };
+
+    let mut stdout = String::new();
+    for case in &report.cases {
+        stdout.push_str(&format!(
+            "{} {} [{}] {}/{} passed ({} failed) {} ms\n",
+            case.classification.label(),
+            paths::display(&case.file),
+            case.name,
+            case.passed_runs,
+            case.repeat_count,
+            case.failed_runs,
+            millis(case.duration),
+        ));
+        for (idx, attempt) in case.attempts.iter().enumerate() {
+            let attempt_no = idx + 1;
+            if let Some(problem) = &attempt.error {
+                stdout.push_str(&format!(
+                    "  attempt {attempt_no}: {} ({} ms): {}\n",
+                    attempt.status.as_str(),
+                    millis(attempt.duration),
+                    problem.message
+                ));
+            } else {
+                stdout.push_str(&format!(
+                    "  attempt {attempt_no}: {} ({} ms)\n",
+                    attempt.status.as_str(),
+                    millis(attempt.duration),
+                ));
+            }
+            for step in &attempt.steps {
+                for assertion in &step.assertions {
+                    if !assertion.passed {
+                        stdout.push_str(&format!("    {}\n", describe(assertion)));
+                    }
+                }
+            }
+            if let Some(bundle) = &attempt.bundle {
+                stdout.push_str(&format!("    bundle: {}\n", paths::display(bundle)));
+            }
+        }
+    }
+
+    let s = report.summary();
+    stdout.push_str(&format!(
+        "Summary (repeat {}): {} {} ({} stable_pass, {} flaky, {} stable_fail, {} filtered), {}/{} attempts passed, {} ms\n",
+        s.repeat_count,
+        s.cases,
+        noun(s.cases, "case", "cases"),
+        s.stable_pass,
+        s.flaky,
+        s.stable_fail,
+        s.filtered,
+        s.passed_attempts,
+        s.total_attempts,
+        millis(report.duration),
+    ));
+
+    Rendered {
+        stdout: secrets.redact(&stdout),
+        stderr: secrets.redact(&repeat_bundle_errors(report)),
+    }
+}
+
+fn raw_repeat_json(outcome: &RepeatOutcome) -> Value {
+    let mut object = Map::new();
+    object.insert("ok".to_string(), Value::Bool(outcome.is_ok()));
+
+    match outcome {
+        RepeatOutcome::Completed(report) => {
+            let s = report.summary();
+            object.insert("repeat_count".to_string(), json!(report.repeat_count));
+            object.insert(
+                "summary".to_string(),
+                json!({
+                    "repeat_count": s.repeat_count,
+                    "cases": s.cases,
+                    "filtered": s.filtered,
+                    "stable_pass": s.stable_pass,
+                    "stable_fail": s.stable_fail,
+                    "flaky": s.flaky,
+                    "total_attempts": s.total_attempts,
+                    "passed_attempts": s.passed_attempts,
+                    "failed_attempts": s.failed_attempts,
+                    "duration_ms": millis(report.duration),
+                }),
+            );
+            object.insert(
+                "bundle_errors".to_string(),
+                Value::Array(
+                    report
+                        .bundle_errors
+                        .iter()
+                        .map(|e| Value::String(e.clone()))
+                        .collect(),
+                ),
+            );
+            object.insert(
+                "cases".to_string(),
+                Value::Array(
+                    report
+                        .cases
+                        .iter()
+                        .map(|case| {
+                            json!({
+                                "file": paths::display(&case.file),
+                                "name": case.name,
+                                "project": case.project,
+                                "suite": case.suite,
+                                "layer": case.layer,
+                                "tags": case.tags,
+                                "classification": case.classification.as_str(),
+                                "repeat_count": case.repeat_count,
+                                "passed_runs": case.passed_runs,
+                                "failed_runs": case.failed_runs,
+                                "duration_ms": millis(case.duration),
+                                "attempts": case
+                                    .attempts
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, attempt)| {
+                                        let mut attempt_obj = case_json(attempt);
+                                        if let Some(map) = attempt_obj.as_object_mut() {
+                                            map.insert("attempt".to_string(), json!(idx + 1));
+                                        }
+                                        attempt_obj
+                                    })
+                                    .collect::<Vec<Value>>(),
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+            object.insert("errors".to_string(), Value::Array(Vec::new()));
+        }
+        RepeatOutcome::Rejected {
+            repeat_count,
+            errors,
+        } => {
+            object.insert("repeat_count".to_string(), json!(repeat_count));
+            object.insert(
+                "summary".to_string(),
+                json!({
+                    "repeat_count": repeat_count,
+                    "cases": 0,
+                    "filtered": 0,
+                    "stable_pass": 0,
+                    "stable_fail": 0,
+                    "flaky": 0,
+                    "total_attempts": 0,
+                    "passed_attempts": 0,
+                    "failed_attempts": 0,
+                    "duration_ms": 0,
+                }),
+            );
+            object.insert("bundle_errors".to_string(), Value::Array(Vec::new()));
+            object.insert("cases".to_string(), Value::Array(Vec::new()));
+            object.insert(
+                "errors".to_string(),
+                Value::Array(
+                    errors
+                        .iter()
+                        .map(|error| {
+                            json!({
+                                "file": paths::display(&error.file),
+                                "message": error.message,
+                                "kind": "invalid_input",
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        RepeatOutcome::NoMatch {
+            repeat_count,
+            message,
+        } => {
+            object.insert("repeat_count".to_string(), json!(repeat_count));
+            object.insert(
+                "summary".to_string(),
+                json!({
+                    "repeat_count": repeat_count,
+                    "cases": 0,
+                    "filtered": 0,
+                    "stable_pass": 0,
+                    "stable_fail": 0,
+                    "flaky": 0,
+                    "total_attempts": 0,
+                    "passed_attempts": 0,
+                    "failed_attempts": 0,
+                    "duration_ms": 0,
+                }),
+            );
+            object.insert("bundle_errors".to_string(), Value::Array(Vec::new()));
+            object.insert("cases".to_string(), Value::Array(Vec::new()));
+            object.insert("errors".to_string(), Value::Array(Vec::new()));
+            object.insert("filter_error".to_string(), Value::String(message.clone()));
+        }
+    }
+
+    Value::Object(object)
 }
 
 #[cfg(test)]
@@ -1002,6 +1776,7 @@ mod tests {
                 },
             ],
             cases: Vec::new(),
+            ..LintReport::default()
         };
 
         let rendered = render_lint(&report, Format::Text, &Secrets::new());
@@ -1024,6 +1799,7 @@ mod tests {
             files: 1,
             errors: Vec::new(),
             cases: Vec::new(),
+            ..LintReport::default()
         };
 
         let rendered = render_lint(&report, Format::Text, &Secrets::new());
@@ -1045,6 +1821,7 @@ mod tests {
             errors: Vec::new(),
             warnings: Vec::new(),
             cases: Vec::new(),
+            ..LintReport::default()
         };
         let rendered = render_lint(&without, Format::Json, &Secrets::new());
         let value: Value = serde_json::from_str(&rendered.stdout).expect("stdout must be JSON");
@@ -1082,6 +1859,7 @@ mod tests {
                 message: "line 2 column 3: unclosed bracket\n --> <input>\n  |".to_string(),
             }],
             cases: Vec::new(),
+            ..LintReport::default()
         };
 
         let rendered = render_lint(&report, Format::Text, &Secrets::new());
@@ -1109,6 +1887,7 @@ mod tests {
                 layer: Some("api".to_string()),
                 tags: vec!["smoke".to_string()],
             }],
+            ..LintReport::default()
         };
 
         let rendered = render_lint(&report, Format::Json, &Secrets::new());
@@ -1212,6 +1991,7 @@ mod tests {
                 message: "step 1: environment variable `s3cr3t-value` is not set".to_string(),
             }],
             cases: Vec::new(),
+            ..LintReport::default()
         };
         let mut secrets = Secrets::new();
         secrets.record("s3cr3t-value");
