@@ -35,6 +35,7 @@ The complete reference for `da`: installation options, building from source, the
   - [`log.file`](#logfile)
 - [Failure bundles](#failure-bundles)
 - [Run records and HTML reports](#run-records-and-html-reports)
+- [RSI verification loop](#rsi-verification-loop)
 - [Output](#output)
 - [Exit codes](#exit-codes)
 
@@ -3193,6 +3194,223 @@ while it still keeps the DOM text, logs and results. Text evidence can still be
 sensitive: review a report before publishing it, and use the recording
 directory's `.gitignore` rules the same way you would for `.da/failures`.
 
+## RSI verification loop
+
+A recursive self-improvement (RSI) loop edits a program and its cases, runs the
+suite and retries until it is green. A single green run cannot show that nothing
+regressed, that the edit did not make the suite pass by weakening what it checks,
+or that a red run is deterministic. Three `da` commands answer those questions
+with no model, no network call and no new dependency.
+
+```text
+baseline cases + baseline record
+        |
+        v
+  da lint --against  (static strength guard, no step runs)
+        |
+      edit
+        |
+        v
+  da lint  ->  da run --record candidate
+                          |
+                          v
+            da compare baseline candidate
+                          |
+        regression?  ->  repair and loop
+        flaky?       ->  da run <case> --repeat N
+```
+
+A complete pass looks like this:
+
+```sh
+# Trusted starting point: record every case and keep the case files too.
+da run cases/ --record baseline-evidence/
+cp -r cases/ baseline-cases/
+
+# After the edit: static guard first, then execute and record.
+da lint cases/ --against baseline-cases/
+da run cases/ --record candidate-evidence/
+da compare baseline-evidence/ candidate-evidence/
+
+# A failure that may be timing-dependent: classify it before repairing it.
+da run cases/suspicious.yaml --repeat 3
+```
+
+### `da lint --against`: the Goodhart guard
+
+`da lint <cases> --against <baseline_cases>` parses and preflights both sides
+and compares their static contract without executing a step. `<baseline_cases>`
+is a case file or a directory of case files, not a `--record` directory. Cases
+are paired by the same stable identity `da compare` uses (the file path relative
+to each input and the declared case name); when each side names exactly one file,
+those files are paired directly even if their names differ.
+
+A finding means the candidate checks less than the baseline:
+
+| `kind` | Meaning |
+| --- | --- |
+| `case_deleted` | A baseline case is missing from the candidate set. |
+| `step_deleted` | A baseline step, including a `finally` step, is gone. |
+| `assertion_deleted` | An `expect` or `retry.until` assertion is gone. |
+| `matcher_weakened` | For example `equals` became `contains` or `exists`, `contains` became `exists`, a `contains` substring got shorter, or `exists: true` became `exists: false`. |
+| `optional_added` | A required step gained `optional: true`. |
+| `retry_timeout_widened` | A step's `retry.timeout_ms` grew. |
+| `fragile_warning_added` | A step gained a lint warning, such as replacing a `testid`/`role` locator with explicit `at` coordinates. |
+| `filter_excluded` | With active `--project`, `--suite`, `--layer`, `--tag` or `--skip-tag` flags, a case that the baseline selected no longer matches. This catches a newly added skip-prone tag. |
+
+Pass the same filter flags you run with, so the guard knows which cases matter:
+
+```sh
+da lint cases/ --against baseline-cases/ --skip-tag quarantined
+```
+
+Text output prints one `strength [kind]: message` line per finding on standard
+output and exits 3. A step that inserts an earlier setup step, adds an assertion
+or strengthens a matcher is not a finding; the step alignment pairs the
+asserted step rather than the earlier setup step.
+
+An intentional change to the specification is allowed only when it is named:
+
+```sh
+da lint cases/ --against baseline-cases/ --allow-weaken "the API now returns 204"
+```
+
+`--allow-weaken` requires a non-empty reason and `--against`; an empty or
+whitespace-only reason exits 2. With a reason, findings become acknowledged
+warnings on standard error, `ok` is `true`, and the process exits 0 unless a
+syntax or schema error exists. Those errors are never acknowledged.
+
+With `--output json` and `--against`, the object gains `against`, a
+`strength_findings` array, and, when acknowledged, `acknowledged_reason`:
+
+```json
+{
+  "ok": false,
+  "files": 1,
+  "errors": [],
+  "cases": [],
+  "against": "baseline-cases/",
+  "strength_findings": [
+    {
+      "file": "cases/login.yaml",
+      "baseline_file": "baseline-cases/login.yaml",
+      "case_name": "Login returns a token",
+      "kind": "matcher_weakened",
+      "message": "step 2 (`http.request`): `expect` assertion on `$.status` weakened (`equals` -> `exists`)",
+      "acknowledged": false
+    }
+  ]
+}
+```
+
+### `da compare`: the regression diff
+
+`da compare <baseline_dir> <candidate_dir>` reads the `meta.json` and
+`report.json` of two directories written by `da run --record`. It never reruns a
+case. Every case subdirectory in both records must contain `meta.json`, which
+`--record` writes last: any incomplete subdirectory (for example, a partial or
+interrupted case directory containing `report.json` or `case.yaml` without
+`meta.json`, or a leftover `.tmp-*` staging directory) is rejected with exit 2
+even when other complete cases exist, so an interrupted run cannot masquerade as
+`added` or `removed`. Missing paths, a file instead of a directory, or a
+directory with no complete case record also exit 2; unreadable or malformed
+JSON, or a record missing a required field, exits 3. Passing the root of a
+`--repeat` record exits 2 and names `attempt-1`, because each attempt is its own
+record.
+
+Cases are matched by `(case_file, case_name)` from `meta.json`, with path
+separators normalized to `/`. The `{position}-{safe_name}` directory name is
+never part of the identity, so inserting or deleting a case before an existing
+one does not turn it into an added and a removed case.
+
+| Classification | Meaning |
+| --- | --- |
+| `regressed` | Passed in the baseline and did not pass in the candidate. |
+| `fixed` | Did not pass in the baseline and passed in the candidate. |
+| `still_failing` | Did not pass in either record. |
+| `still_passing` | Passed in both records. |
+| `added` | Present only in the candidate. |
+| `removed` | Present only in the baseline. |
+
+Each comparison also reports the baseline and candidate status, step and
+assertion counts with signed deltas, per-step differences (`phase`,
+`step_number`, names, statuses, durations, assertion counts and the candidate
+error), case `duration_ms` deltas, and `case_changed`. `case_changed` is true
+only when both records carry a `case_sha256` and the digests differ.
+
+The exit code is 1 when at least one case is `regressed`, and 0 for `fixed`,
+`added`, `removed` or `still_failing` alone. A `removed` case is visible in the
+report but is not a regression; use `da lint --against` to reject deleted cases.
+
+```sh
+da compare baseline-evidence/ candidate-evidence/
+da --output json compare baseline-evidence/ candidate-evidence/
+```
+
+Text output starts with one line per case and lists only the steps that changed:
+
+```text
+REGRESSED cases/login.yaml [Login returns a token] passed -> failed (-2 ms, case_changed)
+  step 2 http.request: failed -> failed (assertions 1/2 -> 0/2): 0 of 2 assertions passed
+  candidate bundle: candidate-evidence/1-login-returns-a-token
+Summary: 1 case (1 regressed, 0 fixed, 0 still_failing, 0 still_passing, 0 added, 0 removed, 1 case_changed), -2 ms
+```
+
+In JSON, `summary` carries every classification count, the total baseline and
+candidate durations and `duration_delta_ms`; `cases` carries one object per case
+with `steps.baseline`, `steps.candidate`, `steps.delta`, `steps.diffs`,
+`assertions.baseline`, `assertions.candidate` and `assertions.delta`.
+
+### `da run --repeat`: the flakiness classifier
+
+`--repeat <N>` executes each selected case `N` times, with `N` at least 1 and a
+default of 1. `--repeat 0` or a non-numeric value exits 2. With `--repeat 1`
+the run is byte-for-byte the ordinary run: same output shape, same record
+layout and same exit code.
+
+With `N > 1`, every selected case is executed on all `N` attempts and classified:
+
+| `classification` | Meaning |
+| --- | --- |
+| `stable_pass` | Passed on all `N` attempts. |
+| `stable_fail` | Passed on none of the `N` attempts. |
+| `flaky` | Passed on at least one and failed or errored on at least one attempt. |
+
+The process exits 0 only when every selected case is `stable_pass`. Otherwise it
+keeps the worst exit code seen across all attempts: 3 (invalid input), then 4
+(environment), then 5 (timeout), then 1 (failed assertion or step). A single
+`flaky` case is therefore a non-zero result even when its last attempt passed.
+
+Text output prints one line per case with `passed_runs`/`N` and every attempt,
+then `Summary (repeat N): ...`. `--output json` adds `repeat_count` at the top
+level and a `summary` with `stable_pass`, `stable_fail`, `flaky`,
+`total_attempts`, `passed_attempts` and `failed_attempts`. Each case object
+carries `classification`, `repeat_count`, `passed_runs`, `failed_runs` and an
+`attempts` array whose entries are ordinary case objects plus a 1-based
+`attempt` number.
+
+`--repeat N --record <directory>` writes one complete record per attempt under
+`attempt-1`, `attempt-2`, ... and a top-level `repeat-summary.json`; attempt
+directories never overwrite each other and the record directory must still be
+empty or absent. `da report attempt-2/` renders one attempt, and
+`da compare attempt-1/ attempt-2/` shows which cases changed between attempts.
+
+### Routing a repair by exit code
+
+| Exit | Meaning in the loop | Next action |
+| ---: | --- | --- |
+| 0 | Every case passed, and under `--repeat` every case was `stable_pass`. | Stop; the candidate is verified. |
+| 1 | An assertion failed or a step could not finish. | Read `da compare`: `regressed` means repair the new behavior; `still_failing` means the old failure remains. Under `--repeat`, `flaky` means stabilize the cause before changing assertions. |
+| 2 | The command line is wrong, including filters that select nothing and an empty `--allow-weaken`. | Fix the invocation, not the case. |
+| 3 | A case is invalid, or `da lint --against` found a strength reduction. | Fix the case at the reported line and column. Use `--allow-weaken "reason"` only for a genuinely intentional spec change that the reviewer can see. |
+| 4 | The environment failed, for example an unreachable service. | Fix the environment and rerun; do not edit the case to hide it. |
+| 5 | A step exceeded its time budget. | Reproduce with `--repeat N` first. Widening `retry.timeout_ms` is a strength reduction and needs an explicit reason. |
+
+`da compare` reads the redacted files written by `--record`, and `--repeat`
+passes its text, JSON and `repeat-summary.json` through the same redaction as an
+ordinary run, so a value read through `${env:NAME}` stays `***` on every path.
+Records also contain the copied `case.yaml` and step evidence; treat them as
+sensitive even after redaction, exactly like a failure bundle.
 ## Output
 
 `--output` is a global option, so it may stand before or after the subcommand:
