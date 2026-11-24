@@ -1970,7 +1970,11 @@ steps:
   as a teardown error instead of passing silently.
 - **Bounded non-blocking pipe draining:** background threads drain stdout and
   stderr continuously into 1 MiB sliding buffers per stream so a chatty process
-  never blocks on a full OS pipe.
+  never blocks on a full OS pipe. Once a stream exceeds 1 MiB (`base_offset > 0`),
+  `ready_pattern` and `proc.wait_output` continue matching against the sliding
+  buffer while returned `stdout`/`stderr` and failure-bundle logs emit an
+  omission notice instead of post-eviction raw bytes so a secret straddling the
+  cutoff cannot leak as a partial fragment.
 - **Redacted failure evidence:** when a case fails or `--record` is enabled, the
   session attaches `proc/stdout.log` and `proc/stderr.log` (or
   `proc/<name>-stdout.log` and `proc/<name>-stderr.log` when named or when

@@ -329,6 +329,16 @@ struct StreamBuffer {
 }
 
 impl StreamBuffer {
+    fn overflow_notice(&self) -> String {
+        // Once any prefix has been evicted, a secret straddling the cutoff
+        // would retain only a tail fragment that `Secrets::redact` cannot
+        // match, so post-eviction snapshots omit all raw retained bytes.
+        format!(
+            "[... output truncated: {} bytes exceeded {} B stream buffer limit; retained tail omitted to prevent secret truncation ...]",
+            self.total_bytes, MAX_STREAM_BYTES
+        )
+    }
+
     fn push_chunk(&mut self, chunk: &[u8]) {
         if chunk.len() >= MAX_STREAM_BYTES {
             self.bytes.clear();
@@ -349,6 +359,9 @@ impl StreamBuffer {
     }
 
     fn unconsumed_text(&mut self) -> String {
+        if self.base_offset > 0 {
+            return self.overflow_notice();
+        }
         let start = self.cursor.saturating_sub(self.base_offset) as usize;
         let slice = self.bytes.make_contiguous();
         String::from_utf8_lossy(&slice[start..]).into_owned()
@@ -369,7 +382,6 @@ impl StreamBuffer {
             .saturating_sub(overlap)
             .max(self.cursor)
             .max(self.base_offset);
-        let unconsumed_start = self.cursor.saturating_sub(self.base_offset) as usize;
         let search_start = search_abs.saturating_sub(self.base_offset) as usize;
         let slice = self.bytes.make_contiguous();
         *scanned_up_to = self.total_bytes;
@@ -378,22 +390,22 @@ impl StreamBuffer {
         }
         let rel_pos = find_subslice(&slice[search_start..], needle)?;
         let match_end = search_start + rel_pos + needle.len();
-        let text = String::from_utf8_lossy(&slice[unconsumed_start..]).into_owned();
+        let text = if self.base_offset > 0 {
+            self.overflow_notice()
+        } else {
+            let unconsumed_start = self.cursor.saturating_sub(self.base_offset) as usize;
+            String::from_utf8_lossy(&slice[unconsumed_start..]).into_owned()
+        };
         self.cursor = self.base_offset + match_end as u64;
         Some(text)
     }
 
     fn evidence_text(&mut self) -> String {
-        let slice = self.bytes.make_contiguous();
-        let body = String::from_utf8_lossy(slice);
-        if self.base_offset == 0 {
-            body.into_owned()
-        } else {
-            format!(
-                "[... {} earlier bytes truncated ...]\n{body}",
-                self.base_offset
-            )
+        if self.base_offset > 0 {
+            return self.overflow_notice();
         }
+        let slice = self.bytes.make_contiguous();
+        String::from_utf8_lossy(slice).into_owned()
     }
 }
 
@@ -1632,23 +1644,152 @@ mod tests {
         buf.push_chunk(b"ping\n");
         assert_eq!(buf.find_and_advance(b"ping").as_deref(), Some("\nping\n"));
 
-        // Pushing more than MAX_STREAM_BYTES drops oldest bytes without losing marker.
+        // Patterns split across consecutive pipe chunks still match before overflow.
+        let mut split_buf = StreamBuffer::default();
+        split_buf.push_chunk(b"SPLIT_");
+        assert!(split_buf.find_and_advance(b"SPLIT_READY").is_none());
+        split_buf.push_chunk(b"READY_OK");
+        assert_eq!(
+            split_buf.find_and_advance(b"SPLIT_READY").as_deref(),
+            Some("SPLIT_READY_OK")
+        );
+
+        // Pushing more than MAX_STREAM_BYTES drops oldest bytes, continues
+        // matching markers, and omits retained tail bytes from returned text.
         let flood = vec![b'x'; MAX_STREAM_BYTES + 128];
         buf.push_chunk(&flood);
         buf.push_chunk(b"TAIL_MARKER");
         let evidence = buf.evidence_text();
-        assert!(evidence.contains("earlier bytes truncated"), "{evidence}");
-        assert!(evidence.ends_with("TAIL_MARKER"));
-        assert!(buf.find_and_advance(b"TAIL_MARKER").is_some());
+        assert!(evidence.contains("exceeded"), "{evidence}");
+        assert!(evidence.contains("omitted"), "{evidence}");
+        assert!(!evidence.contains("TAIL_MARKER"), "{evidence}");
 
-        // Patterns split across consecutive pipe chunks still match.
-        buf.push_chunk(b"SPLIT_");
-        assert!(buf.find_and_advance(b"SPLIT_READY").is_none());
-        buf.push_chunk(b"READY_OK");
-        assert_eq!(
-            buf.find_and_advance(b"SPLIT_READY").as_deref(),
-            Some("SPLIT_READY_OK")
+        let matched = buf
+            .find_and_advance(b"TAIL_MARKER")
+            .expect("marker after overflow must still match");
+        assert!(matched.contains("exceeded"), "{matched}");
+        assert!(matched.contains("omitted"), "{matched}");
+        assert!(!matched.contains("TAIL_MARKER"), "{matched}");
+        assert!(buf.find_and_advance(b"TAIL_MARKER").is_none());
+
+        let unconsumed = buf.unconsumed_text();
+        assert!(unconsumed.contains("exceeded"), "{unconsumed}");
+        assert!(unconsumed.contains("omitted"), "{unconsumed}");
+        assert!(!unconsumed.contains("TAIL_MARKER"), "{unconsumed}");
+
+        // Patterns split across chunks after overflow still match while omitting text.
+        let mut scanned = buf.total_bytes;
+        buf.push_chunk(b"POST_SPLIT_");
+        assert!(
+            buf.find_and_advance_from(b"POST_SPLIT_READY", &mut scanned)
+                .is_none()
         );
+        buf.push_chunk(b"READY");
+        let post = buf
+            .find_and_advance_from(b"POST_SPLIT_READY", &mut scanned)
+            .expect("split pattern after overflow must still match");
+        assert!(post.contains("omitted"), "{post}");
+        assert!(!post.contains("POST_SPLIT_READY"), "{post}");
+    }
+
+    fn assert_stream_buffer_omits_post_eviction_secret(
+        buf: &mut StreamBuffer,
+        secret: &str,
+        marker: &[u8],
+    ) {
+        let prefix = &secret[..10];
+        let suffix = &secret[1..];
+        let half_suffix = &secret[secret.len() / 2..];
+        let marker_str = std::str::from_utf8(marker).expect("ASCII marker");
+
+        let assert_clean = |label: &str, text: &str| {
+            assert!(text.contains("exceeded"), "{label} missing limit: {text}");
+            assert!(
+                text.contains("omitted"),
+                "{label} missing omission notice: {text}"
+            );
+            assert!(!text.contains(secret), "{label} leaked secret: {text}");
+            assert!(
+                !text.contains(prefix),
+                "{label} leaked secret prefix: {text}"
+            );
+            assert!(
+                !text.contains(suffix),
+                "{label} leaked secret suffix: {text}"
+            );
+            assert!(
+                !text.contains(half_suffix),
+                "{label} leaked secret half-suffix: {text}"
+            );
+            assert!(
+                !text.contains(marker_str),
+                "{label} leaked raw tail marker: {text}"
+            );
+        };
+
+        let evidence = buf.evidence_text();
+        assert_clean("evidence_text", &evidence);
+
+        let unconsumed = buf.unconsumed_text();
+        assert_clean("unconsumed_text", &unconsumed);
+
+        let mut scanned = 0;
+        let matched = buf
+            .find_and_advance_from(marker, &mut scanned)
+            .expect("trailing marker must still match post-eviction");
+        assert_clean("find_and_advance_from", &matched);
+        assert!(
+            buf.find_and_advance_from(marker, &mut scanned).is_none(),
+            "cursor must advance past matched marker even when text is omitted"
+        );
+    }
+
+    #[test]
+    fn stream_buffer_omits_secret_straddling_eviction_at_byte_zero() {
+        let secret = "BOUNDARY-s3cr3t-value-987654";
+        let marker = b"END_MARKER";
+        let mut buf = StreamBuffer::default();
+        buf.push_chunk(secret.as_bytes());
+        let filler_len = MAX_STREAM_BYTES + 1 - secret.len() - marker.len();
+        buf.push_chunk(&vec![b'x'; filler_len]);
+        buf.push_chunk(marker);
+
+        assert_eq!(buf.total_bytes, MAX_STREAM_BYTES as u64 + 1);
+        assert_eq!(buf.base_offset, 1);
+        assert_stream_buffer_omits_post_eviction_secret(&mut buf, secret, marker);
+    }
+
+    #[test]
+    fn stream_buffer_omits_secret_straddling_eviction_mid_stream() {
+        let secret = "BOUNDARY-s3cr3t-value-987654";
+        let marker = b"END_MARKER";
+
+        // 1) Secret after an earlier prefix, cut in half at `base_offset`.
+        let mut buf = StreamBuffer::default();
+        let prefix_len = 512;
+        buf.push_chunk(&vec![b'p'; prefix_len]);
+        buf.push_chunk(secret.as_bytes());
+        let cut_in_secret = secret.len() / 2;
+        let filler_len = MAX_STREAM_BYTES + cut_in_secret - secret.len() - marker.len();
+        buf.push_chunk(&vec![b'x'; filler_len]);
+        buf.push_chunk(marker);
+
+        assert_eq!(buf.base_offset, (prefix_len + cut_in_secret) as u64);
+        assert_stream_buffer_omits_post_eviction_secret(&mut buf, secret, marker);
+
+        // 2) Secret literally straddling offset `MAX_STREAM_BYTES` and cut at `base_offset`.
+        let mut buf_at_limit = StreamBuffer::default();
+        buf_at_limit.push_chunk(&vec![b'p'; MAX_STREAM_BYTES - 10]);
+        buf_at_limit.push_chunk(secret.as_bytes());
+        let trailing_len = MAX_STREAM_BYTES + cut_in_secret - secret.len() - marker.len();
+        buf_at_limit.push_chunk(&vec![b'x'; trailing_len]);
+        buf_at_limit.push_chunk(marker);
+
+        assert_eq!(
+            buf_at_limit.base_offset,
+            (MAX_STREAM_BYTES - 10 + cut_in_secret) as u64
+        );
+        assert_stream_buffer_omits_post_eviction_secret(&mut buf_at_limit, secret, marker);
     }
 
     #[test]

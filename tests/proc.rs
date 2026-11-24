@@ -76,6 +76,7 @@ fn next_token() -> String {
 /// - `grandchild`: sleeps while holding pidfile marker
 /// - `crash`: writes stdout/stderr and exits non-zero
 /// - `flood`: writes >2 MiB stdout and >1 MiB stderr to exercise bounded pipe draining
+/// - `boundary-flood`: writes a secret straddling the 1 MiB eviction boundary
 fn helper_bin() -> &'static Path {
     static BIN: LazyLock<(TempDir, PathBuf)> = LazyLock::new(|| {
         let dir = TempDir::new("proc-test-helper");
@@ -319,6 +320,43 @@ fn main() {
             eprintln!("{filler}{secret}");
             let _ = io::stdout().flush();
             let _ = io::stderr().flush();
+            std::process::exit(1);
+        }
+        Some("boundary-flood") => {
+            let secret = env::var("DA_PROC_TEST_SECRET")
+                .or_else(|_| env::var("DA_TEST_PROC_SECRET"))
+                .expect("DA_PROC_TEST_SECRET or DA_TEST_PROC_SECRET must be set");
+            assert!(!secret.is_empty(), "test secret must not be empty");
+            let hang = args.iter().any(|a| a == "--hang");
+            const TARGET_BYTES: usize = 1_048_577;
+
+            let mut err_buf = Vec::with_capacity(TARGET_BYTES);
+            err_buf.extend_from_slice(secret.as_bytes());
+            err_buf.resize(TARGET_BYTES, b'e');
+            let mut err = io::stderr().lock();
+            err.write_all(&err_buf).expect("stderr write");
+            err.flush().expect("stderr flush");
+            drop(err);
+
+            let marker = b"\nEND_MARKER";
+            let mut out_buf = Vec::with_capacity(TARGET_BYTES);
+            out_buf.extend_from_slice(secret.as_bytes());
+            let filler_len = TARGET_BYTES
+                .checked_sub(secret.len() + marker.len())
+                .expect("secret and marker must fit within TARGET_BYTES");
+            out_buf.resize(secret.len() + filler_len, b'a');
+            out_buf.extend_from_slice(marker);
+            assert_eq!(out_buf.len(), TARGET_BYTES);
+            let mut out = io::stdout().lock();
+            out.write_all(&out_buf).expect("stdout write");
+            out.flush().expect("stdout flush");
+            drop(out);
+
+            if hang {
+                loop {
+                    thread::sleep(Duration::from_secs(10));
+                }
+            }
             std::process::exit(1);
         }
         Some("flood") => {
@@ -1706,4 +1744,178 @@ steps:
         lower_err.contains("PROC_LOWER_a_ERR") && !lower_err.contains("PROC_UPPER_A_ERR"),
         "a-2-stderr.log unexpected: {lower_err:?}"
     );
+}
+
+fn assert_no_secret_fragments(label: &str, text: &str, secret: &str) {
+    let prefix = &secret[..10];
+    let suffix = &secret[1..];
+    assert!(
+        !text.contains(secret),
+        "{label} leaked complete secret: {text:?}"
+    );
+    assert!(
+        !text.contains(suffix),
+        "{label} leaked post-eviction secret suffix: {text:?}"
+    );
+    assert!(
+        !text.contains(prefix),
+        "{label} leaked secret prefix: {text:?}"
+    );
+}
+
+#[test]
+fn post_eviction_failure_bundle_never_leaks_boundary_secret() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-r8-bundle");
+    let bundles = dir.path().join("bundles");
+    let secret = "BOUNDARY-s3cr3t-value-987654";
+
+    let case = dir.write(
+        "post-eviction-bundle.yaml",
+        &format!(
+            r#"
+name: Post-eviction failure bundle omits straddling secret
+steps:
+  - proc.start:
+      command: '{helper}'
+      args: ["boundary-flood", "--hang"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+      ready_pattern: "END_MARKER"
+      ready_timeout_ms: 10000
+  - proc.wait_output:
+      pattern: "NEVER_PRINTED"
+      timeout_ms: 250
+"#,
+            helper = helper.display(),
+        ),
+    );
+
+    let output = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_PROC_TEST_SECRET", secret)],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let out_str = stdout(&output);
+    assert_no_secret_fragments("cli json", &out_str, secret);
+    let report = json_stdout(&output);
+    let bundle_dir = PathBuf::from(
+        report["cases"][0]["bundle"]
+            .as_str()
+            .expect("timed out case must write a failure bundle"),
+    );
+
+    for rel in [
+        "proc/stdout.log",
+        "proc/stderr.log",
+        "report.json",
+        "meta.json",
+    ] {
+        let content = fs::read_to_string(bundle_dir.join(rel))
+            .unwrap_or_else(|error| panic!("{rel} must be readable: {error}"));
+        assert_no_secret_fragments(rel, &content, secret);
+        if rel != "meta.json" {
+            assert!(
+                content.contains("omitted"),
+                "{rel} must include post-eviction omission notice: {content:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn post_eviction_step_results_never_leak_boundary_secret() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-r8-steps");
+    let secret = "BOUNDARY-s3cr3t-value-987654";
+
+    let case = dir.write(
+        "post-eviction-steps.yaml",
+        &format!(
+            r#"
+name: Post-eviction step results omit straddling secret
+steps:
+  - proc.start:
+      command: '{helper}'
+      args: ["boundary-flood", "--hang"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+  - proc.wait_output:
+      pattern: "END_MARKER"
+      timeout_ms: 10000
+  - proc.stop: {{}}
+"#,
+            helper = helper.display(),
+        ),
+    );
+
+    let output = run_da_with_env(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+        &[("DA_PROC_TEST_SECRET", secret)],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let out_str = stdout(&output);
+    assert_no_secret_fragments("cli json", &out_str, secret);
+    assert!(
+        out_str.contains("omitted"),
+        "cli json must contain omission notice: {out_str:?}"
+    );
+
+    let report = json_stdout(&output);
+    let wait_result = &report["cases"][0]["steps"][1]["result"];
+    assert_eq!(wait_result["matched"], true, "{wait_result}");
+    let wait_stdout = wait_result["stdout"]
+        .as_str()
+        .expect("proc.wait_output must return stdout string");
+    assert!(
+        wait_stdout.contains("omitted"),
+        "wait_output stdout must include omission notice: {wait_stdout:?}"
+    );
+    assert_no_secret_fragments("wait_output stdout", wait_stdout, secret);
+    if let Some(wait_stderr) = wait_result["stderr"].as_str() {
+        assert_no_secret_fragments("wait_output stderr", wait_stderr, secret);
+    }
+
+    let stop_result = &report["cases"][0]["steps"][2]["result"];
+    let stop_stdout = stop_result["stdout"]
+        .as_str()
+        .expect("proc.stop must return stdout string");
+    assert!(
+        stop_stdout.contains("omitted"),
+        "proc.stop stdout must include omission notice: {stop_stdout:?}"
+    );
+    assert_no_secret_fragments("proc.stop stdout", stop_stdout, secret);
+    let stop_stderr = stop_result["stderr"]
+        .as_str()
+        .expect("proc.stop must return stderr string");
+    assert!(
+        stop_stderr.contains("omitted"),
+        "proc.stop stderr must include omission notice: {stop_stderr:?}"
+    );
+    assert_no_secret_fragments("proc.stop stderr", stop_stderr, secret);
 }
