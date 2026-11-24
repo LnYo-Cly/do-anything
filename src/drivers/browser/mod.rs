@@ -8978,6 +8978,255 @@ fn flush_scroll_frames(
     .map_err(|failure| failure.step("could not settle scroll state", timeout_or_execution))
 }
 
+/// JavaScript capturing the current scroll offsets across the top document,
+/// accessible same-origin iframes, open shadow roots, and scrollable elements.
+const SCROLL_SNAPSHOT_SCRIPT: &str = r#"(function () {
+  var entries = [];
+  var visitedDocs = [];
+  var num = function (v) {
+    var n = Number(v);
+    return isFinite(n) ? n : 0;
+  };
+  var nodeId = function (el) {
+    if (!el || typeof el.getAttribute !== 'function') return '';
+    var raw = el.getAttribute('id');
+    return raw ? String(raw) : '';
+  };
+  var describeNode = function (el) {
+    if (!el || el.nodeType !== 1) return 'element';
+    var tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+    var id = nodeId(el);
+    if (id) return tag + '#' + id;
+    var tid = typeof el.getAttribute === 'function' ? el.getAttribute('data-testid') : '';
+    if (tid) return tag + '[data-testid=' + JSON.stringify(String(tid)) + ']';
+    var cls = '';
+    if (typeof el.className === 'string' && el.className.trim()) {
+      var parts = el.className.trim().split(/\s+/).slice(0, 2);
+      if (parts.length > 0) cls = '.' + parts.join('.');
+    }
+    return tag + cls;
+  };
+  var canScrollAxis = function (overflow) {
+    return overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay' || overflow === 'hidden';
+  };
+  var walkRoot = function (root, doc, win, keyPrefix, scopeParts) {
+    if (!root) return;
+    var kids = root.children;
+    if (!kids) return;
+    var idCounts = Object.create(null);
+    var tagCounts = Object.create(null);
+    var se = doc.scrollingElement;
+    for (var i = 0; i < kids.length; i++) {
+      var child = kids[i];
+      var cid = nodeId(child);
+      var seg;
+      if (cid) {
+        var cIdx = idCounts[cid] || 0;
+        idCounts[cid] = cIdx + 1;
+        seg = '#' + cid + (cIdx > 0 ? '[' + cIdx + ']' : '');
+      } else {
+        var cTag = child.tagName ? child.tagName.toLowerCase() : 'el';
+        var tIdx = tagCounts[cTag] || 0;
+        tagCounts[cTag] = tIdx + 1;
+        seg = cTag + '[' + tIdx + ']';
+      }
+      var childKey = keyPrefix + '/' + seg;
+      if (child !== se) {
+        var sx = num(child.scrollLeft);
+        var sy = num(child.scrollTop);
+        var sh = num(child.scrollHeight);
+        var ch = num(child.clientHeight);
+        var sw = num(child.scrollWidth);
+        var cw = num(child.clientWidth);
+        var track = sx !== 0 || sy !== 0;
+        if (!track && (sh > ch || sw > cw)) {
+          var cs = win ? win.getComputedStyle(child) : null;
+          if (cs && (
+            (sh > ch && canScrollAxis(cs.overflowY)) ||
+            (sw > cw && canScrollAxis(cs.overflowX))
+          )) {
+            track = true;
+          }
+        }
+        if (track) {
+          var label = describeNode(child);
+          if (scopeParts.length > 0) {
+            label += ' (in ' + scopeParts.join(' > ') + ')';
+          }
+          entries.push({
+            key: childKey,
+            label: label,
+            x: sx,
+            y: sy
+          });
+        }
+      }
+      if (child.shadowRoot) {
+        var nextScope = scopeParts.concat(['shadow root of ' + describeNode(child)]);
+        walkRoot(child.shadowRoot, doc, win, childKey + '/::shadow', nextScope);
+      }
+      var tag = child.tagName ? child.tagName.toUpperCase() : '';
+      if (tag === 'IFRAME' || tag === 'FRAME') {
+        var subDoc = null;
+        try {
+          subDoc = child.contentDocument;
+        } catch (e) {
+          subDoc = null;
+        }
+        if (subDoc && visitedDocs.indexOf(subDoc) === -1) {
+          var frameScope = scopeParts.concat([describeNode(child)]);
+          walkDoc(subDoc, childKey + '/::frame', frameScope);
+        }
+      }
+      walkRoot(child, doc, win, childKey, scopeParts);
+    }
+  };
+  var walkDoc = function (doc, docKey, scopeParts) {
+    if (!doc || visitedDocs.indexOf(doc) !== -1) return;
+    visitedDocs.push(doc);
+    var win = doc.defaultView || null;
+    var se = doc.scrollingElement;
+    var vx = num(win && typeof win.scrollX === 'number' ? win.scrollX : (se ? se.scrollLeft : 0));
+    var vy = num(win && typeof win.scrollY === 'number' ? win.scrollY : (se ? se.scrollTop : 0));
+    entries.push({
+      key: docKey,
+      label: scopeParts.length === 0 ? 'the page' : scopeParts.join(' > '),
+      x: vx,
+      y: vy
+    });
+    if (doc.documentElement) {
+      walkRoot(doc.documentElement, doc, win, docKey, scopeParts);
+    }
+  };
+  walkDoc(document, 'doc', []);
+  return entries;
+})()"#;
+
+/// One scroll container entry captured by [`SCROLL_SNAPSHOT_SCRIPT`].
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct ScrollEntry {
+    key: String,
+    label: String,
+    x: f64,
+    y: f64,
+}
+
+/// Snapshot of scroll offsets across the page, same-origin iframes, and open shadow roots.
+#[derive(Clone, Debug, PartialEq)]
+struct ScrollSnapshot {
+    entries: Vec<ScrollEntry>,
+}
+
+/// One container whose scroll offset moved beyond the subpixel tolerance.
+#[derive(Clone, Debug, PartialEq)]
+struct ScrollChange {
+    label: String,
+    from: (f64, f64),
+    to: (f64, f64),
+}
+
+/// Captures scroll offsets across the top document, accessible iframes,
+/// open shadow roots, and scrollable ancestor containers.
+fn read_drag_scroll_snapshot(
+    session: &mut BrowserSession,
+    deadline: Deadline,
+    dialog: &mut DialogContext,
+) -> Result<ScrollSnapshot, StepError> {
+    let scope = session.scope();
+    let value = page_evaluate(
+        session.connection_mut()?,
+        &scope,
+        SCROLL_SNAPSHOT_SCRIPT,
+        deadline,
+        dialog,
+    )
+    .map_err(|failure| failure.step("could not read the scroll state", timeout_or_execution))?;
+    let entries: Vec<ScrollEntry> = serde_json::from_value(value).map_err(|error| {
+        StepError::Environment(format!(
+            "the browser returned an invalid scroll snapshot: {error}"
+        ))
+    })?;
+    Ok(ScrollSnapshot { entries })
+}
+
+/// Returns every scroll container whose `(x, y)` moved by more than `0.5` px
+/// between `before` and `after`.
+fn diff_scroll_snapshots(before: &ScrollSnapshot, after: &ScrollSnapshot) -> Vec<ScrollChange> {
+    let before_map: BTreeMap<&str, &ScrollEntry> = before
+        .entries
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry))
+        .collect();
+    let mut changes = Vec::new();
+    for entry in &after.entries {
+        let from = before_map
+            .get(entry.key.as_str())
+            .map_or((0.0, 0.0), |prev| (prev.x, prev.y));
+        let to = (entry.x, entry.y);
+        if (to.0 - from.0).abs() > 0.5 || (to.1 - from.1).abs() > 0.5 {
+            changes.push(ScrollChange {
+                label: entry.label.clone(),
+                from,
+                to,
+            });
+        }
+    }
+    changes
+}
+
+/// Formats the fail-closed error when resolving one endpoint of a mixed `at` +
+/// locator drag scrolled the page or an inner container.
+fn format_mixed_drag_scroll_error(
+    from_desc: &str,
+    to_desc: &str,
+    resolved_desc: &str,
+    at_side: &str,
+    changes: &[ScrollChange],
+) -> String {
+    let details: Vec<String> = changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{} from ({}, {}) to ({}, {})",
+                change.label,
+                coordinate_number(change.from.0),
+                coordinate_number(change.from.1),
+                coordinate_number(change.to.0),
+                coordinate_number(change.to.1),
+            )
+        })
+        .collect();
+    format!(
+        "cannot drag from {from_desc} to {to_desc}: resolving {resolved_desc} scrolled {}, invalidating the fixed `{at_side}.at` viewport coordinates; scroll first with `browser.scroll` or use deterministic locators for both endpoints",
+        details.join(" and "),
+    )
+}
+
+/// Fails closed when resolving one endpoint of a mixed `at` + located drag
+/// scrolled the page or any container between `before` and `after`.
+fn check_mixed_drag_scroll(
+    from_desc: &str,
+    to_desc: &str,
+    resolved_desc: &str,
+    at_side: &str,
+    before: Option<&ScrollSnapshot>,
+    after: Option<&ScrollSnapshot>,
+) -> Result<(), StepError> {
+    if let (Some(before), Some(after)) = (before, after) {
+        let changes = diff_scroll_snapshots(before, after);
+        if !changes.is_empty() {
+            return Err(StepError::Execution(format_mixed_drag_scroll_error(
+                from_desc,
+                to_desc,
+                resolved_desc,
+                at_side,
+                &changes,
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn read_window_scroll(
     session: &mut BrowserSession,
     deadline: Deadline,
@@ -9786,9 +10035,10 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     };
     let session = session(sessions)?;
 
-    let any_located = parsed.from.at.is_none() || parsed.to.at.is_none();
-    let scroll_before_from = if any_located {
-        Some(read_window_scroll(session, deadline, &mut dialog)?)
+    let from_is_located = parsed.from.at.is_none();
+    let to_is_located = parsed.to.at.is_none();
+    let scroll_before_from = if from_is_located && !to_is_located {
+        Some(read_drag_scroll_snapshot(session, deadline, &mut dialog)?)
     } else {
         None
     };
@@ -9805,8 +10055,8 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     if interactive {
         update_drag_metadata(session, &from.synth, &empty_to);
     }
-    let scroll_after_from = if any_located {
-        Some(read_window_scroll(session, deadline, &mut dialog)?)
+    let scroll_after_from = if from_is_located ^ to_is_located {
+        Some(read_drag_scroll_snapshot(session, deadline, &mut dialog)?)
     } else {
         None
     };
@@ -9822,51 +10072,41 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     if interactive {
         update_drag_metadata(session, &from.synth, &to.synth);
     }
-    let scroll_after_to = if any_located {
-        Some(read_window_scroll(session, deadline, &mut dialog)?)
+    let scroll_after_to = if to_is_located {
+        Some(read_drag_scroll_snapshot(session, deadline, &mut dialog)?)
     } else {
         None
     };
 
     // Guard mixed `at` + located drags: if resolving the located endpoint scrolled
-    // the document, the fixed viewport `at` coordinates no longer point at the same
-    // page content. Fail closed before dispatching any mouse events.
+    // the page or any container (including shadow roots or same-origin iframes),
+    // the fixed viewport `at` coordinates no longer point at the same page content.
+    // Fail closed before dispatching any mouse events.
     if from.located.is_none() && to.located.is_some() {
-        let (sx1, sy1) = scroll_after_from.unwrap_or((0.0, 0.0));
-        let (sx2, sy2) = scroll_after_to.unwrap_or((0.0, 0.0));
-        if (sx2 - sx1).abs() > 0.5 || (sy2 - sy1).abs() > 0.5 {
-            return Err(StepError::Execution(format!(
-                "cannot drag from {} to {}: resolving {} scrolled the page from ({}, {}) to ({}, {}), invalidating the fixed `from.at` viewport coordinates; scroll first with `browser.scroll` or use deterministic locators for both endpoints",
-                from.desc,
-                to.desc,
-                to.desc,
-                coordinate_number(sx1),
-                coordinate_number(sy1),
-                coordinate_number(sx2),
-                coordinate_number(sy2),
-            )));
-        }
+        check_mixed_drag_scroll(
+            &from.desc,
+            &to.desc,
+            &to.desc,
+            "from",
+            scroll_after_from.as_ref(),
+            scroll_after_to.as_ref(),
+        )?;
     }
     if from.located.is_some() && to.located.is_none() {
-        let (sx0, sy0) = scroll_before_from.unwrap_or((0.0, 0.0));
-        let (sx1, sy1) = scroll_after_from.unwrap_or((0.0, 0.0));
-        if (sx1 - sx0).abs() > 0.5 || (sy1 - sy0).abs() > 0.5 {
-            return Err(StepError::Execution(format!(
-                "cannot drag from {} to {}: resolving {} scrolled the page from ({}, {}) to ({}, {}), invalidating the fixed `to.at` viewport coordinates; scroll first with `browser.scroll` or use deterministic locators for both endpoints",
-                from.desc,
-                to.desc,
-                from.desc,
-                coordinate_number(sx0),
-                coordinate_number(sy0),
-                coordinate_number(sx1),
-                coordinate_number(sy1),
-            )));
-        }
+        check_mixed_drag_scroll(
+            &from.desc,
+            &to.desc,
+            &from.desc,
+            "to",
+            scroll_before_from.as_ref(),
+            scroll_after_from.as_ref(),
+        )?;
     }
 
-    // Re-inspect `from` if resolving `to` may have scrolled the page. When `from`
-    // and `to` cannot fit in the viewport simultaneously, bring `from` into view for
-    // `mousePressed` and defer bringing `to` back into view until mid-drag.
+    // Re-inspect `from` if resolving `to` may have scrolled the page or a container.
+    // When `from` and `to` cannot fit in the viewport or container simultaneously,
+    // bring `from` into view for `mousePressed` and defer bringing `to` back into
+    // view until mid-drag.
     let mut mid_drag_to = None;
     if let (Some(from_loc), Some(to_loc)) = (from.located.take(), to.located.take()) {
         let refreshed_from =
@@ -9875,9 +10115,11 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
             (refreshed_from.x - from.x).abs() > 0.5 || (refreshed_from.y - from.y).abs() > 0.5;
         from.x = refreshed_from.x;
         from.y = refreshed_from.y;
-        let (sx2, sy2) = scroll_after_to.unwrap_or((0.0, 0.0));
-        let (sx3, sy3) = read_window_scroll(session, deadline, &mut dialog)?;
-        if (sx3 - sx2).abs() > 0.5 || (sy3 - sy2).abs() > 0.5 {
+        let scroll_after_refresh = read_drag_scroll_snapshot(session, deadline, &mut dialog)?;
+        let scrolled = scroll_after_to
+            .as_ref()
+            .is_some_and(|before| !diff_scroll_snapshots(before, &scroll_after_refresh).is_empty());
+        if scrolled {
             mid_drag_to = Some(to_loc);
         } else if moved {
             let refreshed_to =
@@ -14667,6 +14909,117 @@ mod tests {
                 "{step_label} on dead headless tab must fail as Environment, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn diff_scroll_snapshots_detects_container_and_page_changes_beyond_tolerance() {
+        let before = ScrollSnapshot {
+            entries: vec![
+                ScrollEntry {
+                    key: "doc".to_string(),
+                    label: "the page".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#panel".to_string(),
+                    label: "div#panel".to_string(),
+                    x: 0.0,
+                    y: 120.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#shadow-host/::shadow/#shadow-panel".to_string(),
+                    label: "div#shadow-panel (in shadow root of div#shadow-host)".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+            ],
+        };
+        let after = ScrollSnapshot {
+            entries: vec![
+                ScrollEntry {
+                    key: "doc".to_string(),
+                    label: "the page".to_string(),
+                    x: 0.25,
+                    y: 0.4,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#panel".to_string(),
+                    label: "div#panel".to_string(),
+                    x: 0.0,
+                    y: 520.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#shadow-host/::shadow/#shadow-panel".to_string(),
+                    label: "div#shadow-panel (in shadow root of div#shadow-host)".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+                ScrollEntry {
+                    key: "doc/html[0]/body[0]/#dynamic-pane".to_string(),
+                    label: "div#dynamic-pane".to_string(),
+                    x: 40.0,
+                    y: 0.0,
+                },
+            ],
+        };
+
+        let changes = diff_scroll_snapshots(&before, &after);
+        assert_eq!(
+            changes,
+            vec![
+                ScrollChange {
+                    label: "div#panel".to_string(),
+                    from: (0.0, 120.0),
+                    to: (0.0, 520.0),
+                },
+                ScrollChange {
+                    label: "div#dynamic-pane".to_string(),
+                    from: (0.0, 0.0),
+                    to: (40.0, 0.0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn format_mixed_drag_scroll_error_names_page_and_inner_containers() {
+        let page_only = format_mixed_drag_scroll_error(
+            "from coordinates (10, 20)",
+            "to CSS selector `#dst`",
+            "to CSS selector `#dst`",
+            "from",
+            &[ScrollChange {
+                label: "the page".to_string(),
+                from: (0.0, 0.0),
+                to: (0.0, 1280.0),
+            }],
+        );
+        assert!(page_only.contains("scrolled the page from (0, 0) to (0, 1280)"));
+        assert!(page_only.contains("invalidating the fixed `from.at` viewport coordinates"));
+        assert!(page_only.contains("browser.scroll"));
+
+        let container_and_page = format_mixed_drag_scroll_error(
+            "from CSS selector `#dst`",
+            "to coordinates (100, 100)",
+            "from CSS selector `#dst`",
+            "to",
+            &[
+                ScrollChange {
+                    label: "the page".to_string(),
+                    from: (0.0, 0.0),
+                    to: (0.0, 29.0),
+                },
+                ScrollChange {
+                    label: "div#panel".to_string(),
+                    from: (0.0, 0.0),
+                    to: (0.0, 520.0),
+                },
+            ],
+        );
+        assert!(container_and_page.contains("scrolled the page from (0, 0) to (0, 29)"));
+        assert!(container_and_page.contains("div#panel from (0, 0) to (0, 520)"));
+        assert!(container_and_page.contains("invalidating the fixed `to.at` viewport coordinates"));
     }
 }
 
