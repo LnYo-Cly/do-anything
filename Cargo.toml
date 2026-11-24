@@ -27,7 +27,7 @@ log = ["dep:schemars"]
 # The `fs.watch` observer and the argument schema it needs.
 fs = ["dep:schemars"]
 # The `proc.*` steps for long-lived process sessions.
-proc = ["dep:schemars"]
+proc = ["dep:schemars", "dep:process-wrap"]
 # The `db.query` step and the two database clients it needs.
 db = [
     "dep:schemars",
@@ -94,6 +94,10 @@ uiautomation = { version = "0.25", optional = true }
 # Safe `PrintWindow` RGBA capture and `EnumWindows` enumeration; shares the
 # exact `windows` crate version `uiautomation` already builds with.
 win-screenshot = { version = "4.0", optional = true }
+# Assigns spawned `proc.*` child trees to a kill-on-close Windows Job Object
+# before resuming the child, so intermediate parent exits never orphan
+# descendants. Reuses `windows` and `indexmap` already in `Cargo.lock`.
+process-wrap = { version = "11.0", default-features = false, features = ["std", "job-object", "kill-on-drop"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust synchronous D-Bus client (`async-io`, no `tokio`) for AT-SPI2.

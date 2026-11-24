@@ -1925,8 +1925,8 @@ subsequent steps match only new output. If the process exits before emitting
 #### `proc.stop`
 
 Stops a running process and its entire process tree (`SIGTERM` then `SIGKILL` on
-its Unix process group; `taskkill /T /F` on Windows), reaps the child, and drains
-its pipes.
+its Unix process group; `TerminateJobObject` on Windows), reaps the child, and
+drains its pipes.
 
 | Argument | Meaning |
 | --- | --- |
@@ -1958,13 +1958,16 @@ steps:
 ```
 
 - **Zero orphan process trees:** `proc` spawns each process in its own Unix
-  process group (`process_group(0)`) and uses `taskkill /PID <pid> /T /F` on
-  Windows. When a case ends — whether it passed, failed, errored, or timed out
-  — `da` kills every still-running process tree even if `proc.stop` was never
-  called. On Windows, an exited leader is followed by an independent descendant
-  scan by process lineage, so a child or grandchild that redirected its output
-  to `null` or a file is still terminated and any survivor is reported as a
-  teardown error instead of passing silently.
+  process group (`process_group(0)`) and, on Windows, assigns each spawned
+  process while suspended to a kill-on-close Windows Job Object
+  (`TerminateJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). When a case
+  ends — whether it passed, failed, errored, or timed out — `da` kills every
+  still-running process tree even if `proc.stop` was never called. Because the
+  Windows Job Object tracks kernel job membership directly across exits, any
+  descendant or grandchild whose intermediate parent already exited or whose
+  output pipes were closed or redirected to `null` or a file is still
+  terminated, and any surviving job member past the teardown budget is reported
+  as a teardown error instead of passing silently.
 - **Bounded non-blocking pipe draining:** background threads drain stdout and
   stderr continuously into 1 MiB sliding buffers per stream so a chatty process
   never blocks on a full OS pipe.

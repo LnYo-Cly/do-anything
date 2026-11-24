@@ -15,12 +15,16 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use process_wrap::std::{ChildWrapper, CommandWrap, JobObject, KillOnDrop};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -48,6 +52,7 @@ const READ_CHUNK: usize = 8 * 1024;
 const MAX_STREAM_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(unix)]
 const KILL_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const GRACEFUL_TERM_CAP: Duration = Duration::from_millis(300);
@@ -552,8 +557,62 @@ impl StdinWriter {
     }
 }
 
+#[cfg(windows)]
+type ManagedChild = Box<dyn ChildWrapper>;
+#[cfg(not(windows))]
+type ManagedChild = Child;
+
+#[cfg(windows)]
+fn spawn_child(command: Command, program: &str) -> Result<ManagedChild, StepError> {
+    // Wrap `KillOnDrop` before `JobObject` so `JobObjectChild` stays the
+    // outermost wrapper: `child.try_wait()` checks the whole Job Object while
+    // `child.inner_mut().try_wait()` checks only the root leader, and
+    // `JobObject` still enables `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    let mut wrapped = CommandWrap::from(command);
+    wrapped.wrap(KillOnDrop);
+    wrapped.wrap(JobObject);
+    wrapped
+        .spawn()
+        .map_err(|error| spawn_error(program, &error))
+}
+
+#[cfg(not(windows))]
+fn spawn_child(mut command: Command, program: &str) -> Result<ManagedChild, StepError> {
+    command
+        .spawn()
+        .map_err(|error| spawn_error(program, &error))
+}
+
+#[cfg(windows)]
+fn take_child_pipes(
+    child: &mut ManagedChild,
+) -> (Option<ChildStdin>, Option<ChildStdout>, Option<ChildStderr>) {
+    (
+        child.stdin().take(),
+        child.stdout().take(),
+        child.stderr().take(),
+    )
+}
+
+#[cfg(not(windows))]
+fn take_child_pipes(
+    child: &mut ManagedChild,
+) -> (Option<ChildStdin>, Option<ChildStdout>, Option<ChildStderr>) {
+    (child.stdin.take(), child.stdout.take(), child.stderr.take())
+}
+
+#[cfg(windows)]
+fn child_try_wait_leader(child: &mut ManagedChild) -> std::io::Result<Option<ExitStatus>> {
+    child.inner_mut().try_wait()
+}
+
+#[cfg(not(windows))]
+fn child_try_wait_leader(child: &mut ManagedChild) -> std::io::Result<Option<ExitStatus>> {
+    child.try_wait()
+}
+
 struct ManagedProcess {
-    child: Child,
+    child: ManagedChild,
     stdin: Option<StdinWriter>,
     streams: Arc<SharedStreams>,
     stdout_reader: Option<JoinHandle<()>>,
@@ -603,17 +662,12 @@ impl ManagedProcess {
             command.process_group(0);
         }
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| spawn_error(&args.command, &error))?;
-        let stdin = child.stdin.take().map(StdinWriter::spawn);
-        let stdout_pipe = child
-            .stdout
-            .take()
+        let mut child = spawn_child(command, &args.command)?;
+        let (stdin_pipe, stdout_pipe, stderr_pipe) = take_child_pipes(&mut child);
+        let stdin = stdin_pipe.map(StdinWriter::spawn);
+        let stdout_pipe = stdout_pipe
             .ok_or_else(|| StepError::Environment("failed to capture child stdout".to_string()))?;
-        let stderr_pipe = child
-            .stderr
-            .take()
+        let stderr_pipe = stderr_pipe
             .ok_or_else(|| StepError::Environment("failed to capture child stderr".to_string()))?;
 
         let streams = Arc::new(SharedStreams {
@@ -649,7 +703,7 @@ impl ManagedProcess {
         if let Some(status) = self.exit_status {
             return Ok(Some(status));
         }
-        match self.child.try_wait() {
+        match child_try_wait_leader(&mut self.child) {
             Ok(Some(status)) => {
                 self.exit_status = Some(status);
                 Ok(Some(status))
@@ -827,11 +881,11 @@ impl ManagedProcess {
         }
 
         let mut was_running = self.refresh_exit()?.is_none();
-        if was_running && stdin_was_already_closed && self.both_pipes_closed() {
-            // A process that already had stdin closed and closed both output
-            // pipes is usually in final CRT exit; wait briefly before killing
-            // so it keeps its natural exit code without spawning kill helpers.
-            let settle_deadline = Instant::now() + timeout.min(Duration::from_millis(100));
+        if was_running && (stdin_was_already_closed || self.both_pipes_closed()) {
+            // A process whose stdin was already closed via `proc.send` (`eof`) or
+            // whose output pipes are already closed may be in final CRT exit; wait
+            // briefly before killing so it keeps its natural exit code.
+            let settle_deadline = Instant::now() + timeout.min(Duration::from_millis(150));
             while Instant::now() < settle_deadline {
                 if self.refresh_exit()?.is_some() {
                     was_running = false;
@@ -1212,7 +1266,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn terminate_process_tree(
-    child: &mut Child,
+    child: &mut ManagedChild,
     exit_status: &mut Option<ExitStatus>,
     pid: u32,
     timeout: Duration,
@@ -1223,7 +1277,8 @@ fn terminate_process_tree(
     }
     #[cfg(windows)]
     {
-        terminate_windows_process_tree(child, exit_status, pid, timeout)
+        let _ = pid;
+        terminate_windows_process_tree(child, exit_status, timeout)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1418,392 +1473,46 @@ fn unix_process_group_alive(target_pgid: u32) -> bool {
 
 #[cfg(windows)]
 fn terminate_windows_process_tree(
-    child: &mut Child,
+    child: &mut ManagedChild,
     exit_status: &mut Option<ExitStatus>,
-    pid: u32,
     timeout: Duration,
 ) -> Result<(), String> {
     if exit_status.is_none()
-        && let Ok(Some(status)) = child.try_wait()
+        && let Ok(Some(status)) = child_try_wait_leader(child)
     {
         *exit_status = Some(status);
     }
 
-    if exit_status.is_none() {
-        let taskkill_ok = taskkill_windows_tree(pid, timeout.min(KILL_HELPER_TIMEOUT));
-        let _ = child.kill();
-        *exit_status = child
-            .wait()
-            .map(Some)
-            .map_err(|error| format!("could not wait for process exit: {error}"))?;
-        if taskkill_ok {
-            // `taskkill /T` already walked and killed the live tree.
-            return Ok(());
-        }
-    }
+    // Terminate the whole Windows Job Object so every descendant is killed even
+    // when intermediate parents have already exited or handles stay open.
+    child
+        .start_kill()
+        .map_err(|error| format!("could not terminate Windows job object: {error}"))?;
 
-    // A child can exit while a grandchild survives with stdout/stderr attached
-    // to files or null. Pipe EOF therefore says nothing about the process
-    // tree, so inspect descendants by PID lineage and verify they are gone.
-    // Windows PowerShell startup dominates the cost here, so one bounded
-    // process owns the enumerate/kill/verify loop instead of one probe per
-    // iteration.
-    let budget = timeout.max(Duration::from_secs(10));
-    terminate_windows_descendants(pid, budget)
-}
-
-#[cfg(windows)]
-fn windows_system_tool(parts: &[&str], fallback: &str) -> PathBuf {
-    let Some(root) = std::env::var_os("SystemRoot") else {
-        return PathBuf::from(fallback);
-    };
-    let mut path = PathBuf::from(root).join("System32");
-    for part in parts {
-        path = path.join(part);
-    }
-    if path.is_file() {
-        path
-    } else {
-        PathBuf::from(fallback)
-    }
-}
-
-#[cfg(windows)]
-struct HelperOutput {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-#[cfg(windows)]
-fn run_bounded_helper(mut command: Command, budget: Duration) -> Option<HelperOutput> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut helper = command.spawn().ok()?;
-    let stdout = helper.stdout.take().map(|mut pipe| {
-        thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = pipe.read_to_end(&mut buffer);
-            buffer
-        })
-    });
-    let stderr = helper.stderr.take().map(|mut pipe| {
-        thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = pipe.read_to_end(&mut buffer);
-            buffer
-        })
-    });
+    let budget = timeout.max(Duration::from_secs(5));
     let deadline = Instant::now() + budget;
-    let status = loop {
-        match helper.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(_) => break None,
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break None;
-        }
-        thread::sleep(remaining.min(Duration::from_millis(10)));
-    };
-    let Some(status) = status else {
-        let _ = helper.kill();
-        let _ = helper.wait();
-        return None;
-    };
-    let stdout = join_reader(stdout, Duration::from_secs(1))
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
-    let stderr = join_reader(stderr, Duration::from_secs(1))
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
-    Some(HelperOutput {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-#[cfg(windows)]
-fn join_reader(handle: Option<JoinHandle<Vec<u8>>>, timeout: Duration) -> Option<Vec<u8>> {
-    let handle = handle?;
-    let deadline = Instant::now() + timeout;
-    while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    handle.join().ok()
-}
-
-#[cfg(windows)]
-fn taskkill_windows_tree(pid: u32, budget: Duration) -> bool {
-    let taskkill = windows_system_tool(&["taskkill.exe"], "taskkill");
-    let pid_text = pid.to_string();
-    let mut command = Command::new(taskkill);
-    command.args(["/PID", &pid_text, "/T", "/F"]);
-    run_bounded_helper(command, budget).is_some_and(|output| output.status.success())
-}
-
-#[cfg(windows)]
-fn terminate_windows_descendants(root_pid: u32, budget: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + budget;
-    match terminate_windows_descendants_wmic(root_pid, deadline) {
-        Ok(Some(())) => Ok(()),
-        Ok(None) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            terminate_windows_descendants_powershell(
-                root_pid,
-                remaining.max(Duration::from_secs(1)),
-            )
-        }
-        Err(wmic_error) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining < Duration::from_secs(1) {
-                return Err(wmic_error);
-            }
-            terminate_windows_descendants_powershell(root_pid, remaining)
-                .map_err(|powershell_error| format!("{wmic_error}; {powershell_error}"))
-        }
-    }
-}
-
-/// Enumerates the process table with WMIC and terminates every descendant of
-/// `root_pid`. Returns `Ok(None)` only when WMIC is unavailable before any
-/// teardown was attempted, so the caller can fall back to PowerShell.
-#[cfg(windows)]
-fn terminate_windows_descendants_wmic(
-    root_pid: u32,
-    deadline: Instant,
-) -> Result<Option<()>, String> {
-    let Some(wmic) = windows_wmic() else {
-        return Ok(None);
-    };
-    let mut attempted = false;
-    let mut last_targets = Vec::new();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(descendant_survivor_error(&last_targets));
-        }
-        let parents = match windows_process_parent_map(&wmic, remaining) {
-            Ok(parents) => parents,
-            Err(_error) if !attempted => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let targets = windows_descendants(root_pid, &parents);
-        if targets.is_empty() {
-            return Ok(Some(()));
-        }
-        last_targets = targets.clone();
-        attempted = true;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(descendant_survivor_error(&last_targets));
-        }
-        let _ = taskkill_windows_pids(&targets, remaining.min(KILL_HELPER_TIMEOUT));
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[cfg(windows)]
-fn windows_wmic() -> Option<PathBuf> {
-    let path = windows_system_tool(&["wbem", "WMIC.exe"], "wmic.exe");
-    path.is_file().then_some(path)
-}
-
-#[cfg(windows)]
-fn windows_process_parent_map(
-    wmic: &std::path::Path,
-    budget: Duration,
-) -> Result<BTreeMap<u32, u32>, String> {
-    let mut command = Command::new(wmic);
-    command.args(["process", "get", "ProcessId,ParentProcessId", "/format:csv"]);
-    let output = run_bounded_helper(command, budget).ok_or_else(|| {
-        "could not enumerate Windows processes within the teardown budget".to_string()
-    })?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not enumerate Windows processes ({}): {}",
-            output.status,
-            output.stderr.trim()
-        ));
-    }
-    let mut parents = BTreeMap::new();
-    for line in output.stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.contains("ParentProcessId") {
-            continue;
-        }
-        let mut fields = line.rsplit(',');
-        let Some(pid) = fields
-            .next()
-            .and_then(|field| field.trim().parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Some(parent) = fields
-            .next()
-            .and_then(|field| field.trim().parse::<u32>().ok())
-        else {
-            continue;
-        };
-        parents.insert(pid, parent);
-    }
-    if parents.is_empty() {
-        return Err("Windows process enumeration returned no rows".to_string());
-    }
-    Ok(parents)
-}
-
-#[cfg(windows)]
-fn windows_descendants(root_pid: u32, parents: &BTreeMap<u32, u32>) -> Vec<u32> {
-    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (&pid, &parent) in parents {
-        children.entry(parent).or_default().push(pid);
-    }
-    let mut targets = Vec::new();
-    let mut seen = BTreeMap::new();
-    let mut queue = VecDeque::from([root_pid]);
-    while let Some(parent) = queue.pop_front() {
-        for &child in children.get(&parent).into_iter().flatten() {
-            if seen.insert(child, ()).is_none() {
-                queue.push_back(child);
-                targets.push(child);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if exit_status.is_none() {
+                    *exit_status = Some(status);
+                }
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!("could not poll Windows job object exit: {error}"));
             }
         }
-    }
-    targets.sort_unstable();
-    targets
-}
-
-#[cfg(windows)]
-fn descendant_survivor_error(targets: &[u32]) -> String {
-    if targets.is_empty() {
-        "descendant teardown did not complete within the budget".to_string()
-    } else {
-        format!(
-            "descendant processes survived teardown: {}",
-            targets
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-#[cfg(windows)]
-fn taskkill_windows_pids(pids: &[u32], budget: Duration) -> bool {
-    let taskkill = windows_system_tool(&["taskkill.exe"], "taskkill");
-    let mut command = Command::new(taskkill);
-    for pid in pids {
-        command.args(["/PID", &pid.to_string()]);
-    }
-    command.args(["/T", "/F"]);
-    run_bounded_helper(command, budget).is_some_and(|output| output.status.success())
-}
-
-#[cfg(windows)]
-fn terminate_windows_descendants_powershell(root_pid: u32, budget: Duration) -> Result<(), String> {
-    let powershell = windows_powershell();
-    let script = WINDOWS_DESCENDANT_SCRIPT
-        .replace("__ROOT_PID__", &root_pid.to_string())
-        .replace("__BUDGET_MS__", &budget.as_millis().max(1).to_string());
-    let mut command = Command::new(powershell);
-    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    let output = run_bounded_helper(command, budget + Duration::from_secs(2)).ok_or_else(|| {
-        "could not inspect or terminate descendant processes within the teardown budget".to_string()
-    })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let survivors = output
-        .stdout
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .collect::<Vec<_>>();
-    if survivors.is_empty() {
-        return Err(format!(
-            "descendant teardown failed ({}): {}",
-            output.status,
-            output.stderr.trim()
-        ));
-    }
-    Err(format!(
-        "descendant processes survived teardown: {}",
-        survivors
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
-}
-
-/// Prefer PowerShell 7 when the host has it because its startup is cheaper;
-/// Windows PowerShell 5.1 is always available as the fallback.
-#[cfg(windows)]
-fn windows_powershell() -> PathBuf {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("pwsh.exe");
-            if candidate.is_file() {
-                return candidate;
-            }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Windows job object still had active processes after {} ms",
+                budget.as_millis()
+            ));
         }
+        thread::sleep(Duration::from_millis(10));
     }
-    windows_system_tool(
-        &["WindowsPowerShell", "v1.0", "powershell.exe"],
-        "powershell.exe",
-    )
 }
-
-#[cfg(windows)]
-const WINDOWS_DESCENDANT_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-$root = __ROOT_PID__
-$deadline = [DateTime]::UtcNow.AddMilliseconds(__BUDGET_MS__)
-while ($true) {
-  $children = @{}
-  foreach ($process in Get-CimInstance Win32_Process) {
-    $parent_id = [int]$process.ParentProcessId
-    if (-not $children.ContainsKey($parent_id)) {
-      $children[$parent_id] = [System.Collections.Generic.List[int]]::new()
-    }
-    $children[$parent_id].Add([int]$process.ProcessId)
-  }
-  $queue = [System.Collections.Generic.Queue[int]]::new()
-  $seen = [System.Collections.Generic.HashSet[int]]::new()
-  $queue.Enqueue([int]$root)
-  $targets = [System.Collections.Generic.List[int]]::new()
-  while ($queue.Count -gt 0) {
-    $parent = $queue.Dequeue()
-    $kids = $children[$parent]
-    if ($null -ne $kids) {
-      foreach ($kid in $kids) {
-        $kid_id = [int]$kid
-        if ($seen.Add($kid_id)) {
-          $queue.Enqueue($kid_id)
-          $targets.Add($kid_id)
-        }
-      }
-    }
-  }
-  if ($targets.Count -eq 0) { exit 0 }
-  if ([DateTime]::UtcNow -ge $deadline) {
-    foreach ($target in $targets) { Write-Output $target }
-    exit 2
-  }
-  foreach ($target in $targets) {
-    Stop-Process -Id $target -Force -ErrorAction SilentlyContinue
-  }
-  Start-Sleep -Milliseconds 50
-}
-"#;
 
 #[cfg(test)]
 mod tests {

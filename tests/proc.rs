@@ -130,6 +130,55 @@ fn run_launcher(args: &[String]) {
     let _ = io::stdout().flush();
 }
 
+fn run_intermediate(args: &[String]) {
+    let pid_dir = PathBuf::from(&args[0]);
+    let token = &args[1];
+    let hold_pipes = args.iter().any(|a| a == "--hold-pipes");
+    write_pid(&pid_dir.join("intermediate.pid"));
+    spawn_grandchild(&pid_dir.join("grandchild.pid"), token, hold_pipes);
+}
+
+fn run_launcher_three_level(args: &[String]) {
+    let pid_dir = PathBuf::from(&args[0]);
+    let token = &args[1];
+    let hold_pipes = args.iter().any(|a| a == "--hold-pipes");
+    let exit_root = args.iter().any(|a| a == "--exit-root");
+    let silent = args.iter().any(|a| a == "--silent");
+    write_pid(&pid_dir.join("parent.pid"));
+
+    let exe = env::current_exe().expect("current_exe");
+    let mut cmd = Command::new(exe);
+    cmd.arg("intermediate")
+        .arg(&pid_dir.to_string_lossy().into_owned())
+        .arg(token)
+        .stdin(Stdio::null());
+    if hold_pipes {
+        cmd.arg("--hold-pipes")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let mut intermediate = cmd.spawn().expect("intermediate must spawn");
+    let status = intermediate.wait().expect("intermediate must wait");
+    assert!(status.success(), "intermediate failed: {status}");
+    wait_for_file(&pid_dir.join("intermediate.pid"));
+    wait_for_file(&pid_dir.join("grandchild.pid"));
+
+    if silent {
+        println!("THREE_LEVEL_BOOTED");
+    } else {
+        println!("THREE_LEVEL_LAUNCHED");
+    }
+    let _ = io::stdout().flush();
+
+    if !exit_root {
+        loop {
+            thread::sleep(Duration::from_secs(10));
+        }
+    }
+}
+
 fn run_server(args: &[String]) {
     let pid_dir = PathBuf::from(&args[0]);
     let token = &args[1];
@@ -253,6 +302,8 @@ fn main() {
         Some("repl") => run_repl(),
         Some("hang") => run_hang(&args[2..]),
         Some("launcher") => run_launcher(&args[2..]),
+        Some("intermediate") => run_intermediate(&args[2..]),
+        Some("launcher-three-level") => run_launcher_three_level(&args[2..]),
         Some("crash") => {
             let code: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2);
             println!("BEFORE_CRASH_OUT");
@@ -418,24 +469,42 @@ fn is_token_pid_alive(pid: u32, token: &str) -> bool {
     }
 }
 
-fn assert_process_tree_dead(pid_dir: &Path, token: &str) {
-    let parent_pid = read_pid(&pid_dir.join("parent.pid"));
-    let grandchild_pid = read_pid(&pid_dir.join("grandchild.pid"));
-
+fn assert_pids_dead(pids: &[(&str, u32)], token: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if !is_token_pid_alive(parent_pid, token) && !is_token_pid_alive(grandchild_pid, token) {
+        if pids.iter().all(|&(_, pid)| !is_token_pid_alive(pid, token)) {
             return;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(
-        !is_token_pid_alive(parent_pid, token),
-        "parent process {parent_pid} leaked after da exited"
+    for &(role, pid) in pids {
+        assert!(
+            !is_token_pid_alive(pid, token),
+            "{role} process {pid} leaked after da exited"
+        );
+    }
+}
+
+fn assert_process_tree_dead(pid_dir: &Path, token: &str) {
+    let parent_pid = read_pid(&pid_dir.join("parent.pid"));
+    let grandchild_pid = read_pid(&pid_dir.join("grandchild.pid"));
+    assert_pids_dead(
+        &[("parent", parent_pid), ("grandchild", grandchild_pid)],
+        token,
     );
-    assert!(
-        !is_token_pid_alive(grandchild_pid, token),
-        "grandchild process {grandchild_pid} leaked after da exited"
+}
+
+fn assert_three_level_tree_dead(pid_dir: &Path, token: &str) {
+    let parent_pid = read_pid(&pid_dir.join("parent.pid"));
+    let intermediate_pid = read_pid(&pid_dir.join("intermediate.pid"));
+    let grandchild_pid = read_pid(&pid_dir.join("grandchild.pid"));
+    assert_pids_dead(
+        &[
+            ("parent", parent_pid),
+            ("intermediate", intermediate_pid),
+            ("grandchild", grandchild_pid),
+        ],
+        token,
     );
 }
 
@@ -1175,6 +1244,184 @@ steps:
         stderr(&output)
     );
     assert_process_tree_dead(&pid_dir, &token);
+}
+
+#[test]
+fn stop_kills_sleeping_grandchild_after_intermediate_parent_exited_with_live_root() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-three-level-live-root");
+    let pid_dir = dir.path().join("pids");
+    let token = next_token();
+
+    let case = dir.write(
+        "three-level-live-root.yaml",
+        &format!(
+            r#"
+name: Stop kills grandchild holding stdout after intermediate parent exited
+steps:
+  - proc.start:
+      name: tree
+      command: '{helper}'
+      args: ["launcher-three-level", '{pid_dir}', "{token}", "--hold-pipes"]
+      ready_pattern: "THREE_LEVEL_LAUNCHED"
+      ready_timeout_ms: 5000
+  - proc.stop:
+      name: tree
+    expect:
+      - path: $.was_running
+        equals: true
+"#,
+            helper = helper.display(),
+            pid_dir = pid_dir.display(),
+        ),
+    );
+
+    let started = Instant::now();
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "proc.stop must not stall on orphaned grandchild holding stdout open"
+    );
+    let report = json_stdout(&output);
+    assert_eq!(
+        report["cases"][0]["steps"][1]["result"]["was_running"], true,
+        "{report}"
+    );
+    assert_three_level_tree_dead(&pid_dir, &token);
+}
+
+#[test]
+fn stop_kills_sleeping_grandchild_after_intermediate_and_root_exited() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-three-level-exited-root");
+    let pid_dir = dir.path().join("pids");
+    let token = next_token();
+
+    let case = dir.write(
+        "three-level-exited-root.yaml",
+        &format!(
+            r#"
+name: Stop reports was_running false and kills grandchild when root and intermediate exited
+steps:
+  - proc.start:
+      name: tree
+      command: '{helper}'
+      args: ["launcher-three-level", '{pid_dir}', "{token}", "--hold-pipes", "--exit-root"]
+      ready_pattern: "THREE_LEVEL_LAUNCHED"
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: tree
+      pattern: "PARENT_EXIT"
+      timeout_ms: 500
+    optional: true
+  - proc.stop:
+      name: tree
+    expect:
+      - path: $.was_running
+        equals: false
+"#,
+            helper = helper.display(),
+            pid_dir = pid_dir.display(),
+        ),
+    );
+
+    let started = Instant::now();
+    let output = run_da_in(
+        dir.path(),
+        &["--output", "json", "run", path_str(&case), "--no-bundle"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "proc.stop must not stall on orphaned grandchild holding stdout open"
+    );
+    let report = json_stdout(&output);
+    assert_eq!(
+        report["cases"][0]["steps"][2]["result"]["was_running"], false,
+        "{report}"
+    );
+    assert_three_level_tree_dead(&pid_dir, &token);
+}
+
+#[test]
+fn proc_start_ready_timeout_kills_sleeping_grandchild_after_intermediate_parent_exited() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-three-level-ready-timeout");
+    let pid_dir = dir.path().join("pids");
+    let bundles = dir.path().join("bundles");
+    let token = next_token();
+
+    let case = dir.write(
+        "three-level-ready-timeout.yaml",
+        &format!(
+            r#"
+name: Start ready_timeout kills grandchild after intermediate parent exited
+steps:
+  - proc.start:
+      command: '{helper}'
+      args: ["launcher-three-level", '{pid_dir}', "{token}", "--hold-pipes", "--silent"]
+      ready_pattern: "NEVER_PRINTED"
+      ready_timeout_ms: 1000
+"#,
+            helper = helper.display(),
+            pid_dir = pid_dir.display(),
+        ),
+    );
+
+    let started = Instant::now();
+    let output = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "ready_timeout teardown must not stall on orphaned grandchild holding stdout open"
+    );
+    assert_three_level_tree_dead(&pid_dir, &token);
+    let report = json_stdout(&output);
+    let bundle_dir = PathBuf::from(
+        report["cases"][0]["bundle"]
+            .as_str()
+            .expect("timed out start must write bundle"),
+    );
+    assert!(
+        fs::read_to_string(bundle_dir.join("proc/stdout.log"))
+            .expect("proc/stdout.log must exist on ready timeout")
+            .contains("THREE_LEVEL_BOOTED")
+    );
 }
 
 #[test]
