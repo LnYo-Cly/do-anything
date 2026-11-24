@@ -1658,7 +1658,7 @@ pub(super) mod shared {
 
     use crate::core::paths;
     use crate::core::registry::StepError;
-    use crate::core::session::Evidence;
+    use crate::core::session::{Evidence, SynthesizedTarget};
 
     use super::{
         ClickButton, DesktopLocator, DesktopPoint, DesktopRole, LaunchArgs, LocatorFilter,
@@ -2309,6 +2309,78 @@ pub(super) mod shared {
             cur = node.parent;
         }
         None
+    }
+
+    pub(super) fn synthesize_ref_in_tree(
+        tree: &SharedTreeData,
+        ref_id: &str,
+        refs: &BTreeMap<String, StoredRef>,
+    ) -> Result<Option<SynthesizedTarget>, String> {
+        let idx = resolve_node_in_tree(tree, None, Some(ref_id), refs)
+            .map_err(|e| step_error_message(&e).to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "ref `{ref_id}` is not in the latest snapshot; run `da session snapshot` first"
+                )
+            })?;
+        let (locator, fragile) = synthesize_locator(idx, &tree.nodes);
+        Ok(Some(SynthesizedTarget { locator, fragile }))
+    }
+
+    pub(super) fn synthesize_at_point_in_tree(
+        tree: &SharedTreeData,
+        x: f64,
+        y: f64,
+    ) -> Option<SynthesizedTarget> {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let px = x.round() as i32;
+        let py = y.round() as i32;
+        if px < 0
+            || py < 0
+            || u32::try_from(px).ok().is_none_or(|ux| ux >= tree.win_width)
+            || u32::try_from(py)
+                .ok()
+                .is_none_or(|uy| uy >= tree.win_height)
+        {
+            return None;
+        }
+        let sx = tree.win_left.saturating_add(px);
+        let sy = tree.win_top.saturating_add(py);
+        reverse_lookup_in_tree(tree, sx, sy)
+            .map(|(locator, fragile)| SynthesizedTarget { locator, fragile })
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn resize_rgba_nearest(
+        src: &[u8],
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Vec<u8> {
+        let dst_w = dst_w.max(1);
+        let dst_h = dst_h.max(1);
+        let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+        if src_w == 0 || src_h == 0 || src.len() < (src_w as usize) * (src_h as usize) * 4 {
+            for px in out.as_chunks_mut::<4>().0 {
+                *px = [0, 0, 0, 255];
+            }
+            return out;
+        }
+        for dy in 0..dst_h {
+            let sy = ((u64::from(dy) * u64::from(src_h)) / u64::from(dst_h))
+                .min(u64::from(src_h - 1)) as u32;
+            for dx in 0..dst_w {
+                let sx = ((u64::from(dx) * u64::from(src_w)) / u64::from(dst_w))
+                    .min(u64::from(src_w - 1)) as u32;
+                let s_idx = ((sy * src_w + sx) * 4) as usize;
+                let d_idx = ((dy * dst_w + dx) * 4) as usize;
+                out[d_idx..d_idx + 4].copy_from_slice(&src[s_idx..s_idx + 4]);
+            }
+        }
+        out
     }
 
     fn should_mask_node(node: &SharedNodeData) -> bool {
@@ -3188,5 +3260,58 @@ mod shared_tests {
             build_evidence_items(42, 7, "Sample", Ok(tree), Some(Ok(png_bytes)), &mut refs)
                 .unwrap();
         assert_eq!(evidence.len(), 2);
+    }
+
+    #[test]
+    fn shared_model_hook_synthesis_and_logical_retina_normalization_work() {
+        use super::shared::{
+            resize_rgba_nearest, synthesize_at_point_in_tree, synthesize_ref_in_tree,
+        };
+
+        let tree = sample_tree();
+        let mut refs = BTreeMap::new();
+        let _ = build_snapshot_payload(&tree, 1234, 99, &mut refs, None, 8, 250, true).unwrap();
+
+        let synth_btn = synthesize_ref_in_tree(&tree, "e2", &refs)
+            .unwrap()
+            .expect("e2 synthesized");
+        assert_eq!(
+            synth_btn.locator,
+            serde_json::json!({ "automation_id": "submitBtn" })
+        );
+        assert!(!synth_btn.fragile);
+        assert!(synthesize_ref_in_tree(&tree, "e999", &refs).is_err());
+
+        // Window-relative point (50, 105) -> screen (150, 155) hits submitBtn.
+        let hit_btn =
+            synthesize_at_point_in_tree(&tree, 50.0, 105.0).expect("button hit at window coords");
+        assert_eq!(
+            hit_btn.locator,
+            serde_json::json!({ "automation_id": "submitBtn" })
+        );
+        assert!(!hit_btn.fragile);
+        // Canvas (80, 160 -> screen 180, 210) and out-of-bounds stay None.
+        assert!(synthesize_at_point_in_tree(&tree, 80.0, 160.0).is_none());
+        assert!(synthesize_at_point_in_tree(&tree, -1.0, 10.0).is_none());
+        assert!(synthesize_at_point_in_tree(&tree, 400.0, 10.0).is_none());
+        assert!(synthesize_at_point_in_tree(&tree, f64::NAN, 10.0).is_none());
+
+        // Retina 2x capture (800x600) normalized to logical 400x300 and masked at 1:1.
+        let mut raw_2x = vec![0u8; 800 * 600 * 4];
+        for px in raw_2x.as_chunks_mut::<4>().0 {
+            *px = [30, 190, 210, 255];
+        }
+        let mut logical = resize_rgba_nearest(&raw_2x, 800, 600, tree.win_width, tree.win_height);
+        assert_eq!(
+            logical.len(),
+            (tree.win_width as usize) * (tree.win_height as usize) * 4
+        );
+        let masked_count = mask_tree_inputs(&mut logical, tree.win_width, tree.win_height, &tree);
+        assert_eq!(masked_count, 1);
+        // Center of logical password box (120, 55) is solid black; (10, 10) stays cyan.
+        let pw_idx = ((55 * tree.win_width + 120) * 4) as usize;
+        assert_eq!(&logical[pw_idx..pw_idx + 4], &[0, 0, 0, 255]);
+        let bg_idx = ((10 * tree.win_width + 10) * 4) as usize;
+        assert_eq!(&logical[bg_idx..bg_idx + 4], &[30, 190, 210, 255]);
     }
 }

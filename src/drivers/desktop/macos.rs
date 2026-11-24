@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::core::paths;
 use crate::core::registry::StepError;
-use crate::core::session::Evidence;
+use crate::core::session::{Evidence, MaskedViewportCapture, SynthesizedTarget};
 
 use super::shared::{
     BoundsRect, DEFAULT_SNAPSHOT_MAX_DEPTH, DEFAULT_SNAPSHOT_MAX_NODES, KeyModifier,
@@ -31,9 +31,10 @@ use super::shared::{
     StoredRef, acquire_desktop_input_lock, build_evidence_items, build_snapshot_payload,
     check_window_point_bounds, click_button_name, decode_png_to_rgba8, encode_rgba_png,
     is_unix_pid_alive, mask_tree_inputs, missing_target_timeout, node_summary, parse_uia_key_expr,
-    resolve_command_and_cwd, resolve_node_in_tree, reverse_lookup_in_tree,
-    spawn_unix_desktop_child, step_error_message, synthesize_locator, terminate_unix_child,
-    terminate_unix_detached_pid, verify_unix_reattach_identity, wait_state_name, write_png_private,
+    resize_rgba_nearest, resolve_command_and_cwd, resolve_node_in_tree, reverse_lookup_in_tree,
+    spawn_unix_desktop_child, step_error_message, synthesize_at_point_in_tree, synthesize_locator,
+    synthesize_ref_in_tree, terminate_unix_child, terminate_unix_detached_pid,
+    verify_unix_reattach_identity, wait_state_name, write_png_private,
 };
 use super::{
     AttachArgs, ClickButton, DesktopLocator, DesktopPoint, DesktopRole, LaunchArgs, WaitState,
@@ -700,6 +701,47 @@ impl DesktopBackend {
             true,
         )
         .map(Some)
+    }
+
+    pub fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        let _lock =
+            acquire_desktop_input_lock(5_000).map_err(|e| step_error_message(&e).to_string())?;
+        let live = self
+            .ensure_and_collect_tree()
+            .map_err(|e| step_error_message(&e).to_string())?;
+        if self.hwnd <= 0
+            && let Some(num) = live.win_el.i64_attribute("AXWindowNumber").ok().flatten()
+            && num > 0
+        {
+            self.hwnd = num;
+        }
+        let (png, width, height) = capture_macos_logical_masked_png(
+            self.pid,
+            &live.app_el,
+            &live.win_el,
+            self.hwnd,
+            &live.data,
+        )
+        .map_err(|e| step_error_message(&e).to_string())?;
+        Ok(Some(MaskedViewportCapture { png, width, height }))
+    }
+
+    pub fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        let live = self
+            .ensure_and_collect_tree()
+            .map_err(|e| step_error_message(&e).to_string())?;
+        synthesize_ref_in_tree(&live.data, ref_id, &self.refs)
+    }
+
+    pub fn synthesize_at_point(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> Result<Option<SynthesizedTarget>, String> {
+        let live = self
+            .ensure_and_collect_tree()
+            .map_err(|e| step_error_message(&e).to_string())?;
+        Ok(synthesize_at_point_in_tree(&live.data, x, y))
     }
 
     pub fn evidence(&mut self) -> Result<Vec<Evidence>, String> {
@@ -1561,14 +1603,13 @@ fn invoke_screencapture(args: &[&str], out_path: &Path) -> Result<Vec<u8>, Strin
     Ok(raw_png)
 }
 
-fn capture_macos_window_png(
+fn capture_macos_raw_rgba(
     pid: u32,
     app_el: &AXUIElement,
     win_el: &AXUIElement,
     window_id: i64,
     tree: &SharedTreeData,
-    mask_inputs: bool,
-) -> Result<(Vec<u8>, u32, u32, usize), StepError> {
+) -> Result<(u32, u32, Vec<u8>), StepError> {
     focus_ax_window(app_el, win_el);
 
     let seq = TEMP_CAPTURE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1620,7 +1661,18 @@ fn capture_macos_window_png(
         })?
     };
 
-    let (width, height, mut rgba) = decode_png_to_rgba8(&raw_png)?;
+    decode_png_to_rgba8(&raw_png)
+}
+
+fn capture_macos_window_png(
+    pid: u32,
+    app_el: &AXUIElement,
+    win_el: &AXUIElement,
+    window_id: i64,
+    tree: &SharedTreeData,
+    mask_inputs: bool,
+) -> Result<(Vec<u8>, u32, u32, usize), StepError> {
+    let (width, height, mut rgba) = capture_macos_raw_rgba(pid, app_el, win_el, window_id, tree)?;
     let masked_count = if mask_inputs {
         mask_tree_inputs(&mut rgba, width, height, tree)
     } else {
@@ -1628,4 +1680,30 @@ fn capture_macos_window_png(
     };
     let final_png = encode_rgba_png(&rgba, width, height)?;
     Ok((final_png, width, height, masked_count))
+}
+
+fn capture_macos_logical_masked_png(
+    pid: u32,
+    app_el: &AXUIElement,
+    win_el: &AXUIElement,
+    window_id: i64,
+    tree: &SharedTreeData,
+) -> Result<(Vec<u8>, u32, u32), StepError> {
+    let (raw_w, raw_h, raw_rgba) = capture_macos_raw_rgba(pid, app_el, win_el, window_id, tree)?;
+    let logical_w = tree.win_width.max(1);
+    let logical_h = tree.win_height.max(1);
+    let (mut rgba, width, height) = if raw_w == logical_w && raw_h == logical_h {
+        (raw_rgba, raw_w, raw_h)
+    } else {
+        (
+            resize_rgba_nearest(&raw_rgba, raw_w, raw_h, logical_w, logical_h),
+            logical_w,
+            logical_h,
+        )
+    };
+    // Mask after normalizing to logical window dimensions so Retina downsampling
+    // never blurs input pixels across the mask edge and locate coordinates match `AX` / `at.window`.
+    let _ = mask_tree_inputs(&mut rgba, width, height, tree);
+    let png = encode_rgba_png(&rgba, width, height)?;
+    Ok((png, width, height))
 }
