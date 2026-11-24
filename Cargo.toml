@@ -17,7 +17,7 @@ name = "da"
 path = "src/main.rs"
 
 [features]
-default = ["http", "cli", "log", "db", "browser", "mcp"]
+default = ["http", "cli", "log", "db", "browser", "mcp", "plugin"]
 # The `http.request` step and the HTTP client it needs.
 http = ["dep:schemars", "dep:ureq"]
 # The `cli.run` step and the child-process timeout it needs.
@@ -52,6 +52,13 @@ desktop = [
 ]
 # The MCP JSON-RPC 2.0 server.
 mcp = []
+# External plugins over synchronous stdio JSON-RPC 2.0.
+plugin = ["dep:schemars"]
+
+[[bin]]
+name = "da-plugin-fixture"
+path = "tests/fixtures/fixture_plugin.rs"
+required-features = ["plugin"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

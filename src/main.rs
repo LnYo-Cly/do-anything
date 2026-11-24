@@ -13,7 +13,7 @@ use do_anything::core::filter::Filters;
 use do_anything::core::output::{self, Format};
 use do_anything::core::registry::Registry;
 use do_anything::core::repeat::{RepeatOutcome, RepeatReport};
-use do_anything::core::report::RunOutcome;
+use do_anything::core::report::{RunOutcome, rejected_exit_code};
 use do_anything::core::runner;
 use do_anything::core::schema;
 use do_anything::core::secrets::Secrets;
@@ -35,6 +35,10 @@ struct Cli {
     /// How command results are reported.
     #[arg(long, global = true, value_enum)]
     output: Option<OutputFormat>,
+
+    /// Loads an external plugin executable. Repeat for more than one.
+    #[arg(long = "plugin", global = true, value_name = "EXECUTABLE")]
+    plugins: Vec<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -402,6 +406,8 @@ fn parse_repeat(text: &str) -> Result<usize, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    let plugin_paths = deduplicate_paths(&cli.plugins);
+
     let mut registry = Registry::new();
     if let Err(message) =
         drivers::register(&mut registry).and_then(|()| drivers::register_observers(&mut registry))
@@ -409,6 +415,24 @@ fn main() -> ExitCode {
         let _ = write_stderr(&format!("da: internal error: {message}\n"));
         return DaExitCode::Environment.into();
     }
+    let activated_plugins = match register_plugins(&mut registry, &plugin_paths) {
+        Ok(paths) => paths,
+        Err((code, message)) => {
+            let _ = write_stderr(&format!("da: {message}\n"));
+            return code.into();
+        }
+    };
+    let session_plugins = if matches!(
+        &cli.command,
+        Command::Session {
+            action: SessionCommand::Start { .. },
+            ..
+        }
+    ) {
+        activated_plugins.clone()
+    } else {
+        Vec::new()
+    };
 
     let default_output = cli.output.unwrap_or(OutputFormat::Text);
 
@@ -544,6 +568,7 @@ fn main() -> ExitCode {
                         .unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
                     idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
                     model_hook: hook_spec,
+                    plugins: activated_plugins.clone(),
                 },
             )
             .into()
@@ -557,6 +582,7 @@ fn main() -> ExitCode {
             &registry,
             sessions_dir,
             idle_timeout_ms,
+            &session_plugins,
             action,
         ),
     }
@@ -585,6 +611,7 @@ fn run_session(
     registry: &Registry,
     sessions_dir: Option<PathBuf>,
     idle_timeout_ms: Option<u64>,
+    session_plugins: &[String],
     action: SessionCommand,
 ) -> ExitCode {
     let sessions_dir = sessions_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR));
@@ -614,6 +641,7 @@ fn run_session(
                 idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
                 observe: parsed_observe,
                 model_hook: hook_spec,
+                plugins: session_plugins.to_vec(),
             }
         }
         SessionCommand::Step {
@@ -807,6 +835,38 @@ fn session_usage_error(format: OutputFormat, message: &str) -> ExitCode {
         let _ = write_stderr(&format!("error: {message}\n"));
     }
     DaExitCode::Usage.into()
+}
+
+/// Deduplicates explicit `--plugin` paths on this invocation while preserving order.
+fn deduplicate_paths(raw: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = raw.to_vec();
+    let mut seen = BTreeSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    paths
+}
+
+#[cfg(feature = "plugin")]
+fn register_plugins(
+    registry: &mut Registry,
+    paths: &[PathBuf],
+) -> Result<Vec<String>, (DaExitCode, String)> {
+    do_anything::plugin::register(registry, paths)
+        .map_err(|error| (error.exit_code(), error.message().to_string()))
+}
+
+#[cfg(not(feature = "plugin"))]
+fn register_plugins(
+    _registry: &mut Registry,
+    paths: &[PathBuf],
+) -> Result<Vec<String>, (DaExitCode, String)> {
+    if paths.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Err((
+            DaExitCode::Usage,
+            "this build was compiled without the `plugin` feature; rebuild with `--features plugin`".to_string(),
+        ))
+    }
 }
 
 fn resolve_step_input(
@@ -1284,7 +1344,7 @@ fn lint(registry: &Registry, options: LintOptions) -> ExitCode {
     if report.is_ok() {
         DaExitCode::Success.into()
     } else {
-        DaExitCode::InvalidCase.into()
+        rejected_exit_code(&report.errors).into()
     }
 }
 
@@ -1323,10 +1383,10 @@ fn load_cases(paths: &[PathBuf], sources: &VarSources, secrets: &mut Secrets) ->
         return LoadedCases {
             files,
             cases: Vec::new(),
-            errors: vec![CaseError {
-                file: paths.first().cloned().unwrap_or_default(),
-                message: "no `.yaml` or `.yml` case files found; pass a case file or a directory that contains one".to_string(),
-            }],
+            errors: vec![CaseError::invalid(
+                paths.first().cloned().unwrap_or_default(),
+                "no `.yaml` or `.yml` case files found; pass a case file or a directory that contains one",
+            )],
         };
     }
 
@@ -1343,10 +1403,10 @@ fn load_cases(paths: &[PathBuf], sources: &VarSources, secrets: &mut Secrets) ->
             overridden_names.insert(name.clone());
             match case::expand_env(value, secrets) {
                 Ok(value) => overrides.push((name.clone(), value)),
-                Err(message) => errors.push(CaseError {
-                    file: file.clone(),
-                    message: format!("variable `{name}`: {message}"),
-                }),
+                Err(message) => errors.push(CaseError::invalid(
+                    file.clone(),
+                    format!("variable `{name}`: {message}"),
+                )),
             }
         }
     }
@@ -1360,10 +1420,7 @@ fn load_cases(paths: &[PathBuf], sources: &VarSources, secrets: &mut Secrets) ->
         match case::load_file(file) {
             Ok(mut loaded_case) => {
                 if let Err(message) = case::expand_vars(&mut loaded_case.case.vars, secrets) {
-                    errors.push(CaseError {
-                        file: loaded_case.path.clone(),
-                        message,
-                    });
+                    errors.push(CaseError::invalid(loaded_case.path.clone(), message));
                     continue;
                 }
                 // A case that does not use the name ignores it.

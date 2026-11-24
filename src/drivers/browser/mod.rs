@@ -10701,11 +10701,12 @@ mod tests {
         registry
     }
 
-    fn definition(name: &str) -> StepDefinition {
-        registry()
+    fn definition(name: &str) -> crate::core::registry::StepRef<'static> {
+        static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+        REGISTRY
+            .get_or_init(registry)
             .get(name)
             .unwrap_or_else(|| panic!("`{name}` must be registered"))
-            .clone()
     }
 
     /// Merges the keys of `extra` into the `base` mapping.
@@ -10758,7 +10759,7 @@ mod tests {
             let def = definition(name);
             for args in [json!({}), within_args.clone()] {
                 assert!(
-                    (def.check_retry)(&args).is_ok(),
+                    def.check_retry(&args).is_ok(),
                     "`{name}` must allow retry for {args}"
                 );
             }
@@ -10780,7 +10781,8 @@ mod tests {
         ] {
             let def = definition(name);
             for args in [json!({}), within_args.clone()] {
-                let error = (def.check_retry)(&args)
+                let error = def
+                    .check_retry(&args)
                     .err()
                     .unwrap_or_else(|| panic!("`{name}` must reject retry for {args}"));
                 assert!(error.contains("cannot use `retry`"), "{name}: {error}");
@@ -10791,14 +10793,14 @@ mod tests {
     #[test]
     fn drag_lint_warnings_report_bare_coordinates_on_both_endpoints() {
         let def = definition("browser.drag");
-        let both_bare = (def.lint_warnings)(&json!({
+        let both_bare = def.lint_warnings(&json!({
             "from": { "at": { "x": 10, "y": 20 } },
             "to": { "at": { "x": 50, "y": 60 } },
         }));
         assert_eq!(both_bare.len(), 4, "{both_bare:?}");
         assert!(both_bare[0].starts_with("`from` ") && both_bare[2].starts_with("`to` "));
 
-        let pinned = (def.lint_warnings)(&json!({
+        let pinned = def.lint_warnings(&json!({
             "from": { "at": { "x": 10, "y": 20, "viewport": { "width": 1280, "height": 720 } } },
             "to": { "css": "#drop" },
         }));
@@ -10870,18 +10872,24 @@ mod tests {
             "string"
         );
 
-        assert!((definition.validate)(&json!({"url": "http://127.0.0.1:1/"})).is_ok());
         assert!(
-            (definition.validate)(&json!({"url": "http://127.0.0.1:1/", "timeout_ms": 30000}))
+            definition
+                .validate(&json!({"url": "http://127.0.0.1:1/"}))
+                .is_ok()
+        );
+        assert!(
+            definition
+                .validate(&json!({"url": "http://127.0.0.1:1/", "timeout_ms": 30000}))
                 .is_ok(),
             "a navigation timeout is a valid argument"
         );
         assert!(
-            (definition.validate)(&json!({
-                "url": "http://127.0.0.1:1/",
-                "connect": "http://127.0.0.1:9222"
-            }))
-            .is_ok(),
+            definition
+                .validate(&json!({
+                    "url": "http://127.0.0.1:1/",
+                    "connect": "http://127.0.0.1:9222"
+                }))
+                .is_ok(),
             "a loopback connect endpoint is a valid argument"
         );
         for (label, args) in [
@@ -10909,7 +10917,7 @@ mod tests {
             ),
         ] {
             assert!(
-                (definition.validate)(&args).is_err(),
+                definition.validate(&args).is_err(),
                 "{label} must be refused: {args}"
             );
         }
@@ -10951,7 +10959,7 @@ mod tests {
                 json!({"css": "#name"})
             };
             assert!(
-                (definition.validate)(&base).is_ok(),
+                definition.validate(&base).is_ok(),
                 "`{step}` must accept one locator: {base}"
             );
             let text = if step == "browser.type" {
@@ -10962,7 +10970,7 @@ mod tests {
                 json!({"text": "Later"})
             };
             assert!(
-                (definition.validate)(&text).is_ok(),
+                definition.validate(&text).is_ok(),
                 "`{step}` must accept a text locator: {text}"
             );
             let role = if step == "browser.type" {
@@ -10973,7 +10981,7 @@ mod tests {
                 json!({"role": "textbox", "name": "Name"})
             };
             assert!(
-                (definition.validate)(&role).is_ok(),
+                definition.validate(&role).is_ok(),
                 "`{step}` must accept a role locator: {role}"
             );
             let both = if step == "browser.type" {
@@ -10983,7 +10991,9 @@ mod tests {
             } else {
                 json!({"css": "#a", "xpath": "//*[@id='a']"})
             };
-            let error = (definition.validate)(&both).expect_err("both locators must be refused");
+            let error = definition
+                .validate(&both)
+                .expect_err("both locators must be refused");
             assert!(error.contains("cannot both be set"), "{step}: {error}");
             let none = if step == "browser.type" {
                 json!({"text": "hello"})
@@ -10992,8 +11002,9 @@ mod tests {
             } else {
                 json!({})
             };
-            let error =
-                (definition.validate)(&none).expect_err("a missing locator must be refused");
+            let error = definition
+                .validate(&none)
+                .expect_err("a missing locator must be refused");
             assert!(error.contains("one locator"), "{step}: {error}");
             let name = if step == "browser.type" {
                 json!({"name": "Submit", "text": "hello"})
@@ -11002,8 +11013,9 @@ mod tests {
             } else {
                 json!({"name": "Submit"})
             };
-            let error =
-                (definition.validate)(&name).expect_err("a name without a role must be refused");
+            let error = definition
+                .validate(&name)
+                .expect_err("a name without a role must be refused");
             assert!(error.contains("role"), "{step}: {error}");
         }
     }
@@ -11038,37 +11050,43 @@ mod tests {
             let mut args = locator.clone();
             args["files"] = json!(["fixture.txt"]);
             assert!(
-                (definition.validate)(&args).is_ok(),
+                definition.validate(&args).is_ok(),
                 "every locator form must be accepted with `files`: {args}"
             );
         }
         assert!(
-            (definition.validate)(&json!({"css": "#file", "files": []})).is_ok(),
+            definition
+                .validate(&json!({"css": "#file", "files": []}))
+                .is_ok(),
             "an empty `files` list clears the input and is valid"
         );
         assert!(
-            (definition.validate)(&json!({
-                "css": "#file",
-                "files": ["a.txt"],
-                "within": {"css": "#form"},
-                "nth": 1,
-                "timeout_ms": 250
-            }))
-            .is_ok(),
+            definition
+                .validate(&json!({
+                    "css": "#file",
+                    "files": ["a.txt"],
+                    "within": {"css": "#form"},
+                    "nth": 1,
+                    "timeout_ms": 250
+                }))
+                .is_ok(),
             "the locator modifiers and `timeout_ms` are accepted"
         );
 
-        let error = (definition.validate)(&json!({"css": "#file"}))
+        let error = definition
+            .validate(&json!({"css": "#file"}))
             .expect_err("a missing `files` list must be refused");
         assert!(error.contains("files"), "{error}");
-        let error = (definition.validate)(&json!({"css": "#file", "files": [""]}))
+        let error = definition
+            .validate(&json!({"css": "#file", "files": [""]}))
             .expect_err("an empty path must be refused");
         assert!(error.contains("files[0]"), "{error}");
-        let error =
-            (definition.validate)(&json!({"css": "#file", "files": ["a.txt"], "timeout_ms": 0}))
-                .expect_err("a zero timeout must be refused");
+        let error = definition
+            .validate(&json!({"css": "#file", "files": ["a.txt"], "timeout_ms": 0}))
+            .expect_err("a zero timeout must be refused");
         assert!(error.contains("timeout_ms"), "{error}");
-        let error = (definition.validate)(&json!({"css": "#file", "files": ["a.txt"], "bogus": 1}))
+        let error = definition
+            .validate(&json!({"css": "#file", "files": ["a.txt"], "bogus": 1}))
             .expect_err("an unknown argument must be refused");
         assert!(error.contains("bogus"), "{error}");
     }
@@ -11182,7 +11200,7 @@ mod tests {
             json!({"url_contains": "/done"}),
         ] {
             assert!(
-                (definition.validate)(&args).is_ok(),
+                definition.validate(&args).is_ok(),
                 "one target must be accepted: {args}"
             );
         }
@@ -11205,7 +11223,9 @@ mod tests {
             ),
             ("name without role", json!({"name": "Later"}), "role"),
         ] {
-            let error = (definition.validate)(&args).expect_err("the target must be refused");
+            let error = definition
+                .validate(&args)
+                .expect_err("the target must be refused");
             assert!(error.contains(fragment), "{label}: {error}");
         }
     }
@@ -11220,11 +11240,11 @@ mod tests {
                 json!({"at": {"x": 12, "y": 34}})
             };
             assert!(
-                (definition.validate)(&base).is_ok(),
+                definition.validate(&base).is_ok(),
                 "`{step}` must accept bare coordinates: {base}"
             );
             assert!(
-                jsonschema::is_valid(&definition.args_schema, &base),
+                jsonschema::is_valid(definition.args_schema, &base),
                 "the schema must accept bare coordinates: {base}"
             );
             let pinned = if step == "browser.type" {
@@ -11233,11 +11253,11 @@ mod tests {
                 json!({"at": {"x": 12, "y": 34, "viewport": {"width": 800, "height": 600}}})
             };
             assert!(
-                (definition.validate)(&pinned).is_ok(),
+                definition.validate(&pinned).is_ok(),
                 "`{step}` must accept a recorded viewport: {pinned}"
             );
             assert!(
-                jsonschema::is_valid(&definition.args_schema, &pinned),
+                jsonschema::is_valid(definition.args_schema, &pinned),
                 "the schema must accept a recorded viewport: {pinned}"
             );
 
@@ -11251,14 +11271,15 @@ mod tests {
                 ("name", json!({"name": "A"})),
             ] {
                 let combined = add_fields(base.clone(), extra);
-                let error = (definition.validate)(&combined)
+                let error = definition
+                    .validate(&combined)
                     .expect_err("a locator must not be combined with coordinates");
                 assert!(
                     error.contains("cannot be combined"),
                     "{step}/{label}: {error}"
                 );
                 assert!(
-                    !jsonschema::is_valid(&definition.args_schema, &combined),
+                    !jsonschema::is_valid(definition.args_schema, &combined),
                     "the schema must refuse `at` with {label} on `{step}`: {combined}"
                 );
             }
@@ -11266,30 +11287,30 @@ mod tests {
             if step == "browser.click" {
                 let combined = add_fields(base.clone(), json!({"text": "Later"}));
                 assert!(
-                    (definition.validate)(&combined).is_err(),
+                    definition.validate(&combined).is_err(),
                     "`browser.click` must refuse `at` with a text locator"
                 );
                 assert!(
-                    !jsonschema::is_valid(&definition.args_schema, &combined),
+                    !jsonschema::is_valid(definition.args_schema, &combined),
                     "the schema must refuse `at` with a text locator: {combined}"
                 );
             } else {
                 let combined = add_fields(base.clone(), json!({"value": "hello"}));
                 assert!(
-                    (definition.validate)(&combined).is_err(),
+                    definition.validate(&combined).is_err(),
                     "`browser.type` must refuse both `text` and `value` with `at`"
                 );
                 assert!(
-                    !jsonschema::is_valid(&definition.args_schema, &combined),
+                    !jsonschema::is_valid(definition.args_schema, &combined),
                     "the schema must refuse both `text` and `value` with `at`: {combined}"
                 );
                 let value_only = json!({"at": {"x": 1, "y": 2}, "value": "hello"});
                 assert!(
-                    (definition.validate)(&value_only).is_ok(),
+                    definition.validate(&value_only).is_ok(),
                     "`browser.type` must accept `value` as the typed text with `at`"
                 );
                 assert!(
-                    jsonschema::is_valid(&definition.args_schema, &value_only),
+                    jsonschema::is_valid(definition.args_schema, &value_only),
                     "the schema must accept `value` as the typed text with `at`: {value_only}"
                 );
             }
@@ -11314,11 +11335,11 @@ mod tests {
                     json!({"at": at})
                 };
                 assert!(
-                    (definition.validate)(&args).is_err(),
+                    definition.validate(&args).is_err(),
                     "`{step}` must refuse {label}: {args}"
                 );
                 assert!(
-                    !jsonschema::is_valid(&definition.args_schema, &args),
+                    !jsonschema::is_valid(definition.args_schema, &args),
                     "the schema must refuse {label} on `{step}`: {args}"
                 );
             }
@@ -11334,7 +11355,7 @@ mod tests {
             } else {
                 json!({"at": {"x": 12, "y": 34}})
             };
-            let warnings = (definition.lint_warnings)(&base);
+            let warnings = definition.lint_warnings(&base);
             assert_eq!(
                 warnings.len(),
                 2,
@@ -11349,7 +11370,7 @@ mod tests {
             } else {
                 json!({"at": {"x": 12, "y": 34, "viewport": {"width": 800, "height": 600}}})
             };
-            let warnings = (definition.lint_warnings)(&pinned);
+            let warnings = definition.lint_warnings(&pinned);
             assert_eq!(
                 warnings.len(),
                 1,
@@ -11363,7 +11384,7 @@ mod tests {
                 json!({"css": "#name"})
             };
             assert!(
-                (definition.lint_warnings)(&locator).is_empty(),
+                definition.lint_warnings(&locator).is_empty(),
                 "a locator step must not warn about coordinates"
             );
         }
@@ -11375,7 +11396,7 @@ mod tests {
         ] {
             let definition = definition(step);
             assert!(
-                (definition.lint_warnings)(&json!({})).is_empty(),
+                definition.lint_warnings(&json!({})).is_empty(),
                 "`{step}` has no fragile arguments"
             );
         }
@@ -11417,17 +11438,21 @@ mod tests {
                 _ => json!({"css": "#a"}),
             };
             args["timeout_ms"] = json!(0);
-            let error = (definition.validate)(&args).expect_err("a zero timeout must be refused");
+            let error = definition
+                .validate(&args)
+                .expect_err("a zero timeout must be refused");
             assert!(error.contains("timeout_ms"), "{step}: {error}");
         }
 
         let press = definition("browser.press");
-        assert!((press.validate)(&json!({"key": "Enter"})).is_ok());
-        assert!((press.validate)(&json!({"key": "x"})).is_ok());
-        let error =
-            (press.validate)(&json!({"key": ""})).expect_err("an empty key must be refused");
+        assert!(press.validate(&json!({"key": "Enter"})).is_ok());
+        assert!(press.validate(&json!({"key": "x"})).is_ok());
+        let error = press
+            .validate(&json!({"key": ""}))
+            .expect_err("an empty key must be refused");
         assert!(error.contains("key"), "{error}");
-        let error = (press.validate)(&json!({"key": "NotAKey"}))
+        let error = press
+            .validate(&json!({"key": "NotAKey"}))
             .expect_err("an unknown key name must be refused");
         assert!(error.contains("not a key"), "{error}");
         assert_eq!(press.args_schema["properties"]["key"]["minLength"], 1);
@@ -11437,11 +11462,16 @@ mod tests {
     fn read_returns_the_attribute_only_when_one_is_named() {
         let definition = definition("browser.read");
         assert!(
-            (definition.validate)(&json!({"css": "#a"})).is_ok(),
+            definition.validate(&json!({"css": "#a"})).is_ok(),
             "an attribute is optional"
         );
-        assert!((definition.validate)(&json!({"css": "#a", "attribute": "data-state"})).is_ok());
-        let error = (definition.validate)(&json!({"css": "#a", "attribute": ""}))
+        assert!(
+            definition
+                .validate(&json!({"css": "#a", "attribute": "data-state"}))
+                .is_ok()
+        );
+        let error = definition
+            .validate(&json!({"css": "#a", "attribute": ""}))
             .expect_err("an empty attribute must be refused");
         assert!(error.contains("attribute"), "{error}");
         assert_eq!(
@@ -11661,7 +11691,8 @@ mod tests {
             "string"
         );
         assert!(
-            (open.validate)(&json!({"url": "http://x/", "testid_attribute": "data-qa"})).is_ok()
+            open.validate(&json!({"url": "http://x/", "testid_attribute": "data-qa"}))
+                .is_ok()
         );
         for bad_open in [
             json!({"url": "http://x/", "testid_attribute": ""}),
@@ -11670,7 +11701,7 @@ mod tests {
             json!({"url": "http://x/", "testid_attribute": null}),
         ] {
             assert!(
-                (open.validate)(&bad_open).is_err(),
+                open.validate(&bad_open).is_err(),
                 "invalid open args must be refused: {bad_open}"
             );
         }
@@ -11706,7 +11737,7 @@ mod tests {
                 json!({"testid": "submit-btn"})
             };
             assert!(
-                (def.validate)(&valid_testid).is_ok(),
+                def.validate(&valid_testid).is_ok(),
                 "`{step}` must accept testid: {valid_testid}"
             );
 
@@ -11739,7 +11770,7 @@ mod tests {
                 })
             };
             assert!(
-                (def.validate)(&valid_nested).is_ok(),
+                def.validate(&valid_nested).is_ok(),
                 "`{step}` must accept nested within + nth: {valid_nested}"
             );
 
@@ -11775,7 +11806,7 @@ mod tests {
                     args["text"] = json!("hello");
                 }
                 assert!(
-                    (def.validate)(&args).is_err(),
+                    def.validate(&args).is_err(),
                     "`{step}` must refuse {label}: {args}"
                 );
             }
@@ -11801,7 +11832,7 @@ mod tests {
             ),
         ] {
             assert!(
-                (wait.validate)(&args).is_err(),
+                wait.validate(&args).is_err(),
                 "`browser.wait` must refuse {label}: {args}"
             );
         }
@@ -13471,7 +13502,7 @@ mod tests {
                 let mut args = base.clone();
                 args["dialog"] = valid_dialog.clone();
                 assert!(
-                    (def.validate)(&args).is_ok(),
+                    def.validate(&args).is_ok(),
                     "`{step_name}` validate must accept {valid_dialog}: {args}"
                 );
             }
@@ -13489,7 +13520,7 @@ mod tests {
                 let mut args = base.clone();
                 args["dialog"] = invalid_dialog.clone();
                 assert!(
-                    (def.validate)(&args).is_err(),
+                    def.validate(&args).is_err(),
                     "`{step_name}` validate must refuse {invalid_dialog}: {args}"
                 );
             }
@@ -15054,7 +15085,7 @@ mod tests {
         let save = definition("browser.save_state");
 
         assert!(
-            (open.validate)(&json!({
+            open.validate(&json!({
                 "url": "http://127.0.0.1:8080/orders",
                 "storage_state": "state/admin.json"
             }))
@@ -15070,15 +15101,15 @@ mod tests {
             }),
         ] {
             assert!(
-                (open.validate)(&bad).is_err(),
+                open.validate(&bad).is_err(),
                 "`browser.open` must refuse {bad}"
             );
         }
 
-        assert!((save.validate)(&json!({"path": "state/admin.json"})).is_ok());
+        assert!(save.validate(&json!({"path": "state/admin.json"})).is_ok());
         for bad in [json!({}), json!({"path": ""}), json!({"path": null})] {
             assert!(
-                (save.validate)(&bad).is_err(),
+                save.validate(&bad).is_err(),
                 "`browser.save_state` must refuse {bad}"
             );
         }

@@ -17,6 +17,15 @@ da --version   # the binary; installation is in docs/guide.md
 da schema      # every registered step and observer, as a JSON Schema
 ```
 
+If the flow needs an internal protocol that `da` does not ship, pass an
+external plugin executable explicitly: `da --plugin ./internal-plugin schema`,
+then use the same `--plugin` flag on `da lint`, `da run`, `da session` and
+`da mcp`. A plugin registers steps, read-only observers and detachable sessions
+over synchronous newline-delimited JSON-RPC 2.0, and inherits the same schema,
+lint, session, report and secret-redaction behavior described here. A session
+started with `--plugin` remembers the path, so later `da session` commands do
+not repeat it.
+
 ## Two paths
 
 **A case already exists.** `da lint <file-or-dir>` validates every file against
@@ -292,5 +301,5 @@ Wayland supports semantic AT-SPI2 steps while screenshots, `desktop.press`, and
 
 Details are in `docs/guide.md`: [sessions](../../docs/guide.md#interactive-sessions-da-session),
 [browser steps](../../docs/guide.md#browser-steps), [desktop steps](../../docs/guide.md#desktop-steps),
-[failure bundles](../../docs/guide.md#failure-bundles), [secrets](../../docs/guide.md#secrets),
-[exit codes](../../docs/guide.md#exit-codes).
+[failure bundles](../../docs/guide.md#failure-bundles), [external plugins](../../docs/guide.md#external-plugins),
+[secrets](../../docs/guide.md#secrets), [exit codes](../../docs/guide.md#exit-codes).

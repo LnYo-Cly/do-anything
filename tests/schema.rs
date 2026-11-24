@@ -263,11 +263,11 @@ fn a_cli_timeout_of_zero_is_rejected_by_the_schema_and_by_validate() {
 
     let zero = json!({"command": "da", "timeout_ms": 0});
     assert!(
-        (definition.validate)(&zero).is_err(),
+        definition.validate(&zero).is_err(),
         "validate must reject `timeout_ms: 0`"
     );
     assert!(
-        !jsonschema::is_valid(&definition.args_schema, &zero),
+        !jsonschema::is_valid(definition.args_schema, &zero),
         "the schema must reject `timeout_ms: 0`: {}",
         definition.args_schema
     );
@@ -290,11 +290,11 @@ fn an_http_timeout_of_zero_is_rejected_by_the_schema_and_by_validate() {
 
     let zero = json!({"url": "http://127.0.0.1:1/health", "timeout_ms": 0});
     assert!(
-        (definition.validate)(&zero).is_err(),
+        definition.validate(&zero).is_err(),
         "validate must reject `timeout_ms: 0`"
     );
     assert!(
-        !jsonschema::is_valid(&definition.args_schema, &zero),
+        !jsonschema::is_valid(definition.args_schema, &zero),
         "the schema must reject `timeout_ms: 0`: {}",
         definition.args_schema
     );
@@ -303,11 +303,13 @@ fn an_http_timeout_of_zero_is_rejected_by_the_schema_and_by_validate() {
 /// A registered step definition, for tests that compare the schema with
 /// `validate`.
 #[cfg(any(feature = "cli", feature = "http"))]
-fn step_definition(name: &str) -> do_anything::core::registry::StepDefinition {
-    built_in_registry()
+fn step_definition(name: &str) -> do_anything::core::registry::StepRef<'static> {
+    static REGISTRY: std::sync::OnceLock<do_anything::core::registry::Registry> =
+        std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(built_in_registry)
         .get(name)
         .unwrap_or_else(|| panic!("`{name}` must be registered"))
-        .clone()
 }
 
 /// Every registered step definition, keyed by name.
@@ -458,11 +460,11 @@ fn every_declared_argument_bound_is_enforced_by_validate() {
             .expect("every listed step must be registered");
         let base = valid_arguments(name);
         assert!(
-            (definition.validate)(&base).is_ok(),
+            definition.validate(&base).is_ok(),
             "the base arguments for `{name}` must be valid: {base}"
         );
         assert!(
-            jsonschema::is_valid(&definition.args_schema, &base),
+            jsonschema::is_valid(definition.args_schema, &base),
             "the schema must accept the base arguments for `{name}`: {base}"
         );
 
@@ -481,11 +483,11 @@ fn every_declared_argument_bound_is_enforced_by_validate() {
                 let mut args = base.clone();
                 args[argument] = violating;
                 assert!(
-                    !jsonschema::is_valid(&definition.args_schema, &args),
+                    !jsonschema::is_valid(definition.args_schema, &args),
                     "the test must build a value that violates `{keyword}` for `{argument}` of `{name}`: {args}"
                 );
                 assert!(
-                    (definition.validate)(&args).is_err(),
+                    definition.validate(&args).is_err(),
                     "`{name}` declares `{keyword}: {bound}` for `{argument}`, but validate accepts {args}"
                 );
 
@@ -495,7 +497,7 @@ fn every_declared_argument_bound_is_enforced_by_validate() {
                     let mut args = base.clone();
                     args[argument] = allowed;
                     assert!(
-                        (definition.validate)(&args).is_ok(),
+                        definition.validate(&args).is_ok(),
                         "`{name}` declares `{keyword}: {bound}` for `{argument}`, but validate rejects {args}"
                     );
                 }
@@ -731,11 +733,11 @@ fn every_declared_observer_argument_bound_is_enforced_by_validate() {
             .expect("every listed observer must be registered");
         let base = observer_arguments(name);
         assert!(
-            (definition.validate)(&base).is_ok(),
+            definition.validate(&base).is_ok(),
             "the base arguments for `{name}` must be valid: {base}"
         );
         assert!(
-            jsonschema::is_valid(&definition.args_schema, &base),
+            jsonschema::is_valid(definition.args_schema, &base),
             "the schema must accept the base arguments for `{name}`: {base}"
         );
         assert_eq!(
@@ -759,11 +761,11 @@ fn every_declared_observer_argument_bound_is_enforced_by_validate() {
                 let mut args = base.clone();
                 args[argument] = violating;
                 assert!(
-                    !jsonschema::is_valid(&definition.args_schema, &args),
+                    !jsonschema::is_valid(definition.args_schema, &args),
                     "the test must build a value that violates `{keyword}` for `{argument}` of `{name}`: {args}"
                 );
                 assert!(
-                    (definition.validate)(&args).is_err(),
+                    definition.validate(&args).is_err(),
                     "`{name}` declares `{keyword}: {bound}` for `{argument}`, but validate accepts {args}"
                 );
 
@@ -771,7 +773,7 @@ fn every_declared_observer_argument_bound_is_enforced_by_validate() {
                     let mut args = base.clone();
                     args[argument] = allowed;
                     assert!(
-                        (definition.validate)(&args).is_ok(),
+                        definition.validate(&args).is_ok(),
                         "`{name}` declares `{keyword}: {bound}` for `{argument}`, but validate rejects {args}"
                     );
                 }
@@ -878,7 +880,7 @@ fn browser_dialog_schema_agrees_with_validate() {
                 "`{step_name}` schema must accept {dialog}: {case}"
             );
             assert!(
-                (def.validate)(&step_args).is_ok(),
+                def.validate(&step_args).is_ok(),
                 "`{step_name}` validate must accept {dialog}: {step_args}"
             );
         }
@@ -900,7 +902,7 @@ fn browser_dialog_schema_agrees_with_validate() {
                 "`{step_name}` schema must reject {bad}: {case}"
             );
             assert!(
-                (def.validate)(&step_args).is_err(),
+                def.validate(&step_args).is_err(),
                 "`{step_name}` validate must reject {bad}: {step_args}"
             );
         }
@@ -1382,7 +1384,7 @@ fn browser_computer_use_schemas_match_validate() {
                 "`{step}` schema must accept {args}"
             );
             assert!(
-                (def.validate)(&args).is_ok(),
+                def.validate(&args).is_ok(),
                 "`{step}` validate must accept {args}"
             );
         }
@@ -1396,7 +1398,7 @@ fn browser_computer_use_schemas_match_validate() {
                 "`{step}` schema must reject ({label}): {args}"
             );
             assert!(
-                (def.validate)(&args).is_err(),
+                def.validate(&args).is_err(),
                 "`{step}` validate must reject ({label}): {args}"
             );
         }

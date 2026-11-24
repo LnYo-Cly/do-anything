@@ -17,6 +17,7 @@ The complete reference for `da`: installation options, building from source, the
   - [Interactive sessions (`da session`)](#interactive-sessions-da-session)
     - [External model hooks](#external-model-hooks)
   - [Model Context Protocol (`da mcp`)](#model-context-protocol-da-mcp)
+  - [External plugins](#external-plugins)
   - [Classification and filtering](#classification-and-filtering)
   - [Linting](#linting)
   - [Secrets](#secrets)
@@ -88,8 +89,9 @@ cargo build
 The binary is written to `target/debug/da` (`target\debug\da.exe` on Windows).
 The `http` feature provides the `http.request` step, `cli` provides `cli.run`,
 `log` provides the `log.file` observer, `db` provides `db.query`, `browser`
-provides the `browser.*` steps and `mcp` provides `da mcp`; these six are
-enabled by default. The `android` feature provides the [`android.*`
+provides the `browser.*` steps, `mcp` provides `da mcp`, and `plugin` provides
+the [external plugin host](#external-plugins); these seven are enabled by
+default. The `android` feature provides the [`android.*`
 steps](#android-steps) and is off by default, because it is only useful on a
 machine with an Android device: build it with `cargo build --features android`.
 The `desktop` feature provides the [`desktop.*` steps](#desktop-steps) and is
@@ -99,7 +101,9 @@ The `browser` feature adds about 0.5 MiB to the release
 binary and needs a Chrome or Chromium installed on the machine; it never
 downloads a browser. The `mcp` feature adds about 54 KiB to a build with no
 drivers and about 82 KiB to the default build; it has no dependency and no
-async runtime. Build a subset with
+async runtime. The `plugin` feature reuses an optional dependency the drivers
+already build with, so it adds no new crate and no async runtime; plugins are
+loaded only from explicit `--plugin` flags. Build a subset with
 `--no-default-features --features http,cli,log,db`, build only one driver with
 `--no-default-features --features cli`, or build nothing extra with
 `--no-default-features`.
@@ -971,6 +975,208 @@ Every tool output passes through the same `Secrets` redaction as the command
 line: a value read through `${env:NAME}` becomes `***`, in results, in error
 messages and in the exported case, including its percent-encoded and base64
 forms. The exported YAML keeps the `${env:NAME}` reference, never the value.
+
+### External plugins
+
+`da` compiles every built-in driver into one binary. A team that drives a
+proprietary protocol, a serial or hardware rig, or a niche GUI toolkit can add
+its own synchronous plugin instead of forking `da`: an executable named
+explicitly with the repeatable global `--plugin <EXECUTABLE>` flag. The plugin
+runs in its own process, so a crash or a hang cannot corrupt the runner, and the
+host adds no async runtime and no new third-party dependency.
+
+The `plugin` Cargo feature (part of `default`) builds the host. Plugins are
+loaded only from `--plugin` flags. Nothing is discovered from the working
+directory, `PATH` or an environment variable. A session started with
+`--plugin` stores the absolute paths in `.da/sessions/<id>/state.json`, so later
+`da session step`, `da session snapshot` and `da session stop` commands reconnect
+to the same explicit plugin without repeating the flag. `da schema`, `da lint`,
+`da run`, `da session`, `da mcp`, `da report`, failure bundles and `Secrets`
+redaction all see plugin steps, observers and sessions exactly as they see
+built-ins.
+
+#### Transport
+
+The host starts one child process per path with piped standard input and output;
+standard error is discarded so a plugin cannot corrupt the protocol or a
+terminal. Both directions use newline-delimited JSON-RPC 2.0: exactly one UTF-8
+JSON object per line, no `Content-Length` framing and no batch requests. A
+request is:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"plugin/manifest","params":{}}
+```
+
+A successful answer carries `result`; a refusal carries `error` with a numeric
+`code` and a `message`:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"name":"internal-harness","version":"1.0.0","steps":[],"observers":[],"sessions":[]}}
+```
+
+```json
+{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"`count` must be between 1 and 5"}}
+```
+
+The host matches answers by `id` and ignores unrelated lines. A line that is not
+JSON, a closed pipe, a non-zero exit or a missing `result` is a protocol failure,
+not a plugin result: the host terminates the child and reports an environment
+error.
+
+#### Manifest
+
+`plugin/manifest` is the first request and declares everything the plugin
+registers:
+
+```json
+{
+  "name": "internal-harness",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "name": "internal.echo",
+      "summary": "Echoes a value.",
+      "args_schema": {"type": "object", "required": ["value"]},
+      "allow_retry": true,
+      "session_kind": "internal"
+    }
+  ],
+  "observers": [
+    {
+      "name": "internal.metrics",
+      "summary": "Reports a read-only metric.",
+      "args_schema": {"type": "object", "required": ["name"]}
+    }
+  ],
+  "sessions": [{"kind": "internal", "detachable": true}]
+}
+```
+
+`name` in each step and observer is the name a case writes (`internal.echo:`) and
+must satisfy the same character rule as a built-in name. `summary` becomes the
+description `da schema` prints; `args_schema` is the JSON Schema that `da schema`
+publishes, and `da lint` asks the plugin's `step/validate` about step arguments.
+`allow_retry` permits `retry:` only for a step that is read-only;
+`session_kind` names a session the same manifest declares.
+`sessions[].detachable` allows `da session` to persist and reattach its handle.
+A step or observer colliding with a built-in or an earlier plugin is refused, a
+session kind must be unique, and a `session_kind` the manifest does not declare
+is refused. The command exits `2` (usage) after reporting the collision; no case
+runs.
+
+#### Step and observer calls
+
+`step/validate` and `step/run` carry the step name and its expanded argument
+object:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"step/validate","params":{"step":"internal.echo","args":{"value":"hello"}}}
+{"jsonrpc":"2.0","id":3,"method":"step/run","params":{"step":"internal.echo","args":{"value":"hello"}}}
+```
+
+`step/validate` returns `{"valid":true}` or an error with code `-32602`; `da
+lint` calls it for every case step. `step/run` returns
+`{"result":<any JSON>}`. A step that declares `session_kind` also receives the
+current handle and returns an updated one:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"step/run","params":{"step":"internal.act","args":{"value":"hello"},"session":{"kind":"internal","handle":{"token":"abc","count":1}}}}
+{"jsonrpc":"2.0","id":4,"result":{"result":{"count":2},"session":{"token":"abc","count":2}}}
+```
+
+The first call receives `handle: null`; the returned handle is stored for the
+next step and, for a detachable session, in the session state. The host never
+interprets a handle: it is the plugin's opaque JSON. `-32602` from `step/run`
+becomes an invalid-argument case; any other error code becomes an execution
+failure (exit `1`).
+
+`observer/start` is called before the observed step and `observer/collect` after
+it:
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"observer/start","params":{"observer":"internal.metrics","args":{"name":"queue_depth"}}}
+{"jsonrpc":"2.0","id":5,"result":{"handle":{"name":"queue_depth"}}}
+{"jsonrpc":"2.0","id":6,"method":"observer/collect","params":{"observer":"internal.metrics","handle":{"name":"queue_depth"}}}
+{"jsonrpc":"2.0","id":6,"result":{"value":{"depth":3}}}
+```
+
+The value is merged into the step result under `observed.<alias>` exactly like a
+built-in observer. The protocol gives an observer no method that can change a
+step or the environment; it is the plugin author's contract to keep it read-only.
+
+#### Detachable sessions
+
+A session kind declared in the manifest may be used by `da session`:
+
+| Method | Parameters | Result |
+| --- | --- | --- |
+| `session/snapshot` | `kind`, `handle`, `scope_ref`, `max_depth`, `max_nodes` | `{"snapshot": <JSON or null>}` |
+| `session/evidence` | `kind`, `handle` | `{"files":[{"name":"log.txt","text":"..."} or {"name":"screen.bin","bytes":[...]}]}` |
+| `session/detach` | `kind`, `handle` | `{"handle": <JSON or null>}`; `null` means the kind is not detachable |
+| `session/reattach` | `kind`, `handle` | `{"handle": <JSON>}`; when omitted the given handle is kept |
+| `session/close` | `kind`, `handle` | Any result; on success the host frees the handle (on failure unclosed handles stay persisted for retry) |
+
+The lifecycle for `da session start --plugin <path>` is:
+
+```text
+start   -> state.json records the explicit plugin path; no child is kept alive
+step    -> host starts the plugin, calls step/run (session.handle null first)
+           plugin returns a handle; step/handle are redacted and stored
+snapshot-> later command starts the plugin, calls session/reattach, then snapshot
+export  -> reads the recorded steps; no plugin call is needed
+stop    -> starts the plugin when handles remain, calls session/close, removes the session directory on success
+```
+
+`da run` and `da mcp` use the same methods around each case and each session
+step. Every `Session::close()` and every host drop terminates the child and
+waits for it, so a completed command leaves no plugin process behind.
+
+`da session start` and `da session list` reap expired sessions. Only an expired
+session that still holds a non-built-in handle loads its persisted absolute
+canonical plugin paths so `session/close` can dispose them; active or
+handle-less sessions never spawn plugins during `start` or `list`, and relative
+or non-canonical persisted paths are rejected without resolving against the
+working directory. Those paths are used for that session's cleanup only; a newly
+started session persists just the `--plugin` flags given on its own command
+line. When plugin loading or `session/close` fails during `stop` or reaping,
+the unclosed handles remain in `state.json` for retry, the session is omitted
+from `reaped`, and other sessions still list or start normally.
+
+#### Timeouts and exit codes
+
+`DA_PLUGIN_TIMEOUT_MS` sets the per-request deadline in milliseconds; the
+default is `30000`. A positive integer is required; an unset, zero or invalid
+value keeps the default. The deadline covers `plugin/manifest` and every step,
+observer and session request, and it is not a case timeout. On expiry the host
+kills and reaps the child, then reports:
+
+| Failure | `da` exit code |
+| --- | --- |
+| Plugin answers `step/validate` with `-32602` | `3` (invalid case) |
+| Plugin returns another step error | `1` (test failure) |
+| `plugin/manifest` or a step request times out | `5` (timeout) |
+| Plugin cannot start, exits, closes a pipe, sends malformed JSON, or an observer/session request fails | `4` (environment) |
+| Manifest is invalid or a name collides | `2` (usage) |
+
+#### Redaction boundary
+
+A plugin is outside the process, but its data is not outside `Secrets`. Every
+JSON value a plugin returns is redacted exactly like a built-in result:
+
+- a step result, including `result.observed.*` observer values;
+- an observer value and a session snapshot;
+- a step or session error message;
+- the `steps.jsonl` session record, `state.json`, `report.json`, `meta.json`,
+  `report.html`, terminal output and failure bundles;
+- a UTF-8 evidence file returned by `session/evidence` (`text`).
+
+The boundary is the `bytes` form of evidence. It is an opaque binary blob and is
+written unchanged: the host never parses or searches it. A plugin must not place
+a secret in `bytes`; put text in `text` instead. Plugin standard error is
+discarded, and plugin standard output is protocol traffic, so a plugin should
+never print a secret there either. A value read through `${env:NAME}` is replaced
+with `***` wherever the JSON or text path above carries it, including the
+percent-encoded and base64 forms `Secrets` already recognizes.
 
 ### Classification and filtering
 

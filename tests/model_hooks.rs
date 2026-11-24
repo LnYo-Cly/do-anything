@@ -649,6 +649,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             idle_timeout_ms: 60_000,
             observe: Vec::new(),
             model_hook: Some(hook_spec.clone()),
+            plugins: Vec::new(),
         },
         &registry,
     );
@@ -986,6 +987,7 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
             idle_timeout_ms: 60_000,
             observe: Vec::new(),
             model_hook: None,
+            plugins: Vec::new(),
         },
         &registry,
     );

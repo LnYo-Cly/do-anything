@@ -9,6 +9,7 @@ pub mod export;
 pub mod model_hook;
 pub mod store;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,6 +112,7 @@ pub enum SessionRequest {
         idle_timeout_ms: u64,
         observe: Vec<StoredObservation>,
         model_hook: Option<ModelHookSpec>,
+        plugins: Vec<String>,
     },
     Step {
         sessions_dir: PathBuf,
@@ -163,11 +165,13 @@ pub fn handle(request: SessionRequest, registry: &Registry) -> SessionResponse {
             idle_timeout_ms,
             observe,
             model_hook,
+            plugins,
         } => handle_start(
             &sessions_dir,
             idle_timeout_ms,
             observe,
             model_hook,
+            plugins,
             registry,
         ),
         SessionRequest::Step {
@@ -227,6 +231,7 @@ fn handle_start(
     idle_timeout_ms: u64,
     observe: Vec<StoredObservation>,
     model_hook: Option<ModelHookSpec>,
+    plugins: Vec<String>,
     registry: &Registry,
 ) -> SessionResponse {
     if let Some(hook) = &model_hook
@@ -267,9 +272,15 @@ fn handle_start(
         }
     }
 
-    let list_report = match store::list_and_reap(sessions_dir, None, registry) {
+    let list_report = match store::list_and_reap(sessions_dir, None, registry, &secrets) {
         Ok(result) => result,
-        Err(message) => return error_response(ExitCode::Environment, "environment", message),
+        Err(message) => {
+            return error_response(
+                ExitCode::Environment,
+                "environment",
+                secrets.redact(&message),
+            );
+        }
     };
 
     let id = store::generate_session_id();
@@ -278,10 +289,10 @@ fn handle_start(
         return error_response(
             ExitCode::Environment,
             "environment",
-            format!(
+            secrets.redact(&format!(
                 "could not create session directory `{}`: {error}",
                 paths::display(&session_dir)
-            ),
+            )),
         );
     }
 
@@ -297,6 +308,7 @@ fn handle_start(
         vars: BTreeMap::new(),
         env_names,
         observe,
+        plugins,
         model_hook,
     };
     if let Err(message) = store::save_state(&session_dir, &state, &secrets) {
@@ -314,18 +326,50 @@ fn handle_start(
         "dir": paths::display(&session_dir),
         "idle_timeout_ms": idle_timeout_ms,
         "observers": observer_names,
+        "plugins": state.plugins,
         "reaped": list_report.reaped,
         "reap_errors": list_report.errors,
     });
     if let Some(cmd) = hook_display {
         payload["model_hook"] = Value::String(cmd);
     }
-
     SessionResponse {
         exit_code: ExitCode::Success,
-        payload,
+        payload: secrets.redact_json(&payload),
         raw_yaml: None,
         raw_text: None,
+    }
+}
+
+fn resolve_target_session_registry<'a>(
+    plugins: &[String],
+    base_registry: &'a Registry,
+) -> Result<Cow<'a, Registry>, (ExitCode, &'static str, String)> {
+    if plugins.is_empty() {
+        return Ok(Cow::Borrowed(base_registry));
+    }
+    #[cfg(feature = "plugin")]
+    {
+        let mut reg = base_registry.clone();
+        crate::plugin::register_persisted(&mut reg, plugins).map_err(|error| {
+            let code = error.exit_code();
+            let kind = match code {
+                ExitCode::Timeout => "timeout",
+                ExitCode::Environment => "environment",
+                _ => "usage",
+            };
+            (code, kind, error.message().to_string())
+        })?;
+        Ok(Cow::Owned(reg))
+    }
+    #[cfg(not(feature = "plugin"))]
+    {
+        let _ = base_registry;
+        Err((
+            ExitCode::Usage,
+            "usage",
+            "this build was compiled without the `plugin` feature; rebuild with `--features plugin`".to_string(),
+        ))
     }
 }
 
@@ -384,7 +428,7 @@ fn reattach_sessions(
                 state.id
             ));
         };
-        let session = (def.reattach)(handle).map_err(|err| {
+        let session = def.reattach(handle).map_err(|err| {
             format!(
                 "session `{}` has expired or could not reconnect to `{kind}`: {err}",
                 state.id
@@ -407,17 +451,28 @@ fn handle_step(
         Err(resp) => return resp,
     };
 
-    let step = match parse_step_input(step_input, registry) {
+    let mut secrets = store::secrets_from_env_names(&state.env_names);
+    let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
+        Ok(reg) => reg,
+        Err((code, kind, message)) => return error_response(code, kind, secrets.redact(&message)),
+    };
+
+    let step = match parse_step_input(step_input, effective_registry.as_ref()) {
         Ok(step) => step,
         Err(message) => {
-            return error_response(ExitCode::InvalidCase, "invalid_input", message);
+            return error_response(
+                ExitCode::InvalidCase,
+                "invalid_input",
+                secrets.redact(&message),
+            );
         }
     };
 
     state.env_names.extend(case::env_references(&step.args));
-    let mut secrets = store::secrets_from_env_names(&state.env_names);
+    secrets = store::secrets_from_env_names(&state.env_names);
 
-    let mut sessions = match reattach_sessions(&state, base_directory, registry) {
+    let mut sessions = match reattach_sessions(&state, base_directory, effective_registry.as_ref())
+    {
         Ok(sessions) => sessions,
         Err(message) => {
             return error_response(
@@ -443,7 +498,7 @@ fn handle_step(
     let report = runner::run_single_step_with_observations(
         &step,
         &observations,
-        registry,
+        effective_registry.as_ref(),
         &mut state.vars,
         &mut secrets,
         &mut sessions,
@@ -479,7 +534,7 @@ fn handle_step(
         existing_steps.len() + 1,
         &step,
         &report,
-        registry,
+        effective_registry.as_ref(),
         started_at_ms,
         synthesis,
     );
@@ -541,7 +596,12 @@ fn handle_snapshot(
     };
 
     let secrets = store::secrets_from_env_names(&state.env_names);
-    let mut sessions = match reattach_sessions(&state, Path::new("."), registry) {
+    let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
+        Ok(reg) => reg,
+        Err((code, kind, message)) => return error_response(code, kind, secrets.redact(&message)),
+    };
+    let mut sessions = match reattach_sessions(&state, Path::new("."), effective_registry.as_ref())
+    {
         Ok(sessions) => sessions,
         Err(message) => {
             return error_response(
@@ -779,16 +839,22 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
         }
     };
 
-    let mut sessions = match reattach_sessions(&state, &req.base_directory, registry) {
-        Ok(sessions) => sessions,
-        Err(message) => {
-            return error_response(
-                ExitCode::Environment,
-                "environment",
-                secrets.redact(&message),
-            );
-        }
+    let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
+        Ok(reg) => reg,
+        Err((code, kind, message)) => return error_response(code, kind, secrets.redact(&message)),
     };
+
+    let mut sessions =
+        match reattach_sessions(&state, &req.base_directory, effective_registry.as_ref()) {
+            Ok(sessions) => sessions,
+            Err(message) => {
+                return error_response(
+                    ExitCode::Environment,
+                    "environment",
+                    secrets.redact(&message),
+                );
+            }
+        };
 
     let started_at_ms = store::now_ms();
     let (session_kind, snapshot) = match sessions.collect_snapshot(
@@ -911,7 +977,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
             pairs.insert(0, ("ref".to_string(), outcome.selected_ref.clone()));
         }
         let step = match build_step_from_flags(
-            registry,
+            effective_registry.as_ref(),
             &act_spec.action,
             act_spec.with_raw.as_deref(),
             &pairs,
@@ -933,7 +999,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
         let report = runner::run_single_step_with_observations(
             &step,
             &observations,
-            registry,
+            effective_registry.as_ref(),
             &mut state.vars,
             &mut secrets,
             &mut sessions,
@@ -960,7 +1026,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
             existing_steps.len() + 2,
             &step,
             &report,
-            registry,
+            effective_registry.as_ref(),
             act_started_ms,
             synthesis,
         );
@@ -1076,16 +1142,22 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         }
     };
 
-    let mut sessions = match reattach_sessions(&state, &req.base_directory, registry) {
-        Ok(sessions) => sessions,
-        Err(message) => {
-            return error_response(
-                ExitCode::Environment,
-                "environment",
-                secrets.redact(&message),
-            );
-        }
+    let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
+        Ok(reg) => reg,
+        Err((code, kind, message)) => return error_response(code, kind, secrets.redact(&message)),
     };
+
+    let mut sessions =
+        match reattach_sessions(&state, &req.base_directory, effective_registry.as_ref()) {
+            Ok(sessions) => sessions,
+            Err(message) => {
+                return error_response(
+                    ExitCode::Environment,
+                    "environment",
+                    secrets.redact(&message),
+                );
+            }
+        };
 
     let started_at_ms = store::now_ms();
     let (session_kind, capture) = match sessions.collect_masked_viewport_capture() {
@@ -1237,7 +1309,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         let report = runner::run_single_step_with_observations(
             &step,
             &observations,
-            registry,
+            effective_registry.as_ref(),
             &mut state.vars,
             &mut secrets,
             &mut sessions,
@@ -1264,7 +1336,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
             existing_steps.len() + 2,
             &step,
             &report,
-            registry,
+            effective_registry.as_ref(),
             click_started_ms,
             synthesis,
         );
@@ -1445,7 +1517,13 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
             .next()
             .cloned()
             .unwrap_or_else(|| "session".to_string());
-        match reattach_sessions(&state, Path::new("."), registry) {
+        let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
+            Ok(reg) => reg,
+            Err((code, kind, message)) => {
+                return error_response(code, kind, secrets.redact(&message));
+            }
+        };
+        match reattach_sessions(&state, Path::new("."), effective_registry.as_ref()) {
             Ok(mut sessions) => {
                 let snap_res = sessions.collect_snapshot(None, None, None);
                 let detached = sessions.detach_all();
@@ -1664,23 +1742,29 @@ fn handle_stop(sessions_dir: &Path, id: &str, registry: &Registry) -> SessionRes
     } else {
         (None, None)
     };
-    let mut errors = store::close_and_remove_session(&session_dir, state.as_ref(), lock, registry);
+    let secrets = state
+        .as_ref()
+        .map(|s| store::secrets_from_env_names(&s.env_names))
+        .unwrap_or_default();
+    let mut errors =
+        store::close_and_remove_session(&session_dir, state.as_ref(), lock, registry, &secrets);
     if let Some(err) = load_error {
-        errors.insert(0, err);
+        errors.insert(0, secrets.redact(&err));
     }
 
     let ok = errors.is_empty();
+    let payload = json!({
+        "ok": ok,
+        "session_id": id,
+        "errors": errors,
+    });
     SessionResponse {
         exit_code: if ok {
             ExitCode::Success
         } else {
             ExitCode::Environment
         },
-        payload: json!({
-            "ok": ok,
-            "session_id": id,
-            "errors": errors,
-        }),
+        payload: secrets.redact_json(&payload),
         raw_yaml: None,
         raw_text: None,
     }
@@ -1691,7 +1775,8 @@ fn handle_list(
     idle_override_ms: Option<u64>,
     registry: &Registry,
 ) -> SessionResponse {
-    match store::list_and_reap(sessions_dir, idle_override_ms, registry) {
+    let empty_secrets = Secrets::new();
+    match store::list_and_reap(sessions_dir, idle_override_ms, registry, &empty_secrets) {
         Ok(report) => SessionResponse {
             exit_code: if report.errors.is_empty() {
                 ExitCode::Success
@@ -2132,7 +2217,7 @@ fn validate_start_observations(
                 ),
             ));
         };
-        (def.create)(&args).map_err(|error| {
+        def.create(&args).map_err(|error| {
             let (exit_code, kind) = match &error {
                 ObserverError::InvalidArguments(_) => (ExitCode::InvalidCase, "invalid_input"),
                 ObserverError::Environment(_) => (ExitCode::Environment, "environment"),
@@ -2282,6 +2367,7 @@ mod tests {
                     raw_args: json!({ "path": "" }),
                 }],
                 model_hook: None,
+                plugins: Vec::new(),
             },
             &registry,
         );
@@ -2306,6 +2392,7 @@ mod tests {
                     },
                 ],
                 model_hook: None,
+                plugins: Vec::new(),
             },
             &registry,
         );

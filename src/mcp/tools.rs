@@ -56,6 +56,8 @@ pub struct Context<'a> {
     pub idle_timeout_ms: u64,
     /// Optional server-default model hook configured on `da mcp`.
     pub model_hook: Option<&'a ModelHookSpec>,
+    /// Absolute paths of the explicit plugins this server was started with.
+    pub plugins: &'a [String],
 }
 
 /// The result of one tool call, before redaction and framing.
@@ -337,6 +339,7 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
             idle_timeout_ms: context.idle_timeout_ms,
             observe: Vec::new(),
             model_hook,
+            plugins: context.plugins.to_vec(),
         },
         context.registry,
     ))
@@ -918,10 +921,10 @@ fn load_cases(
     if files.is_empty() {
         return (
             Vec::new(),
-            vec![CaseError {
-                file: paths.first().cloned().unwrap_or_default(),
-                message: "no `.yaml` or `.yml` case files found; pass a case file or a directory that contains one".to_string(),
-            }],
+            vec![CaseError::invalid(
+                paths.first().cloned().unwrap_or_default(),
+                "no `.yaml` or `.yml` case files found; pass a case file or a directory that contains one",
+            )],
         );
     }
 
@@ -932,10 +935,10 @@ fn load_cases(
         overridden_names.insert(name.clone());
         match case::expand_env(value, secrets) {
             Ok(value) => expanded.push((name.clone(), value)),
-            Err(message) => errors.push(CaseError {
-                file: PathBuf::from("<vars>"),
-                message: format!("variable `{name}`: {message}"),
-            }),
+            Err(message) => errors.push(CaseError::invalid(
+                PathBuf::from("<vars>"),
+                format!("variable `{name}`: {message}"),
+            )),
         }
     }
     let overridden_vars: Vec<String> = overridden_names.into_iter().collect();
@@ -945,10 +948,7 @@ fn load_cases(
         match case::load_file(file) {
             Ok(mut loaded) => {
                 if let Err(message) = case::expand_vars(&mut loaded.case.vars, secrets) {
-                    errors.push(CaseError {
-                        file: loaded.path.clone(),
-                        message,
-                    });
+                    errors.push(CaseError::invalid(loaded.path.clone(), message));
                     continue;
                 }
                 // A case that does not use the name ignores it.
@@ -1010,6 +1010,7 @@ mod tests {
             sessions_dir: Path::new(".da/sessions"),
             idle_timeout_ms: 60_000,
             model_hook: None,
+            plugins: &[],
         }
     }
 

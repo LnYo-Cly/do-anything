@@ -12,8 +12,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::core::case::DEFAULT_RETRY_INTERVAL_MS;
-use crate::core::observer::ObserverDefinition;
-use crate::core::registry::{Registry, StepDefinition};
+use crate::core::registry::{ObserverRef, Registry, StepRef};
 
 /// Builds a JSON Schema for one case file.
 ///
@@ -31,7 +30,7 @@ pub fn case_schema(registry: &Registry) -> Value {
         let Some(definition) = registry.get(name) else {
             continue;
         };
-        definitions.insert(name.to_string(), step_arguments_schema(definition));
+        definitions.insert(name.to_string(), step_arguments_schema(&definition));
         branches.push(step_branch(name));
     }
 
@@ -49,7 +48,7 @@ pub fn case_schema(registry: &Registry) -> Value {
         let Some(definition) = registry.observer(name) else {
             continue;
         };
-        definitions.insert(name.to_string(), observer_arguments_schema(definition));
+        definitions.insert(name.to_string(), observer_arguments_schema(&definition));
         observer_branches.push(observation_branch(name));
     }
 
@@ -203,14 +202,14 @@ fn arguments_schema(description: &str, args_schema: &Value) -> Value {
 }
 
 /// The step's own argument schema, with its description and no dialect header.
-fn step_arguments_schema(definition: &StepDefinition) -> Value {
-    arguments_schema(definition.description, &definition.args_schema)
+fn step_arguments_schema(definition: &StepRef<'_>) -> Value {
+    arguments_schema(definition.description, definition.args_schema)
 }
 
 /// The observer's own argument schema, with its description and no dialect
 /// header.
-fn observer_arguments_schema(definition: &ObserverDefinition) -> Value {
-    arguments_schema(definition.description, &definition.args_schema)
+fn observer_arguments_schema(definition: &ObserverRef<'_>) -> Value {
+    arguments_schema(definition.description, definition.args_schema)
 }
 
 /// One assertion entry allowed in `expect` and `retry.until`.
@@ -304,7 +303,7 @@ fn save_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::observer::{Observer, ObserverError};
+    use crate::core::observer::{Observer, ObserverDefinition, ObserverError};
     use crate::core::registry::StepDefinition;
     use serde_json::json;
 

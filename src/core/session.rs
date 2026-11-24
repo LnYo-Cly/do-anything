@@ -255,7 +255,7 @@ pub struct Sessions {
 
 /// One open session and the kind it is stored under.
 struct SessionEntry {
-    kind: &'static str,
+    kind: String,
     session: Box<dyn Session>,
 }
 
@@ -293,14 +293,17 @@ impl Sessions {
     /// Fails if `kind` is invalid or already open in this [`Sessions`].
     pub fn insert_reattached(
         &mut self,
-        kind: &'static str,
+        kind: &str,
         session: Box<dyn Session>,
     ) -> Result<(), String> {
         check_kind(kind)?;
         if self.entries.iter().any(|entry| entry.kind == kind) {
             return Err(format!("session `{kind}` is already open"));
         }
-        self.entries.push(SessionEntry { kind, session });
+        self.entries.push(SessionEntry {
+            kind: kind.to_string(),
+            session,
+        });
         Ok(())
     }
 
@@ -314,7 +317,7 @@ impl Sessions {
     /// is left behind, so a later step may try again.
     pub fn get_or_create<T>(
         &mut self,
-        kind: &'static str,
+        kind: &str,
         create: impl FnOnce() -> Result<T, String>,
     ) -> Result<&mut T, String>
     where
@@ -327,7 +330,7 @@ impl Sessions {
         let session =
             create().map_err(|message| format!("could not create session `{kind}`: {message}"))?;
         self.entries.push(SessionEntry {
-            kind,
+            kind: kind.to_string(),
             session: Box::new(session),
         });
         let entry = self
@@ -341,7 +344,7 @@ impl Sessions {
     ///
     /// A missing session is `Ok(None)`: an observation may run before the step
     /// that opens the resource. A kind that holds another type is an error.
-    pub fn get<T>(&mut self, kind: &'static str) -> Result<Option<&mut T>, String>
+    pub fn get<T>(&mut self, kind: &str) -> Result<Option<&mut T>, String>
     where
         T: Session + 'static,
     {
@@ -556,7 +559,7 @@ impl Drop for Sessions {
 }
 
 /// Borrows one entry as its concrete type.
-fn downcast<'a, T>(entry: &'a mut SessionEntry, kind: &'static str) -> Result<&'a mut T, String>
+fn downcast<'a, T>(entry: &'a mut SessionEntry, kind: &str) -> Result<&'a mut T, String>
 where
     T: Session + 'static,
 {

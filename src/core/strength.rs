@@ -317,9 +317,9 @@ fn collect_list_warnings(
         let mut step_warnings = Vec::new();
         if let Ok(args) = case::interpolate(&step.args, vars, secrets)
             && let Some(definition) = registry.get(&step.action)
-            && (definition.validate)(&args).is_ok()
+            && definition.validate(&args).is_ok()
         {
-            step_warnings = (definition.lint_warnings)(&args);
+            step_warnings = definition.lint_warnings(&args);
         }
         for saved in &step.save {
             vars.insert(saved.name.clone(), format!("${{{}}}", saved.name));

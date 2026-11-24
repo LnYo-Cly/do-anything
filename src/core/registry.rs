@@ -7,7 +7,8 @@
 //! `sample.call` do not collide, because a case names a step in `steps:` and an
 //! observer in `observe:`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -25,6 +26,18 @@ pub enum StepError {
     Timeout(String),
     /// The step ran but could not finish its work.
     Execution(String),
+}
+
+impl StepError {
+    /// The human-readable diagnostic message.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidArguments(message)
+            | Self::Environment(message)
+            | Self::Timeout(message)
+            | Self::Execution(message) => message,
+        }
+    }
 }
 
 /// A step implementation and the contract it declares to the engine.
@@ -90,23 +103,364 @@ pub struct SessionDefinition {
     pub dispose_handle: fn(&Value) -> Result<(), String>,
 }
 
+type DynamicValidate = Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>;
+type DynamicStepValidate = Arc<dyn Fn(&Value) -> Result<(), StepError> + Send + Sync>;
+type DynamicCheckRetry = Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>;
+type DynamicLintWarnings = Arc<dyn Fn(&Value) -> Vec<String> + Send + Sync>;
+type DynamicRun = Arc<dyn Fn(&Value, &mut Sessions) -> Result<Value, StepError> + Send + Sync>;
+type DynamicCreateObserver = Arc<
+    dyn Fn(
+            &Value,
+        )
+            -> Result<Box<dyn crate::core::observer::Observer>, crate::core::observer::ObserverError>
+        + Send
+        + Sync,
+>;
+type DynamicReattach = Arc<dyn Fn(&Value) -> Result<Box<dyn Session>, String> + Send + Sync>;
+type DynamicDispose = Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>;
+
+/// A step declared at runtime, for example by an external plugin.
+///
+/// Built-in steps keep [`StepDefinition`]; this variant carries owned names and
+/// closures so a registry can hold definitions whose values come from a file or
+/// another process rather than from a compile-time constant.
+#[derive(Clone)]
+pub struct DynamicStepDefinition {
+    /// Name used in case files.
+    pub name: String,
+    /// One sentence describing what the step does.
+    pub description: String,
+    /// JSON Schema for the step's arguments.
+    pub args_schema: Value,
+    /// Checks arguments against the same contract as [`Self::args_schema`].
+    pub validate: DynamicStepValidate,
+    /// Checks whether the step may be retried.
+    pub check_retry: DynamicCheckRetry,
+    /// Reports fragile but valid arguments for `da lint`.
+    pub lint_warnings: DynamicLintWarnings,
+    /// Runs the step and returns its JSON result.
+    pub run: DynamicRun,
+}
+
+/// An observer declared at runtime.
+#[derive(Clone)]
+pub struct DynamicObserverDefinition {
+    /// Name used in case files.
+    pub name: String,
+    /// One sentence describing what the observer reports.
+    pub description: String,
+    /// JSON Schema for the observer's arguments.
+    pub args_schema: Value,
+    /// Checks arguments against the same contract as [`Self::args_schema`].
+    pub validate: DynamicValidate,
+    /// Creates the observation of one case.
+    pub create: DynamicCreateObserver,
+}
+
+/// A detachable session kind declared at runtime.
+#[derive(Clone)]
+pub struct DynamicSessionDefinition {
+    /// Session kind, matching the key passed to [`Sessions`].
+    pub kind: String,
+    /// Reconnects to a detached resource from its opaque JSON handle.
+    pub reattach: DynamicReattach,
+    /// Releases resources named by `handle` when reattach fails or is skipped.
+    pub dispose_handle: DynamicDispose,
+}
+
+/// One registered step, either compiled in or registered at runtime.
+#[derive(Clone)]
+enum StepEntry {
+    Builtin(StepDefinition),
+    Dynamic(Arc<DynamicStepDefinition>),
+}
+
+impl StepEntry {
+    fn name(&self) -> &str {
+        match self {
+            Self::Builtin(definition) => definition.name,
+            Self::Dynamic(definition) => &definition.name,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Self::Builtin(definition) => definition.description,
+            Self::Dynamic(definition) => &definition.description,
+        }
+    }
+
+    fn args_schema(&self) -> &Value {
+        match self {
+            Self::Builtin(definition) => &definition.args_schema,
+            Self::Dynamic(definition) => &definition.args_schema,
+        }
+    }
+
+    fn validate_step(&self, args: &Value) -> Result<(), StepError> {
+        match self {
+            Self::Builtin(definition) => {
+                (definition.validate)(args).map_err(StepError::InvalidArguments)
+            }
+            Self::Dynamic(definition) => (definition.validate)(args),
+        }
+    }
+
+    fn validate(&self, args: &Value) -> Result<(), String> {
+        self.validate_step(args)
+            .map_err(|error| error.message().to_string())
+    }
+
+    fn check_retry(&self, args: &Value) -> Result<(), String> {
+        match self {
+            Self::Builtin(definition) => (definition.check_retry)(args),
+            Self::Dynamic(definition) => (definition.check_retry)(args),
+        }
+    }
+
+    fn lint_warnings(&self, args: &Value) -> Vec<String> {
+        match self {
+            Self::Builtin(definition) => (definition.lint_warnings)(args),
+            Self::Dynamic(definition) => (definition.lint_warnings)(args),
+        }
+    }
+
+    fn run(&self, args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+        match self {
+            Self::Builtin(definition) => (definition.run)(args, sessions),
+            Self::Dynamic(definition) => (definition.run)(args, sessions),
+        }
+    }
+}
+
+/// A borrowed view of one registered step.
+///
+/// The runner and schema builder use this whether the step was compiled in or
+/// registered at runtime; callers never need to know which storage it came
+/// from.
+#[derive(Clone, Copy)]
+pub struct StepRef<'a> {
+    /// Name used in case files.
+    pub name: &'a str,
+    /// One sentence describing what the step does.
+    pub description: &'a str,
+    /// JSON Schema for the step's arguments.
+    pub args_schema: &'a Value,
+    entry: &'a StepEntry,
+}
+
+impl StepRef<'_> {
+    /// Checks arguments against the step's contract.
+    pub fn validate(&self, args: &Value) -> Result<(), String> {
+        self.entry.validate(args)
+    }
+
+    /// Checks arguments against the step's contract while preserving timeout
+    /// and environment errors from out-of-process validators.
+    pub fn validate_step(&self, args: &Value) -> Result<(), StepError> {
+        self.entry.validate_step(args)
+    }
+
+    /// Checks whether the step may be retried.
+    pub fn check_retry(&self, args: &Value) -> Result<(), String> {
+        self.entry.check_retry(args)
+    }
+
+    /// Reports fragile but valid arguments.
+    pub fn lint_warnings(&self, args: &Value) -> Vec<String> {
+        self.entry.lint_warnings(args)
+    }
+
+    /// Runs the step.
+    pub fn run(&self, args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
+        self.entry.run(args, sessions)
+    }
+}
+
+/// One registered observer, either compiled in or registered at runtime.
+#[derive(Clone)]
+enum ObserverEntry {
+    Builtin(ObserverDefinition),
+    Dynamic(Arc<DynamicObserverDefinition>),
+}
+
+impl ObserverEntry {
+    fn name(&self) -> &str {
+        match self {
+            Self::Builtin(definition) => definition.name,
+            Self::Dynamic(definition) => &definition.name,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Self::Builtin(definition) => definition.description,
+            Self::Dynamic(definition) => &definition.description,
+        }
+    }
+
+    fn args_schema(&self) -> &Value {
+        match self {
+            Self::Builtin(definition) => &definition.args_schema,
+            Self::Dynamic(definition) => &definition.args_schema,
+        }
+    }
+
+    fn validate(&self, args: &Value) -> Result<(), String> {
+        match self {
+            Self::Builtin(definition) => (definition.validate)(args),
+            Self::Dynamic(definition) => (definition.validate)(args),
+        }
+    }
+
+    fn create(
+        &self,
+        args: &Value,
+    ) -> Result<Box<dyn crate::core::observer::Observer>, crate::core::observer::ObserverError>
+    {
+        match self {
+            Self::Builtin(definition) => (definition.create)(args),
+            Self::Dynamic(definition) => (definition.create)(args),
+        }
+    }
+}
+
+/// A borrowed view of one registered observer.
+pub struct ObserverRef<'a> {
+    /// Name used in case files.
+    pub name: &'a str,
+    /// One sentence describing what the observer reports.
+    pub description: &'a str,
+    /// JSON Schema for the observer's arguments.
+    pub args_schema: &'a Value,
+    entry: &'a ObserverEntry,
+}
+
+impl ObserverRef<'_> {
+    /// Checks arguments against the observer's contract.
+    pub fn validate(&self, args: &Value) -> Result<(), String> {
+        self.entry.validate(args)
+    }
+
+    /// Creates the observation of one case.
+    pub fn create(
+        &self,
+        args: &Value,
+    ) -> Result<Box<dyn crate::core::observer::Observer>, crate::core::observer::ObserverError>
+    {
+        self.entry.create(args)
+    }
+}
+
+/// One registered detachable session kind.
+#[derive(Clone)]
+enum SessionEntry {
+    Builtin(SessionDefinition),
+    Dynamic(Arc<DynamicSessionDefinition>),
+}
+
+impl SessionEntry {
+    fn kind(&self) -> &str {
+        match self {
+            Self::Builtin(definition) => definition.kind,
+            Self::Dynamic(definition) => &definition.kind,
+        }
+    }
+
+    fn reattach(&self, handle: &Value) -> Result<Box<dyn Session>, String> {
+        match self {
+            Self::Builtin(definition) => (definition.reattach)(handle),
+            Self::Dynamic(definition) => (definition.reattach)(handle),
+        }
+    }
+
+    fn dispose_handle(&self, handle: &Value) -> Result<(), String> {
+        match self {
+            Self::Builtin(definition) => (definition.dispose_handle)(handle),
+            Self::Dynamic(definition) => (definition.dispose_handle)(handle),
+        }
+    }
+}
+
+/// A borrowed view of one registered detachable session kind.
+pub struct SessionRef<'a> {
+    /// Session kind, matching the key passed to [`Sessions`].
+    pub kind: &'a str,
+    entry: &'a SessionEntry,
+}
+
+impl SessionRef<'_> {
+    /// Reconnects to a detached resource from its opaque JSON handle.
+    pub fn reattach(&self, handle: &Value) -> Result<Box<dyn Session>, String> {
+        self.entry.reattach(handle)
+    }
+
+    /// Releases resources named by `handle`.
+    pub fn dispose_handle(&self, handle: &Value) -> Result<(), String> {
+        self.entry.dispose_handle(handle)
+    }
+}
+
 type ValidateFn = fn(&Value) -> Result<(), String>;
 type ArgRedactorFn = fn(&Value, bool) -> Value;
 
 /// The steps, observers and detachable sessions available to the runner.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
-    steps: BTreeMap<&'static str, StepDefinition>,
-    observers: BTreeMap<&'static str, ObserverDefinition>,
-    sessions: BTreeMap<&'static str, SessionDefinition>,
+    steps: BTreeMap<String, StepEntry>,
+    observers: BTreeMap<String, ObserverEntry>,
+    sessions: BTreeMap<String, SessionEntry>,
     session_validators: BTreeMap<&'static str, ValidateFn>,
     arg_redactors: BTreeMap<&'static str, ArgRedactorFn>,
+    dynamic_sources: BTreeSet<String>,
 }
 
 impl Registry {
     /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns a copy of this registry containing only built-in registrations.
+    pub fn builtins_clone(&self) -> Self {
+        Self {
+            steps: self
+                .steps
+                .iter()
+                .filter(|(_, entry)| matches!(entry, StepEntry::Builtin(_)))
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect(),
+            observers: self
+                .observers
+                .iter()
+                .filter(|(_, entry)| matches!(entry, ObserverEntry::Builtin(_)))
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect(),
+            sessions: self
+                .sessions
+                .iter()
+                .filter(|(_, entry)| matches!(entry, SessionEntry::Builtin(_)))
+                .map(|(kind, entry)| (kind.clone(), entry.clone()))
+                .collect(),
+            session_validators: self.session_validators.clone(),
+            arg_redactors: self.arg_redactors.clone(),
+            dynamic_sources: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `kind` was registered as a built-in detachable session.
+    pub fn is_builtin_session(&self, kind: &str) -> bool {
+        matches!(self.sessions.get(kind), Some(SessionEntry::Builtin(_)))
+    }
+
+    /// Records a canonical runtime source path registered into this registry.
+    pub fn record_dynamic_source(&mut self, source: String) {
+        self.dynamic_sources.insert(source);
+    }
+
+    /// Whether `source` has already been registered into this registry.
+    pub fn has_dynamic_source(&self, source: &str) -> bool {
+        self.dynamic_sources.contains(source)
     }
 
     /// Adds a step.
@@ -116,24 +470,46 @@ impl Registry {
     /// itself is checked by [`validate_name`].
     pub fn register(&mut self, definition: StepDefinition) -> Result<(), String> {
         validate_name(definition.name)?;
-        if self.steps.contains_key(definition.name) {
+        let name = definition.name.to_string();
+        if self.steps.contains_key(&name) {
             return Err(format!(
                 "step `{}` is already registered; every step name must be unique",
                 definition.name
             ));
         }
-        self.steps.insert(definition.name, definition);
+        self.steps.insert(name, StepEntry::Builtin(definition));
+        Ok(())
+    }
+
+    /// Adds a step whose name and behavior were loaded at runtime.
+    pub fn register_dynamic(&mut self, definition: DynamicStepDefinition) -> Result<(), String> {
+        validate_name(&definition.name)?;
+        if self.steps.contains_key(&definition.name) {
+            return Err(format!(
+                "step `{}` is already registered; every step name must be unique",
+                definition.name
+            ));
+        }
+        self.steps.insert(
+            definition.name.clone(),
+            StepEntry::Dynamic(Arc::new(definition)),
+        );
         Ok(())
     }
 
     /// Looks a step up by name.
-    pub fn get(&self, name: &str) -> Option<&StepDefinition> {
-        self.steps.get(name)
+    pub fn get(&self, name: &str) -> Option<StepRef<'_>> {
+        self.steps.get(name).map(|entry| StepRef {
+            name: entry.name(),
+            description: entry.description(),
+            args_schema: entry.args_schema(),
+            entry,
+        })
     }
 
     /// Every registered step name, in order.
-    pub fn names(&self) -> Vec<&'static str> {
-        self.steps.keys().copied().collect()
+    pub fn names(&self) -> Vec<&str> {
+        self.steps.keys().map(String::as_str).collect()
     }
 
     /// Adds an observer.
@@ -143,43 +519,93 @@ impl Registry {
     /// `steps:`.
     pub fn register_observer(&mut self, definition: ObserverDefinition) -> Result<(), String> {
         validate_name(definition.name)?;
-        if self.observers.contains_key(definition.name) {
+        let name = definition.name.to_string();
+        if self.observers.contains_key(&name) {
             return Err(format!(
                 "observer `{}` is already registered; every observer name must be unique",
                 definition.name
             ));
         }
-        self.observers.insert(definition.name, definition);
+        self.observers
+            .insert(name, ObserverEntry::Builtin(definition));
+        Ok(())
+    }
+
+    /// Adds an observer whose name and behavior were loaded at runtime.
+    pub fn register_observer_dynamic(
+        &mut self,
+        definition: DynamicObserverDefinition,
+    ) -> Result<(), String> {
+        validate_name(&definition.name)?;
+        if self.observers.contains_key(&definition.name) {
+            return Err(format!(
+                "observer `{}` is already registered; every observer name must be unique",
+                definition.name
+            ));
+        }
+        self.observers.insert(
+            definition.name.clone(),
+            ObserverEntry::Dynamic(Arc::new(definition)),
+        );
         Ok(())
     }
 
     /// Looks an observer up by name.
-    pub fn observer(&self, name: &str) -> Option<&ObserverDefinition> {
-        self.observers.get(name)
+    pub fn observer(&self, name: &str) -> Option<ObserverRef<'_>> {
+        self.observers.get(name).map(|entry| ObserverRef {
+            name: entry.name(),
+            description: entry.description(),
+            args_schema: entry.args_schema(),
+            entry,
+        })
     }
 
     /// Every registered observer name, in order.
-    pub fn observer_names(&self) -> Vec<&'static str> {
-        self.observers.keys().copied().collect()
+    pub fn observer_names(&self) -> Vec<&str> {
+        self.observers.keys().map(String::as_str).collect()
     }
 
     /// Registers a detachable session kind so `da session` can reattach to or
     /// dispose of its handle across processes.
     pub fn register_session(&mut self, definition: SessionDefinition) -> Result<(), String> {
         check_kind(definition.kind)?;
-        if self.sessions.contains_key(definition.kind) {
+        let kind = definition.kind.to_string();
+        if self.sessions.contains_key(&kind) {
             return Err(format!(
                 "session `{}` is already registered; every session kind must be unique",
                 definition.kind
             ));
         }
-        self.sessions.insert(definition.kind, definition);
+        self.sessions
+            .insert(kind, SessionEntry::Builtin(definition));
+        Ok(())
+    }
+
+    /// Registers a detachable session kind whose behavior was loaded at runtime.
+    pub fn register_session_dynamic(
+        &mut self,
+        definition: DynamicSessionDefinition,
+    ) -> Result<(), String> {
+        check_kind(&definition.kind)?;
+        if self.sessions.contains_key(&definition.kind) {
+            return Err(format!(
+                "session `{}` is already registered; every session kind must be unique",
+                definition.kind
+            ));
+        }
+        self.sessions.insert(
+            definition.kind.clone(),
+            SessionEntry::Dynamic(Arc::new(definition)),
+        );
         Ok(())
     }
 
     /// Looks up a registered detachable session kind.
-    pub fn session(&self, kind: &str) -> Option<&SessionDefinition> {
-        self.sessions.get(kind)
+    pub fn session(&self, kind: &str) -> Option<SessionRef<'_>> {
+        self.sessions.get(kind).map(|entry| SessionRef {
+            kind: entry.kind(),
+            entry,
+        })
     }
 
     /// Registers a validator for `step_name` used inside interactive `da session`
@@ -203,13 +629,27 @@ impl Registry {
     /// Falls back to the step's regular validator when no interactive-specific
     /// validator is registered.
     pub fn validate_for_session(&self, step_name: &str, args: &Value) -> Result<(), String> {
+        self.validate_step_for_session(step_name, args)
+            .map_err(|error| error.message().to_string())
+    }
+
+    /// Validates `args` for `step_name` inside an interactive session while
+    /// preserving timeout and environment errors from out-of-process
+    /// validators.
+    pub fn validate_step_for_session(
+        &self,
+        step_name: &str,
+        args: &Value,
+    ) -> Result<(), StepError> {
         if let Some(validate) = self.session_validators.get(step_name) {
-            return validate(args);
+            return validate(args).map_err(StepError::InvalidArguments);
         }
-        let Some(definition) = self.steps.get(step_name) else {
-            return Err(format!("`{step_name}` is not a registered step"));
+        let Some(definition) = self.get(step_name) else {
+            return Err(StepError::InvalidArguments(format!(
+                "`{step_name}` is not a registered step"
+            )));
         };
-        (definition.validate)(args)
+        definition.validate_step(args)
     }
 
     /// Registers a step-specific argument redactor called before step arguments

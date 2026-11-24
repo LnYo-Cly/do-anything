@@ -191,6 +191,29 @@ impl LoadedCase {
     }
 }
 
+/// Category of a case loading or preflight failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaseErrorKind {
+    /// The case file or a step's arguments are invalid.
+    #[default]
+    InvalidInput,
+    /// An external validator or environment check failed.
+    Environment,
+    /// An external validator exceeded its timeout.
+    Timeout,
+}
+
+impl CaseErrorKind {
+    /// The name used in JSON reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::Environment => "environment",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
 /// A case file that could not be loaded or is not valid.
 #[derive(Debug, Clone)]
 pub struct CaseError {
@@ -198,6 +221,19 @@ pub struct CaseError {
     pub file: PathBuf,
     /// What is wrong and, where the parser knows it, where.
     pub message: String,
+    /// Failure category, which decides the process exit code.
+    pub kind: CaseErrorKind,
+}
+
+impl CaseError {
+    /// Constructs an input/validation error for `file`.
+    pub fn invalid(file: PathBuf, message: impl Into<String>) -> Self {
+        Self {
+            file,
+            message: message.into(),
+            kind: CaseErrorKind::InvalidInput,
+        }
+    }
 }
 
 /// A valid case that relies on something fragile.
@@ -1942,12 +1978,14 @@ fn collect_env_references(value: &Value, names: &mut BTreeSet<String>) {
 pub fn discover(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, CaseError> {
     let mut files = Vec::new();
     for input in inputs {
-        let metadata = std::fs::metadata(input).map_err(|error| CaseError {
-            file: input.clone(),
-            message: format!(
-                "could not read `{}`: {error}; check that the path exists",
-                paths::display(input)
-            ),
+        let metadata = std::fs::metadata(input).map_err(|error| {
+            CaseError::invalid(
+                input.clone(),
+                format!(
+                    "could not read `{}`: {error}; check that the path exists",
+                    paths::display(input)
+                ),
+            )
         })?;
         if metadata.is_dir() {
             collect_yaml(input, &mut files)?;
@@ -1961,24 +1999,30 @@ pub fn discover(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, CaseError> {
 }
 
 fn collect_yaml(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), CaseError> {
-    let entries = std::fs::read_dir(dir).map_err(|error| CaseError {
-        file: dir.to_path_buf(),
-        message: format!("could not list `{}`: {error}", paths::display(dir)),
+    let entries = std::fs::read_dir(dir).map_err(|error| {
+        CaseError::invalid(
+            dir.to_path_buf(),
+            format!("could not list `{}`: {error}", paths::display(dir)),
+        )
     })?;
     for entry in entries {
-        let entry = entry.map_err(|error| CaseError {
-            file: dir.to_path_buf(),
-            message: format!(
-                "could not read an entry of `{}`: {error}",
-                paths::display(dir)
-            ),
+        let entry = entry.map_err(|error| {
+            CaseError::invalid(
+                dir.to_path_buf(),
+                format!(
+                    "could not read an entry of `{}`: {error}",
+                    paths::display(dir)
+                ),
+            )
         })?;
-        let file_type = entry.file_type().map_err(|error| CaseError {
-            file: entry.path(),
-            message: format!(
-                "could not inspect `{}`: {error}",
-                paths::display(&entry.path())
-            ),
+        let file_type = entry.file_type().map_err(|error| {
+            CaseError::invalid(
+                entry.path(),
+                format!(
+                    "could not inspect `{}`: {error}",
+                    paths::display(&entry.path())
+                ),
+            )
         })?;
         let path = entry.path();
         if file_type.is_dir() {
@@ -2062,16 +2106,15 @@ fn vars_file_problem(path: &Path, source: &str, location: Location, message: Str
 
 /// Loads and parses one case file.
 pub fn load_file(path: &Path) -> Result<LoadedCase, CaseError> {
-    let text = std::fs::read_to_string(path).map_err(|error| CaseError {
-        file: path.to_path_buf(),
-        message: format!(
-            "could not read the case file: {error}; check the path and that the file is UTF-8"
-        ),
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        CaseError::invalid(
+            path.to_path_buf(),
+            format!(
+                "could not read the case file: {error}; check the path and that the file is UTF-8"
+            ),
+        )
     })?;
-    let case = parse(&text).map_err(|message| CaseError {
-        file: path.to_path_buf(),
-        message,
-    })?;
+    let case = parse(&text).map_err(|message| CaseError::invalid(path.to_path_buf(), message))?;
     Ok(LoadedCase {
         path: path.to_path_buf(),
         case,
