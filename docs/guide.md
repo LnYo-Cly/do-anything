@@ -850,13 +850,17 @@ Boundary and replay guarantees:
 - **Input masking & secret scrubbing**: `model/locate` always captures a 1:1
   CSS-viewport PNG through the session's input-masked screenshot path: every
   accessible `<input>`, `<textarea>`, `<select>`, and `[contenteditable]` field —
+  including controls inside browser top-layer elements (modal `<dialog>` via
+  `showModal()`, open `[popover]:popover-open` popovers, and `:fullscreen`
+  elements), open shadow DOM roots, accessible same-origin and nested frames,
   plus the entire bounding rectangle of any cross-origin `<iframe>` or `<frame>`
-  (including cross-origin frames nested inside same-origin frames) — is covered
-  with solid black `#000000` before capture so cross-origin password fields can
-  never leak to external vision hooks. Every outgoing `query`, `rubric`,
-  `candidates`, `snapshot`, and `evidence` payload is scrubbed through `Secrets`
-  before reaching the hook's stdin, and every incoming `rationale`, `model`,
-  `usage`, `trace_id`, and stderr diagnostic is scrubbed before being printed or
+  (including cross-origin frames nested inside same-origin frames or top-layer
+  elements) — is covered with solid black `#000000` above the element's layer
+  before capture so sensitive or cross-origin password fields can never leak to
+  external vision hooks. Every outgoing `query`, `rubric`, `candidates`,
+  `snapshot`, and `evidence` payload is scrubbed through `Secrets` before
+  reaching the hook's stdin, and every incoming `rationale`, `model`, `usage`,
+  `trace_id`, and stderr diagnostic is scrubbed before being printed or
   persisted.
 - **Audit trail & model-free `da run`**: `.da/sessions/<id>/steps.jsonl` records
   `model`, `latency_ms`, `usage`, `trace_id`, and `confidence` on hook-assisted
@@ -2193,12 +2197,14 @@ The cover hides editable fields, not ordinary text. A page that writes a secret
 into a heading, a paragraph or an attribute still shows it in the screenshot
 pixels; `dom.html` is redacted, but the PNG is not. The cover also descends into
 accessible same-origin and nested frames (`<iframe>` and `<frame>`) and into open
-shadow roots, scaling masks across axis-aligned frame transforms
-(`scale(...)`, `translate(...)`, `zoom`), and refuses to emit a screenshot when a
-visible field lies inside an unmappable transform (such as rotation, skew,
-reflection, or 3D transforms), whereas cross-origin frames cannot be reached from
-the main page. Treat both kinds of page as unsuitable for screenshots that leave
-the machine.
+shadow roots, promotes masks into the top layer for fields inside modal
+`<dialog>`, open `[popover]`, or `:fullscreen` elements, scales masks across
+axis-aligned frame transforms (`scale(...)`, `translate(...)`, `zoom`), and
+refuses to emit a screenshot when a visible field lies inside an unmappable
+transform (such as rotation, skew, reflection, or 3D transforms), whereas
+cross-origin frames cannot be reached from `browser.screenshot` (though
+`model/locate` covers cross-origin frames entirely). Treat both kinds of page
+as unsuitable for screenshots that leave the machine.
 
 `headless`, `width` and `height` only apply when the first `browser.open` creates
 the page. A later `browser.open` that gives a different effective value is a step

@@ -436,6 +436,10 @@ fn route(
         (_, "/browser/mask-iframe") => html_response("200 OK", browser_mask_iframe()),
         (_, "/browser/mask-iframe-inner") => html_response("200 OK", browser_mask_iframe_inner()),
         (_, "/browser/mask-iframe-nested") => html_response("200 OK", browser_mask_iframe_nested()),
+        (_, "/browser/mask-top-layer") => html_response("200 OK", browser_mask_top_layer()),
+        (_, "/browser/mask-top-layer-inner") => {
+            html_response("200 OK", browser_mask_top_layer_inner())
+        }
         (_, "/browser/probe/shadow") => html_response("200 OK", browser_probe_shadow()),
         (_, "/browser/shadow") => html_response("200 OK", &browser_shadow(query)),
         (_, "/browser/shadow-closed") => html_response("200 OK", browser_shadow_closed()),
@@ -1495,6 +1499,60 @@ fn browser_mask_iframe_nested() -> &'static str {
 <input id="nested-pw" type="password" value="nested-secret" autocomplete="off"
   style="position:fixed;left:12px;top:12px;width:200px;height:30px;color:#f00;">
 </body></html>"#
+}
+
+fn browser_mask_top_layer() -> &'static str {
+    r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>Mask Top Layer Probe</title>
+<style>
+html,body{margin:0;padding:0;background:#fff;font:16px sans-serif}
+::backdrop{background:rgba(0,140,0,0.15)}
+#modal-dlg{position:fixed;left:30px;top:30px;width:440px;height:280px;margin:0;padding:0;border:0;background:#fff;transform:translate(10px,10px) scale(1.1);transform-origin:0 0}
+#modal-pw{position:fixed;left:20px;top:20px;width:200px;height:40px;background:#ff00ff;color:#ff00ff;border:0;padding:0;margin:0}
+#modal-shadow-host{position:fixed;left:20px;top:80px;width:200px;height:40px}
+#modal-frame{position:fixed;left:20px;top:140px;width:240px;height:80px;border:0}
+#modal-btn{position:fixed;left:260px;top:20px;width:140px;height:40px;background:rgb(0,200,80);color:#fff;border:0}
+#top-pop{position:fixed;left:560px;top:40px;width:280px;height:160px;margin:0;padding:0;border:0;background:#fff}
+#pop-pw{position:fixed;left:580px;top:60px;width:200px;height:40px;background:#ff00ff;color:#ff00ff;border:0;padding:0;margin:0}
+#top-layer-report{position:fixed;left:30px;top:380px}
+</style></head>
+<body>
+<dialog id="modal-dlg">
+  <input id="modal-pw" type="password" value="modal-secret" autocomplete="off">
+  <div id="modal-shadow-host"></div>
+  <iframe id="modal-frame" src="/browser/mask-top-layer-inner" onload="document.getElementById('modal-btn').setAttribute('data-frame-loaded','1')"></iframe>
+  <button id="modal-btn" type="button">OK</button>
+</dialog>
+<div id="top-pop" popover="auto">
+  <input id="pop-pw" type="password" value="popover-secret" autocomplete="off">
+</div>
+<p id="top-layer-report">pending</p>
+<script>
+var sr = document.getElementById('modal-shadow-host').attachShadow({ mode: 'open' });
+var spw = document.createElement('input');
+spw.id = 'modal-shadow-pw';
+spw.type = 'password';
+spw.value = 'shadow-modal-secret';
+spw.style.cssText = 'display:block;width:200px;height:40px;background:#ff00ff;color:#ff00ff;border:0;padding:0;margin:0';
+sr.appendChild(spw);
+
+var dlg = document.getElementById('modal-dlg');
+var pop = document.getElementById('top-pop');
+dlg.showModal();
+pop.showPopover();
+document.getElementById('top-layer-report').textContent =
+  'modal=' + dlg.matches(':modal') + ',pop=' + pop.matches(':popover-open');
+</script>
+</body></html>"##
+}
+
+fn browser_mask_top_layer_inner() -> &'static str {
+    r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>Mask Top Layer Frame</title></head>
+<body style="margin:0;background:#fff;">
+<input id="frame-pw" type="password" value="frame-modal-secret" autocomplete="off"
+  style="position:fixed;left:10px;top:10px;width:180px;height:40px;background:#ff00ff;color:#ff00ff;border:0;padding:0;margin:0;">
+</body></html>"##
 }
 
 fn browser_probe_shadow() -> &'static str {
