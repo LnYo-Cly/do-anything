@@ -324,7 +324,14 @@ struct StreamBuffer {
     bytes: VecDeque<u8>,
     base_offset: u64,
     total_bytes: u64,
+    /// Absolute offset where the next snapshot starts. It only ever moves to
+    /// the start of a line, so a snapshot can never begin in the middle of a
+    /// value that `Secrets::redact` would otherwise fail to recognize.
     cursor: u64,
+    /// Absolute offset where pattern matching resumes. It advances to the end
+    /// of every match, independently of `cursor`, so a later wait still finds
+    /// the next occurrence even when the snapshot replays the matched line.
+    search_floor: u64,
     closed: bool,
 }
 
@@ -356,6 +363,9 @@ impl StreamBuffer {
         if self.cursor < self.base_offset {
             self.cursor = self.base_offset;
         }
+        if self.search_floor < self.base_offset {
+            self.search_floor = self.base_offset;
+        }
     }
 
     fn unconsumed_text(&mut self) -> String {
@@ -380,7 +390,7 @@ impl StreamBuffer {
         let overlap = needle.len().saturating_sub(1) as u64;
         let search_abs = (*scanned_up_to)
             .saturating_sub(overlap)
-            .max(self.cursor)
+            .max(self.search_floor)
             .max(self.base_offset);
         let search_start = search_abs.saturating_sub(self.base_offset) as usize;
         let slice = self.bytes.make_contiguous();
@@ -390,14 +400,29 @@ impl StreamBuffer {
         }
         let rel_pos = find_subslice(&slice[search_start..], needle)?;
         let match_end = search_start + rel_pos + needle.len();
+        let match_end_abs = self.base_offset + match_end as u64;
         let text = if self.base_offset > 0 {
             self.overflow_notice()
         } else {
             let unconsumed_start = self.cursor.saturating_sub(self.base_offset) as usize;
             String::from_utf8_lossy(&slice[unconsumed_start..]).into_owned()
         };
-        self.cursor = self.base_offset + match_end as u64;
+        self.search_floor = match_end_abs;
+        self.cursor = self.line_start(match_end_abs).max(self.cursor);
         Some(text)
+    }
+
+    /// Returns the absolute offset just after the last newline before
+    /// `offset`, or the retained-buffer start when no newline precedes it.
+    fn line_start(&self, offset: u64) -> u64 {
+        let end = offset.saturating_sub(self.base_offset) as usize;
+        self.bytes
+            .iter()
+            .take(end)
+            .rposition(|byte| *byte == b'\n')
+            .map_or(self.base_offset, |index| {
+                self.base_offset + index as u64 + 1
+            })
     }
 
     fn evidence_text(&mut self) -> String {
@@ -1637,12 +1662,18 @@ mod tests {
             buf.find_and_advance(b"ping").as_deref(),
             Some("ping\npong\n")
         );
-        assert_eq!(buf.find_and_advance(b"pong").as_deref(), Some("\npong\n"));
+        assert_eq!(
+            buf.find_and_advance(b"pong").as_deref(),
+            Some("ping\npong\n")
+        );
         assert!(buf.find_and_advance(b"ping").is_none());
 
         // Pushing another `ping` wakes a subsequent search.
         buf.push_chunk(b"ping\n");
-        assert_eq!(buf.find_and_advance(b"ping").as_deref(), Some("\nping\n"));
+        assert_eq!(
+            buf.find_and_advance(b"ping").as_deref(),
+            Some("pong\nping\n")
+        );
 
         // Patterns split across consecutive pipe chunks still match before overflow.
         let mut split_buf = StreamBuffer::default();
@@ -1690,6 +1721,34 @@ mod tests {
             .expect("split pattern after overflow must still match");
         assert!(post.contains("omitted"), "{post}");
         assert!(!post.contains("POST_SPLIT_READY"), "{post}");
+    }
+
+    #[test]
+    fn stream_buffer_snapshots_start_at_line_boundaries_after_mid_secret_matches() {
+        let mut buf = StreamBuffer::default();
+        buf.push_chunk(b"token=supersecretvalue123\nCURSOR_READY\n");
+
+        // A match that ends inside a secret must not leave the next snapshot
+        // starting mid-value where `Secrets::redact` cannot recognize it.
+        assert_eq!(
+            buf.find_and_advance(b"ersec").as_deref(),
+            Some("token=supersecretvalue123\nCURSOR_READY\n")
+        );
+        assert!(
+            buf.find_and_advance(b"token=").is_none(),
+            "the consumed occurrence must not match again"
+        );
+        let second = buf
+            .find_and_advance(b"value")
+            .expect("the suffix of the secret must still match");
+        assert!(
+            second.starts_with("token=supersecretvalue123"),
+            "snapshot must start at the matched line's beginning: {second:?}"
+        );
+        assert!(
+            !second.starts_with("retvalue123"),
+            "snapshot must never start mid-secret: {second:?}"
+        );
     }
 
     fn assert_stream_buffer_omits_post_eviction_secret(

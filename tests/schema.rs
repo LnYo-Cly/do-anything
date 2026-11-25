@@ -1638,7 +1638,7 @@ fn proc_steps_schema_agrees_with_validate() {
             "`{step_name}` schema must reject {bad_args}: {instance}"
         );
         assert!(
-            (def.validate)(&bad_args).is_err(),
+            def.validate(&bad_args).is_err(),
             "`{step_name}` validate must reject {bad_args}"
         );
     }
@@ -1693,11 +1693,11 @@ fn fs_watch_schema_agrees_with_validate() {
         json!({"path": "artifacts", "recursive": true, "max_entries": 1, "hash": false}),
     ] {
         assert!(
-            jsonschema::is_valid(&def.args_schema, &valid_args),
+            jsonschema::is_valid(def.args_schema, &valid_args),
             "fs.watch schema must accept {valid_args}"
         );
         assert!(
-            (def.validate)(&valid_args).is_ok(),
+            def.validate(&valid_args).is_ok(),
             "fs.watch validate must accept {valid_args}"
         );
     }
@@ -1711,11 +1711,11 @@ fn fs_watch_schema_agrees_with_validate() {
         json!({"path": "out", "extra": true}),
     ] {
         assert!(
-            !jsonschema::is_valid(&def.args_schema, &bad_args),
+            !jsonschema::is_valid(def.args_schema, &bad_args),
             "fs.watch schema must reject {bad_args}"
         );
         assert!(
-            (def.validate)(&bad_args).is_err(),
+            def.validate(&bad_args).is_err(),
             "fs.watch validate must reject {bad_args}"
         );
     }

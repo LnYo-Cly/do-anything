@@ -1907,8 +1907,8 @@ At least one of `input` or `eof: true` must be provided. Returns
 
 #### `proc.wait_output`
 
-Waits for a non-empty `pattern` substring in unconsumed output emitted after the
-previous match cursor on that process.
+Waits for a non-empty `pattern` substring in output emitted after the previous
+match on that process.
 
 | Argument | Meaning |
 | --- | --- |
@@ -1917,10 +1917,13 @@ previous match cursor on that process.
 | `stream` | Which stream to search: `both` (default), `stdout`, or `stderr`. |
 | `timeout_ms` | Maximum wait in milliseconds. Defaults to `30000`. |
 
-Returns `{ "name", "matched", "stream", "stdout", "stderr" }`, advancing the
-matched stream's cursor past the match so repeated prompts or lines across
-subsequent steps match only new output. If the process exits before emitting
-`pattern`, the step fails fast with an execution error (exit 1).
+Returns `{ "name", "matched", "stream", "stdout", "stderr" }`. Matching resumes
+after the match, so repeated prompts or lines across subsequent steps match only
+new output. Returned text starts at the beginning of the matched line rather
+than at the match end, so a pattern that ends inside a `${env:NAME}` value still
+returns the complete value for redaction instead of an unredactable suffix. If
+the process exits before emitting `pattern`, the step fails fast with an
+execution error (exit 1).
 
 #### `proc.stop`
 

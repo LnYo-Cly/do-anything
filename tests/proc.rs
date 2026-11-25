@@ -359,6 +359,16 @@ fn main() {
             }
             std::process::exit(1);
         }
+        Some("cursor-secret") => {
+            let secret = env::var("DA_TEST_PROC_SECRET")
+                .expect("DA_TEST_PROC_SECRET must be set for cursor-secret");
+            println!("token={secret}");
+            println!("CURSOR_READY");
+            let _ = io::stdout().flush();
+            loop {
+                thread::sleep(Duration::from_secs(10));
+            }
+        }
         Some("flood") => {
             let chunk_out = vec![b'A'; 65_536];
             let chunk_err = vec![b'E'; 65_536];
@@ -1918,4 +1928,121 @@ steps:
         "proc.stop stderr must include omission notice: {stop_stderr:?}"
     );
     assert_no_secret_fragments("proc.stop stderr", stop_stderr, secret);
+}
+
+#[test]
+fn cursor_split_secret_suffixes_never_leak_from_wait_or_ready_paths() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-r9-cursor-secret");
+    let bundles = dir.path().join("bundles");
+    let secret = "supersecretvalue123";
+
+    let case = dir.write(
+        "cursor-split-secret.yaml",
+        &format!(
+            r#"
+name: Cursor split secret stays redacted
+steps:
+  - proc.start:
+      name: wait_path
+      command: '{helper}'
+      args: ["cursor-secret"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+      ready_pattern: "token="
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: wait_path
+      pattern: "ersec"
+      stream: stdout
+      timeout_ms: 5000
+  - proc.wait_output:
+      name: wait_path
+      pattern: "value"
+      stream: stdout
+      timeout_ms: 5000
+  - proc.start:
+      name: ready_path
+      command: '{helper}'
+      args: ["cursor-secret"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+      ready_pattern: "ersec"
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: ready_path
+      pattern: "value"
+      stream: stdout
+      timeout_ms: 5000
+    expect:
+      - path: $.stdout
+        equals: "force-failure-to-inspect-bundle"
+"#,
+            helper = helper.display(),
+        ),
+    );
+
+    let output = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&case),
+            "--bundle-dir",
+            path_str(&bundles),
+        ],
+        &[("DA_PROC_TEST_SECRET", secret)],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let out_str = stdout(&output);
+    assert_no_secret_fragments("cli json", &out_str, secret);
+    assert!(
+        !out_str.contains("retvalue123"),
+        "cli json leaked the post-match secret suffix: {out_str:?}"
+    );
+
+    let report = json_stdout(&output);
+    assert_eq!(report["cases"][0]["status"], "failed", "{report}");
+    assert_eq!(report["cases"][0]["error"]["kind"], "assertion", "{report}");
+    for index in [1, 2, 3, 4] {
+        let result = &report["cases"][0]["steps"][index]["result"];
+        let result_text = result["stdout"].as_str().unwrap_or_default();
+        assert!(
+            result_text.contains("***"),
+            "step {index} must return the redacted line: {result_text:?}"
+        );
+        assert!(
+            !result_text.contains("retvalue123"),
+            "step {index} leaked the post-match secret suffix: {result_text:?}"
+        );
+        assert_no_secret_fragments("step result", result_text, secret);
+    }
+
+    let bundle_dir = PathBuf::from(
+        report["cases"][0]["bundle"]
+            .as_str()
+            .expect("the failed case must write a bundle"),
+    );
+    for rel in [
+        "report.json",
+        "proc/wait_path-stdout.log",
+        "proc/ready_path-stdout.log",
+    ] {
+        let content = fs::read_to_string(bundle_dir.join(rel))
+            .unwrap_or_else(|error| panic!("{rel} must be readable: {error}"));
+        assert_no_secret_fragments(rel, &content, secret);
+        assert!(
+            !content.contains("retvalue123"),
+            "{rel} leaked the post-match secret suffix: {content:?}"
+        );
+    }
 }
