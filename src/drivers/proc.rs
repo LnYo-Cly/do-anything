@@ -324,13 +324,10 @@ struct StreamBuffer {
     bytes: VecDeque<u8>,
     base_offset: u64,
     total_bytes: u64,
-    /// Absolute offset where the next snapshot starts. It only ever moves to
-    /// the start of a line, so a snapshot can never begin in the middle of a
-    /// value that `Secrets::redact` would otherwise fail to recognize.
-    cursor: u64,
     /// Absolute offset where pattern matching resumes. It advances to the end
-    /// of every match, independently of `cursor`, so a later wait still finds
-    /// the next occurrence even when the snapshot replays the matched line.
+    /// of every match while snapshots still return the full un-evicted buffer,
+    /// so repeated waits match only new output without ever slicing inside a
+    /// single-line or multi-line `${env:NAME}` secret before `Secrets` redacts it.
     search_floor: u64,
     closed: bool,
 }
@@ -360,21 +357,9 @@ impl StreamBuffer {
         }
         self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         self.base_offset = self.total_bytes - self.bytes.len() as u64;
-        if self.cursor < self.base_offset {
-            self.cursor = self.base_offset;
-        }
         if self.search_floor < self.base_offset {
             self.search_floor = self.base_offset;
         }
-    }
-
-    fn unconsumed_text(&mut self) -> String {
-        if self.base_offset > 0 {
-            return self.overflow_notice();
-        }
-        let start = self.cursor.saturating_sub(self.base_offset) as usize;
-        let slice = self.bytes.make_contiguous();
-        String::from_utf8_lossy(&slice[start..]).into_owned()
     }
 
     #[cfg(test)]
@@ -400,29 +385,8 @@ impl StreamBuffer {
         }
         let rel_pos = find_subslice(&slice[search_start..], needle)?;
         let match_end = search_start + rel_pos + needle.len();
-        let match_end_abs = self.base_offset + match_end as u64;
-        let text = if self.base_offset > 0 {
-            self.overflow_notice()
-        } else {
-            let unconsumed_start = self.cursor.saturating_sub(self.base_offset) as usize;
-            String::from_utf8_lossy(&slice[unconsumed_start..]).into_owned()
-        };
-        self.search_floor = match_end_abs;
-        self.cursor = self.line_start(match_end_abs).max(self.cursor);
-        Some(text)
-    }
-
-    /// Returns the absolute offset just after the last newline before
-    /// `offset`, or the retained-buffer start when no newline precedes it.
-    fn line_start(&self, offset: u64) -> u64 {
-        let end = offset.saturating_sub(self.base_offset) as usize;
-        self.bytes
-            .iter()
-            .take(end)
-            .rposition(|byte| *byte == b'\n')
-            .map_or(self.base_offset, |index| {
-                self.base_offset + index as u64 + 1
-            })
+        self.search_floor = self.base_offset + match_end as u64;
+        Some(self.evidence_text())
     }
 
     fn evidence_text(&mut self) -> String {
@@ -754,16 +718,6 @@ impl ManagedProcess {
         !self.stopped && self.refresh_exit().is_ok_and(|status| status.is_none())
     }
 
-    fn snapshot_unconsumed(&self) -> (String, String) {
-        match self.streams.state.lock() {
-            Ok(mut guard) => (
-                guard.stdout.unconsumed_text(),
-                guard.stderr.unconsumed_text(),
-            ),
-            Err(_) => (String::new(), String::new()),
-        }
-    }
-
     fn snapshot_evidence(&self) -> (String, String) {
         match self.streams.state.lock() {
             Ok(mut guard) => (guard.stdout.evidence_text(), guard.stderr.evidence_text()),
@@ -813,7 +767,7 @@ impl ManagedProcess {
                             .stdout
                             .find_and_advance_from(needle, &mut stdout_scanned)
                         {
-                            let stderr = guard.stderr.unconsumed_text();
+                            let stderr = guard.stderr.evidence_text();
                             Some(WaitMatch {
                                 matched_stream: StreamKind::Stdout,
                                 stdout,
@@ -823,7 +777,7 @@ impl ManagedProcess {
                             .stderr
                             .find_and_advance_from(needle, &mut stderr_scanned)
                         {
-                            let stdout = guard.stdout.unconsumed_text();
+                            let stdout = guard.stdout.evidence_text();
                             Some(WaitMatch {
                                 matched_stream: StreamKind::Stderr,
                                 stdout,
@@ -1198,7 +1152,7 @@ fn run_start(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             .processes
             .get(&args.name)
             .ok_or_else(|| StepError::Environment("missing spawned process".to_string()))?;
-        proc.snapshot_unconsumed()
+        proc.snapshot_evidence()
     };
 
     Ok(json!({
@@ -1655,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_buffer_caps_memory_and_advances_cursor_past_repeats() {
+    fn stream_buffer_caps_memory_and_advances_search_floor_past_repeats() {
         let mut buf = StreamBuffer::default();
         buf.push_chunk(b"ping\npong\n");
         assert_eq!(
@@ -1668,12 +1622,13 @@ mod tests {
         );
         assert!(buf.find_and_advance(b"ping").is_none());
 
-        // Pushing another `ping` wakes a subsequent search.
+        // Pushing another `ping` wakes a subsequent search while retaining the full buffer.
         buf.push_chunk(b"ping\n");
         assert_eq!(
             buf.find_and_advance(b"ping").as_deref(),
-            Some("pong\nping\n")
+            Some("ping\npong\nping\n")
         );
+        assert!(buf.find_and_advance(b"ping").is_none());
 
         // Patterns split across consecutive pipe chunks still match before overflow.
         let mut split_buf = StreamBuffer::default();
@@ -1703,11 +1658,6 @@ mod tests {
         assert!(!matched.contains("TAIL_MARKER"), "{matched}");
         assert!(buf.find_and_advance(b"TAIL_MARKER").is_none());
 
-        let unconsumed = buf.unconsumed_text();
-        assert!(unconsumed.contains("exceeded"), "{unconsumed}");
-        assert!(unconsumed.contains("omitted"), "{unconsumed}");
-        assert!(!unconsumed.contains("TAIL_MARKER"), "{unconsumed}");
-
         // Patterns split across chunks after overflow still match while omitting text.
         let mut scanned = buf.total_bytes;
         buf.push_chunk(b"POST_SPLIT_");
@@ -1724,31 +1674,42 @@ mod tests {
     }
 
     #[test]
-    fn stream_buffer_snapshots_start_at_line_boundaries_after_mid_secret_matches() {
-        let mut buf = StreamBuffer::default();
-        buf.push_chunk(b"token=supersecretvalue123\nCURSOR_READY\n");
+    fn stream_buffer_snapshots_retain_full_un_evicted_buffer_for_multiline_secrets() {
+        let mut single = StreamBuffer::default();
+        single.push_chunk(b"token=supersecretvalue123\nCURSOR_READY\n");
 
-        // A match that ends inside a secret must not leave the next snapshot
-        // starting mid-value where `Secrets::redact` cannot recognize it.
+        // A match ending inside a secret must never drop the secret's prefix from later snapshots.
         assert_eq!(
-            buf.find_and_advance(b"ersec").as_deref(),
+            single.find_and_advance(b"ersec").as_deref(),
             Some("token=supersecretvalue123\nCURSOR_READY\n")
         );
         assert!(
-            buf.find_and_advance(b"token=").is_none(),
+            single.find_and_advance(b"token=").is_none(),
             "the consumed occurrence must not match again"
         );
-        let second = buf
+        let second = single
             .find_and_advance(b"value")
             .expect("the suffix of the secret must still match");
-        assert!(
-            second.starts_with("token=supersecretvalue123"),
-            "snapshot must start at the matched line's beginning: {second:?}"
-        );
-        assert!(
-            !second.starts_with("retvalue123"),
-            "snapshot must never start mid-secret: {second:?}"
-        );
+        assert_eq!(second, "token=supersecretvalue123\nCURSOR_READY\n");
+
+        for sep in ["\n", "\r", "\r\n"] {
+            let payload = format!("token=abc{sep}def-tail{sep}CURSOR_READY\n");
+            let mut multi = StreamBuffer::default();
+            multi.push_chunk(payload.as_bytes());
+            assert_eq!(
+                multi.find_and_advance(b"def").as_deref(),
+                Some(payload.as_str())
+            );
+            assert!(
+                multi.find_and_advance(b"def").is_none(),
+                "matched substring inside multiline secret must not match again"
+            );
+            assert_eq!(
+                multi.find_and_advance(b"CURSOR").as_deref(),
+                Some(payload.as_str())
+            );
+            assert_eq!(multi.evidence_text(), payload);
+        }
     }
 
     fn assert_stream_buffer_omits_post_eviction_secret(
@@ -1789,9 +1750,6 @@ mod tests {
         let evidence = buf.evidence_text();
         assert_clean("evidence_text", &evidence);
 
-        let unconsumed = buf.unconsumed_text();
-        assert_clean("unconsumed_text", &unconsumed);
-
         let mut scanned = 0;
         let matched = buf
             .find_and_advance_from(marker, &mut scanned)
@@ -1799,7 +1757,7 @@ mod tests {
         assert_clean("find_and_advance_from", &matched);
         assert!(
             buf.find_and_advance_from(marker, &mut scanned).is_none(),
-            "cursor must advance past matched marker even when text is omitted"
+            "search_floor must advance past matched marker even when text is omitted"
         );
     }
 

@@ -1919,11 +1919,13 @@ match on that process.
 
 Returns `{ "name", "matched", "stream", "stdout", "stderr" }`. Matching resumes
 after the match, so repeated prompts or lines across subsequent steps match only
-new output. Returned text starts at the beginning of the matched line rather
-than at the match end, so a pattern that ends inside a `${env:NAME}` value still
-returns the complete value for redaction instead of an unredactable suffix. If
-the process exits before emitting `pattern`, the step fails fast with an
-execution error (exit 1).
+new output. While output remains within the 1 MiB per-stream buffer, returned
+`stdout` and `stderr` snapshots include the full un-evicted buffer from byte 0
+so complete `${env:NAME}` values — including values containing `\n`, `\r`, or
+`\r\n` — stay intact for redaction even when a pattern matches inside a secret;
+once eviction occurs (`base_offset > 0`), snapshots emit the non-sensitive
+truncation notice instead. If the process exits before emitting `pattern`, the
+step fails fast with an execution error (exit 1).
 
 #### `proc.stop`
 

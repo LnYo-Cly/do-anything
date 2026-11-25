@@ -362,9 +362,16 @@ fn main() {
         Some("cursor-secret") => {
             let secret = env::var("DA_TEST_PROC_SECRET")
                 .expect("DA_TEST_PROC_SECRET must be set for cursor-secret");
-            println!("token={secret}");
-            println!("CURSOR_READY");
-            let _ = io::stdout().flush();
+            let payload = format!("token={secret}\nCURSOR_READY\n");
+            if args.iter().any(|arg| arg == "--stderr") {
+                let mut err = io::stderr().lock();
+                err.write_all(payload.as_bytes()).expect("stderr write");
+                err.flush().expect("stderr flush");
+            } else {
+                let mut out = io::stdout().lock();
+                out.write_all(payload.as_bytes()).expect("stdout write");
+                out.flush().expect("stdout flush");
+            }
             loop {
                 thread::sleep(Duration::from_secs(10));
             }
@@ -2044,5 +2051,157 @@ steps:
             !content.contains("retvalue123"),
             "{rel} leaked the post-match secret suffix: {content:?}"
         );
+    }
+}
+
+#[test]
+fn multiline_secret_suffixes_never_leak_from_wait_or_ready_paths() {
+    let _process_table = lock_process_table();
+    let helper = helper_bin();
+    let dir = TempDir::new("proc-r10-multiline-secret");
+
+    for (label, sep) in [("lf", "\n"), ("cr", "\r"), ("crlf", "\r\n")] {
+        let bundles = dir.path().join(format!("bundles-{label}"));
+        let secret = format!("r10partA{sep}r10midB-tail");
+        let case = dir.write(
+            &format!("multiline-secret-{label}.yaml"),
+            &format!(
+                r#"
+name: Multiline secret stays redacted ({label})
+steps:
+  - proc.start:
+      name: wait_path
+      command: '{helper}'
+      args: ["cursor-secret"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+      ready_pattern: "token="
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: wait_path
+      pattern: "r10midB"
+      stream: stdout
+      timeout_ms: 5000
+  - proc.wait_output:
+      name: wait_path
+      pattern: "CURSOR"
+      stream: stdout
+      timeout_ms: 5000
+  - proc.start:
+      name: ready_path
+      command: '{helper}'
+      args: ["cursor-secret"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+      ready_pattern: "r10midB"
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: ready_path
+      pattern: "CURSOR"
+      stream: stdout
+      timeout_ms: 5000
+  - proc.start:
+      name: stderr_path
+      command: '{helper}'
+      args: ["cursor-secret", "--stderr"]
+      env:
+        DA_TEST_PROC_SECRET: "${{env:DA_PROC_TEST_SECRET}}"
+      ready_pattern: "r10midB"
+      ready_timeout_ms: 5000
+  - proc.wait_output:
+      name: stderr_path
+      pattern: "CURSOR"
+      timeout_ms: 5000
+    expect:
+      - path: $.stderr
+        equals: "force-failure-to-inspect-bundle"
+"#,
+                helper = helper.display(),
+            ),
+        );
+
+        let output = run_da_with_env(
+            dir.path(),
+            &[
+                "--output",
+                "json",
+                "run",
+                path_str(&case),
+                "--bundle-dir",
+                path_str(&bundles),
+            ],
+            &[("DA_PROC_TEST_SECRET", &secret)],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "[{label}] stdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output)
+        );
+
+        let assert_no_multiline_leak = |surface: &str, text: &str, check_pattern: bool| {
+            assert!(
+                !text.contains(&secret),
+                "[{label}] {surface} leaked complete secret: {text:?}"
+            );
+            for fragment in ["r10partA", "r10midB-tail", "midB-tail"] {
+                assert!(
+                    !text.contains(fragment),
+                    "[{label}] {surface} leaked secret fragment `{fragment}`: {text:?}"
+                );
+            }
+            if check_pattern {
+                assert!(
+                    !text.contains("r10midB"),
+                    "[{label}] {surface} leaked matched secret fragment `r10midB`: {text:?}"
+                );
+            }
+        };
+
+        let out_str = stdout(&output);
+        assert_no_multiline_leak("cli json", &out_str, false);
+
+        let report = json_stdout(&output);
+        assert_eq!(report["cases"][0]["status"], "failed", "{report}");
+        assert_eq!(report["cases"][0]["error"]["kind"], "assertion", "{report}");
+
+        for (index, field) in [
+            (0, "stdout"),
+            (1, "stdout"),
+            (2, "stdout"),
+            (3, "stdout"),
+            (4, "stdout"),
+            (5, "stderr"),
+            (6, "stderr"),
+        ] {
+            let result = &report["cases"][0]["steps"][index]["result"];
+            let result_text = result[field].as_str().unwrap_or_default();
+            assert!(
+                result_text.contains("***"),
+                "[{label}] step {index} {field} must return redacted output: {result_text:?}"
+            );
+            assert_no_multiline_leak(&format!("step {index} {field}"), result_text, true);
+        }
+
+        let bundle_dir = PathBuf::from(
+            report["cases"][0]["bundle"]
+                .as_str()
+                .expect("the failed case must write a bundle"),
+        );
+        for (rel, check_pattern) in [
+            ("report.json", false),
+            ("proc/wait_path-stdout.log", true),
+            ("proc/ready_path-stdout.log", true),
+            ("proc/stderr_path-stderr.log", true),
+        ] {
+            let content = fs::read_to_string(bundle_dir.join(rel))
+                .unwrap_or_else(|error| panic!("[{label}] {rel} must be readable: {error}"));
+            assert!(
+                content.contains("***"),
+                "[{label}] {rel} must contain redaction marker: {content:?}"
+            );
+            assert_no_multiline_leak(rel, &content, check_pattern);
+        }
     }
 }
