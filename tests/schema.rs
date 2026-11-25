@@ -63,7 +63,9 @@ fn schema() -> &'static Value {
     feature = "browser",
     feature = "cli",
     feature = "desktop",
-    feature = "http"
+    feature = "fs",
+    feature = "http",
+    feature = "proc"
 ))]
 fn validator(schema: &'static Value) -> jsonschema::Validator {
     jsonschema::validator_for(schema).expect("the emitted schema must compile")
@@ -318,7 +320,9 @@ fn step_definition(name: &str) -> do_anything::core::registry::StepRef<'static> 
     feature = "cli",
     feature = "db",
     feature = "desktop",
-    feature = "http"
+    feature = "fs",
+    feature = "http",
+    feature = "proc"
 ))]
 fn built_in_registry() -> do_anything::core::registry::Registry {
     let mut registry = do_anything::core::registry::Registry::new();
@@ -337,7 +341,8 @@ fn built_in_registry() -> do_anything::core::registry::Registry {
     feature = "cli",
     feature = "db",
     feature = "desktop",
-    feature = "http"
+    feature = "http",
+    feature = "proc"
 ))]
 fn valid_arguments(step: &str) -> Value {
     match step {
@@ -376,6 +381,10 @@ fn valid_arguments(step: &str) -> Value {
         "desktop.wait" => json!({"automation_id": "status"}),
         "desktop.read" => json!({"automation_id": "status"}),
         "desktop.screenshot" => json!({"path": "out.png"}),
+        "proc.start" => json!({"command": "da"}),
+        "proc.send" => json!({"input": "x"}),
+        "proc.wait_output" => json!({"pattern": "ok"}),
+        "proc.stop" => json!({}),
         other => panic!("add the valid arguments of `{other}` to this test"),
     }
 }
@@ -389,7 +398,8 @@ fn valid_arguments(step: &str) -> Value {
     feature = "cli",
     feature = "db",
     feature = "desktop",
-    feature = "http"
+    feature = "http",
+    feature = "proc"
 ))]
 fn declared_bounds(schema: &Value) -> Vec<(&'static str, Value)> {
     ["minimum", "minLength", "pattern"]
@@ -405,7 +415,8 @@ fn declared_bounds(schema: &Value) -> Vec<(&'static str, Value)> {
     feature = "cli",
     feature = "db",
     feature = "desktop",
-    feature = "http"
+    feature = "http",
+    feature = "proc"
 ))]
 fn bound_values(keyword: &str, bound: &Value) -> (Value, Option<Value>) {
     match keyword {
@@ -447,7 +458,8 @@ fn bound_values(keyword: &str, bound: &Value) -> (Value, Option<Value>) {
     feature = "cli",
     feature = "db",
     feature = "desktop",
-    feature = "http"
+    feature = "http",
+    feature = "proc"
 ))]
 #[test]
 fn every_declared_argument_bound_is_enforced_by_validate() {
@@ -509,7 +521,8 @@ fn every_declared_argument_bound_is_enforced_by_validate() {
     let drivers = usize::from(cfg!(feature = "browser"))
         + usize::from(cfg!(feature = "cli"))
         + usize::from(cfg!(feature = "desktop"))
-        + usize::from(cfg!(feature = "http"));
+        + usize::from(cfg!(feature = "http"))
+        + usize::from(cfg!(feature = "proc"));
     assert!(
         checked >= drivers,
         "expected at least one bounded argument per built-in driver, checked {checked}"
@@ -793,6 +806,7 @@ fn every_declared_observer_argument_bound_is_enforced_by_validate() {
 fn observer_arguments(observer: &str) -> Value {
     match observer {
         "browser.network" => json!({}),
+        "fs.watch" => json!({"path": "."}),
         "log.file" => json!({"path": "app.log"}),
         other => panic!("add the valid arguments of `{other}` to this test"),
     }
@@ -1014,7 +1028,8 @@ fn the_schema_embeds_each_registered_step_with_its_description() {
     feature = "cli",
     feature = "db",
     feature = "desktop",
-    feature = "http"
+    feature = "http",
+    feature = "proc"
 )))]
 #[test]
 fn the_schema_is_valid_when_no_step_is_registered() {
@@ -1539,6 +1554,171 @@ fn browser_computer_use_schemas_match_validate() {
             ("unknown field", json!({"extra": true})),
         ],
     );
+}
+
+#[cfg(feature = "proc")]
+#[test]
+fn proc_steps_schema_agrees_with_validate() {
+    let validator = validator(schema());
+    let registry = built_in_registry();
+
+    let valid = json!({
+        "name": "Process session",
+        "steps": [
+            {
+                "proc.start": {
+                    "name": "api_1.0",
+                    "command": "da",
+                    "args": ["--version"],
+                    "cwd": ".",
+                    "env": {"PORT": "8080"},
+                    "ready_pattern": "Listening",
+                    "ready_timeout_ms": 2000
+                }
+            },
+            { "proc.send": { "name": "api_1.0", "input": "ping\n", "eof": true } },
+            { "proc.send": { "eof": true } },
+            {
+                "proc.wait_output": {
+                    "name": "api_1.0",
+                    "pattern": "pong",
+                    "stream": "stderr",
+                    "timeout_ms": 1000
+                }
+            },
+            { "proc.stop": { "name": "api_1.0", "timeout_ms": 500 } },
+            { "proc.stop": {} }
+        ]
+    });
+    assert!(
+        validator.is_valid(&valid),
+        "valid proc.* steps must validate against the case schema: {valid}"
+    );
+
+    for (step_name, bad_args) in [
+        ("proc.start", json!({})),
+        ("proc.start", json!({"command": ""})),
+        ("proc.start", json!({"command": "da", "name": "../bad"})),
+        ("proc.start", json!({"command": "da", "name": "."})),
+        ("proc.start", json!({"command": "da", "ready_pattern": ""})),
+        (
+            "proc.start",
+            json!({"command": "da", "ready_timeout_ms": 0}),
+        ),
+        ("proc.start", json!({"command": "da", "extra": true})),
+        ("proc.send", json!({})),
+        ("proc.send", json!({"eof": false})),
+        ("proc.send", json!({"input": "x", "name": "/bad"})),
+        ("proc.send", json!({"input": "x", "timeout_ms": 0})),
+        ("proc.send", json!({"input": "x", "extra": 1})),
+        ("proc.wait_output", json!({})),
+        ("proc.wait_output", json!({"pattern": ""})),
+        (
+            "proc.wait_output",
+            json!({"pattern": "ok", "stream": "invalid"}),
+        ),
+        (
+            "proc.wait_output",
+            json!({"pattern": "ok", "timeout_ms": 0}),
+        ),
+        ("proc.wait_output", json!({"pattern": "ok", "extra": 1})),
+        ("proc.stop", json!({"name": "bad name"})),
+        ("proc.stop", json!({"timeout_ms": 0})),
+        ("proc.stop", json!({"extra": 1})),
+    ] {
+        let def = registry
+            .get(step_name)
+            .unwrap_or_else(|| panic!("`{step_name}` must be registered"));
+        let instance = json!({
+            "name": "Invalid proc",
+            "steps": [{ step_name: bad_args.clone() }]
+        });
+        assert!(
+            !validator.is_valid(&instance),
+            "`{step_name}` schema must reject {bad_args}: {instance}"
+        );
+        assert!(
+            def.validate(&bad_args).is_err(),
+            "`{step_name}` validate must reject {bad_args}"
+        );
+    }
+}
+
+#[cfg(feature = "fs")]
+#[test]
+fn fs_watch_schema_agrees_with_validate() {
+    let validator = validator(schema());
+    let registry = built_in_registry();
+    let def = registry
+        .observer("fs.watch")
+        .expect("`fs.watch` must be registered");
+
+    let step = if cfg!(feature = "proc") {
+        json!({"proc.stop": {}})
+    } else if cfg!(feature = "cli") {
+        json!({"cli.run": {"command": "da"}})
+    } else if cfg!(feature = "http") {
+        json!({"http.request": {"url": "http://127.0.0.1:1/"}})
+    } else if cfg!(feature = "db") {
+        json!({"db.query": {"url": "sqlite:app.db", "sql": "SELECT 1"}})
+    } else if cfg!(feature = "browser") {
+        json!({"browser.open": {"url": "http://127.0.0.1:1/"}})
+    } else {
+        json!(null)
+    };
+
+    if !step.is_null() {
+        let valid = json!({
+            "name": "Watch directory",
+            "observe": {
+                "out_dir": {
+                    "fs.watch": {
+                        "path": "artifacts",
+                        "recursive": false,
+                        "max_entries": 250,
+                        "hash": true
+                    }
+                }
+            },
+            "steps": [step]
+        });
+        assert!(
+            validator.is_valid(&valid),
+            "valid fs.watch observation must validate: {valid}"
+        );
+    }
+
+    for valid_args in [
+        json!({"path": "artifacts"}),
+        json!({"path": "artifacts", "recursive": true, "max_entries": 1, "hash": false}),
+    ] {
+        assert!(
+            jsonschema::is_valid(def.args_schema, &valid_args),
+            "fs.watch schema must accept {valid_args}"
+        );
+        assert!(
+            def.validate(&valid_args).is_ok(),
+            "fs.watch validate must accept {valid_args}"
+        );
+    }
+
+    for bad_args in [
+        json!({}),
+        json!({"path": ""}),
+        json!({"path": "out", "max_entries": 0}),
+        json!({"path": "out", "recursive": "yes"}),
+        json!({"path": "out", "hash": 1}),
+        json!({"path": "out", "extra": true}),
+    ] {
+        assert!(
+            !jsonschema::is_valid(def.args_schema, &bad_args),
+            "fs.watch schema must reject {bad_args}"
+        );
+        assert!(
+            def.validate(&bad_args).is_err(),
+            "fs.watch validate must reject {bad_args}"
+        );
+    }
 }
 
 /// Every file directly inside `dir` with the given extension, sorted by path.
