@@ -43,6 +43,8 @@ pub struct Options {
     pub idle_timeout_ms: u64,
     /// Optional external model hook configured for sessions started by this server.
     pub model_hook: Option<ModelHookSpec>,
+    /// Absolute paths of the explicit plugins this server was started with.
+    pub plugins: Vec<String>,
 }
 
 /// JSON-RPC error code for a body that is not JSON.
@@ -390,6 +392,7 @@ impl Server<'_> {
                 sessions_dir: self.options.sessions_dir.as_path(),
                 idle_timeout_ms: self.options.idle_timeout_ms,
                 model_hook: self.options.model_hook.as_ref(),
+                plugins: &self.options.plugins,
             };
             tools::call(&context, name, &arguments)
         };

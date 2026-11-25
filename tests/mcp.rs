@@ -795,6 +795,7 @@ fn a_browser_step_and_a_snapshot_round_trip() {
     server.finish();
 }
 
+#[cfg(feature = "cli")]
 const MCP_MOCK_HOOK_RS: &str = r#"
 use std::env;
 use std::fs;

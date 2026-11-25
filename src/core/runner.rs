@@ -12,12 +12,13 @@ use serde_saphyr::Location;
 use crate::core::assert::{self, AssertionReport};
 use crate::core::bundle::{FailureBundles, StepPhase, StepTrace};
 use crate::core::case::{
-    self, CaseError, CaseWarning, Expectation, LoadedCase, Observation, SavedValue, Step,
+    self, CaseError, CaseErrorKind, CaseWarning, Expectation, LoadedCase, Observation, SavedValue,
+    Step,
 };
 use crate::core::events::{Event, EventBus};
 use crate::core::filter::{self, Filters};
 use crate::core::observer::{Observer, ObserverError};
-use crate::core::registry::{Registry, StepDefinition, StepError};
+use crate::core::registry::{Registry, StepError};
 use crate::core::report::{
     CaseReport, CaseStatus, Problem, ProblemKind, RunOutcome, RunReport, StepReport, StepStatus,
 };
@@ -416,9 +417,9 @@ fn check_step_warnings(
     // the same case twice.
     if let Ok(args) = case::interpolate(&step.args, vars, secrets)
         && let Some(definition) = registry.get(&step.action)
-        && (definition.validate)(&args).is_ok()
+        && definition.validate(&args).is_ok()
     {
-        for warning in (definition.lint_warnings)(&args) {
+        for warning in definition.lint_warnings(&args) {
             warnings.push(CaseWarning {
                 file: loaded.path.clone(),
                 message: render_at(
@@ -461,17 +462,25 @@ fn check_step(
                 ),
             )),
             Some(definition) => {
-                if let Err(message) = (definition.validate)(&args) {
+                if let Err(error) = definition.validate_step(&args) {
+                    let (kind, message) = match error {
+                        StepError::InvalidArguments(message) | StepError::Execution(message) => {
+                            (CaseErrorKind::InvalidInput, message)
+                        }
+                        StepError::Environment(message) => (CaseErrorKind::Environment, message),
+                        StepError::Timeout(message) => (CaseErrorKind::Timeout, message),
+                    };
                     // Arguments are validated as one mapping, so the
                     // mapping start is the node the message names.
-                    errors.push(positioned(
+                    errors.push(positioned_with_kind(
                         loaded,
                         step.args_location,
                         format!("{label}: `{}` {message}", step.action),
+                        kind,
                     ));
                 }
                 if step.retry.is_some()
-                    && let Err(message) = (definition.check_retry)(&args)
+                    && let Err(message) = definition.check_retry(&args)
                 {
                     errors.push(positioned(
                         loaded,
@@ -535,7 +544,7 @@ fn check_observation(
             ),
         ));
     };
-    (definition.validate)(&args).map_err(|message| {
+    definition.validate(&args).map_err(|message| {
         positioned(
             loaded,
             observation.args_location,
@@ -562,9 +571,19 @@ fn render_at(loaded: &LoadedCase, location: Location, message: String) -> String
 
 /// Renders one case error at the place in the case file it belongs to.
 fn positioned(loaded: &LoadedCase, location: Location, message: String) -> CaseError {
+    positioned_with_kind(loaded, location, message, CaseErrorKind::InvalidInput)
+}
+
+fn positioned_with_kind(
+    loaded: &LoadedCase,
+    location: Location,
+    message: String,
+    kind: CaseErrorKind,
+) -> CaseError {
     CaseError {
         file: loaded.path.clone(),
         message: render_at(loaded, location, message),
+        kind,
     }
 }
 
@@ -858,7 +877,7 @@ struct ObservationSlot {
     /// Name the case gave the observation.
     name: String,
     /// Registered observer name, reported in an error.
-    kind: &'static str,
+    kind: String,
     /// The observation of this case.
     observer: Box<dyn Observer>,
 }
@@ -899,7 +918,7 @@ fn create_observations_with(
                 ),
             });
         };
-        let observer = (definition.create)(&args).map_err(|error| Problem {
+        let observer = definition.create(&args).map_err(|error| Problem {
             kind: problem_kind_of(&error),
             message: format!(
                 "observation `{}` (`{}`): {}",
@@ -910,7 +929,7 @@ fn create_observations_with(
         })?;
         slots.push(ObservationSlot {
             name: observation.name.clone(),
-            kind: definition.name,
+            kind: definition.name.to_string(),
             observer,
         });
     }
@@ -963,7 +982,7 @@ fn execute_step(
     };
 
     let Some(policy) = &step.retry else {
-        let result = run_attempt(definition, &args, observations, sessions)?;
+        let result = run_attempt(&definition, &args, observations, sessions)?;
         let evaluated = evaluate_and_save(step, result, vars)?;
         if !evaluated.saved.is_empty() {
             let secrets = lock(secrets);
@@ -972,7 +991,7 @@ fn execute_step(
         return Ok((evaluated.result, evaluated.assertions));
     };
 
-    if let Err(message) = (definition.check_retry)(&args) {
+    if let Err(message) = definition.check_retry(&args) {
         return Err(Problem {
             kind: ProblemKind::InvalidInput,
             message: format!("`{}` {message}", step.action),
@@ -982,7 +1001,7 @@ fn execute_step(
     let deadline = Instant::now().checked_add(Duration::from_millis(policy.timeout_ms));
     let interval = Duration::from_millis(policy.interval_ms);
     loop {
-        match run_attempt(definition, &args, observations, sessions) {
+        match run_attempt(&definition, &args, observations, sessions) {
             Ok(result) => {
                 let until_assertions = evaluate_all(&policy.until, &result);
                 if until_assertions.iter().all(|item| item.passed) {
@@ -1036,7 +1055,7 @@ fn wait_before_next_attempt_with(
 }
 
 fn run_attempt(
-    definition: &StepDefinition,
+    definition: &crate::core::registry::StepRef<'_>,
     args: &Value,
     observations: &mut [ObservationSlot],
     sessions: &mut Sessions,
@@ -1049,7 +1068,7 @@ fn run_attempt(
             .map_err(|error| observer_problem(slot, &error))?;
     }
 
-    match (definition.run)(args, sessions) {
+    match definition.run(args, sessions) {
         Ok(result) => {
             // Collection happens before assertions are evaluated: an `until` or
             // `expect` entry that names `$.observed.<name>` must see the values of this
@@ -1176,13 +1195,16 @@ pub fn run_single_step_with_observations(
         })?;
         report.args = Some(secrets.redact_json(&registry.redact_step_args(&step.action, &args)));
         let validation = if sessions.is_interactive() {
-            registry.validate_for_session(&step.action, &args)
+            registry.validate_step_for_session(&step.action, &args)
         } else {
-            (definition.validate)(&args)
+            definition.validate_step(&args)
         };
-        validation.map_err(|message| Problem {
-            kind: ProblemKind::InvalidInput,
-            message: format!("`{}` {message}", step.action),
+        validation.map_err(|error| match error {
+            StepError::InvalidArguments(message) => Problem {
+                kind: ProblemKind::InvalidInput,
+                message: format!("`{}` {message}", step.action),
+            },
+            other => problem_from_step_error(other),
         })?;
         let mut slots = if observations.is_empty() {
             Vec::new()
@@ -1192,7 +1214,7 @@ pub fn run_single_step_with_observations(
                 case::interpolate(raw, &empty_vars, secrets).map_err(|error| error.message)
             })?
         };
-        let result = run_attempt(definition, &args, &mut slots, sessions)?;
+        let result = run_attempt(&definition, &args, &mut slots, sessions)?;
         evaluate_and_save(step, result, vars)
     })();
 
@@ -3769,6 +3791,85 @@ mod tests {
         assert_eq!(
             invalid_report.error.as_ref().map(|e| e.kind),
             Some(ProblemKind::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn dynamic_step_validator_timeout_and_environment_preserve_problem_kind() {
+        use crate::core::registry::{DynamicStepDefinition, disallow_retry, no_lint_warnings};
+
+        let mut reg = Registry::new();
+        reg.register_dynamic(DynamicStepDefinition {
+            name: "dyn.timeout".to_string(),
+            description: "Timeout during validation.".to_string(),
+            args_schema: json!({"type": "object"}),
+            validate: std::sync::Arc::new(|_| Err(StepError::Timeout("timed out".to_string()))),
+            check_retry: std::sync::Arc::new(disallow_retry),
+            lint_warnings: std::sync::Arc::new(no_lint_warnings),
+            run: std::sync::Arc::new(|_, _| Ok(json!({}))),
+        })
+        .expect("register dyn.timeout");
+        reg.register_dynamic(DynamicStepDefinition {
+            name: "dyn.env".to_string(),
+            description: "Environment error during validation.".to_string(),
+            args_schema: json!({"type": "object"}),
+            validate: std::sync::Arc::new(|_| {
+                Err(StepError::Environment("broken pipe".to_string()))
+            }),
+            check_retry: std::sync::Arc::new(disallow_retry),
+            lint_warnings: std::sync::Arc::new(no_lint_warnings),
+            run: std::sync::Arc::new(|_, _| Ok(json!({}))),
+        })
+        .expect("register dyn.env");
+
+        let timeout_step =
+            crate::core::case::parse_single_step("dyn.timeout: {}\n").expect("parse dyn.timeout");
+        let env_step =
+            crate::core::case::parse_single_step("dyn.env: {}\n").expect("parse dyn.env");
+
+        let timeout_outcome = run(
+            &[LoadedCase::new(
+                "timeout.yaml".into(),
+                test_case("timeout", vec![timeout_step.clone()]),
+            )],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert_eq!(timeout_outcome.exit_code(), crate::exit::ExitCode::Timeout);
+
+        let env_outcome = run(
+            &[LoadedCase::new(
+                "env.yaml".into(),
+                test_case("env", vec![env_step.clone()]),
+            )],
+            &reg,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut Secrets::new(),
+            1,
+        );
+        assert_eq!(env_outcome.exit_code(), crate::exit::ExitCode::Environment);
+
+        let mut vars = BTreeMap::new();
+        let mut secrets = Secrets::new();
+        let mut sessions = Sessions::new();
+        sessions.set_interactive(true);
+
+        let single_timeout =
+            run_single_step(&timeout_step, &reg, &mut vars, &mut secrets, &mut sessions);
+        assert_eq!(
+            single_timeout.error.as_ref().map(|e| e.kind),
+            Some(ProblemKind::Timeout)
+        );
+        let single_env = run_single_step(&env_step, &reg, &mut vars, &mut secrets, &mut sessions);
+        assert_eq!(
+            single_env.error.as_ref().map(|e| e.kind),
+            Some(ProblemKind::Environment)
         );
     }
 

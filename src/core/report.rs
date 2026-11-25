@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::core::assert::AssertionReport;
-use crate::core::case::CaseError;
+use crate::core::case::{CaseError, CaseErrorKind};
 use crate::exit::ExitCode;
 
 /// The state of a finished case.
@@ -278,7 +278,7 @@ impl RunOutcome {
     /// invalid input, then environment, then timeout, then a failed assertion.
     pub fn exit_code(&self) -> ExitCode {
         let report = match self {
-            Self::Rejected { .. } => return ExitCode::InvalidCase,
+            Self::Rejected { errors } => return rejected_exit_code(errors),
             Self::NoMatch { .. } => return ExitCode::Usage,
             Self::Completed(report) => report,
         };
@@ -302,6 +302,31 @@ impl RunOutcome {
     pub fn is_ok(&self) -> bool {
         self.exit_code() == ExitCode::Success
     }
+}
+
+/// Maps rejected load or preflight errors to the process exit code using the
+/// same precedence as [`RunOutcome::exit_code`]: invalid input, then
+/// environment, then timeout.
+pub fn rejected_exit_code(errors: &[CaseError]) -> ExitCode {
+    if errors
+        .iter()
+        .any(|error| error.kind == CaseErrorKind::InvalidInput)
+    {
+        return ExitCode::InvalidCase;
+    }
+    if errors
+        .iter()
+        .any(|error| error.kind == CaseErrorKind::Environment)
+    {
+        return ExitCode::Environment;
+    }
+    if errors
+        .iter()
+        .any(|error| error.kind == CaseErrorKind::Timeout)
+    {
+        return ExitCode::Timeout;
+    }
+    ExitCode::InvalidCase
 }
 
 #[cfg(test)]
@@ -499,6 +524,43 @@ mod tests {
         assert_eq!(
             RunOutcome::Completed(report).exit_code(),
             ExitCode::Environment
+        );
+    }
+
+    #[test]
+    fn rejected_exit_code_follows_invalid_input_then_environment_then_timeout() {
+        let timeout = CaseError {
+            file: PathBuf::from("a.yaml"),
+            message: "timed out".to_string(),
+            kind: CaseErrorKind::Timeout,
+        };
+        let environment = CaseError {
+            file: PathBuf::from("b.yaml"),
+            message: "crashed".to_string(),
+            kind: CaseErrorKind::Environment,
+        };
+        let invalid = CaseError::invalid(PathBuf::from("c.yaml"), "bad arg");
+
+        assert_eq!(
+            RunOutcome::Rejected {
+                errors: vec![timeout.clone()],
+            }
+            .exit_code(),
+            ExitCode::Timeout
+        );
+        assert_eq!(
+            RunOutcome::Rejected {
+                errors: vec![timeout.clone(), environment.clone()],
+            }
+            .exit_code(),
+            ExitCode::Environment
+        );
+        assert_eq!(
+            RunOutcome::Rejected {
+                errors: vec![timeout, environment, invalid],
+            }
+            .exit_code(),
+            ExitCode::InvalidCase
         );
     }
 }

@@ -842,7 +842,7 @@ fn a_detachable_session_survives_detach_and_closes_after_reattach() {
     let mut second = Sessions::new();
     let handle = handles.get(KIND).expect("handle for KIND must exist");
     let def = reg.session(KIND).expect("session kind must be registered");
-    let session = (def.reattach)(handle).expect("reattach must succeed");
+    let session = def.reattach(handle).expect("reattach must succeed");
     second
         .insert_reattached(def.kind, session)
         .expect("insert_reattached must succeed");

@@ -316,39 +316,59 @@ fn desktop_registry_and_validation_enforces_locators_at_and_key_specs() {
     }
 
     let click = registry.get("desktop.click").expect("desktop.click");
-    assert!((click.validate)(&json!({"automation_id": "btn"})).is_ok());
-    assert!((click.validate)(&json!({"role": "Button", "name": "Submit"})).is_ok());
-    assert!((click.validate)(&json!({"at": {"x": 10, "y": 20}})).is_ok());
+    assert!(click.validate(&json!({"automation_id": "btn"})).is_ok());
     assert!(
-        (click.validate)(
-            &json!({"at": {"x": 10, "y": 20, "window": {"width": 440, "height": 320}}})
-        )
-        .is_ok()
+        click
+            .validate(&json!({"role": "Button", "name": "Submit"}))
+            .is_ok()
+    );
+    assert!(click.validate(&json!({"at": {"x": 10, "y": 20}})).is_ok());
+    assert!(
+        click
+            .validate(&json!({"at": {"x": 10, "y": 20, "window": {"width": 440, "height": 320}}}))
+            .is_ok()
     );
     // Ref is rejected by static validator (session validator handles it).
-    assert!((click.validate)(&json!({"ref": "e1"})).is_err());
+    assert!(click.validate(&json!({"ref": "e1"})).is_err());
     // Cannot combine `at` with locator.
-    assert!((click.validate)(&json!({"at": {"x": 10, "y": 20}, "automation_id": "btn"})).is_err());
-    // Negative coordinates and zero window bounds rejected.
-    assert!((click.validate)(&json!({"at": {"x": -1, "y": 5}})).is_err());
     assert!(
-        (click.validate)(&json!({"at": {"x": 5, "y": 5, "window": {"width": 0, "height": 100}}}))
+        click
+            .validate(&json!({"at": {"x": 10, "y": 20}, "automation_id": "btn"}))
+            .is_err()
+    );
+    // Negative coordinates and zero window bounds rejected.
+    assert!(click.validate(&json!({"at": {"x": -1, "y": 5}})).is_err());
+    assert!(
+        click
+            .validate(&json!({"at": {"x": 5, "y": 5, "window": {"width": 0, "height": 100}}}))
             .is_err()
     );
     // Unknown role rejected.
-    assert!((click.validate)(&json!({"role": "NotARealRole"})).is_err());
+    assert!(click.validate(&json!({"role": "NotARealRole"})).is_err());
     // Empty locator rejected.
-    assert!((click.validate)(&json!({})).is_err());
+    assert!(click.validate(&json!({})).is_err());
 
     let type_step = registry.get("desktop.type").expect("desktop.type");
-    assert!((type_step.validate)(&json!({"automation_id": "user", "text": "alice"})).is_ok());
     assert!(
-        (type_step.validate)(&json!({"text": "Username", "value": "alice"})).is_ok(),
+        type_step
+            .validate(&json!({"automation_id": "user", "text": "alice"}))
+            .is_ok()
+    );
+    assert!(
+        type_step
+            .validate(&json!({"text": "Username", "value": "alice"}))
+            .is_ok(),
         "text locator + value text-to-type must validate"
     );
-    assert!((type_step.validate)(&json!({"at": {"x": 20, "y": 20}, "text": "alice"})).is_ok());
     assert!(
-        (type_step.validate)(&json!({"automation_id": "user"})).is_err(),
+        type_step
+            .validate(&json!({"at": {"x": 20, "y": 20}, "text": "alice"}))
+            .is_ok()
+    );
+    assert!(
+        type_step
+            .validate(&json!({"automation_id": "user"}))
+            .is_err(),
         "missing typing text must be rejected"
     );
 
@@ -363,40 +383,67 @@ fn desktop_registry_and_validation_enforces_locators_at_and_key_specs() {
         "a",
     ] {
         assert!(
-            (press.validate)(&json!({"key": good})).is_ok(),
+            press.validate(&json!({"key": good})).is_ok(),
             "`{good}` should validate cleanly"
         );
     }
     for bad in ["", "   ", "Ctrl+", "UnknownKey999", "Ctrl+Alt+"] {
         assert!(
-            (press.validate)(&json!({"key": bad})).is_err(),
+            press.validate(&json!({"key": bad})).is_err(),
             "`{bad}` should be rejected"
         );
     }
 
     let attach = registry.get("desktop.attach").expect("desktop.attach");
-    assert!((attach.validate)(&json!({"pid": 1234})).is_ok());
-    assert!((attach.validate)(&json!({"executable": "notepad.exe"})).is_ok());
-    assert!((attach.validate)(&json!({"title_contains": "Notepad"})).is_ok());
-    assert!((attach.validate)(&json!({})).is_err());
-    assert!((attach.validate)(&json!({"pid": 0})).is_err());
+    assert!(attach.validate(&json!({"pid": 1234})).is_ok());
+    assert!(
+        attach
+            .validate(&json!({"executable": "notepad.exe"}))
+            .is_ok()
+    );
+    assert!(
+        attach
+            .validate(&json!({"title_contains": "Notepad"}))
+            .is_ok()
+    );
+    assert!(attach.validate(&json!({})).is_err());
+    assert!(attach.validate(&json!({"pid": 0})).is_err());
 
     // Verify retryability classification matches read-only vs mutating steps.
     assert!(
-        (registry.get("desktop.wait").unwrap().check_retry)(&json!({"automation_id": "x"})).is_ok()
-    );
-    assert!(
-        (registry.get("desktop.read").unwrap().check_retry)(&json!({"automation_id": "x"})).is_ok()
-    );
-    assert!(
-        (registry.get("desktop.screenshot").unwrap().check_retry)(&json!({"path": "a.png"}))
+        registry
+            .get("desktop.wait")
+            .unwrap()
+            .check_retry(&json!({"automation_id": "x"}))
             .is_ok()
     );
-    assert!((click.check_retry)(&json!({"automation_id": "x"})).is_err());
-    assert!((type_step.check_retry)(&json!({"automation_id": "x", "text": "a"})).is_err());
-    assert!((press.check_retry)(&json!({"key": "Enter"})).is_err());
     assert!(
-        (registry.get("desktop.launch").unwrap().check_retry)(&json!({"command": "x"})).is_err()
+        registry
+            .get("desktop.read")
+            .unwrap()
+            .check_retry(&json!({"automation_id": "x"}))
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get("desktop.screenshot")
+            .unwrap()
+            .check_retry(&json!({"path": "a.png"}))
+            .is_ok()
+    );
+    assert!(click.check_retry(&json!({"automation_id": "x"})).is_err());
+    assert!(
+        type_step
+            .check_retry(&json!({"automation_id": "x", "text": "a"}))
+            .is_err()
+    );
+    assert!(press.check_retry(&json!({"key": "Enter"})).is_err());
+    assert!(
+        registry
+            .get("desktop.launch")
+            .unwrap()
+            .check_retry(&json!({"command": "x"}))
+            .is_err()
     );
 }
 

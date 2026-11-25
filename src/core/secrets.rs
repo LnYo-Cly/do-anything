@@ -44,6 +44,13 @@ impl Secrets {
         self.values.insert(value.to_string());
     }
 
+    /// Merges every recorded value from `other` into this set.
+    pub fn merge(&mut self, other: &Self) {
+        for value in &other.values {
+            self.values.insert(value.clone());
+        }
+    }
+
     /// Whether nothing has been read from the environment yet.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()

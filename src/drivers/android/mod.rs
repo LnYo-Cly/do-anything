@@ -1161,7 +1161,9 @@ mod tests {
         let definition = registry
             .get(step)
             .unwrap_or_else(|| panic!("`{step}` must be registered"));
-        (definition.validate)(&args).expect_err("the arguments must be refused")
+        definition
+            .validate(&args)
+            .expect_err("the arguments must be refused")
     }
 
     fn accepts(step: &str, args: Value) {
@@ -1169,7 +1171,7 @@ mod tests {
         let definition = registry
             .get(step)
             .unwrap_or_else(|| panic!("`{step}` must be registered"));
-        if let Err(message) = (definition.validate)(&args) {
+        if let Err(message) = definition.validate(&args) {
             panic!("`{step}` must accept {args}: {message}");
         }
     }
@@ -1298,15 +1300,15 @@ mod tests {
                 value
             };
             assert!(
-                jsonschema::is_valid(&definition.args_schema, &with_deadline(DEFAULT_TIMEOUT_MS)),
+                jsonschema::is_valid(definition.args_schema, &with_deadline(DEFAULT_TIMEOUT_MS)),
                 "the schema of `{step}` must accept the documented default"
             );
             assert!(
-                !jsonschema::is_valid(&definition.args_schema, &with_deadline(0)),
+                !jsonschema::is_valid(definition.args_schema, &with_deadline(0)),
                 "the schema of `{step}` must refuse a zero deadline"
             );
             assert!(
-                !jsonschema::is_valid(&definition.args_schema, &with_deadline(MAX_TIMEOUT_MS + 1)),
+                !jsonschema::is_valid(definition.args_schema, &with_deadline(MAX_TIMEOUT_MS + 1)),
                 "the schema of `{step}` must refuse an absurd deadline"
             );
         }
@@ -1499,7 +1501,7 @@ mod tests {
                 let mut args = json!({});
                 args[field] = Value::Null;
                 assert!(
-                    !jsonschema::is_valid(&definition.args_schema, &args),
+                    !jsonschema::is_valid(definition.args_schema, &args),
                     "the schema of `{step}` must refuse a null `{field}`"
                 );
             }
@@ -1526,7 +1528,7 @@ mod tests {
         let registry = registry();
         let allows = |name: &str| {
             let definition = registry.get(name).expect("the step must be registered");
-            (definition.check_retry)(&json!({})).is_ok()
+            definition.check_retry(&json!({})).is_ok()
         };
         assert!(allows("android.dump"), "a dump changes nothing");
         for name in [

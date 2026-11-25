@@ -47,6 +47,9 @@ pub struct SessionState {
     pub env_names: BTreeSet<String>,
     #[serde(default)]
     pub observe: Vec<StoredObservation>,
+    /// Absolute paths of the explicit plugins this session was started with.
+    #[serde(default)]
+    pub plugins: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_hook: Option<ModelHookSpec>,
 }
@@ -234,6 +237,9 @@ pub fn save_state(
     for value in sanitized.vars.values_mut() {
         *value = secrets.redact(value);
     }
+    for handle in sanitized.handles.values_mut() {
+        *handle = secrets.redact_json(handle);
+    }
     if let Some(hook) = &mut sanitized.model_hook {
         hook.command = secrets.redact(&hook.command);
         for arg in &mut hook.args {
@@ -334,22 +340,83 @@ pub fn secrets_from_env_names(env_names: &BTreeSet<String>) -> Secrets {
     secrets
 }
 
+/// Result of attempting to close a session's detached handles.
+#[derive(Debug, Clone, Default)]
+pub struct DisposeReport {
+    /// Handles that failed to close and must remain persisted for retry.
+    pub remaining: BTreeMap<String, Value>,
+    /// Redacted error messages for every handle that could not be closed.
+    pub errors: Vec<String>,
+}
+
 /// Closes all detached handles stored in `handles`, continuing through failures
-/// and returning every error encountered.
-pub fn dispose_handles(handles: &BTreeMap<String, Value>, registry: &Registry) -> Vec<String> {
-    let mut errors = Vec::new();
+/// and returning redacted errors alongside any unclosed handles.
+pub fn dispose_handles(
+    handles: &BTreeMap<String, Value>,
+    registry: &Registry,
+    secrets: &Secrets,
+) -> DisposeReport {
+    dispose_handles_inner(handles, registry, secrets, false)
+}
+
+fn dispose_handles_inner(
+    handles: &BTreeMap<String, Value>,
+    registry: &Registry,
+    secrets: &Secrets,
+    has_plugin_load_errors: bool,
+) -> DisposeReport {
+    let mut report = DisposeReport::default();
     for (kind, handle) in handles {
         let Some(def) = registry.session(kind) else {
-            errors.push(format!(
-                "cannot close session `{kind}`: driver is not enabled in this build"
-            ));
+            report.remaining.insert(kind.clone(), handle.clone());
+            let message = if has_plugin_load_errors {
+                format!("cannot close session `{kind}`: persisted plugin failed to load")
+            } else {
+                format!("cannot close session `{kind}`: driver is not enabled in this build")
+            };
+            report.errors.push(secrets.redact(&message));
             continue;
         };
-        if let Err(dispose_err) = (def.dispose_handle)(handle) {
-            errors.push(format!("could not close `{kind}`: {dispose_err}"));
+        if let Err(dispose_err) = def.dispose_handle(handle) {
+            report.remaining.insert(kind.clone(), handle.clone());
+            report
+                .errors
+                .push(secrets.redact(&format!("could not close `{kind}`: {dispose_err}")));
         }
     }
-    errors
+    report
+}
+
+#[cfg(feature = "plugin")]
+fn resolve_persisted_for_dispose(
+    plugins: &[String],
+    base_registry: &Registry,
+    secrets: &Secrets,
+) -> (Option<Registry>, Vec<String>) {
+    let (per_session, raw_errors) =
+        crate::plugin::resolve_persisted_for_dispose(base_registry, plugins);
+    let errors = raw_errors
+        .into_iter()
+        .map(|err| secrets.redact(&err))
+        .collect();
+    (per_session, errors)
+}
+
+#[cfg(not(feature = "plugin"))]
+fn resolve_persisted_for_dispose(
+    plugins: &[String],
+    _base_registry: &Registry,
+    secrets: &Secrets,
+) -> (Option<Registry>, Vec<String>) {
+    if plugins.is_empty() {
+        return (None, Vec::new());
+    }
+    (
+        None,
+        vec![secrets.redact(
+            "this build was compiled without the `plugin` feature; rebuild with `--features plugin`",
+        )],
+    )
 }
 
 /// Removes a session directory, retrying briefly on Windows handle release.
@@ -372,25 +439,63 @@ pub fn remove_session_dir(session_dir: &Path) -> Result<(), String> {
     ))
 }
 
-/// Closes a session's detached resources and deletes its directory, reporting
-/// every error encountered along the way.
+/// Closes a session's detached resources and deletes its directory only when
+/// every handle closes cleanly.
+///
+/// When any handle fails to close (or its persisted plugin fails to load),
+/// `state.json` is retained and updated in place so successfully closed handles
+/// are cleared while unclosed handles remain recoverable.
 pub fn close_and_remove_session(
     session_dir: &Path,
     state: Option<&SessionState>,
     lock: SessionLock,
     registry: &Registry,
+    secrets: &Secrets,
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    if let Some(state) = state {
-        errors.extend(dispose_handles(&state.handles, registry));
+    if let Some(state) = state
+        && !state.handles.is_empty()
+    {
+        let needs_plugins = state
+            .handles
+            .keys()
+            .any(|kind| !registry.is_builtin_session(kind))
+            && !state.plugins.is_empty();
+        let (per_session_registry, plugin_errors) = if needs_plugins {
+            resolve_persisted_for_dispose(&state.plugins, registry, secrets)
+        } else {
+            (None, Vec::new())
+        };
+        let has_plugin_load_errors = !plugin_errors.is_empty();
+        errors.extend(plugin_errors);
+
+        let effective_registry = per_session_registry.as_ref().unwrap_or(registry);
+        let dispose = dispose_handles_inner(
+            &state.handles,
+            effective_registry,
+            secrets,
+            has_plugin_load_errors,
+        );
+        errors.extend(dispose.errors);
+
+        if !errors.is_empty() {
+            let mut retained = state.clone();
+            retained.handles = dispose.remaining;
+            if let Err(save_err) = save_state(session_dir, &retained, secrets) {
+                errors.push(secrets.redact(&save_err));
+            }
+            lock.release();
+            return errors;
+        }
     }
+
     // Remove state.json while still holding the lock so any concurrent starter
     // sees the session is gone, then release the lock handle before removing
     // the directory on Windows.
     let _ = fs::remove_file(session_dir.join(STATE_FILE));
     lock.release();
     if let Err(error) = remove_session_dir(session_dir) {
-        errors.push(error);
+        errors.push(secrets.redact(&error));
     }
     errors
 }
@@ -420,6 +525,7 @@ pub fn list_and_reap(
     sessions_dir: &Path,
     idle_override_ms: Option<u64>,
     registry: &Registry,
+    extra_secrets: &Secrets,
 ) -> Result<ListReport, String> {
     if !sessions_dir.exists() {
         return Ok(ListReport::default());
@@ -464,7 +570,7 @@ pub fn list_and_reap(
                 continue;
             }
             Err(LockError::Io(message)) => {
-                errors.push(message);
+                errors.push(extra_secrets.redact(&message));
                 continue;
             }
         };
@@ -473,7 +579,7 @@ pub fn list_and_reap(
             Ok(state) => state,
             Err(err) => {
                 if dir.join(STATE_FILE).exists() {
-                    errors.push(err);
+                    errors.push(extra_secrets.redact(&err));
                 }
                 lock.release();
                 continue;
@@ -483,12 +589,14 @@ pub fn list_and_reap(
         let threshold = idle_override_ms.unwrap_or(state.idle_timeout_ms);
         let elapsed = now.saturating_sub(state.last_active_ms);
         if threshold == 0 || elapsed >= threshold {
-            let reap_errs = close_and_remove_session(&dir, Some(&state), lock, registry);
+            let mut session_secrets = secrets_from_env_names(&state.env_names);
+            session_secrets.merge(extra_secrets);
+            let reap_errs =
+                close_and_remove_session(&dir, Some(&state), lock, registry, &session_secrets);
             if reap_errs.is_empty() {
                 reaped.push(state.id);
             } else {
                 errors.extend(reap_errs);
-                reaped.push(state.id);
             }
         } else {
             active.push(SessionSummary {
@@ -599,6 +707,113 @@ mod tests {
         assert_eq!(
             loaded[0].result,
             Some(serde_json::json!({ "body": { "echo": "***" } }))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_and_remove_session_retains_only_unclosed_handles_and_redacts_errors() {
+        use crate::core::registry::SessionDefinition;
+        use crate::core::session::Session;
+
+        struct StubSession;
+        impl Session for StubSession {
+            fn close(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let dir = temp_session_dir("retain-unclosed");
+        let sess_dir = dir.join("s-1");
+        fs::create_dir_all(&sess_dir).unwrap();
+
+        let mut registry = Registry::new();
+        registry
+            .register_session(SessionDefinition {
+                kind: "test.ok",
+                reattach: |_| Ok(Box::new(StubSession)),
+                dispose_handle: |_| Ok(()),
+            })
+            .unwrap();
+        registry
+            .register_session(SessionDefinition {
+                kind: "test.fail",
+                reattach: |_| Ok(Box::new(StubSession)),
+                dispose_handle: |handle| {
+                    let fail = handle.get("fail").and_then(Value::as_bool).unwrap_or(false);
+                    if fail {
+                        Err("close failed with secret tok-secret-999".to_string())
+                    } else {
+                        Ok(())
+                    }
+                },
+            })
+            .unwrap();
+
+        let mut handles = BTreeMap::new();
+        handles.insert("test.ok".to_string(), serde_json::json!({"id": 1}));
+        handles.insert(
+            "test.fail".to_string(),
+            serde_json::json!({"id": 2, "fail": true}),
+        );
+        let state = SessionState {
+            schema_version: 1,
+            id: "s-1".to_string(),
+            created_at_ms: 1,
+            last_active_ms: 1,
+            idle_timeout_ms: 1,
+            handles,
+            vars: BTreeMap::new(),
+            env_names: BTreeSet::new(),
+            observe: Vec::new(),
+            plugins: Vec::new(),
+            model_hook: None,
+        };
+        let mut secrets = Secrets::new();
+        secrets.record("tok-secret-999");
+        save_state(&sess_dir, &state, &secrets).unwrap();
+
+        // First reap attempt: `test.fail` fails -> state retained with only `test.fail`,
+        // `reaped` excludes `s-1`, and secret is scrubbed.
+        let first = list_and_reap(&dir, Some(0), &registry, &secrets).expect("list_and_reap");
+        assert!(
+            first.reaped.is_empty(),
+            "failed reap must not be in reaped: {:?}",
+            first.reaped
+        );
+        assert_eq!(first.errors.len(), 1);
+        assert!(
+            !first.errors[0].contains("tok-secret-999"),
+            "{:?}",
+            first.errors
+        );
+        assert!(first.errors[0].contains("***"), "{:?}", first.errors);
+        assert!(sess_dir.exists(), "session dir must be retained");
+        let retained = load_state(&sess_dir).expect("state.json must be retained");
+        assert!(
+            !retained.handles.contains_key("test.ok"),
+            "closed handle must be removed from retained state"
+        );
+        assert_eq!(
+            retained.handles.get("test.fail"),
+            Some(&serde_json::json!({"id": 2, "fail": true}))
+        );
+
+        // Simulate recovery by flipping the handle's `fail` flag, then retry reap.
+        let mut recovered = retained;
+        recovered.handles.insert(
+            "test.fail".to_string(),
+            serde_json::json!({"id": 2, "fail": false}),
+        );
+        save_state(&sess_dir, &recovered, &secrets).unwrap();
+
+        let second = list_and_reap(&dir, Some(0), &registry, &secrets).expect("retry reap");
+        assert_eq!(second.reaped, vec!["s-1".to_string()]);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(
+            !sess_dir.exists(),
+            "session dir must be deleted after recovery"
         );
 
         let _ = fs::remove_dir_all(&dir);

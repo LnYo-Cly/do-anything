@@ -590,7 +590,7 @@ fn json_report(outcome: &RunOutcome) -> Value {
                             json!({
                                 "file": paths::display(&error.file),
                                 "message": error.message,
-                                "kind": "invalid_input",
+                                "kind": error.kind.as_str(),
                             })
                         })
                         .collect(),
@@ -1708,10 +1708,10 @@ mod tests {
     #[test]
     fn rejected_input_is_reported_on_stderr_and_as_json_errors() {
         let outcome = RunOutcome::Rejected {
-            errors: vec![crate::core::case::CaseError {
-                file: PathBuf::from("broken.yaml"),
-                message: "line 2: unknown field".to_string(),
-            }],
+            errors: vec![crate::core::case::CaseError::invalid(
+                PathBuf::from("broken.yaml"),
+                "line 2: unknown field",
+            )],
         };
 
         let text = render(&outcome, Format::Text, &Secrets::new());
@@ -1766,14 +1766,8 @@ mod tests {
             warnings: Vec::new(),
             files: 2,
             errors: vec![
-                CaseError {
-                    file: PathBuf::from("a.yaml"),
-                    message: "line 2: unknown field".to_string(),
-                },
-                CaseError {
-                    file: PathBuf::from("b.yaml"),
-                    message: "step 1: undefined variable".to_string(),
-                },
+                CaseError::invalid(PathBuf::from("a.yaml"), "line 2: unknown field"),
+                CaseError::invalid(PathBuf::from("b.yaml"), "step 1: undefined variable"),
             ],
             cases: Vec::new(),
             ..LintReport::default()
@@ -1854,10 +1848,10 @@ mod tests {
         let report = LintReport {
             warnings: Vec::new(),
             files: 1,
-            errors: vec![CaseError {
-                file: PathBuf::from("broken.yaml"),
-                message: "line 2 column 3: unclosed bracket\n --> <input>\n  |".to_string(),
-            }],
+            errors: vec![CaseError::invalid(
+                PathBuf::from("broken.yaml"),
+                "line 2 column 3: unclosed bracket\n --> <input>\n  |",
+            )],
             cases: Vec::new(),
             ..LintReport::default()
         };
@@ -1875,10 +1869,10 @@ mod tests {
         let report = LintReport {
             warnings: Vec::new(),
             files: 1,
-            errors: vec![CaseError {
-                file: PathBuf::from("broken.yaml"),
-                message: "line 2: unknown field".to_string(),
-            }],
+            errors: vec![CaseError::invalid(
+                PathBuf::from("broken.yaml"),
+                "line 2: unknown field",
+            )],
             cases: vec![LintCase {
                 file: PathBuf::from("cases/login.yaml"),
                 name: "Login".to_string(),
@@ -1958,10 +1952,10 @@ mod tests {
     #[test]
     fn a_rejected_run_redacts_its_error_messages() {
         let outcome = RunOutcome::Rejected {
-            errors: vec![crate::core::case::CaseError {
-                file: PathBuf::from("bad.yaml"),
-                message: "`url` must start with a scheme, found `nope://s3cr3t-value`".to_string(),
-            }],
+            errors: vec![crate::core::case::CaseError::invalid(
+                PathBuf::from("bad.yaml"),
+                "`url` must start with a scheme, found `nope://s3cr3t-value`",
+            )],
         };
         let mut secrets = Secrets::new();
         secrets.record("s3cr3t-value");
@@ -1986,10 +1980,10 @@ mod tests {
         let report = LintReport {
             warnings: Vec::new(),
             files: 1,
-            errors: vec![CaseError {
-                file: PathBuf::from("bad.yaml"),
-                message: "step 1: environment variable `s3cr3t-value` is not set".to_string(),
-            }],
+            errors: vec![CaseError::invalid(
+                PathBuf::from("bad.yaml"),
+                "step 1: environment variable `s3cr3t-value` is not set",
+            )],
             cases: Vec::new(),
             ..LintReport::default()
         };
