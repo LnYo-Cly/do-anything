@@ -3,7 +3,10 @@
 use serde_json::{Map, Value, json};
 
 use crate::core::case;
-use crate::session::model_hook::{STEP_ACTION_JUDGE, STEP_ACTION_LOCATE, STEP_ACTION_SELECT_REF};
+use crate::session::model_hook::{
+    STEP_ACTION_ACT, STEP_ACTION_EXTRACT, STEP_ACTION_JUDGE, STEP_ACTION_LOCATE,
+    STEP_ACTION_SELECT_REF,
+};
 use crate::session::store::{StepRecord, StoredObservation};
 
 /// Options controlling how a session is exported to YAML.
@@ -45,7 +48,11 @@ pub fn export_session(
     for record in records {
         if matches!(
             record.action.as_str(),
-            STEP_ACTION_SELECT_REF | STEP_ACTION_LOCATE | STEP_ACTION_JUDGE
+            STEP_ACTION_SELECT_REF
+                | STEP_ACTION_LOCATE
+                | STEP_ACTION_JUDGE
+                | STEP_ACTION_EXTRACT
+                | STEP_ACTION_ACT
         ) {
             skipped_steps.push(json!({
                 "index": record.index,

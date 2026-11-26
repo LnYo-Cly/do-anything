@@ -22,10 +22,13 @@ use do_anything::drivers;
 use do_anything::exit::ExitCode as DaExitCode;
 use do_anything::report as html_report;
 use do_anything::session::export::ExportOptions;
-use do_anything::session::model_hook::{BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
+use do_anything::session::model_hook::{
+    BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec, validate_reasoning_effort,
+};
 use do_anything::session::{
-    self, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR, JudgeRequest, LocateRequest,
-    SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
+    self, ActRequest, DEFAULT_ACT_MAX_STEPS, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR,
+    ExtractRequest, JudgeRequest, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest,
+    StepInput,
 };
 
 /// An agent-friendly, cross-layer testing tool.
@@ -198,6 +201,9 @@ enum Command {
         /// Environment variable name holding the API key for `--model`.
         #[arg(long, value_name = "NAME")]
         model_api_key_env: Option<String>,
+        /// Optional reasoning effort level for `--model` (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+        #[arg(long, value_name = "LEVEL")]
+        model_reasoning_effort: Option<String>,
     },
     /// Manage persistent interactive sessions for step-by-step exploration.
     Session {
@@ -241,6 +247,9 @@ enum SessionCommand {
         /// Environment variable name holding the API key for `--model`.
         #[arg(long, value_name = "NAME")]
         model_api_key_env: Option<String>,
+        /// Optional reasoning effort level for `--model` (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+        #[arg(long, value_name = "LEVEL")]
+        model_reasoning_effort: Option<String>,
     },
     /// Execute one step in an existing session.
     Step {
@@ -315,6 +324,9 @@ enum SessionCommand {
         /// Environment variable name holding the API key for `--model`.
         #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
         api_key_env: Option<String>,
+        /// Optional reasoning effort level (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+        #[arg(long, alias = "model-reasoning-effort", value_name = "LEVEL")]
+        reasoning_effort: Option<String>,
         /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
         timeout_ms: u64,
@@ -356,6 +368,9 @@ enum SessionCommand {
         /// Environment variable name holding the API key for `--model`.
         #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
         api_key_env: Option<String>,
+        /// Optional reasoning effort level (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+        #[arg(long, alias = "model-reasoning-effort", value_name = "LEVEL")]
+        reasoning_effort: Option<String>,
         /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
         timeout_ms: u64,
@@ -394,7 +409,95 @@ enum SessionCommand {
         /// Environment variable name holding the API key for `--model`.
         #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
         api_key_env: Option<String>,
+        /// Optional reasoning effort level (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+        #[arg(long, alias = "model-reasoning-effort", value_name = "LEVEL")]
+        reasoning_effort: Option<String>,
         /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Extract structured JSON data from redacted session state and optional masked screenshot (omitted from `export`).
+    Extract {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// What structured data to extract (redacted via `Secrets`).
+        #[arg(long, value_name = "TEXT")]
+        query: String,
+        /// Optional JSON Schema (YAML or JSON object) constraining extracted `data`.
+        #[arg(long, value_name = "YAML_OR_JSON")]
+        schema: Option<String>,
+        /// Custom evidence as YAML or JSON; defaults to redacted session steps and variables.
+        #[arg(long, value_name = "YAML_OR_JSON")]
+        evidence: Option<String>,
+        /// Attach an input-masked PNG screenshot from the active visual session.
+        #[arg(long)]
+        screenshot: bool,
+        /// Save the extracted value into session variable `NAME` for subsequent steps.
+        #[arg(long, value_name = "NAME")]
+        save: Option<String>,
+        /// Override the session's model hook executable for this call.
+        #[arg(long, value_name = "EXECUTABLE")]
+        hook: Option<String>,
+        /// Pass an argument to `--hook`. Repeat for more than one.
+        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
+        hook_args: Vec<String>,
+        /// Override with a built-in `genai` model identifier for this call.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Optional `genai` adapter override for `--model`.
+        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
+        adapter: Option<String>,
+        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+        #[arg(long, alias = "model-endpoint", value_name = "URL")]
+        endpoint: Option<String>,
+        /// Environment variable name holding the API key for `--model`.
+        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Optional reasoning effort level (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+        #[arg(long, alias = "model-reasoning-effort", value_name = "LEVEL")]
+        reasoning_effort: Option<String>,
+        /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Run a bounded autonomous observe → decide → execute loop toward `--goal`, recording deterministic UI steps.
+    Act {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// High-level goal for the bounded exploration loop (redacted via `Secrets`).
+        #[arg(long, value_name = "TEXT")]
+        goal: String,
+        /// Maximum autonomous steps before stopping. Defaults to 8.
+        #[arg(long, value_name = "N", default_value_t = DEFAULT_ACT_MAX_STEPS)]
+        max_steps: usize,
+        /// Optional custom evidence as YAML or JSON supplied on each iteration.
+        #[arg(long, value_name = "YAML_OR_JSON")]
+        evidence: Option<String>,
+        /// Capture and attach an input-masked PNG screenshot on every iteration.
+        #[arg(long)]
+        screenshot: bool,
+        /// Override the session's model hook executable for this call.
+        #[arg(long, value_name = "EXECUTABLE")]
+        hook: Option<String>,
+        /// Pass an argument to `--hook`. Repeat for more than one.
+        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
+        hook_args: Vec<String>,
+        /// Override with a built-in `genai` model identifier for this call.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Optional `genai` adapter override for `--model`.
+        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
+        adapter: Option<String>,
+        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+        #[arg(long, alias = "model-endpoint", value_name = "URL")]
+        endpoint: Option<String>,
+        /// Environment variable name holding the API key for `--model`.
+        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Optional reasoning effort level (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+        #[arg(long, alias = "model-reasoning-effort", value_name = "LEVEL")]
+        reasoning_effort: Option<String>,
+        /// Per-iteration model/hook runtime limit in milliseconds. Defaults to 30000.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
         timeout_ms: u64,
     },
@@ -618,20 +721,23 @@ fn main() -> ExitCode {
             model_adapter,
             model_endpoint,
             model_api_key_env,
+            model_reasoning_effort,
         } => {
-            let (hook_spec, model_spec) = match resolve_cli_model_config(
+            let resolved_models = match resolve_cli_model_config(
                 model_hook,
                 model_hook_args,
                 model,
                 model_adapter,
                 model_endpoint,
                 model_api_key_env,
+                model_reasoning_effort,
                 &START_CLI_MODEL_FLAGS,
+                true,
             ) {
-                Ok(pair) => pair,
+                Ok(models) => models,
                 Err(message) => return usage_error(&message),
             };
-            if let Some(spec) = &model_spec
+            if let Some(spec) = &resolved_models.model
                 && let Err(message) = session::validate_builtin_model(spec)
             {
                 return usage_error(&message);
@@ -642,8 +748,8 @@ fn main() -> ExitCode {
                     sessions_dir: sessions_dir
                         .unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
                     idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
-                    model_hook: hook_spec,
-                    model: model_spec,
+                    model_hook: resolved_models.hook,
+                    model: resolved_models.model,
                     plugins: activated_plugins.clone(),
                 },
             )
@@ -671,6 +777,7 @@ struct CliModelFlags<'a> {
     adapter_flag: &'a str,
     endpoint_flag: &'a str,
     api_key_env_flag: &'a str,
+    reasoning_effort_flag: &'a str,
 }
 
 const START_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
@@ -680,6 +787,7 @@ const START_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
     adapter_flag: "--model-adapter",
     endpoint_flag: "--model-endpoint",
     api_key_env_flag: "--model-api-key-env",
+    reasoning_effort_flag: "--model-reasoning-effort",
 };
 
 const CALL_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
@@ -689,6 +797,7 @@ const CALL_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
     adapter_flag: "--adapter",
     endpoint_flag: "--endpoint",
     api_key_env_flag: "--api-key-env",
+    reasoning_effort_flag: "--reasoning-effort",
 };
 
 fn build_cli_hook_spec(
@@ -714,8 +823,10 @@ fn build_cli_model_spec(
     adapter: Option<String>,
     endpoint: Option<String>,
     api_key_env: Option<String>,
+    reasoning_effort: Option<String>,
     flags: &CliModelFlags<'_>,
-) -> Result<Option<BuiltinModelSpec>, String> {
+    require_model_for_effort: bool,
+) -> Result<(Option<BuiltinModelSpec>, Option<String>), String> {
     for (value, flag) in [
         (&adapter, flags.adapter_flag),
         (&endpoint, flags.endpoint_flag),
@@ -727,33 +838,52 @@ fn build_cli_model_spec(
             return Err(format!("`{flag}` must not be empty"));
         }
     }
+    let normalized_effort = match reasoning_effort {
+        Some(raw) => Some(validate_reasoning_effort(&raw)?),
+        None => None,
+    };
     match model {
         Some(m) => {
             if m.trim().is_empty() {
                 return Err(format!("`{}` must not be empty", flags.model_flag));
             }
-            Ok(Some(BuiltinModelSpec {
-                model: m,
-                adapter,
-                endpoint,
-                api_key_env,
-            }))
+            Ok((
+                Some(BuiltinModelSpec {
+                    model: m,
+                    adapter,
+                    endpoint,
+                    api_key_env,
+                    reasoning_effort: normalized_effort,
+                }),
+                None,
+            ))
         }
         None => {
             for (present, flag) in [
                 (adapter.is_some(), flags.adapter_flag),
                 (endpoint.is_some(), flags.endpoint_flag),
                 (api_key_env.is_some(), flags.api_key_env_flag),
+                (
+                    require_model_for_effort && normalized_effort.is_some(),
+                    flags.reasoning_effort_flag,
+                ),
             ] {
                 if present {
                     return Err(format!("`{flag}` requires `{} <MODEL>`", flags.model_flag));
                 }
             }
-            Ok(None)
+            Ok((None, normalized_effort))
         }
     }
 }
 
+struct ResolvedCliModelConfig {
+    hook: Option<ModelHookSpec>,
+    model: Option<BuiltinModelSpec>,
+    reasoning_effort: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_cli_model_config(
     hook_cmd: Option<String>,
     hook_args: Vec<String>,
@@ -761,17 +891,49 @@ fn resolve_cli_model_config(
     adapter: Option<String>,
     endpoint: Option<String>,
     api_key_env: Option<String>,
+    reasoning_effort: Option<String>,
     flags: &CliModelFlags<'_>,
-) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
+    require_model_for_effort: bool,
+) -> Result<ResolvedCliModelConfig, String> {
     let hook_spec = build_cli_hook_spec(hook_cmd, hook_args, flags.hook_flag, flags.hook_arg_flag)?;
-    let model_spec = build_cli_model_spec(model, adapter, endpoint, api_key_env, flags)?;
+    let (model_spec, effort_override) = build_cli_model_spec(
+        model,
+        adapter,
+        endpoint,
+        api_key_env,
+        reasoning_effort,
+        flags,
+        require_model_for_effort,
+    )?;
     if hook_spec.is_some() && model_spec.is_some() {
         return Err(format!(
             "pass either `{}` or `{}`, not both",
             flags.hook_flag, flags.model_flag
         ));
     }
-    Ok((hook_spec, model_spec))
+    if hook_spec.is_some() && effort_override.is_some() {
+        return Err(format!(
+            "`{}` applies only to the built-in `{}`, not `{}`",
+            flags.reasoning_effort_flag, flags.model_flag, flags.hook_flag
+        ));
+    }
+    Ok(ResolvedCliModelConfig {
+        hook: hook_spec,
+        model: model_spec,
+        reasoning_effort: effort_override,
+    })
+}
+
+fn parse_optional_session_json(
+    raw: Option<String>,
+    flag: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    match raw {
+        Some(text) => case::parse_json_value(&text)
+            .map(Some)
+            .map_err(|err| format!("could not parse `{flag}`: {err}")),
+        None => Ok(None),
+    }
 }
 
 fn run_session(
@@ -794,29 +956,32 @@ fn run_session(
             model_adapter,
             model_endpoint,
             model_api_key_env,
+            model_reasoning_effort,
         } => {
             let parsed_observe = match session::parse_observe_specs(&observe, registry) {
                 Ok(items) => items,
                 Err(message) => return session_usage_error(format, &message),
             };
-            let (hook_spec, model_spec) = match resolve_cli_model_config(
+            let resolved_models = match resolve_cli_model_config(
                 model_hook,
                 model_hook_args,
                 model,
                 model_adapter,
                 model_endpoint,
                 model_api_key_env,
+                model_reasoning_effort,
                 &START_CLI_MODEL_FLAGS,
+                true,
             ) {
-                Ok(pair) => pair,
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
             SessionRequest::Start {
                 sessions_dir,
                 idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
                 observe: parsed_observe,
-                model_hook: hook_spec,
-                model: model_spec,
+                model_hook: resolved_models.hook,
+                model: resolved_models.model,
                 plugins: session_plugins.to_vec(),
             }
         }
@@ -867,22 +1032,25 @@ fn run_session(
             adapter,
             endpoint,
             api_key_env,
+            reasoning_effort,
             timeout_ms,
             act,
             with,
             args,
             save,
         } => {
-            let (hook_override, model_override) = match resolve_cli_model_config(
+            let resolved_models = match resolve_cli_model_config(
                 hook,
                 hook_args,
                 model,
                 adapter,
                 endpoint,
                 api_key_env,
+                reasoning_effort,
                 &CALL_CLI_MODEL_FLAGS,
+                false,
             ) {
-                Ok(pair) => pair,
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
             if (with.is_some() || !args.is_empty() || !save.is_empty()) && act.is_none() {
@@ -906,8 +1074,9 @@ fn run_session(
                 scope_ref,
                 max_depth,
                 max_nodes,
-                hook_override,
-                model_override,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
                 timeout_ms,
                 act: act_spec,
             })
@@ -921,19 +1090,22 @@ fn run_session(
             adapter,
             endpoint,
             api_key_env,
+            reasoning_effort,
             timeout_ms,
             click,
         } => {
-            let (hook_override, model_override) = match resolve_cli_model_config(
+            let resolved_models = match resolve_cli_model_config(
                 hook,
                 hook_args,
                 model,
                 adapter,
                 endpoint,
                 api_key_env,
+                reasoning_effort,
                 &CALL_CLI_MODEL_FLAGS,
+                false,
             ) {
-                Ok(pair) => pair,
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -942,8 +1114,9 @@ fn run_session(
                 id,
                 base_directory,
                 query,
-                hook_override,
-                model_override,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
                 timeout_ms,
                 click,
             })
@@ -959,31 +1132,26 @@ fn run_session(
             adapter,
             endpoint,
             api_key_env,
+            reasoning_effort,
             timeout_ms,
         } => {
-            let (hook_override, model_override) = match resolve_cli_model_config(
+            let resolved_models = match resolve_cli_model_config(
                 hook,
                 hook_args,
                 model,
                 adapter,
                 endpoint,
                 api_key_env,
+                reasoning_effort,
                 &CALL_CLI_MODEL_FLAGS,
+                false,
             ) {
-                Ok(pair) => pair,
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
-            let parsed_evidence = match evidence {
-                Some(raw) => match case::parse_json_value(&raw) {
-                    Ok(val) => Some(val),
-                    Err(err) => {
-                        return session_usage_error(
-                            format,
-                            &format!("could not parse `--evidence`: {err}"),
-                        );
-                    }
-                },
-                None => None,
+            let parsed_evidence = match parse_optional_session_json(evidence, "--evidence") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
             };
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             SessionRequest::Judge(JudgeRequest {
@@ -993,8 +1161,111 @@ fn run_session(
                 rubric,
                 evidence: parsed_evidence,
                 screenshot,
-                hook_override,
-                model_override,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
+                timeout_ms,
+            })
+        }
+        SessionCommand::Extract {
+            id,
+            query,
+            schema,
+            evidence,
+            screenshot,
+            save,
+            hook,
+            hook_args,
+            model,
+            adapter,
+            endpoint,
+            api_key_env,
+            reasoning_effort,
+            timeout_ms,
+        } => {
+            let resolved_models = match resolve_cli_model_config(
+                hook,
+                hook_args,
+                model,
+                adapter,
+                endpoint,
+                api_key_env,
+                reasoning_effort,
+                &CALL_CLI_MODEL_FLAGS,
+                false,
+            ) {
+                Ok(models) => models,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let parsed_schema = match parse_optional_session_json(schema, "--schema") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let parsed_evidence = match parse_optional_session_json(evidence, "--evidence") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            SessionRequest::Extract(ExtractRequest {
+                sessions_dir,
+                id,
+                base_directory,
+                query,
+                schema: parsed_schema,
+                evidence: parsed_evidence,
+                screenshot,
+                save,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
+                timeout_ms,
+            })
+        }
+        SessionCommand::Act {
+            id,
+            goal,
+            max_steps,
+            evidence,
+            screenshot,
+            hook,
+            hook_args,
+            model,
+            adapter,
+            endpoint,
+            api_key_env,
+            reasoning_effort,
+            timeout_ms,
+        } => {
+            let resolved_models = match resolve_cli_model_config(
+                hook,
+                hook_args,
+                model,
+                adapter,
+                endpoint,
+                api_key_env,
+                reasoning_effort,
+                &CALL_CLI_MODEL_FLAGS,
+                false,
+            ) {
+                Ok(models) => models,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let parsed_evidence = match parse_optional_session_json(evidence, "--evidence") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            SessionRequest::Act(ActRequest {
+                sessions_dir,
+                id,
+                base_directory,
+                goal,
+                max_steps,
+                evidence: parsed_evidence,
+                screenshot,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
                 timeout_ms,
             })
         }

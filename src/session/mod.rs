@@ -32,20 +32,28 @@ use crate::exit::ExitCode;
 
 use self::export::ExportOptions;
 use self::model_hook::{
-    BuiltinModelSpec, HookError, JudgeOutcome, JudgeParams, LocateOutcome, LocateParams,
-    ModelAudit, ModelHookSpec, STEP_ACTION_JUDGE, STEP_ACTION_LOCATE, STEP_ACTION_SELECT_REF,
-    SelectRefOutcome, SelectRefParams,
+    ActStepAction, ActStepParams, ActStepStatus, BuiltinModelSpec, ExtractParams, HookError,
+    JudgeOutcome, JudgeParams, LocateOutcome, LocateParams, ModelAudit, ModelHookSpec,
+    STEP_ACTION_ACT, STEP_ACTION_EXTRACT, STEP_ACTION_JUDGE, STEP_ACTION_LOCATE,
+    STEP_ACTION_SELECT_REF, SelectRefOutcome, SelectRefParams, validate_point_in_viewport,
+    validate_reasoning_effort,
 };
 use self::store::{
     LockError, SessionLock, SessionState, StepRecord, StoredExpectation, StoredObservation,
 };
-use crate::core::session::MaskedViewportCapture;
+use crate::core::session::{MaskedViewportCapture, SynthesizedTarget};
 
 /// Default directory relative to the working directory for session storage.
 pub const DEFAULT_SESSIONS_DIR: &str = ".da/sessions";
 
 /// Default idle timeout before `start` or `list` reaps a session (30 minutes).
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1_800_000;
+
+/// Default maximum steps executed by one [`SessionRequest::Act`] call.
+pub const DEFAULT_ACT_MAX_STEPS: usize = 8;
+
+/// Hard upper bound on `--max-steps` per [`SessionRequest::Act`] invocation.
+pub const MAX_ACT_MAX_STEPS: usize = 50;
 
 /// How a caller supplies one step to [`SessionRequest::Step`].
 #[derive(Debug, Clone)]
@@ -82,6 +90,7 @@ pub struct SelectRefRequest {
     pub max_nodes: Option<usize>,
     pub hook_override: Option<ModelHookSpec>,
     pub model_override: Option<BuiltinModelSpec>,
+    pub reasoning_effort_override: Option<String>,
     pub timeout_ms: u64,
     pub act: Option<SelectRefAction>,
 }
@@ -95,6 +104,7 @@ pub struct LocateRequest {
     pub query: String,
     pub hook_override: Option<ModelHookSpec>,
     pub model_override: Option<BuiltinModelSpec>,
+    pub reasoning_effort_override: Option<String>,
     pub timeout_ms: u64,
     pub click: bool,
 }
@@ -110,6 +120,40 @@ pub struct JudgeRequest {
     pub screenshot: bool,
     pub hook_override: Option<ModelHookSpec>,
     pub model_override: Option<BuiltinModelSpec>,
+    pub reasoning_effort_override: Option<String>,
+    pub timeout_ms: u64,
+}
+
+/// Request arguments for [`SessionRequest::Extract`].
+#[derive(Debug, Clone)]
+pub struct ExtractRequest {
+    pub sessions_dir: PathBuf,
+    pub id: String,
+    pub base_directory: PathBuf,
+    pub query: String,
+    pub schema: Option<Value>,
+    pub evidence: Option<Value>,
+    pub screenshot: bool,
+    pub save: Option<String>,
+    pub hook_override: Option<ModelHookSpec>,
+    pub model_override: Option<BuiltinModelSpec>,
+    pub reasoning_effort_override: Option<String>,
+    pub timeout_ms: u64,
+}
+
+/// Request arguments for [`SessionRequest::Act`].
+#[derive(Debug, Clone)]
+pub struct ActRequest {
+    pub sessions_dir: PathBuf,
+    pub id: String,
+    pub base_directory: PathBuf,
+    pub goal: String,
+    pub max_steps: usize,
+    pub evidence: Option<Value>,
+    pub screenshot: bool,
+    pub hook_override: Option<ModelHookSpec>,
+    pub model_override: Option<BuiltinModelSpec>,
+    pub reasoning_effort_override: Option<String>,
     pub timeout_ms: u64,
 }
 
@@ -140,6 +184,8 @@ pub enum SessionRequest {
     SelectRef(SelectRefRequest),
     Locate(LocateRequest),
     Judge(JudgeRequest),
+    Extract(ExtractRequest),
+    Act(ActRequest),
     Export {
         sessions_dir: PathBuf,
         id: String,
@@ -209,6 +255,8 @@ pub fn handle(request: SessionRequest, registry: &Registry) -> SessionResponse {
         SessionRequest::SelectRef(req) => handle_select_ref(req, registry),
         SessionRequest::Locate(req) => handle_locate(req, registry),
         SessionRequest::Judge(req) => handle_judge(req, registry),
+        SessionRequest::Extract(req) => handle_extract(req, registry),
+        SessionRequest::Act(req) => handle_act(req, registry),
         SessionRequest::Export {
             sessions_dir,
             id,
@@ -243,7 +291,7 @@ fn handle_start(
     idle_timeout_ms: u64,
     observe: Vec<StoredObservation>,
     model_hook: Option<ModelHookSpec>,
-    model: Option<BuiltinModelSpec>,
+    mut model: Option<BuiltinModelSpec>,
     plugins: Vec<String>,
     registry: &Registry,
 ) -> SessionResponse {
@@ -263,10 +311,16 @@ fn handle_start(
             "`--model-hook` executable path must not be empty",
         );
     }
-    if let Some(spec) = &model
-        && let Err(msg) = validate_builtin_model(spec)
-    {
-        return error_response(ExitCode::Usage, "usage", msg);
+    if let Some(spec) = &mut model {
+        if let Some(raw_effort) = &spec.reasoning_effort {
+            match validate_reasoning_effort(raw_effort) {
+                Ok(canonical) => spec.reasoning_effort = Some(canonical),
+                Err(msg) => return error_response(ExitCode::Usage, "usage", msg),
+            }
+        }
+        if let Err(msg) = validate_builtin_model(spec) {
+            return error_response(ExitCode::Usage, "usage", msg);
+        }
     }
 
     let (observer_names, mut env_names) = match validate_start_observations(&observe, registry) {
@@ -383,6 +437,9 @@ fn handle_start(
         }
         if let Some(api_key_env) = &spec.api_key_env {
             payload["model_api_key_env"] = Value::String(secrets.redact(api_key_env));
+        }
+        if let Some(effort) = &spec.reasoning_effort {
+            payload["model_reasoning_effort"] = Value::String(secrets.redact(effort));
         }
     }
     SessionResponse {
@@ -772,15 +829,24 @@ pub fn builtin_model_from_env() -> Option<BuiltinModelSpec> {
         adapter: read_opt("DA_MODEL_ADAPTER"),
         endpoint: read_opt("DA_MODEL_ENDPOINT"),
         api_key_env: read_opt("DA_MODEL_API_KEY_ENV"),
+        reasoning_effort: read_opt("DA_MODEL_REASONING_EFFORT"),
     })
 }
 
 fn resolve_model_backend(
     hook_override: Option<&ModelHookSpec>,
     model_override: Option<&BuiltinModelSpec>,
+    reasoning_effort_override: Option<&str>,
     state: &mut SessionState,
     secrets: &mut Secrets,
 ) -> Result<ModelBackend, Box<SessionResponse>> {
+    let normalized_effort = match reasoning_effort_override {
+        Some(raw) => Some(
+            validate_reasoning_effort(raw)
+                .map_err(|msg| Box::new(error_response(ExitCode::Usage, "usage", msg)))?,
+        ),
+        None => None,
+    };
     if hook_override.is_some() && model_override.is_some() {
         return Err(Box::new(error_response(
             ExitCode::Usage,
@@ -788,20 +854,54 @@ fn resolve_model_backend(
             "pass either `--hook` or `--model`, not both",
         )));
     }
+    if hook_override.is_some() && normalized_effort.is_some() {
+        return Err(Box::new(error_response(
+            ExitCode::Usage,
+            "usage",
+            "`--reasoning-effort` applies only to the built-in `--model`, not `--hook`",
+        )));
+    }
 
     if let Some(hook) = hook_override {
         return expand_hook_spec(hook, state, secrets).map(ModelBackend::Hook);
     }
     if let Some(model) = model_override {
-        return prepare_builtin_model(model, state, secrets).map(ModelBackend::Builtin);
+        let mut merged = model.clone();
+        if let Some(effort) = normalized_effort {
+            merged.reasoning_effort = Some(effort);
+        } else if let Some(raw_effort) = &merged.reasoning_effort {
+            merged.reasoning_effort = Some(
+                validate_reasoning_effort(raw_effort)
+                    .map_err(|msg| Box::new(error_response(ExitCode::Usage, "usage", msg)))?,
+            );
+        }
+        return prepare_builtin_model(&merged, state, secrets).map(ModelBackend::Builtin);
     }
     if let Some(hook) = state.model_hook.clone() {
+        if normalized_effort.is_some() {
+            return Err(Box::new(error_response(
+                ExitCode::Usage,
+                "usage",
+                "`--reasoning-effort` applies only to built-in `--model` backends, not sessions configured with `--model-hook`",
+            )));
+        }
         return expand_hook_spec(&hook, state, secrets).map(ModelBackend::Hook);
     }
-    if let Some(model) = state.model.clone() {
+    if let Some(mut model) = state.model.clone() {
+        if let Some(effort) = normalized_effort {
+            model.reasoning_effort = Some(effort);
+        }
         return prepare_builtin_model(&model, state, secrets).map(ModelBackend::Builtin);
     }
-    if let Some(env_model) = builtin_model_from_env() {
+    if let Some(mut env_model) = builtin_model_from_env() {
+        if let Some(effort) = normalized_effort {
+            env_model.reasoning_effort = Some(effort);
+        } else if let Some(raw_effort) = &env_model.reasoning_effort {
+            env_model.reasoning_effort = Some(
+                validate_reasoning_effort(raw_effort)
+                    .map_err(|msg| Box::new(error_response(ExitCode::Usage, "usage", msg)))?,
+            );
+        }
         return prepare_builtin_model(&env_model, state, secrets).map(ModelBackend::Builtin);
     }
 
@@ -919,6 +1019,69 @@ fn invoke_judge(
     }
 }
 
+fn invoke_extract(
+    backend: &ModelBackend,
+    timeout_ms: u64,
+    params: ExtractParams<'_>,
+    secrets: &mut Secrets,
+) -> Result<model_hook::ExtractOutcome, HookError> {
+    match backend {
+        ModelBackend::Hook(hook) => model_hook::call_extract(hook, timeout_ms, params, secrets),
+        #[cfg(feature = "ai")]
+        ModelBackend::Builtin(spec) => model_ai::call_extract(spec, timeout_ms, params, secrets),
+        #[cfg(not(feature = "ai"))]
+        ModelBackend::Builtin(spec) => Err(ai_feature_disabled_error(spec)),
+    }
+}
+
+fn invoke_act_step(
+    backend: &ModelBackend,
+    timeout_ms: u64,
+    params: ActStepParams<'_>,
+    secrets: &mut Secrets,
+) -> Result<model_hook::ActStepOutcome, HookError> {
+    match backend {
+        ModelBackend::Hook(hook) => model_hook::call_act_step(hook, timeout_ms, params, secrets),
+        #[cfg(feature = "ai")]
+        ModelBackend::Builtin(spec) => model_ai::call_act_step(spec, timeout_ms, params, secrets),
+        #[cfg(not(feature = "ai"))]
+        ModelBackend::Builtin(spec) => Err(ai_feature_disabled_error(spec)),
+    }
+}
+
+fn build_at_value(
+    session_kind: &str,
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+) -> (Value, Value, Value, Value) {
+    let viewport = json!({
+        "width": width,
+        "height": height,
+    });
+    let bounds_field = if session_kind == "desktop" {
+        "window"
+    } else {
+        "viewport"
+    };
+    let x_val = if session_kind == "desktop" {
+        json!(x.round() as i64)
+    } else {
+        coordinate_json_number(x)
+    };
+    let y_val = if session_kind == "desktop" {
+        json!(y.round() as i64)
+    } else {
+        coordinate_json_number(y)
+    };
+    let mut at_map = Map::new();
+    at_map.insert("x".to_string(), x_val.clone());
+    at_map.insert("y".to_string(), y_val.clone());
+    at_map.insert(bounds_field.to_string(), viewport.clone());
+    (viewport, Value::Object(at_map), x_val, y_val)
+}
+
 fn detach_and_persist_handles(
     session_dir: &Path,
     state: &mut SessionState,
@@ -1033,6 +1196,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
+        req.reasoning_effort_override.as_deref(),
         &mut state,
         &mut secrets,
     ) {
@@ -1341,6 +1505,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
+        req.reasoning_effort_override.as_deref(),
         &mut state,
         &mut secrets,
     ) {
@@ -1431,30 +1596,13 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         }
     };
 
-    let viewport = json!({
-        "width": capture.width,
-        "height": capture.height,
-    });
-    let bounds_field = if session_kind == "desktop" {
-        "window"
-    } else {
-        "viewport"
-    };
-    let x_val = if session_kind == "desktop" {
-        json!(outcome.x.round() as i64)
-    } else {
-        coordinate_json_number(outcome.x)
-    };
-    let y_val = if session_kind == "desktop" {
-        json!(outcome.y.round() as i64)
-    } else {
-        coordinate_json_number(outcome.y)
-    };
-    let mut at_map = Map::new();
-    at_map.insert("x".to_string(), x_val.clone());
-    at_map.insert("y".to_string(), y_val.clone());
-    at_map.insert(bounds_field.to_string(), viewport.clone());
-    let at_value = Value::Object(at_map);
+    let (viewport, at_value, x_val, y_val) = build_at_value(
+        &session_kind,
+        outcome.x,
+        outcome.y,
+        capture.width,
+        capture.height,
+    );
 
     let synth_locator = synth_target.as_ref().map(|t| t.locator.clone());
     let fragile = match &synth_target {
@@ -1520,51 +1668,17 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
                 );
             }
         };
-        let click_started_ms = store::now_ms();
-        let observations = state_observations(&state);
-        let report = runner::run_single_step_with_observations(
+        click_outcome_opt = Some(execute_synthesized_step(
             &step,
-            &observations,
+            existing_steps.len() + 2,
+            Some(&viewport),
+            synth_target.as_ref(),
+            Some(&outcome.audit),
             effective_registry.as_ref(),
-            &mut state.vars,
+            &mut state,
             &mut secrets,
             &mut sessions,
-        );
-        let step_meta = sessions.take_step_metadata();
-        let mut synthesis = extract_synthesis(&step, &step_meta);
-        if synthesis.synthesized_locator.is_none() && synth_locator.is_some() {
-            synthesis.synthesized_locator = synth_locator.clone();
-            synthesis.fragile = synth_target.as_ref().is_some_and(|t| t.fragile);
-        }
-        let post_snap = if !matches!(
-            report.error.as_ref().map(|p| p.kind),
-            Some(ProblemKind::Environment)
-        ) {
-            sessions
-                .collect_step_snapshot()
-                .ok()
-                .flatten()
-                .map(|(_, s)| s)
-        } else {
-            None
-        };
-        let mut step_rec = build_step_record(
-            existing_steps.len() + 2,
-            &step,
-            &report,
-            effective_registry.as_ref(),
-            click_started_ms,
-            synthesis,
-        );
-        if step_rec.observed_viewport.is_none() {
-            step_rec.observed_viewport = Some(viewport.clone());
-        }
-        step_rec.model = Some(outcome.audit.model.clone());
-        step_rec.latency_ms = Some(outcome.audit.latency_ms);
-        step_rec.usage = outcome.audit.usage.clone();
-        step_rec.trace_id = outcome.audit.trace_id.clone();
-        step_rec.confidence = outcome.audit.confidence;
-        click_outcome_opt = Some((report, post_snap, step_rec));
+        ));
     }
 
     let local_only_reason = sessions.local_only_reason();
@@ -1636,6 +1750,242 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_synthesized_step(
+    step: &Step,
+    step_index: usize,
+    viewport_opt: Option<&Value>,
+    fallback_synth: Option<&SynthesizedTarget>,
+    audit: Option<&ModelAudit>,
+    effective_registry: &Registry,
+    state: &mut SessionState,
+    secrets: &mut Secrets,
+    sessions: &mut Sessions,
+) -> (StepReport, Option<Value>, StepRecord) {
+    let started_ms = store::now_ms();
+    let observations = state_observations(state);
+    let report = runner::run_single_step_with_observations(
+        step,
+        &observations,
+        effective_registry,
+        &mut state.vars,
+        secrets,
+        sessions,
+    );
+    let step_meta = sessions.take_step_metadata();
+    let mut synthesis = extract_synthesis(step, &step_meta);
+    if synthesis.synthesized_locator.is_none()
+        && let Some(target) = fallback_synth
+    {
+        synthesis.synthesized_locator = Some(target.locator.clone());
+        synthesis.fragile = target.fragile;
+    }
+    let post_snap = if !matches!(
+        report.error.as_ref().map(|p| p.kind),
+        Some(ProblemKind::Environment)
+    ) {
+        sessions
+            .collect_step_snapshot()
+            .ok()
+            .flatten()
+            .map(|(_, s)| s)
+    } else {
+        None
+    };
+    let mut step_rec = build_step_record(
+        step_index,
+        step,
+        &report,
+        effective_registry,
+        started_ms,
+        synthesis,
+    );
+    if step_rec.observed_viewport.is_none()
+        && let Some(vp) = viewport_opt
+    {
+        step_rec.observed_viewport = Some(vp.clone());
+    }
+    if let Some(audit) = audit {
+        step_rec.model = Some(audit.model.clone());
+        step_rec.latency_ms = Some(audit.latency_ms);
+        step_rec.usage = audit.usage.clone();
+        step_rec.trace_id = audit.trace_id.clone();
+        step_rec.confidence = audit.confidence;
+    }
+    (report, post_snap, step_rec)
+}
+
+struct VisualContext {
+    session_kind: String,
+    snapshot: Option<Value>,
+    masked_capture: Option<MaskedViewportCapture>,
+    detach_errors: Vec<String>,
+    local_only_reason: Option<String>,
+}
+
+fn resolve_session_evidence(
+    explicit: Option<&Value>,
+    flag_name: &str,
+    existing_steps: &[StepRecord],
+    state: &SessionState,
+    secrets: &mut Secrets,
+) -> Result<Option<Value>, Box<SessionResponse>> {
+    match explicit {
+        Some(raw_ev) => match case::interpolate(raw_ev, &state.vars, secrets) {
+            Ok(interpolated) => Ok(Some(secrets.redact_json(&interpolated))),
+            Err(err) => Err(Box::new(error_response(
+                ExitCode::InvalidCase,
+                "invalid_input",
+                secrets.redact(&format!("`{flag_name}`: {}", err.message)),
+            ))),
+        },
+        None => {
+            if existing_steps.is_empty() && state.vars.is_empty() {
+                Ok(None)
+            } else {
+                let summarized: Vec<Value> = existing_steps
+                    .iter()
+                    .map(|rec| {
+                        json!({
+                            "index": rec.index,
+                            "action": rec.action,
+                            "status": rec.status,
+                            "error": rec.error,
+                            "result": rec.result,
+                        })
+                    })
+                    .collect();
+                Ok(Some(secrets.redact_json(&json!({
+                    "steps": summarized,
+                    "vars": state.vars,
+                }))))
+            }
+        }
+    }
+}
+
+fn capture_snapshot_and_screenshot(
+    session_dir: &Path,
+    state: &mut SessionState,
+    base_directory: &Path,
+    registry: &Registry,
+    screenshot: bool,
+    op_name: &str,
+    secrets: &Secrets,
+) -> Result<VisualContext, Box<SessionResponse>> {
+    if screenshot && state.handles.is_empty() {
+        return Err(Box::new(error_response(
+            ExitCode::Environment,
+            "environment",
+            format!(
+                "no active visual session; run `browser.open` or `desktop.launch` before calling `{op_name}` with `--screenshot`"
+            ),
+        )));
+    }
+    if state.handles.is_empty() {
+        return Ok(VisualContext {
+            session_kind: "session".to_string(),
+            snapshot: None,
+            masked_capture: None,
+            detach_errors: Vec::new(),
+            local_only_reason: None,
+        });
+    }
+
+    let fallback_kind = state
+        .handles
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "session".to_string());
+    let effective_registry = resolve_target_session_registry(&state.plugins, registry).map_err(
+        |(code, kind, message)| Box::new(error_response(code, kind, secrets.redact(&message))),
+    )?;
+    let mut sessions = reattach_sessions(state, base_directory, effective_registry.as_ref())
+        .map_err(|message| {
+            Box::new(error_response(
+                ExitCode::Environment,
+                "environment",
+                secrets.redact(&message),
+            ))
+        })?;
+
+    let snap_res = sessions.collect_snapshot(None, None, None);
+    let cap_res = if screenshot {
+        Some(sessions.collect_masked_viewport_capture())
+    } else {
+        None
+    };
+    let local_only_reason = sessions.local_only_reason();
+    let detached = sessions.detach_all();
+    state.handles = detached.handles;
+
+    let (session_kind, snapshot, masked_capture) = if let Some(cap_result) = cap_res {
+        match cap_result {
+            Ok(Some((cap_kind, cap))) => {
+                let (kind, snap) = match snap_res {
+                    Ok(Some((kind, snap))) => (kind, Some(snap)),
+                    Ok(None) | Err(_) => (cap_kind, None),
+                };
+                (kind, snap, Some(cap))
+            }
+            Ok(None) => {
+                state.last_active_ms = store::now_ms();
+                let _ = store::save_state(session_dir, state, secrets);
+                return Err(Box::new(error_response(
+                    ExitCode::Environment,
+                    "environment",
+                    "active session has no visual surface for `--screenshot`",
+                )));
+            }
+            Err(message) => {
+                state.last_active_ms = store::now_ms();
+                let _ = store::save_state(session_dir, state, secrets);
+                return Err(Box::new(error_response(
+                    ExitCode::Environment,
+                    "environment",
+                    secrets.redact(&message),
+                )));
+            }
+        }
+    } else {
+        let (kind, snap) = match snap_res {
+            Ok(Some((kind, snap))) => (kind, Some(snap)),
+            Ok(None) | Err(_) => (fallback_kind, None),
+        };
+        (kind, snap, None)
+    };
+
+    Ok(VisualContext {
+        session_kind,
+        snapshot,
+        masked_capture,
+        detach_errors: detached.errors,
+        local_only_reason,
+    })
+}
+
+fn validate_var_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.contains('=')
+        || trimmed.contains('$')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+    {
+        return Err(format!("invalid `--save` variable name `{name}`"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn value_to_var_string(value: &Value, secrets: &Secrets) -> String {
+    match value {
+        Value::String(text) => secrets.redact(text),
+        other => secrets.redact(&other.to_string()),
+    }
+}
+
 fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
     if req.rubric.trim().is_empty() {
         return error_response(ExitCode::Usage, "usage", "`--rubric` must not be empty");
@@ -1664,6 +2014,7 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
+        req.reasoning_effort_override.as_deref(),
         &mut state,
         &mut secrets,
     ) {
@@ -1692,124 +2043,29 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         }
     };
 
-    let resolved_evidence = match &req.evidence {
-        Some(raw_ev) => match case::interpolate(raw_ev, &state.vars, &mut secrets) {
-            Ok(interpolated) => Some(secrets.redact_json(&interpolated)),
-            Err(err) => {
-                return error_response(
-                    ExitCode::InvalidCase,
-                    "invalid_input",
-                    secrets.redact(&format!("`--evidence`: {}", err.message)),
-                );
-            }
-        },
-        None => {
-            if existing_steps.is_empty() && state.vars.is_empty() {
-                None
-            } else {
-                let summarized: Vec<Value> = existing_steps
-                    .iter()
-                    .map(|rec| {
-                        json!({
-                            "index": rec.index,
-                            "action": rec.action,
-                            "status": rec.status,
-                            "error": rec.error,
-                            "result": rec.result,
-                        })
-                    })
-                    .collect();
-                Some(secrets.redact_json(&json!({
-                    "steps": summarized,
-                    "vars": state.vars,
-                })))
-            }
-        }
+    let resolved_evidence = match resolve_session_evidence(
+        req.evidence.as_ref(),
+        "--evidence",
+        &existing_steps,
+        &state,
+        &mut secrets,
+    ) {
+        Ok(ev) => ev,
+        Err(resp) => return *resp,
     };
 
-    if req.screenshot && state.handles.is_empty() {
-        return error_response(
-            ExitCode::Environment,
-            "environment",
-            "no active visual session; run `browser.open` or `desktop.launch` before calling `judge` with `--screenshot`",
-        );
-    }
-
     let started_at_ms = store::now_ms();
-    let mut detach_errors = Vec::new();
-    let mut local_only_reason: Option<String> = None;
-    let mut masked_capture: Option<MaskedViewportCapture> = None;
-    let (session_kind, snapshot) = if state.handles.is_empty() {
-        ("session".to_string(), None)
-    } else {
-        let fallback_kind = state
-            .handles
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "session".to_string());
-        let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
-            Ok(reg) => reg,
-            Err((code, kind, message)) => {
-                return error_response(code, kind, secrets.redact(&message));
-            }
-        };
-        match reattach_sessions(&state, &req.base_directory, effective_registry.as_ref()) {
-            Ok(mut sessions) => {
-                let snap_res = sessions.collect_snapshot(None, None, None);
-                let cap_res = if req.screenshot {
-                    Some(sessions.collect_masked_viewport_capture())
-                } else {
-                    None
-                };
-                local_only_reason = sessions.local_only_reason();
-                let detached = sessions.detach_all();
-                state.handles = detached.handles;
-                detach_errors = detached.errors;
-
-                if let Some(cap_result) = cap_res {
-                    match cap_result {
-                        Ok(Some((cap_kind, cap))) => {
-                            masked_capture = Some(cap);
-                            match snap_res {
-                                Ok(Some((kind, snap))) => (kind, Some(snap)),
-                                Ok(None) | Err(_) => (cap_kind, None),
-                            }
-                        }
-                        Ok(None) => {
-                            state.last_active_ms = store::now_ms();
-                            let _ = store::save_state(&session_dir, &state, &secrets);
-                            return error_response(
-                                ExitCode::Environment,
-                                "environment",
-                                "active session has no visual surface for `--screenshot`",
-                            );
-                        }
-                        Err(message) => {
-                            state.last_active_ms = store::now_ms();
-                            let _ = store::save_state(&session_dir, &state, &secrets);
-                            return error_response(
-                                ExitCode::Environment,
-                                "environment",
-                                secrets.redact(&message),
-                            );
-                        }
-                    }
-                } else {
-                    match snap_res {
-                        Ok(Some((kind, snap))) => (kind, Some(snap)),
-                        Ok(None) | Err(_) => (fallback_kind, None),
-                    }
-                }
-            }
-            Err(message) => {
-                return error_response(
-                    ExitCode::Environment,
-                    "environment",
-                    secrets.redact(&message),
-                );
-            }
-        }
+    let visual = match capture_snapshot_and_screenshot(
+        &session_dir,
+        &mut state,
+        &req.base_directory,
+        registry,
+        req.screenshot,
+        "judge",
+        &secrets,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
     };
 
     let outcome = match invoke_judge(
@@ -1817,11 +2073,11 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         req.timeout_ms,
         JudgeParams {
             session_id: &state.id,
-            session_kind: &session_kind,
+            session_kind: &visual.session_kind,
             rubric: &expanded_rubric,
-            snapshot: snapshot.as_ref(),
+            snapshot: visual.snapshot.as_ref(),
             evidence: resolved_evidence.as_ref(),
-            masked_capture: masked_capture.as_ref(),
+            masked_capture: visual.masked_capture.as_ref(),
         },
         &mut secrets,
     ) {
@@ -1863,7 +2119,7 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
             used_ref: None,
             synthesized_locator: None,
             fragile: false,
-            observed_viewport: masked_capture.as_ref().map(|cap| {
+            observed_viewport: visual.masked_capture.as_ref().map(|cap| {
                 json!({
                     "width": cap.width,
                     "height": cap.height,
@@ -1884,8 +2140,8 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         return error_response(ExitCode::Environment, "environment", secrets.redact(&err));
     }
 
-    let ok = outcome.passed && detach_errors.is_empty();
-    let exit_code = if !detach_errors.is_empty() && outcome.passed {
+    let ok = outcome.passed && visual.detach_errors.is_empty();
+    let exit_code = if !visual.detach_errors.is_empty() && outcome.passed {
         ExitCode::Environment
     } else if outcome.passed {
         ExitCode::Success
@@ -1896,7 +2152,7 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
     let mut payload = json!({
         "ok": ok,
         "session_id": state.id,
-        "session_kind": session_kind,
+        "session_kind": visual.session_kind,
         "passed": outcome.passed,
         "rationale": outcome.rationale,
         "confidence": outcome.audit.confidence,
@@ -1905,14 +2161,14 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         "usage": outcome.audit.usage,
         "trace_id": outcome.audit.trace_id,
     });
-    if let Some(cap) = &masked_capture {
+    if let Some(cap) = &visual.masked_capture {
         payload["screenshot"] = json!(true);
         payload["viewport"] = json!({ "width": cap.width, "height": cap.height });
     }
-    if !detach_errors.is_empty() {
-        payload["detach_errors"] = json!(detach_errors);
+    if !visual.detach_errors.is_empty() {
+        payload["detach_errors"] = json!(visual.detach_errors);
     }
-    if let Some(reason) = local_only_reason {
+    if let Some(reason) = visual.local_only_reason {
         payload["local_only"] = json!(true);
         payload["local_only_reason"] = json!(reason);
     }
@@ -1927,6 +2183,812 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
     }
     if let Some(tid) = &outcome.audit.trace_id {
         text.push_str(&format!("trace_id: {tid}\n"));
+    }
+
+    SessionResponse {
+        exit_code,
+        payload: secrets.redact_json(&payload),
+        raw_yaml: None,
+        raw_text: Some(secrets.redact(&text)),
+    }
+}
+
+fn handle_extract(req: ExtractRequest, registry: &Registry) -> SessionResponse {
+    if req.query.trim().is_empty() {
+        return error_response(ExitCode::Usage, "usage", "`--query` must not be empty");
+    }
+    if req.timeout_ms == 0 {
+        return error_response(
+            ExitCode::Usage,
+            "usage",
+            "`--timeout-ms` must be at least 1",
+        );
+    }
+    if let Some(schema) = &req.schema
+        && !schema.is_object()
+    {
+        return error_response(
+            ExitCode::Usage,
+            "usage",
+            "`--schema` must be a JSON Schema object",
+        );
+    }
+    let save_var = match req.save.as_deref() {
+        Some(raw) => match validate_var_name(raw) {
+            Ok(name) => Some(name),
+            Err(msg) => return error_response(ExitCode::Usage, "usage", msg),
+        },
+        None => None,
+    };
+
+    let (session_dir, _lock, mut state) = match acquire_existing(&req.sessions_dir, &req.id) {
+        Ok(found) => found,
+        Err(resp) => return *resp,
+    };
+
+    state
+        .env_names
+        .extend(case::env_references(&Value::String(req.query.clone())));
+    if let Some(ev) = &req.evidence {
+        state.env_names.extend(case::env_references(ev));
+    }
+    if let Some(schema) = &req.schema {
+        state.env_names.extend(case::env_references(schema));
+    }
+
+    let mut secrets = store::secrets_from_env_names(&state.env_names);
+    let backend = match resolve_model_backend(
+        req.hook_override.as_ref(),
+        req.model_override.as_ref(),
+        req.reasoning_effort_override.as_deref(),
+        &mut state,
+        &mut secrets,
+    ) {
+        Ok(backend) => backend,
+        Err(resp) => return *resp,
+    };
+    let expanded_query = match case::expand_env(&req.query, &mut secrets) {
+        Ok(q) => q,
+        Err(msg) => {
+            return error_response(
+                ExitCode::InvalidCase,
+                "invalid_input",
+                secrets.redact(&format!("`--query`: {msg}")),
+            );
+        }
+    };
+
+    let existing_steps = match store::load_steps(&session_dir) {
+        Ok(steps) => steps,
+        Err(message) => {
+            return error_response(
+                ExitCode::Environment,
+                "environment",
+                secrets.redact(&message),
+            );
+        }
+    };
+
+    let resolved_evidence = match resolve_session_evidence(
+        req.evidence.as_ref(),
+        "--evidence",
+        &existing_steps,
+        &state,
+        &mut secrets,
+    ) {
+        Ok(ev) => ev,
+        Err(resp) => return *resp,
+    };
+    let redacted_schema = req.schema.as_ref().map(|s| secrets.redact_json(s));
+
+    let started_at_ms = store::now_ms();
+    let visual = match capture_snapshot_and_screenshot(
+        &session_dir,
+        &mut state,
+        &req.base_directory,
+        registry,
+        req.screenshot,
+        "extract",
+        &secrets,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
+    let outcome = match invoke_extract(
+        &backend,
+        req.timeout_ms,
+        ExtractParams {
+            session_id: &state.id,
+            session_kind: &visual.session_kind,
+            query: &expanded_query,
+            schema: redacted_schema.as_ref(),
+            snapshot: visual.snapshot.as_ref(),
+            evidence: resolved_evidence.as_ref(),
+            masked_capture: visual.masked_capture.as_ref(),
+        },
+        &mut secrets,
+    ) {
+        Ok(outcome) => outcome,
+        Err(hook_err) => {
+            state.last_active_ms = store::now_ms();
+            let _ = store::save_state(&session_dir, &state, &secrets);
+            let (code, kind, msg) = hook_err.into_code_and_kind();
+            return error_response(code, kind, secrets.redact(&msg));
+        }
+    };
+
+    let mut saved_map = BTreeMap::new();
+    if let Some(var_name) = save_var {
+        let safe_var = secrets.redact(&var_name);
+        let stored_val = value_to_var_string(&outcome.data, &secrets);
+        state.vars.insert(safe_var.clone(), stored_val.clone());
+        saved_map.insert(safe_var, stored_val);
+    }
+
+    let duration_ms = store::now_ms().saturating_sub(started_at_ms);
+    let mut raw_args = Map::new();
+    raw_args.insert(
+        "query".to_string(),
+        Value::String(secrets.redact(&req.query)),
+    );
+    if let Some(schema) = &redacted_schema {
+        raw_args.insert("schema".to_string(), schema.clone());
+    }
+    if req.screenshot {
+        raw_args.insert("screenshot".to_string(), Value::Bool(true));
+    }
+
+    let diag_result = json!({
+        "data": outcome.data,
+        "saved": saved_map,
+        "confidence": outcome.audit.confidence,
+        "model": outcome.audit.model,
+        "latency_ms": outcome.audit.latency_ms,
+        "usage": outcome.audit.usage,
+        "trace_id": outcome.audit.trace_id,
+    });
+    let diag_record = build_model_diagnostic_record(
+        ModelDiagnosticSpec {
+            index: existing_steps.len() + 1,
+            action: STEP_ACTION_EXTRACT,
+            raw_args: Value::Object(raw_args),
+            status: "passed",
+            error: None,
+            used_ref: None,
+            synthesized_locator: None,
+            fragile: false,
+            observed_viewport: visual.masked_capture.as_ref().map(|cap| {
+                json!({
+                    "width": cap.width,
+                    "height": cap.height,
+                })
+            }),
+            started_at_ms,
+            duration_ms,
+            result: diag_result,
+        },
+        &outcome.audit,
+    );
+
+    state.last_active_ms = store::now_ms();
+    if let Err(err) = store::append_step(&session_dir, &diag_record, &secrets) {
+        return error_response(ExitCode::Environment, "environment", secrets.redact(&err));
+    }
+    if let Err(err) = store::save_state(&session_dir, &state, &secrets) {
+        return error_response(ExitCode::Environment, "environment", secrets.redact(&err));
+    }
+
+    let ok = visual.detach_errors.is_empty();
+    let exit_code = if ok {
+        ExitCode::Success
+    } else {
+        ExitCode::Environment
+    };
+
+    let mut payload = json!({
+        "ok": ok,
+        "session_id": state.id,
+        "session_kind": visual.session_kind,
+        "data": outcome.data,
+        "saved": saved_map,
+        "confidence": outcome.audit.confidence,
+        "model": outcome.audit.model,
+        "latency_ms": outcome.audit.latency_ms,
+        "usage": outcome.audit.usage,
+        "trace_id": outcome.audit.trace_id,
+    });
+    if let Some(cap) = &visual.masked_capture {
+        payload["screenshot"] = json!(true);
+        payload["viewport"] = json!({ "width": cap.width, "height": cap.height });
+    }
+    if !visual.detach_errors.is_empty() {
+        payload["detach_errors"] = json!(visual.detach_errors);
+    }
+    if let Some(reason) = visual.local_only_reason {
+        payload["local_only"] = json!(true);
+        payload["local_only_reason"] = json!(reason);
+    }
+
+    let rendered_data =
+        serde_json::to_string_pretty(&outcome.data).unwrap_or_else(|_| outcome.data.to_string());
+    let mut text = format!(
+        "extract (model: {}, latency_ms: {})\ndata: {}\n",
+        outcome.audit.model, outcome.audit.latency_ms, rendered_data
+    );
+    if !saved_map.is_empty() {
+        for (k, v) in &saved_map {
+            text.push_str(&format!("saved: {k} = {v}\n"));
+        }
+    }
+
+    SessionResponse {
+        exit_code,
+        payload: secrets.redact_json(&payload),
+        raw_yaml: None,
+        raw_text: Some(secrets.redact(&text)),
+    }
+}
+
+fn act_available_actions(registry: &Registry, session_kind: &str) -> Vec<String> {
+    registry
+        .names()
+        .into_iter()
+        .filter(|name| !name.starts_with("model."))
+        .filter(|name| match session_kind {
+            "browser" => !name.starts_with("desktop."),
+            "desktop" => !name.starts_with("browser."),
+            _ => true,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn act_probe_visual_point_step(
+    kind: &str,
+    x: f64,
+    y: f64,
+    text: Option<&str>,
+    session_kind: &str,
+    cached_capture: Option<&MaskedViewportCapture>,
+    sessions: &mut Sessions,
+) -> Result<(Step, Value, Option<SynthesizedTarget>), HookError> {
+    if !matches!(session_kind, "browser" | "desktop") {
+        return Err(HookError::Environment(format!(
+            "visual coordinate action `{kind}` requires an active browser or desktop session"
+        )));
+    }
+    let (width, height) = if let Some(cap) = cached_capture {
+        (cap.width, cap.height)
+    } else {
+        let Some((_cap_kind, cap)) = sessions
+            .collect_masked_viewport_capture()
+            .map_err(HookError::Environment)?
+        else {
+            return Err(HookError::Environment(format!(
+                "active `{session_kind}` session has no visual viewport for `{kind}`"
+            )));
+        };
+        (cap.width, cap.height)
+    };
+    validate_point_in_viewport(x, y, width, height, model_hook::METHOD_ACT_STEP)?;
+    let synth_target = sessions
+        .synthesize_at_point(Some(session_kind), x, y)
+        .map_err(HookError::Environment)?
+        .map(|(_, target)| target);
+    let (viewport, at_value, _, _) = build_at_value(session_kind, x, y, width, height);
+
+    let step_name = match (session_kind, text.is_some()) {
+        ("desktop", false) => "desktop.click",
+        ("desktop", true) => "desktop.type",
+        (_, false) => "browser.click",
+        (_, true) => "browser.type",
+    };
+    let mut step_args = Map::new();
+    step_args.insert("at".to_string(), at_value);
+    if let Some(txt) = text {
+        step_args.insert("text".to_string(), Value::String(txt.to_string()));
+    }
+    let mut outer = Map::new();
+    outer.insert(step_name.to_string(), Value::Object(step_args));
+    let step = case::parse_single_step(&Value::Object(outer).to_string())
+        .map_err(HookError::Environment)?;
+    Ok((step, viewport, synth_target))
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
+    if req.goal.trim().is_empty() {
+        return error_response(ExitCode::Usage, "usage", "`--goal` must not be empty");
+    }
+    if req.max_steps == 0 || req.max_steps > MAX_ACT_MAX_STEPS {
+        return error_response(
+            ExitCode::Usage,
+            "usage",
+            format!("`--max-steps` must be between 1 and {MAX_ACT_MAX_STEPS}"),
+        );
+    }
+    if req.timeout_ms == 0 {
+        return error_response(
+            ExitCode::Usage,
+            "usage",
+            "`--timeout-ms` must be at least 1",
+        );
+    }
+
+    let (session_dir, _lock, mut state) = match acquire_existing(&req.sessions_dir, &req.id) {
+        Ok(found) => found,
+        Err(resp) => return *resp,
+    };
+
+    state
+        .env_names
+        .extend(case::env_references(&Value::String(req.goal.clone())));
+    if let Some(ev) = &req.evidence {
+        state.env_names.extend(case::env_references(ev));
+    }
+
+    let mut secrets = store::secrets_from_env_names(&state.env_names);
+    let backend = match resolve_model_backend(
+        req.hook_override.as_ref(),
+        req.model_override.as_ref(),
+        req.reasoning_effort_override.as_deref(),
+        &mut state,
+        &mut secrets,
+    ) {
+        Ok(backend) => backend,
+        Err(resp) => return *resp,
+    };
+    let expanded_goal = match case::expand_env(&req.goal, &mut secrets) {
+        Ok(g) => g,
+        Err(msg) => {
+            return error_response(
+                ExitCode::InvalidCase,
+                "invalid_input",
+                secrets.redact(&format!("`--goal`: {msg}")),
+            );
+        }
+    };
+
+    if req.screenshot && state.handles.is_empty() {
+        return error_response(
+            ExitCode::Environment,
+            "environment",
+            "no active visual session; run `browser.open` or `desktop.launch` before calling `act` with `--screenshot`",
+        );
+    }
+
+    let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
+        Ok(reg) => reg,
+        Err((code, kind, message)) => return error_response(code, kind, secrets.redact(&message)),
+    };
+
+    let explicit_evidence = match &req.evidence {
+        Some(raw_ev) => match case::interpolate(raw_ev, &state.vars, &mut secrets) {
+            Ok(interpolated) => Some(secrets.redact_json(&interpolated)),
+            Err(err) => {
+                return error_response(
+                    ExitCode::InvalidCase,
+                    "invalid_input",
+                    secrets.redact(&format!("`--evidence`: {}", err.message)),
+                );
+            }
+        },
+        None => None,
+    };
+
+    let existing_steps = match store::load_steps(&session_dir) {
+        Ok(steps) => steps,
+        Err(message) => {
+            return error_response(
+                ExitCode::Environment,
+                "environment",
+                secrets.redact(&message),
+            );
+        }
+    };
+    let mut next_step_index = existing_steps.len() + 1;
+
+    let mut sessions =
+        match reattach_sessions(&state, &req.base_directory, effective_registry.as_ref()) {
+            Ok(s) => s,
+            Err(message) => {
+                return error_response(
+                    ExitCode::Environment,
+                    "environment",
+                    secrets.redact(&message),
+                );
+            }
+        };
+
+    let act_started_ms = store::now_ms();
+    let mut history: Vec<Value> = Vec::new();
+    let mut executed_steps: Vec<Value> = Vec::new();
+    let mut final_status = "max_steps_exceeded";
+    let mut final_summary = String::new();
+    let mut final_reason: Option<String> = None;
+    let mut final_session_kind = state
+        .handles
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "session".to_string());
+    let mut last_viewport: Option<Value> = None;
+    let mut last_audit: Option<ModelAudit> = None;
+    let mut total_model_latency_ms: u64 = 0;
+
+    for step_num in 1..=req.max_steps {
+        let (mut session_kind, snapshot) = match sessions.collect_snapshot(None, None, None) {
+            Ok(Some((kind, snap))) => (kind, Some(secrets.redact_json(&snap))),
+            Ok(None) | Err(_) => (final_session_kind.clone(), None),
+        };
+        let masked_capture = if req.screenshot {
+            match sessions.collect_masked_viewport_capture() {
+                Ok(Some((cap_kind, cap))) => {
+                    if session_kind == "session" {
+                        session_kind = cap_kind;
+                    }
+                    last_viewport = Some(json!({ "width": cap.width, "height": cap.height }));
+                    Some(cap)
+                }
+                Ok(None) => {
+                    let _ =
+                        detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                    return error_response(
+                        ExitCode::Environment,
+                        "environment",
+                        "active session has no visual surface for `--screenshot`",
+                    );
+                }
+                Err(message) => {
+                    let _ =
+                        detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                    return error_response(
+                        ExitCode::Environment,
+                        "environment",
+                        secrets.redact(&message),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        final_session_kind = session_kind.clone();
+
+        let available_actions = act_available_actions(effective_registry.as_ref(), &session_kind);
+        let dyn_evidence = explicit_evidence.clone().or_else(|| {
+            if state.vars.is_empty() {
+                None
+            } else {
+                Some(secrets.redact_json(&json!({ "vars": state.vars })))
+            }
+        });
+
+        let outcome = match invoke_act_step(
+            &backend,
+            req.timeout_ms,
+            ActStepParams {
+                session_id: &state.id,
+                session_kind: &session_kind,
+                goal: &expanded_goal,
+                step_index: step_num,
+                max_steps: req.max_steps,
+                available_actions: &available_actions,
+                history: &history,
+                snapshot: snapshot.as_ref(),
+                evidence: dyn_evidence.as_ref(),
+                masked_capture: masked_capture.as_ref(),
+            },
+            &mut secrets,
+        ) {
+            Ok(outcome) => outcome,
+            Err(hook_err) => {
+                let _ = detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                let (code, kind, msg) = hook_err.into_code_and_kind();
+                return error_response(code, kind, secrets.redact(&msg));
+            }
+        };
+
+        total_model_latency_ms = total_model_latency_ms.saturating_add(outcome.audit.latency_ms);
+        final_summary = outcome.summary.clone();
+        last_audit = Some(outcome.audit.clone());
+
+        match outcome.status {
+            ActStepStatus::Done => {
+                final_status = "done";
+                final_reason = outcome.reason;
+                break;
+            }
+            ActStepStatus::Failed => {
+                final_status = "failed";
+                final_reason = outcome.reason.or(Some(outcome.summary));
+                break;
+            }
+            ActStepStatus::Continue => {
+                let Some(act_action) = outcome.action else {
+                    let _ =
+                        detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                    return error_response(
+                        ExitCode::Environment,
+                        "environment",
+                        "model `model/act_step` returned `continue` without an `action`",
+                    );
+                };
+
+                struct ActStepSetup {
+                    step: Step,
+                    viewport: Option<Value>,
+                    synth: Option<SynthesizedTarget>,
+                    kind_label: &'static str,
+                }
+
+                let step_setup: Result<ActStepSetup, HookError> = match act_action {
+                    ActStepAction::Step { use_action, with } => {
+                        if use_action.starts_with("model.")
+                            || effective_registry.get(&use_action).is_none()
+                        {
+                            Err(HookError::Environment(secrets.redact(&format!(
+                                "model `model/act_step` requested unavailable or disallowed step action `{use_action}`"
+                            ))))
+                        } else {
+                            state.env_names.extend(case::env_references(&with));
+                            secrets = store::secrets_from_env_names(&state.env_names);
+                            let step_json = json!({ use_action: with });
+                            case::parse_single_step(&step_json.to_string())
+                                .map(|step| ActStepSetup {
+                                    step,
+                                    viewport: None,
+                                    synth: None,
+                                    kind_label: "step",
+                                })
+                                .map_err(|msg| HookError::Environment(secrets.redact(&msg)))
+                        }
+                    }
+                    ActStepAction::LocateClick { x, y } => act_probe_visual_point_step(
+                        "locate_click",
+                        x,
+                        y,
+                        None,
+                        &session_kind,
+                        masked_capture.as_ref(),
+                        &mut sessions,
+                    )
+                    .map(|(step, vp, synth)| ActStepSetup {
+                        step,
+                        viewport: Some(vp),
+                        synth,
+                        kind_label: "locate_click",
+                    }),
+                    ActStepAction::LocateType { x, y, text } => {
+                        state
+                            .env_names
+                            .extend(case::env_references(&Value::String(text.clone())));
+                        secrets = store::secrets_from_env_names(&state.env_names);
+                        act_probe_visual_point_step(
+                            "locate_type",
+                            x,
+                            y,
+                            Some(&text),
+                            &session_kind,
+                            masked_capture.as_ref(),
+                            &mut sessions,
+                        )
+                        .map(|(step, vp, synth)| ActStepSetup {
+                            step,
+                            viewport: Some(vp),
+                            synth,
+                            kind_label: "locate_type",
+                        })
+                    }
+                };
+
+                let ActStepSetup {
+                    step,
+                    viewport: step_vp,
+                    synth: synth_target,
+                    kind_label: action_kind_label,
+                } = match step_setup {
+                    Ok(setup) => setup,
+                    Err(hook_err) => {
+                        let _ = detach_and_persist_handles(
+                            &session_dir,
+                            &mut state,
+                            sessions,
+                            &secrets,
+                        );
+                        let (code, kind, msg) = hook_err.into_code_and_kind();
+                        return error_response(code, kind, secrets.redact(&msg));
+                    }
+                };
+                if let Some(vp) = &step_vp {
+                    last_viewport = Some(vp.clone());
+                }
+
+                let (report, _post_snap, step_rec) = execute_synthesized_step(
+                    &step,
+                    next_step_index,
+                    step_vp.as_ref(),
+                    synth_target.as_ref(),
+                    Some(&outcome.audit),
+                    effective_registry.as_ref(),
+                    &mut state,
+                    &mut secrets,
+                    &mut sessions,
+                );
+                if let Err(err) = store::append_step(&session_dir, &step_rec, &secrets) {
+                    let _ =
+                        detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                    return error_response(
+                        ExitCode::Environment,
+                        "environment",
+                        secrets.redact(&err),
+                    );
+                }
+                next_step_index += 1;
+
+                let step_ok = report.status == StepStatus::Passed;
+                let step_err = report.error.as_ref().map(|p| secrets.redact(&p.message));
+                let exec_entry = json!({
+                    "iteration": step_num,
+                    "step_index": step_rec.index,
+                    "action_kind": action_kind_label,
+                    "use": step.action,
+                    "status": step_rec.status,
+                    "used_ref": step_rec.used_ref,
+                    "synthesized_locator": step_rec.synthesized_locator,
+                    "fragile": step_rec.fragile,
+                    "summary": outcome.summary,
+                    "error": step_err,
+                });
+                executed_steps.push(exec_entry);
+                history.push(json!({
+                    "iteration": step_num,
+                    "action_kind": action_kind_label,
+                    "use": step.action,
+                    "status": if step_ok { "passed" } else { "failed" },
+                    "summary": outcome.summary,
+                    "error": step_err,
+                }));
+
+                if matches!(
+                    report.error.as_ref().map(|p| p.kind),
+                    Some(ProblemKind::Environment)
+                ) {
+                    let _ =
+                        detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                    return error_response(
+                        ExitCode::Environment,
+                        "environment",
+                        step_err.unwrap_or_else(|| {
+                            "session step failed with environment error".to_string()
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    if final_status == "max_steps_exceeded" && final_reason.is_none() {
+        final_reason = Some(format!(
+            "reached `--max-steps` limit ({}) without completing goal",
+            req.max_steps
+        ));
+    }
+
+    let local_only_reason = sessions.local_only_reason();
+    let detached = sessions.detach_all();
+    state.handles = detached.handles;
+    state.last_active_ms = store::now_ms();
+
+    let Some(mut diag_audit) = last_audit else {
+        let _ = store::save_state(&session_dir, &state, &secrets);
+        return error_response(
+            ExitCode::Environment,
+            "environment",
+            "model `model/act_step` did not produce an outcome",
+        );
+    };
+    diag_audit.latency_ms = total_model_latency_ms;
+
+    let act_passed = final_status == "done";
+    let act_duration_ms = store::now_ms().saturating_sub(act_started_ms);
+    let mut raw_args = json!({
+        "goal": secrets.redact(&req.goal),
+        "max_steps": req.max_steps,
+    });
+    if req.screenshot {
+        raw_args["screenshot"] = json!(true);
+    }
+    let diag_result = json!({
+        "status": final_status,
+        "summary": final_summary,
+        "reason": final_reason,
+        "steps_taken": executed_steps.len(),
+        "max_steps": req.max_steps,
+        "executed_steps": executed_steps,
+        "model": diag_audit.model,
+        "latency_ms": total_model_latency_ms,
+        "confidence": diag_audit.confidence,
+        "trace_id": diag_audit.trace_id,
+    });
+    let diag_record = build_model_diagnostic_record(
+        ModelDiagnosticSpec {
+            index: next_step_index,
+            action: STEP_ACTION_ACT,
+            raw_args,
+            status: if act_passed { "passed" } else { "failed" },
+            error: if act_passed {
+                None
+            } else {
+                final_reason.clone()
+            },
+            used_ref: None,
+            synthesized_locator: None,
+            fragile: false,
+            observed_viewport: last_viewport.clone(),
+            started_at_ms: act_started_ms,
+            duration_ms: act_duration_ms,
+            result: diag_result,
+        },
+        &diag_audit,
+    );
+
+    if let Err(err) = store::append_step(&session_dir, &diag_record, &secrets) {
+        return error_response(ExitCode::Environment, "environment", secrets.redact(&err));
+    }
+    if let Err(err) = store::save_state(&session_dir, &state, &secrets) {
+        return error_response(ExitCode::Environment, "environment", secrets.redact(&err));
+    }
+
+    let ok = act_passed && detached.errors.is_empty();
+    let exit_code = if !detached.errors.is_empty() && act_passed {
+        ExitCode::Environment
+    } else if act_passed {
+        ExitCode::Success
+    } else {
+        ExitCode::TestFailure
+    };
+
+    let mut payload = json!({
+        "ok": ok,
+        "session_id": state.id,
+        "session_kind": final_session_kind,
+        "status": final_status,
+        "summary": final_summary,
+        "reason": final_reason,
+        "steps_taken": executed_steps.len(),
+        "max_steps": req.max_steps,
+        "executed_steps": executed_steps,
+        "model": diag_audit.model,
+        "latency_ms": total_model_latency_ms,
+        "confidence": diag_audit.confidence,
+        "trace_id": diag_audit.trace_id,
+    });
+    if req.screenshot {
+        payload["screenshot"] = json!(true);
+        if let Some(vp) = &last_viewport {
+            payload["viewport"] = vp.clone();
+        }
+    }
+    if !detached.errors.is_empty() {
+        payload["detach_errors"] = json!(detached.errors);
+    }
+    if let Some(reason) = local_only_reason {
+        payload["local_only"] = json!(true);
+        payload["local_only_reason"] = json!(reason);
+    }
+
+    let mut text = format!(
+        "act: {final_status} (steps: {}/{}, model: {}, latency_ms: {total_model_latency_ms})\n",
+        executed_steps.len(),
+        req.max_steps,
+        diag_audit.model
+    );
+    if !final_summary.is_empty() {
+        text.push_str(&format!("summary: {final_summary}\n"));
+    }
+    if let Some(reason) = &final_reason {
+        text.push_str(&format!("reason: {reason}\n"));
     }
 
     SessionResponse {

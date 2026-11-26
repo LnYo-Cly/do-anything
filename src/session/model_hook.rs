@@ -1,9 +1,9 @@
 //! Synchronous stdin/stdout JSON-RPC 2.0 host for external model hooks.
 //!
 //! Model hooks assist interactive exploration (`da session` and `da mcp`) across
-//! three atomic operations — `model/select_ref`, `model/locate`, and
-//! `model/judge` — without bringing an async runtime or model SDK into `da` and
-//! without running during `da run` case replay.
+//! five operations — `model/select_ref`, `model/locate`, `model/judge`,
+//! `model/extract`, and `model/act_step` — without bringing an async runtime or
+//! model SDK into `da` and without running during `da run` case replay.
 //!
 //! Every outgoing prompt/evidence payload and every incoming rationale, model
 //! name, usage block, trace identifier, or error message passes through
@@ -37,6 +37,12 @@ pub const METHOD_LOCATE: &str = "model/locate";
 /// JSON-RPC 2.0 method name for exploration-time semantic verdicts (e.g., vLLM / LLM).
 pub const METHOD_JUDGE: &str = "model/judge";
 
+/// JSON-RPC 2.0 method name for exploration-time structured data extraction.
+pub const METHOD_EXTRACT: &str = "model/extract";
+
+/// JSON-RPC 2.0 method name for one iteration of a bounded autonomous `act` loop.
+pub const METHOD_ACT_STEP: &str = "model/act_step";
+
 /// Action name recorded in `steps.jsonl` for `select-ref` diagnostics.
 pub const STEP_ACTION_SELECT_REF: &str = "model.select_ref";
 
@@ -45,6 +51,33 @@ pub const STEP_ACTION_LOCATE: &str = "model.locate";
 
 /// Action name recorded in `steps.jsonl` for `judge` diagnostics.
 pub const STEP_ACTION_JUDGE: &str = "model.judge";
+
+/// Action name recorded in `steps.jsonl` for `extract` diagnostics.
+pub const STEP_ACTION_EXTRACT: &str = "model.extract";
+
+/// Action name recorded in `steps.jsonl` for bounded `act` loop summaries.
+pub const STEP_ACTION_ACT: &str = "model.act";
+
+/// Accepted reasoning effort keywords forwarded to the built-in `genai` model layer.
+pub const VALID_REASONING_EFFORTS: &[&str] = &[
+    "none", "zero", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+
+/// Normalizes and validates a `reasoning_effort` keyword (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+pub fn validate_reasoning_effort(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err("`--reasoning-effort` must not be empty".to_string());
+    }
+    if VALID_REASONING_EFFORTS.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(format!(
+            "unsupported reasoning effort `{raw}`; expected one of: {}",
+            VALID_REASONING_EFFORTS.join(", ")
+        ))
+    }
+}
 
 const READ_CHUNK: usize = 8 * 1024;
 const MAX_HOOK_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -75,6 +108,9 @@ pub struct BuiltinModelSpec {
     /// Optional environment variable name storing the API key (never the literal secret).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Optional reasoning effort keyword (`none`, `zero`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Categorized failure from invoking or validating an external model hook.
@@ -162,6 +198,78 @@ pub struct JudgeParams<'a> {
 pub struct JudgeOutcome {
     pub passed: bool,
     pub rationale: String,
+    pub audit: ModelAudit,
+}
+
+/// Input parameters for [`METHOD_EXTRACT`].
+pub struct ExtractParams<'a> {
+    pub session_id: &'a str,
+    pub session_kind: &'a str,
+    pub query: &'a str,
+    pub schema: Option<&'a Value>,
+    pub snapshot: Option<&'a Value>,
+    pub evidence: Option<&'a Value>,
+    pub masked_capture: Option<&'a MaskedViewportCapture>,
+}
+
+/// Validated response from [`METHOD_EXTRACT`].
+#[derive(Debug, Clone)]
+pub struct ExtractOutcome {
+    pub data: Value,
+    pub audit: ModelAudit,
+}
+
+/// Input parameters for [`METHOD_ACT_STEP`].
+pub struct ActStepParams<'a> {
+    pub session_id: &'a str,
+    pub session_kind: &'a str,
+    pub goal: &'a str,
+    pub step_index: usize,
+    pub max_steps: usize,
+    pub available_actions: &'a [String],
+    pub history: &'a [Value],
+    pub snapshot: Option<&'a Value>,
+    pub evidence: Option<&'a Value>,
+    pub masked_capture: Option<&'a MaskedViewportCapture>,
+}
+
+/// Decision status returned by [`METHOD_ACT_STEP`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActStepStatus {
+    Continue,
+    Done,
+    Failed,
+}
+
+impl ActStepStatus {
+    /// Returns the canonical lowercase status string (`continue`, `done`, or `failed`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Concrete step or visual action returned by [`METHOD_ACT_STEP`] when `status` is `continue`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActStepAction {
+    /// Invoke a registered non-diagnostic `da` action (`use` + `with`).
+    Step { use_action: String, with: Value },
+    /// Click visual coordinates `(x, y)` and synthesize a deterministic locator.
+    LocateClick { x: f64, y: f64 },
+    /// Type text at visual coordinates `(x, y)` and synthesize a deterministic locator.
+    LocateType { x: f64, y: f64, text: String },
+}
+
+/// Validated response from [`METHOD_ACT_STEP`].
+#[derive(Debug, Clone)]
+pub struct ActStepOutcome {
+    pub status: ActStepStatus,
+    pub summary: String,
+    pub reason: Option<String>,
+    pub action: Option<ActStepAction>,
     pub audit: ModelAudit,
 }
 
@@ -287,6 +395,12 @@ pub fn call_locate(
     Ok(LocateOutcome { x, y, audit })
 }
 
+fn insert_optional_json(map: &mut Map<String, Value>, key: &str, val: Option<&Value>) {
+    if let Some(v) = val {
+        map.insert(key.to_string(), v.clone());
+    }
+}
+
 pub(crate) fn build_judge_payload(params: &JudgeParams<'_>, secrets: &Secrets) -> Value {
     let mut map = Map::new();
     map.insert(
@@ -301,33 +415,65 @@ pub(crate) fn build_judge_payload(params: &JudgeParams<'_>, secrets: &Secrets) -
         "rubric".to_string(),
         Value::String(params.rubric.to_string()),
     );
-    if let Some(snap) = params.snapshot {
-        map.insert("snapshot".to_string(), snap.clone());
-    }
-    if let Some(ev) = params.evidence {
-        map.insert("evidence".to_string(), ev.clone());
-    }
+    insert_optional_json(&mut map, "snapshot", params.snapshot);
+    insert_optional_json(&mut map, "evidence", params.evidence);
     secrets.redact_json(&Value::Object(map))
 }
 
-/// Invokes `model/judge` over redacted session evidence and parses the verdict.
-pub fn call_judge(
-    hook: &ModelHookSpec,
-    timeout_ms: u64,
-    params: JudgeParams<'_>,
-    secrets: &Secrets,
-) -> Result<JudgeOutcome, HookError> {
-    if let Some(capture) = params.masked_capture
-        && (capture.width == 0 || capture.height == 0)
-    {
-        return Err(HookError::Environment(
-            "cannot call `model/judge` with a zero-sized viewport".to_string(),
-        ));
+pub(crate) fn build_extract_payload(params: &ExtractParams<'_>, secrets: &Secrets) -> Value {
+    let mut map = Map::new();
+    map.insert(
+        "session_id".to_string(),
+        Value::String(params.session_id.to_string()),
+    );
+    map.insert(
+        "session_kind".to_string(),
+        Value::String(params.session_kind.to_string()),
+    );
+    map.insert("query".to_string(), Value::String(params.query.to_string()));
+    insert_optional_json(&mut map, "schema", params.schema);
+    insert_optional_json(&mut map, "snapshot", params.snapshot);
+    insert_optional_json(&mut map, "evidence", params.evidence);
+    secrets.redact_json(&Value::Object(map))
+}
+
+pub(crate) fn build_act_step_payload(params: &ActStepParams<'_>, secrets: &Secrets) -> Value {
+    let mut map = Map::new();
+    map.insert(
+        "session_id".to_string(),
+        Value::String(params.session_id.to_string()),
+    );
+    map.insert(
+        "session_kind".to_string(),
+        Value::String(params.session_kind.to_string()),
+    );
+    map.insert("goal".to_string(), Value::String(params.goal.to_string()));
+    map.insert("step_index".to_string(), json!(params.step_index));
+    map.insert("max_steps".to_string(), json!(params.max_steps));
+    map.insert(
+        "available_actions".to_string(),
+        json!(params.available_actions),
+    );
+    map.insert("history".to_string(), Value::Array(params.history.to_vec()));
+    insert_optional_json(&mut map, "snapshot", params.snapshot);
+    insert_optional_json(&mut map, "evidence", params.evidence);
+    secrets.redact_json(&Value::Object(map))
+}
+
+fn attach_masked_capture(
+    payload: &mut Value,
+    capture: Option<&MaskedViewportCapture>,
+    method: &str,
+) -> Result<(), HookError> {
+    let Some(capture) = capture else {
+        return Ok(());
+    };
+    if capture.width == 0 || capture.height == 0 {
+        return Err(HookError::Environment(format!(
+            "cannot call `{method}` with a zero-sized viewport"
+        )));
     }
-    let mut redacted_params = build_judge_payload(&params, secrets);
-    if let Some(capture) = params.masked_capture
-        && let Value::Object(obj) = &mut redacted_params
-    {
+    if let Value::Object(obj) = payload {
         obj.insert(
             "image_base64".to_string(),
             Value::String(base64_encode(&capture.png)),
@@ -341,6 +487,18 @@ pub fn call_judge(
             json!({ "width": capture.width, "height": capture.height }),
         );
     }
+    Ok(())
+}
+
+/// Invokes `model/judge` over redacted session evidence and parses the verdict.
+pub fn call_judge(
+    hook: &ModelHookSpec,
+    timeout_ms: u64,
+    params: JudgeParams<'_>,
+    secrets: &Secrets,
+) -> Result<JudgeOutcome, HookError> {
+    let mut redacted_params = build_judge_payload(&params, secrets);
+    attach_masked_capture(&mut redacted_params, params.masked_capture, METHOD_JUDGE)?;
 
     let (result, elapsed_ms) =
         invoke_jsonrpc(hook, timeout_ms, METHOD_JUDGE, redacted_params, secrets)?;
@@ -350,6 +508,49 @@ pub fn call_judge(
     Ok(JudgeOutcome {
         passed,
         rationale,
+        audit,
+    })
+}
+
+/// Invokes `model/extract` over redacted session evidence and validates extracted JSON `data`.
+pub fn call_extract(
+    hook: &ModelHookSpec,
+    timeout_ms: u64,
+    params: ExtractParams<'_>,
+    secrets: &Secrets,
+) -> Result<ExtractOutcome, HookError> {
+    let mut redacted_params = build_extract_payload(&params, secrets);
+    attach_masked_capture(&mut redacted_params, params.masked_capture, METHOD_EXTRACT)?;
+
+    let (result, elapsed_ms) =
+        invoke_jsonrpc(hook, timeout_ms, METHOD_EXTRACT, redacted_params, secrets)?;
+    let obj = expect_result_object(&result, METHOD_EXTRACT, secrets)?;
+    let data = validate_extract_fields(obj, secrets)?;
+    let audit = parse_audit(obj, METHOD_EXTRACT, elapsed_ms, secrets)?;
+    Ok(ExtractOutcome { data, audit })
+}
+
+/// Invokes `model/act_step` to choose the next step, visual target, or terminal status.
+pub fn call_act_step(
+    hook: &ModelHookSpec,
+    timeout_ms: u64,
+    params: ActStepParams<'_>,
+    secrets: &Secrets,
+) -> Result<ActStepOutcome, HookError> {
+    let mut redacted_params = build_act_step_payload(&params, secrets);
+    attach_masked_capture(&mut redacted_params, params.masked_capture, METHOD_ACT_STEP)?;
+
+    let (result, elapsed_ms) =
+        invoke_jsonrpc(hook, timeout_ms, METHOD_ACT_STEP, redacted_params, secrets)?;
+    let obj = expect_result_object(&result, METHOD_ACT_STEP, secrets)?;
+    let viewport = params.masked_capture.map(|c| (c.width, c.height));
+    let (status, summary, reason, action) = validate_act_step_fields(obj, viewport, secrets)?;
+    let audit = parse_audit(obj, METHOD_ACT_STEP, elapsed_ms, secrets)?;
+    Ok(ActStepOutcome {
+        status,
+        summary,
+        reason,
+        action,
         audit,
     })
 }
@@ -368,6 +569,21 @@ pub(crate) fn validate_select_ref_choice(
     Ok(selected_ref)
 }
 
+pub(crate) fn validate_point_in_viewport(
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    method: &str,
+) -> Result<(), HookError> {
+    if x < 0.0 || y < 0.0 || x >= f64::from(width) || y >= f64::from(height) {
+        return Err(HookError::Environment(format!(
+            "model `{method}` returned coordinates ({x}, {y}) outside the {width}x{height} viewport"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_locate_coords(
     obj: &Map<String, Value>,
     width: u32,
@@ -375,11 +591,7 @@ pub(crate) fn validate_locate_coords(
 ) -> Result<(f64, f64), HookError> {
     let x = required_finite_f64(obj, "x", METHOD_LOCATE)?;
     let y = required_finite_f64(obj, "y", METHOD_LOCATE)?;
-    if x < 0.0 || y < 0.0 || x >= f64::from(width) || y >= f64::from(height) {
-        return Err(HookError::Environment(format!(
-            "model `{METHOD_LOCATE}` returned coordinates ({x}, {y}) outside the {width}x{height} viewport"
-        )));
-    }
+    validate_point_in_viewport(x, y, width, height, METHOD_LOCATE)?;
     Ok((x, y))
 }
 
@@ -401,6 +613,129 @@ pub(crate) fn validate_judge_fields(
             ))
         })?;
     Ok((passed, secrets.redact(rationale)))
+}
+
+pub(crate) fn validate_extract_fields(
+    obj: &Map<String, Value>,
+    secrets: &Secrets,
+) -> Result<Value, HookError> {
+    let data = obj.get("data").ok_or_else(|| {
+        HookError::Environment(format!(
+            "model `{METHOD_EXTRACT}` response must carry field `data`"
+        ))
+    })?;
+    Ok(secrets.redact_json(data))
+}
+
+pub(crate) fn validate_act_step_fields(
+    obj: &Map<String, Value>,
+    viewport: Option<(u32, u32)>,
+    secrets: &Secrets,
+) -> Result<(ActStepStatus, String, Option<String>, Option<ActStepAction>), HookError> {
+    let status_raw = required_non_empty_str(obj, "status", METHOD_ACT_STEP, secrets)?;
+    let status = match status_raw.trim() {
+        "continue" => ActStepStatus::Continue,
+        "done" => ActStepStatus::Done,
+        "failed" => ActStepStatus::Failed,
+        other => {
+            return Err(HookError::Environment(secrets.redact(&format!(
+                "model `{METHOD_ACT_STEP}` status `{other}` must be `continue`, `done`, or `failed`"
+            ))));
+        }
+    };
+    let summary = required_non_empty_str(obj, "summary", METHOD_ACT_STEP, secrets)?;
+    let reason = match obj.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(secrets.redact(trimmed))
+            }
+        }
+        Some(_) => {
+            return Err(HookError::Environment(format!(
+                "model `{METHOD_ACT_STEP}` field `reason` must be a string"
+            )));
+        }
+    };
+
+    let raw_action = obj.get("action").filter(|v| !v.is_null());
+    match status {
+        ActStepStatus::Done | ActStepStatus::Failed => {
+            if raw_action.is_some() {
+                return Err(HookError::Environment(format!(
+                    "model `{METHOD_ACT_STEP}` must omit `action` when `status` is `{}`",
+                    status.as_str()
+                )));
+            }
+            Ok((status, summary, reason, None))
+        }
+        ActStepStatus::Continue => {
+            let action_obj = raw_action.and_then(Value::as_object).ok_or_else(|| {
+                HookError::Environment(format!(
+                    "model `{METHOD_ACT_STEP}` must carry an `action` object when `status` is `continue`"
+                ))
+            })?;
+            let action = parse_act_step_action(action_obj, viewport, secrets)?;
+            Ok((status, summary, reason, Some(action)))
+        }
+    }
+}
+
+fn parse_act_step_action(
+    action_obj: &Map<String, Value>,
+    viewport: Option<(u32, u32)>,
+    secrets: &Secrets,
+) -> Result<ActStepAction, HookError> {
+    let kind = required_non_empty_str(action_obj, "kind", METHOD_ACT_STEP, secrets)?;
+    match kind.trim() {
+        "step" => {
+            let use_action = required_non_empty_str(action_obj, "use", METHOD_ACT_STEP, secrets)?;
+            let with = match action_obj.get("with") {
+                None | Some(Value::Null) => Value::Object(Map::new()),
+                Some(val @ Value::Object(_)) => secrets.redact_json(val),
+                Some(_) => {
+                    return Err(HookError::Environment(format!(
+                        "model `{METHOD_ACT_STEP}` `action.with` must be a JSON object"
+                    )));
+                }
+            };
+            Ok(ActStepAction::Step { use_action, with })
+        }
+        "locate_click" | "locate_type" => {
+            let x = required_finite_f64(action_obj, "x", METHOD_ACT_STEP)?;
+            let y = required_finite_f64(action_obj, "y", METHOD_ACT_STEP)?;
+            if let Some((w, h)) = viewport {
+                validate_point_in_viewport(x, y, w, h, METHOD_ACT_STEP)?;
+            } else if x < 0.0 || y < 0.0 {
+                return Err(HookError::Environment(format!(
+                    "model `{METHOD_ACT_STEP}` coordinates ({x}, {y}) must be non-negative"
+                )));
+            }
+            if kind.trim() == "locate_click" {
+                Ok(ActStepAction::LocateClick { x, y })
+            } else {
+                let text = action_obj
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        HookError::Environment(format!(
+                            "model `{METHOD_ACT_STEP}` `locate_type` action must carry string `text`"
+                        ))
+                    })?;
+                Ok(ActStepAction::LocateType {
+                    x,
+                    y,
+                    text: secrets.redact(text),
+                })
+            }
+        }
+        other => Err(HookError::Environment(secrets.redact(&format!(
+            "model `{METHOD_ACT_STEP}` action kind `{other}` must be `step`, `locate_click`, or `locate_type`"
+        )))),
+    }
 }
 
 pub(crate) fn extract_confidence(
@@ -918,5 +1253,106 @@ mod tests {
             parse_jsonrpc_stdout(&framed).expect("framed")["result"]["ref"],
             "e1"
         );
+    }
+
+    #[test]
+    fn validate_reasoning_effort_normalizes_keywords_and_rejects_unknown() {
+        for raw in [
+            "none", "Zero", "minimal", "LOW", "medium", "high", "xhigh", "max",
+        ] {
+            assert_eq!(
+                validate_reasoning_effort(raw).expect("valid effort"),
+                raw.to_ascii_lowercase()
+            );
+        }
+        assert!(validate_reasoning_effort("").is_err());
+        assert!(validate_reasoning_effort("ultra").is_err());
+    }
+
+    #[test]
+    fn validate_extract_fields_requires_data_and_redacts_secrets() {
+        let mut secrets = Secrets::new();
+        secrets.record("tok-secret-999");
+        let missing = json!({ "model": "m" });
+        assert!(validate_extract_fields(missing.as_object().expect("obj"), &secrets).is_err());
+
+        let valid = json!({ "data": { "token": "tok-secret-999", "count": 2 } });
+        let data =
+            validate_extract_fields(valid.as_object().expect("obj"), &secrets).expect("data");
+        assert_eq!(data, json!({ "token": "***", "count": 2 }));
+    }
+
+    #[test]
+    fn validate_act_step_fields_validates_statuses_actions_and_bounds() {
+        let mut secrets = Secrets::new();
+        secrets.record("pw-secret-123");
+
+        let step_resp = json!({
+            "status": "continue",
+            "summary": "Click button with pw-secret-123",
+            "action": { "kind": "step", "use": "browser.click", "with": { "ref": "e1" } }
+        });
+        let (status, summary, reason, action) = validate_act_step_fields(
+            step_resp.as_object().expect("obj"),
+            Some((800, 600)),
+            &secrets,
+        )
+        .expect("valid continue");
+        assert_eq!(status, ActStepStatus::Continue);
+        assert_eq!(summary, "Click button with ***");
+        assert_eq!(reason, None);
+        assert_eq!(
+            action,
+            Some(ActStepAction::Step {
+                use_action: "browser.click".to_string(),
+                with: json!({ "ref": "e1" }),
+            })
+        );
+
+        let locate_type_resp = json!({
+            "status": "continue",
+            "summary": "Type query",
+            "action": { "kind": "locate_type", "x": 120.0, "y": 40.0, "text": "hello pw-secret-123" }
+        });
+        let (_, _, _, action) = validate_act_step_fields(
+            locate_type_resp.as_object().expect("obj"),
+            Some((800, 600)),
+            &secrets,
+        )
+        .expect("valid locate_type");
+        assert_eq!(
+            action,
+            Some(ActStepAction::LocateType {
+                x: 120.0,
+                y: 40.0,
+                text: "hello ***".to_string(),
+            })
+        );
+
+        let out_of_bounds = json!({
+            "status": "continue",
+            "summary": "OOB",
+            "action": { "kind": "locate_click", "x": 900.0, "y": 40.0 }
+        });
+        assert!(
+            validate_act_step_fields(
+                out_of_bounds.as_object().expect("obj"),
+                Some((800, 600)),
+                &secrets,
+            )
+            .is_err()
+        );
+
+        let done_resp = json!({
+            "status": "done",
+            "summary": "All complete",
+            "reason": "Order confirmed"
+        });
+        let (status, _, reason, action) =
+            validate_act_step_fields(done_resp.as_object().expect("obj"), None, &secrets)
+                .expect("valid done");
+        assert_eq!(status, ActStepStatus::Done);
+        assert_eq!(reason.as_deref(), Some("Order confirmed"));
+        assert_eq!(action, None);
     }
 }

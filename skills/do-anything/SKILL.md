@@ -71,11 +71,12 @@ between commands and prints JSON by default.
      accessibility node; `da lint` warns on every `at` step, and `da session
      export` pins the observed `viewport` automatically.
    - When an accessibility tree is dense, an opaque `<canvas>` has no DOM
-     nodes, or you want an exploration-time verdict, use built-in multi-provider
-     models (`da session start --model <model>` / `--model-endpoint <url>` /
-     `--model-api-key-env <VAR>`, `DA_MODEL*`, or per-call `--model` /
-     `--adapter` / `--endpoint` / `--api-key-env`) or an external JSON-RPC hook
-     (`--model-hook <exe>` or `--hook <exe>`):
+     nodes, or you want exploration-time data extraction, multi-step driving,
+     or a verdict, use built-in multi-provider models (`da session start
+     --model <model>` / `--model-endpoint <url>` / `--model-api-key-env <VAR>`
+     / `--model-reasoning-effort <level>`, `DA_MODEL*`, or per-call `--model` /
+     `--adapter` / `--endpoint` / `--api-key-env` / `--reasoning-effort`) or an
+     external JSON-RPC hook (`--model-hook <exe>` or `--hook <exe>`):
      - `da session select-ref <id> --query "Save button" --act browser.click`
        asks `model/select_ref` to pick a snapshot `ref` and synthesizes its
        deterministic locator;
@@ -87,14 +88,24 @@ between commands and prints JSON by default.
      - `da session judge <id> --rubric "No error banner"` (add `--screenshot` to
        attach a 1:1 input-masked viewport/window PNG on visual sessions) runs an
        exploration-time `model/judge` check over `Secrets`-redacted evidence
-       (recorded in `steps.jsonl`, never exported to YAML).
+       (recorded in `steps.jsonl`, never exported to YAML);
+     - `da session extract <id> --query "Order ID and total"` (optional
+       `--schema`, `--screenshot`, `--save VAR`) extracts structured JSON via
+       `model/extract` and optionally stores it into a session variable without
+       exporting a `model.extract` step;
+     - `da session act <id> --goal "Fill coupon and submit"` (optional
+       `--max-steps N`, default `8`, max `50`; `--screenshot`) runs bounded
+       autonomous `model/act_step` iterations that execute real steps
+       (`step`, `locate_click`, `locate_type`) and synthesize deterministic
+       locators so `da session export` compiles them cleanly into model-free
+       YAML.
 3. `da session export <id> -o cases/flow.yaml --name "Create a note"` writes a
    100% deterministic, model-free case; transient refs (including both endpoints
-   of `browser.drag` and `browser.scroll`/`browser.hover` targets) and
-   model-located control hits compile into verified locators against the live
-   page, and `model.*` diagnostic entries are omitted. `da session stop <id>`
-   closes the session (`da session list` shows open sessions; idle ones are
-   reaped after 30 minutes).
+   of `browser.drag` and `browser.scroll`/`browser.hover` targets),
+   model-located control hits, and steps executed during `act` compile into
+   verified locators against the live page, and `model.*` diagnostic entries are
+   omitted. `da session stop <id>` closes the session (`da session list` shows
+   open sessions; idle ones are reaped after 30 minutes).
 4. Edit the exported YAML to add the other layers, then `da lint cases/flow.yaml`
    and `da run cases/flow.yaml`. That is the replay: it must pass with no session
    and no `ref` left in the file.

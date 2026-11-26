@@ -137,8 +137,8 @@ An `observe:` block watches another layer with a read-only observer: the built-i
 | Evidence for every case | `da run --record evidence/` records passed, failed and errored cases; `da report evidence/` renders one offline HTML file |
 | Inputs from outside | `--var name=value` for URLs, tokens and paths |
 | Check a case without running it | `da lint cases/`: the same validation as `da run`, every problem in every file, no step executed |
-| Exploratory driving & export | `da session start \| step \| snapshot \| select-ref \| locate \| judge \| export \| stop`: keep one session, optionally call built-in `--model` or `--model-hook`, and export a deterministic, model-free YAML case |
-| A host with no shell | `da mcp`: the same session protocol over stdio (6 base tools, or 9 with `--model` / `--model-hook`), returning a step's JSON Schema when arguments are wrong |
+| Exploratory driving & export | `da session start \| step \| snapshot \| select-ref \| locate \| judge \| extract \| act \| export \| stop`: keep one session, optionally call built-in `--model` (with `--reasoning-effort`) or `--model-hook`, and export a deterministic, model-free YAML case |
+| A host with no shell | `da mcp`: the same session protocol over stdio (6 base tools, or 11 with `--model` / `DA_MODEL` / `--model-hook`), returning a step's JSON Schema when arguments are wrong |
 | The case format, machine-readable | `da schema`: a JSON Schema with every registered step, also usable by editors |
 | Agent skill | [skills/do-anything/SKILL.md](skills/do-anything/SKILL.md): concise instructions for coding agents to explore, export, replay and inspect failure bundles |
 

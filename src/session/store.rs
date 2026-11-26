@@ -259,6 +259,9 @@ pub fn save_state(
         if let Some(api_key_env) = &mut model.api_key_env {
             *api_key_env = secrets.redact(api_key_env);
         }
+        if let Some(effort) = &mut model.reasoning_effort {
+            *effort = secrets.redact(effort);
+        }
     }
     let path = session_dir.join(STATE_FILE);
     let json = serde_json::to_string_pretty(&sanitized)

@@ -1,10 +1,13 @@
-//! The six tools `da mcp` exposes and how each one reaches the session engine.
+//! The base tools `da mcp` exposes (and optional model tools when configured)
+//! and how each one reaches the session engine.
 //!
-//! The list is fixed on purpose: one tool per registered step would grow with
-//! every driver and would differ between builds, which spends a model's context
-//! on tool descriptions it cannot use. Instead `step` takes the same
-//! `use`/`with`/`expect`/`save` shape a case file holds and validates it with
-//! the case parser, so a new driver needs no protocol change.
+//! The base list is fixed at six on purpose: one tool per registered step would
+//! grow with every driver and would differ between builds, which spends a
+//! model's context on tool descriptions it cannot use. Instead `step` takes the
+//! same `use`/`with`/`expect`/`save` shape a case file holds and validates it
+//! with the case parser, so a new driver needs no protocol change. When model
+//! access is enabled, `definitions_for` appends `select_ref`, `locate`,
+//! `judge`, `extract`, and `act`.
 
 use std::path::{Path, PathBuf};
 
@@ -18,9 +21,12 @@ use crate::core::registry::Registry;
 use crate::core::report::RunOutcome;
 use crate::core::secrets::Secrets;
 use crate::session::export::ExportOptions;
-use crate::session::model_hook::{BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
+use crate::session::model_hook::{
+    BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec, validate_reasoning_effort,
+};
 use crate::session::{
-    self, JudgeRequest, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
+    self, ActRequest, DEFAULT_ACT_MAX_STEPS, ExtractRequest, JudgeRequest, LocateRequest,
+    MAX_ACT_MAX_STEPS, SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
 };
 
 /// Names of the base tools, in the order `tools/list` reports them without server model config.
@@ -33,14 +39,16 @@ pub const NAMES: [&str; 6] = [
     "session_stop",
 ];
 
-/// Names of all tools exposed when `--model-hook` or `--model` is configured on `da mcp`.
-pub const ALL_NAMES: [&str; 9] = [
+/// Names of all tools exposed when `--model-hook`, `--model`, or `DA_MODEL` is configured on `da mcp`.
+pub const ALL_NAMES: [&str; 11] = [
     "session_start",
     "step",
     "snapshot",
     "select_ref",
     "locate",
     "judge",
+    "extract",
+    "act",
     "export",
     "run",
     "session_stop",
@@ -83,9 +91,10 @@ impl ToolOutcome {
 /// Describes the six base tools for `tools/list`.
 ///
 /// Use [`definitions_for`] to include the optional model tools (`select_ref`,
-/// `locate`, `judge`). The schemas are written by hand because they describe
-/// this protocol, not a step: a step's own arguments schema comes from the
-/// registry and is echoed back when a `step` call is refused.
+/// `locate`, `judge`, `extract`, `act`). The schemas are written by hand
+/// because they describe this protocol, not a step: a step's own arguments
+/// schema comes from the registry and is echoed back when a `step` call is
+/// refused.
 pub fn definitions() -> Vec<Value> {
     vec![
         json!({
@@ -119,6 +128,11 @@ pub fn definitions() -> Vec<Value> {
                     "model_api_key_env": {
                         "type": "string",
                         "description": "Optional environment variable name holding the API key for `model`.",
+                    },
+                    "model_reasoning_effort": {
+                        "type": "string",
+                        "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"],
+                        "description": "Optional reasoning effort level forwarded to the built-in `genai` model (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).",
                     },
                 },
             },
@@ -248,8 +262,8 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
-/// Describes `tools/list`, including `select_ref`, `locate`, and `judge` when
-/// `--model-hook` or `--model` is configured on `da mcp`.
+/// Describes `tools/list`, including `select_ref`, `locate`, `judge`, `extract`,
+/// and `act` when `--model-hook`, `--model`, or `DA_MODEL` is configured on `da mcp`.
 pub fn definitions_for(include_model_hooks: bool) -> Vec<Value> {
     let mut base = definitions();
     if !include_model_hooks {
@@ -282,6 +296,7 @@ fn model_hook_definitions() -> Vec<Value> {
                     "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
                     "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
                     "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
+                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
                     "act": {"type": "string", "description": "Optional step name (such as `browser.click`) to execute immediately with the selected `ref`."},
                     "with": {"type": "object", "description": "Optional step arguments merged when `act` is set."},
@@ -304,6 +319,7 @@ fn model_hook_definitions() -> Vec<Value> {
                     "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
                     "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
                     "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
+                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
                     "click": {"type": "boolean", "description": "Immediately click the located target and record the step for export."},
                 },
@@ -327,7 +343,57 @@ fn model_hook_definitions() -> Vec<Value> {
                     "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
                     "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
                     "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
+                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
+                },
+            },
+        }),
+        json!({
+            "name": "extract",
+            "description": "Invokes `model/extract` over redacted session evidence (and an optional masked screenshot when `screenshot` is `true`), returns structured `data` (optionally constrained by `schema`), and optionally saves to session variable `save`; omitted from `export`.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "query"],
+                "properties": {
+                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                    "query": {"type": "string", "description": "What structured information to extract (redacted via `Secrets`)."},
+                    "schema": {"type": "object", "description": "Optional JSON Schema object describing the expected `data` shape."},
+                    "evidence": {"description": "Optional custom JSON evidence; defaults to redacted session steps and variables."},
+                    "screenshot": {"type": "boolean", "description": "Attach an input-masked PNG viewport/window screenshot from the active visual session (default false)."},
+                    "save": {"type": "string", "description": "Optional session variable name in which to store the extracted value for subsequent `${var}` steps."},
+                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
+                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
+                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
+                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
+                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
+                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
+                },
+            },
+        }),
+        json!({
+            "name": "act",
+            "description": "Runs a bounded observe → decide (`model/act_step`) → execute loop up to `max_steps` (default 8) toward `goal`, recording real deterministic UI steps (plus synthesized locators for visual actions) that export cleanly to YAML.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "goal"],
+                "properties": {
+                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                    "goal": {"type": "string", "description": "Autonomous goal description (redacted via `Secrets`)."},
+                    "max_steps": {"type": "integer", "minimum": 1, "maximum": MAX_ACT_MAX_STEPS, "description": "Maximum autonomous steps before stopping (default 8)."},
+                    "evidence": {"description": "Optional extra JSON context made available to every iteration."},
+                    "screenshot": {"type": "boolean", "description": "Capture and attach an input-masked PNG screenshot on every iteration (default false)."},
+                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
+                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
+                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
+                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
+                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
+                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Per-iteration model/hook timeout in milliseconds (default 30000)."},
                 },
             },
         }),
@@ -347,6 +413,8 @@ pub fn call(context: &Context, name: &str, arguments: &Map<String, Value>) -> Op
         "select_ref" => select_ref(context, arguments),
         "locate" => locate(context, arguments),
         "judge" => judge(context, arguments),
+        "extract" => extract(context, arguments),
+        "act" => act(context, arguments),
         "export" => export(context, arguments),
         "run" => run(context, arguments),
         "session_stop" => session_stop(context, arguments),
@@ -366,12 +434,13 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
             "model_adapter",
             "model_endpoint",
             "model_api_key_env",
+            "model_reasoning_effort",
         ],
     ) {
         return ToolOutcome::failed(refusal(message));
     }
-    let (model_hook, model) = match resolve_start_models(context, arguments, &START_MODEL_KEYS) {
-        Ok(pair) => pair,
+    let resolved_models = match resolve_start_models(context, arguments, &START_MODEL_KEYS) {
+        Ok(models) => models,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
     from_response(session::handle(
@@ -379,8 +448,8 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
             sessions_dir: context.sessions_dir.to_path_buf(),
             idle_timeout_ms: context.idle_timeout_ms,
             observe: Vec::new(),
-            model_hook,
-            model,
+            model_hook: resolved_models.hook,
+            model: resolved_models.model,
             plugins: context.plugins.to_vec(),
         },
         context.registry,
@@ -498,6 +567,7 @@ fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome 
             "adapter",
             "endpoint",
             "api_key_env",
+            "reasoning_effort",
             "timeout_ms",
             "act",
             "with",
@@ -525,8 +595,8 @@ fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome 
         Ok(value) => value,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let (hook_override, model_override) = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
-        Ok(pair) => pair,
+    let resolved_models = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(models) => models,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
     let timeout_ms = match optional_timeout_ms(arguments) {
@@ -561,8 +631,9 @@ fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome 
             scope_ref,
             max_depth,
             max_nodes,
-            hook_override,
-            model_override,
+            hook_override: resolved_models.hook,
+            model_override: resolved_models.model,
+            reasoning_effort_override: resolved_models.reasoning_effort,
             timeout_ms,
             act,
         }),
@@ -583,6 +654,7 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             "adapter",
             "endpoint",
             "api_key_env",
+            "reasoning_effort",
             "timeout_ms",
             "click",
         ],
@@ -597,8 +669,8 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
         Ok(value) => value,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let (hook_override, model_override) = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
-        Ok(pair) => pair,
+    let resolved_models = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(models) => models,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
     let timeout_ms = match optional_timeout_ms(arguments) {
@@ -616,8 +688,9 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             id: session_id,
             base_directory,
             query,
-            hook_override,
-            model_override,
+            hook_override: resolved_models.hook,
+            model_override: resolved_models.model,
+            reasoning_effort_override: resolved_models.reasoning_effort,
             timeout_ms,
             click,
         }),
@@ -640,6 +713,7 @@ fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             "adapter",
             "endpoint",
             "api_key_env",
+            "reasoning_effort",
             "timeout_ms",
         ],
     ) {
@@ -658,8 +732,8 @@ fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
         Ok(flag) => flag.unwrap_or(false),
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let (hook_override, model_override) = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
-        Ok(pair) => pair,
+    let resolved_models = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(models) => models,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
     let timeout_ms = match optional_timeout_ms(arguments) {
@@ -675,8 +749,158 @@ fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             rubric,
             evidence,
             screenshot,
-            hook_override,
-            model_override,
+            hook_override: resolved_models.hook,
+            model_override: resolved_models.model,
+            reasoning_effort_override: resolved_models.reasoning_effort,
+            timeout_ms,
+        }),
+        context.registry,
+    ))
+}
+
+/// Invokes `model/extract` over redacted session evidence and optional schema/screenshot.
+fn extract(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
+    if let Err(message) = only(
+        arguments,
+        &[
+            "session_id",
+            "query",
+            "schema",
+            "evidence",
+            "screenshot",
+            "save",
+            "hook",
+            "hook_args",
+            "model",
+            "adapter",
+            "endpoint",
+            "api_key_env",
+            "reasoning_effort",
+            "timeout_ms",
+        ],
+    ) {
+        return ToolOutcome::failed(refusal(message));
+    }
+    let session_id = match text_argument(arguments, "session_id") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let query = match text_argument(arguments, "query") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let schema = match arguments.get("schema") {
+        None | Some(Value::Null) => None,
+        Some(val @ Value::Object(_)) => Some(val.clone()),
+        Some(_) => {
+            return ToolOutcome::failed(refusal(
+                "`schema` must be a JSON Schema object".to_string(),
+            ));
+        }
+    };
+    let evidence = arguments.get("evidence").filter(|v| !v.is_null()).cloned();
+    let screenshot = match optional_flag(arguments, "screenshot") {
+        Ok(flag) => flag.unwrap_or(false),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let save = match optional_text(arguments, "save") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let resolved_models = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(models) => models,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let timeout_ms = match optional_timeout_ms(arguments) {
+        Ok(ms) => ms,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    from_response(session::handle(
+        SessionRequest::Extract(ExtractRequest {
+            sessions_dir: context.sessions_dir.to_path_buf(),
+            id: session_id,
+            base_directory,
+            query,
+            schema,
+            evidence,
+            screenshot,
+            save,
+            hook_override: resolved_models.hook,
+            model_override: resolved_models.model,
+            reasoning_effort_override: resolved_models.reasoning_effort,
+            timeout_ms,
+        }),
+        context.registry,
+    ))
+}
+
+/// Executes a bounded autonomous loop toward `goal` via `model/act_step`.
+fn act(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
+    if let Err(message) = only(
+        arguments,
+        &[
+            "session_id",
+            "goal",
+            "max_steps",
+            "evidence",
+            "screenshot",
+            "hook",
+            "hook_args",
+            "model",
+            "adapter",
+            "endpoint",
+            "api_key_env",
+            "reasoning_effort",
+            "timeout_ms",
+        ],
+    ) {
+        return ToolOutcome::failed(refusal(message));
+    }
+    let session_id = match text_argument(arguments, "session_id") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let goal = match text_argument(arguments, "goal") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let max_steps = match optional_count(arguments, "max_steps") {
+        Ok(Some(n)) if n <= MAX_ACT_MAX_STEPS => n,
+        Ok(Some(_)) => {
+            return ToolOutcome::failed(refusal(format!(
+                "`max_steps` must be between 1 and {MAX_ACT_MAX_STEPS}"
+            )));
+        }
+        Ok(None) => DEFAULT_ACT_MAX_STEPS,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let evidence = arguments.get("evidence").filter(|v| !v.is_null()).cloned();
+    let screenshot = match optional_flag(arguments, "screenshot") {
+        Ok(flag) => flag.unwrap_or(false),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let resolved_models = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(models) => models,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let timeout_ms = match optional_timeout_ms(arguments) {
+        Ok(ms) => ms,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    from_response(session::handle(
+        SessionRequest::Act(ActRequest {
+            sessions_dir: context.sessions_dir.to_path_buf(),
+            id: session_id,
+            base_directory,
+            goal,
+            max_steps,
+            evidence,
+            screenshot,
+            hook_override: resolved_models.hook,
+            model_override: resolved_models.model,
+            reasoning_effort_override: resolved_models.reasoning_effort,
             timeout_ms,
         }),
         context.registry,
@@ -897,6 +1121,7 @@ struct ModelOptionKeys<'a> {
     adapter: &'a str,
     endpoint: &'a str,
     api_key_env: &'a str,
+    reasoning_effort: &'a str,
 }
 
 const START_MODEL_KEYS: ModelOptionKeys<'static> = ModelOptionKeys {
@@ -906,6 +1131,7 @@ const START_MODEL_KEYS: ModelOptionKeys<'static> = ModelOptionKeys {
     adapter: "model_adapter",
     endpoint: "model_endpoint",
     api_key_env: "model_api_key_env",
+    reasoning_effort: "model_reasoning_effort",
 };
 
 const CALL_MODEL_KEYS: ModelOptionKeys<'static> = ModelOptionKeys {
@@ -915,6 +1141,7 @@ const CALL_MODEL_KEYS: ModelOptionKeys<'static> = ModelOptionKeys {
     adapter: "adapter",
     endpoint: "endpoint",
     api_key_env: "api_key_env",
+    reasoning_effort: "reasoning_effort",
 };
 
 fn optional_hook_spec(
@@ -947,49 +1174,80 @@ fn optional_hook_spec(
 fn optional_model_spec(
     arguments: &Map<String, Value>,
     keys: &ModelOptionKeys<'_>,
-) -> Result<Option<BuiltinModelSpec>, String> {
+    require_model_for_effort: bool,
+) -> Result<(Option<BuiltinModelSpec>, Option<String>), String> {
     let model = optional_text(arguments, keys.model)?;
     let adapter = optional_text(arguments, keys.adapter)?;
     let endpoint = optional_text(arguments, keys.endpoint)?;
     let api_key_env = optional_text(arguments, keys.api_key_env)?;
+    let reasoning_effort = match optional_text(arguments, keys.reasoning_effort)? {
+        Some(raw) => Some(validate_reasoning_effort(&raw)?),
+        None => None,
+    };
     match model {
-        Some(model) => Ok(Some(BuiltinModelSpec {
-            model,
-            adapter,
-            endpoint,
-            api_key_env,
-        })),
+        Some(model) => Ok((
+            Some(BuiltinModelSpec {
+                model,
+                adapter,
+                endpoint,
+                api_key_env,
+                reasoning_effort,
+            }),
+            None,
+        )),
         None => {
             for (present, name) in [
                 (adapter.is_some(), keys.adapter),
                 (endpoint.is_some(), keys.endpoint),
                 (api_key_env.is_some(), keys.api_key_env),
+                (
+                    require_model_for_effort && reasoning_effort.is_some(),
+                    keys.reasoning_effort,
+                ),
             ] {
                 if present {
                     return Err(format!("`{name}` requires `{}`", keys.model));
                 }
             }
-            Ok(None)
+            Ok((None, reasoning_effort))
         }
     }
 }
 
-/// Parses per-call model/hook overrides without substituting server defaults,
-/// so session-level `model` / `model_hook` persisted at `session_start` remain
-/// authoritative unless explicitly overridden on the call.
+#[derive(Debug)]
+struct ResolvedToolModels {
+    hook: Option<ModelHookSpec>,
+    model: Option<BuiltinModelSpec>,
+    reasoning_effort: Option<String>,
+}
+
+/// Parses per-call model/hook/reasoning-effort overrides without substituting
+/// server defaults, so session-level `model` / `model_hook` persisted at
+/// `session_start` remain authoritative unless explicitly overridden on the
+/// call.
 fn resolve_call_models(
     arguments: &Map<String, Value>,
     keys: &ModelOptionKeys<'_>,
-) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
+) -> Result<ResolvedToolModels, String> {
     let hook = optional_hook_spec(arguments, keys.hook, keys.hook_args)?;
-    let model = optional_model_spec(arguments, keys)?;
+    let (model, reasoning_effort_override) = optional_model_spec(arguments, keys, false)?;
     if hook.is_some() && model.is_some() {
         return Err(format!(
             "pass either `{}` or `{}`, not both",
             keys.hook, keys.model
         ));
     }
-    Ok((hook, model))
+    if hook.is_some() && reasoning_effort_override.is_some() {
+        return Err(format!(
+            "`{}` applies only to built-in `{}`, not `{}`",
+            keys.reasoning_effort, keys.model, keys.hook
+        ));
+    }
+    Ok(ResolvedToolModels {
+        hook,
+        model,
+        reasoning_effort: reasoning_effort_override,
+    })
 }
 
 /// Resolves session-start model/hook config, falling back to the MCP server's
@@ -998,12 +1256,27 @@ fn resolve_start_models(
     context: &Context,
     arguments: &Map<String, Value>,
     keys: &ModelOptionKeys<'_>,
-) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
-    let (hook, model) = resolve_call_models(arguments, keys)?;
+) -> Result<ResolvedToolModels, String> {
+    let hook = optional_hook_spec(arguments, keys.hook, keys.hook_args)?;
+    let (model, _) = optional_model_spec(arguments, keys, true)?;
+    if hook.is_some() && model.is_some() {
+        return Err(format!(
+            "pass either `{}` or `{}`, not both",
+            keys.hook, keys.model
+        ));
+    }
     if hook.is_some() || model.is_some() {
-        Ok((hook, model))
+        Ok(ResolvedToolModels {
+            hook,
+            model,
+            reasoning_effort: None,
+        })
     } else {
-        Ok((context.model_hook.cloned(), context.model.cloned()))
+        Ok(ResolvedToolModels {
+            hook: context.model_hook.cloned(),
+            model: context.model.cloned(),
+            reasoning_effort: None,
+        })
     }
 }
 
@@ -1375,6 +1648,7 @@ mod tests {
             adapter: None,
             endpoint: None,
             api_key_env: None,
+            reasoning_effort: None,
         };
         let mut ctx = context(&registry);
         ctx.model = Some(&default_model);
@@ -1389,35 +1663,47 @@ mod tests {
         // Omitting per-call args must leave overrides `None` so session-level
         // `model` / `model_hook` persisted by `session_start` are not shadowed.
         let empty = Map::new();
-        let (call_hook, call_model) =
+        let resolved_empty =
             resolve_call_models(&empty, &CALL_MODEL_KEYS).expect("empty call args must not fail");
-        assert!(call_hook.is_none());
-        assert!(call_model.is_none());
+        assert!(resolved_empty.hook.is_none());
+        assert!(resolved_empty.model.is_none());
+        assert!(resolved_empty.reasoning_effort.is_none());
 
         // `session_start` inherits server defaults when both args are omitted,
         // and overrides server defaults when the caller specifies `model_hook`.
-        let (start_default_hook, start_default_model) =
-            resolve_start_models(&ctx, &empty, &START_MODEL_KEYS)
-                .expect("empty session_start inherits server default");
-        assert!(start_default_hook.is_none());
+        let start_default = resolve_start_models(&ctx, &empty, &START_MODEL_KEYS)
+            .expect("empty session_start inherits server default");
+        assert!(start_default.hook.is_none());
         assert_eq!(
-            start_default_model.as_ref().map(|m| m.model.as_str()),
+            start_default.model.as_ref().map(|m| m.model.as_str()),
             Some("openai::gpt-4o-mini")
         );
 
         let mut start_hook_only = Map::new();
         start_hook_only.insert("model_hook".to_string(), json!("./hook"));
-        let (hook, model) = resolve_start_models(&ctx, &start_hook_only, &START_MODEL_KEYS)
+        let start_hook = resolve_start_models(&ctx, &start_hook_only, &START_MODEL_KEYS)
             .expect("session_start hook suppresses server default model");
-        assert!(hook.is_some());
-        assert!(model.is_none());
+        assert!(start_hook.hook.is_some());
+        assert!(start_hook.model.is_none());
 
         let mut call_hook_only = Map::new();
         call_hook_only.insert("hook".to_string(), json!("./hook"));
-        let (hook, model) = resolve_call_models(&call_hook_only, &CALL_MODEL_KEYS)
+        let resolved_hook = resolve_call_models(&call_hook_only, &CALL_MODEL_KEYS)
             .expect("per-call hook override succeeds");
-        assert!(hook.is_some());
-        assert!(model.is_none());
+        assert!(resolved_hook.hook.is_some());
+        assert!(resolved_hook.model.is_none());
+        assert!(resolved_hook.reasoning_effort.is_none());
+
+        // Passing `reasoning_effort` alone must pass through as a per-call
+        // override without substituting the server default model, so it applies
+        // to the session's own persisted model.
+        let mut effort_only = Map::new();
+        effort_only.insert("reasoning_effort".to_string(), json!("low"));
+        let resolved_effort = resolve_call_models(&effort_only, &CALL_MODEL_KEYS)
+            .expect("effort alone passes through to session model");
+        assert!(resolved_effort.hook.is_none());
+        assert!(resolved_effort.model.is_none());
+        assert_eq!(resolved_effort.reasoning_effort.as_deref(), Some("low"));
 
         let mut orphan_endpoint = Map::new();
         orphan_endpoint.insert("endpoint".to_string(), json!("http://127.0.0.1:8000/v1"));
