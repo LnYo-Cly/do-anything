@@ -97,169 +97,193 @@ impl ToolOutcome {
 /// refused.
 pub fn definitions() -> Vec<Value> {
     vec![
-        json!({
-            "name": "session_start",
-            "description": "Starts an interactive session and returns its `session_id`. The session keeps live resources such as a browser open across calls and stores its state under `.da/sessions`.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "model_hook": {
-                        "type": "string",
-                        "description": "Optional external JSON-RPC 2.0 model hook executable persisted for `select_ref`, `locate`, and `judge`.",
-                    },
-                    "model_hook_args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional arguments passed to `model_hook`.",
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Optional built-in `genai` model identifier (`openai::gpt-4o-mini`, `deepseek::deepseek-chat`, `omlx::ui-tars-1.5-7b`, ...).",
-                    },
-                    "model_adapter": {
-                        "type": "string",
-                        "description": "Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).",
-                    },
-                    "model_endpoint": {
-                        "type": "string",
-                        "description": "Optional custom HTTP endpoint URL for `model` (supports `${env:NAME}`).",
-                    },
-                    "model_api_key_env": {
-                        "type": "string",
-                        "description": "Optional environment variable name holding the API key for `model`.",
-                    },
-                    "model_reasoning_effort": {
-                        "type": "string",
-                        "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"],
-                        "description": "Optional reasoning effort level forwarded to the built-in `genai` model (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).",
-                    },
-                },
-            },
-        }),
-        json!({
-            "name": "step",
-            "description": "Runs one step in an existing session. `use` names a registered step and `with` holds its arguments, exactly as a case file nests them under the step name; `expect` and `save` behave as in a case file. When the arguments do not satisfy the step's schema, the error result carries that schema so the call can be corrected.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id", "use"],
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "description": "Identifier returned by `session_start`.",
-                    },
-                    "use": {
-                        "type": "string",
-                        "description": "Registered step name, for example `browser.open` or `cli.run`.",
-                    },
-                    "with": {
-                        "type": "object",
-                        "description": "Arguments of the step, as the mapping a case file nests under the step name.",
-                    },
-                    "expect": {
-                        "type": "array",
-                        "description": "Assertions evaluated against the step result, as in a case file.",
-                        "items": {"type": "object"},
-                    },
-                    "save": {
-                        "type": "object",
-                        "description": "Variables filled from the step result as `NAME` to JSONPath, as in a case file.",
-                        "additionalProperties": {"type": "string"},
-                    },
-                },
-            },
-        }),
-        json!({
-            "name": "snapshot",
-            "description": "Captures an accessibility snapshot of the session's browser without running a step. Only a session with an open browser page can answer; the result is the same compact tree `da session snapshot` prints.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                    "ref": {
-                        "type": "string",
-                        "description": "Element reference from a previous snapshot to expand within.",
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum traversal depth, relative to the root or `ref`.",
-                    },
-                    "max_nodes": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum nodes included before the tree is truncated.",
-                    },
-                },
-            },
-        }),
-        json!({
-            "name": "export",
-            "description": "Exports the session's passed steps as one deterministic, replayable YAML case. The YAML is byte for byte what `da session export --yaml` writes for the same steps: transient browser `ref` values become stable locators and `${env:...}` references stay references.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                    "name": {
-                        "type": "string",
-                        "description": "Case `name:` written into the exported YAML. Defaults to a name derived from the session id.",
-                    },
-                    "include_reads": {
-                        "type": "boolean",
-                        "description": "Include read-only `browser.read` steps that have neither `expect` nor `save`.",
-                    },
-                    "out": {
-                        "type": "string",
-                        "description": "Also write the YAML to this file path.",
-                    },
-                },
-            },
-        }),
-        json!({
-            "name": "run",
-            "description": "Runs case files or directories and returns the same JSON report `da --output json run` prints: one object with every case, step, assertion and the summary.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["paths"],
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {"type": "string"},
-                        "description": "Case files or directories that contain `.yaml` or `.yml` cases.",
-                    },
-                    "vars": {
-                        "type": "object",
-                        "description": "Case variables that override the ones declared in the case files.",
-                        "additionalProperties": {"type": ["string", "number", "boolean"]},
-                    },
-                    "jobs": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Runs up to N cases at the same time. Defaults to 1.",
-                    },
-                },
-            },
-        }),
-        json!({
-            "name": "session_stop",
-            "description": "Closes every resource the session holds and removes its state directory, the same cleanup `da session stop` performs.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                },
-            },
-        }),
+        session_start_definition(),
+        step_definition(),
+        snapshot_definition(),
+        export_definition(),
+        run_definition(),
+        session_stop_definition(),
     ]
+}
+
+fn session_start_definition() -> Value {
+    json!({
+        "name": "session_start",
+        "description": "Starts an interactive session and returns its `session_id`. The session keeps live resources such as a browser open across calls and stores its state under `.da/sessions`.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "model_hook": {
+                    "type": "string",
+                    "description": "Optional external JSON-RPC 2.0 model hook executable persisted for `select_ref`, `locate`, and `judge`.",
+                },
+                "model_hook_args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional arguments passed to `model_hook`.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional built-in `genai` model identifier (`openai::gpt-4o-mini`, `deepseek::deepseek-chat`, `omlx::ui-tars-1.5-7b`, ...).",
+                },
+                "model_adapter": {
+                    "type": "string",
+                    "description": "Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).",
+                },
+                "model_endpoint": {
+                    "type": "string",
+                    "description": "Optional custom HTTP endpoint URL for `model` (supports `${env:NAME}`).",
+                },
+                "model_api_key_env": {
+                    "type": "string",
+                    "description": "Optional environment variable name holding the API key for `model`.",
+                },
+                "model_reasoning_effort": {
+                    "type": "string",
+                    "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"],
+                    "description": "Optional reasoning effort level forwarded to the built-in `genai` model (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).",
+                },
+            },
+        },
+    })
+}
+
+fn step_definition() -> Value {
+    json!({
+        "name": "step",
+        "description": "Runs one step in an existing session. `use` names a registered step and `with` holds its arguments, exactly as a case file nests them under the step name; `expect` and `save` behave as in a case file. When the arguments do not satisfy the step's schema, the error result carries that schema so the call can be corrected.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id", "use"],
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Identifier returned by `session_start`.",
+                },
+                "use": {
+                    "type": "string",
+                    "description": "Registered step name, for example `browser.open` or `cli.run`.",
+                },
+                "with": {
+                    "type": "object",
+                    "description": "Arguments of the step, as the mapping a case file nests under the step name.",
+                },
+                "expect": {
+                    "type": "array",
+                    "description": "Assertions evaluated against the step result, as in a case file.",
+                    "items": {"type": "object"},
+                },
+                "save": {
+                    "type": "object",
+                    "description": "Variables filled from the step result as `NAME` to JSONPath, as in a case file.",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+        },
+    })
+}
+
+fn snapshot_definition() -> Value {
+    json!({
+        "name": "snapshot",
+        "description": "Captures an accessibility snapshot of the session's browser without running a step. Only a session with an open browser page can answer; the result is the same compact tree `da session snapshot` prints.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                "ref": {
+                    "type": "string",
+                    "description": "Element reference from a previous snapshot to expand within.",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum traversal depth, relative to the root or `ref`.",
+                },
+                "max_nodes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum nodes included before the tree is truncated.",
+                },
+            },
+        },
+    })
+}
+
+fn export_definition() -> Value {
+    json!({
+        "name": "export",
+        "description": "Exports the session's passed steps as one deterministic, replayable YAML case. The YAML is byte for byte what `da session export --yaml` writes for the same steps: transient browser `ref` values become stable locators and `${env:...}` references stay references.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                "name": {
+                    "type": "string",
+                    "description": "Case `name:` written into the exported YAML. Defaults to a name derived from the session id.",
+                },
+                "include_reads": {
+                    "type": "boolean",
+                    "description": "Include read-only `browser.read` steps that have neither `expect` nor `save`.",
+                },
+                "out": {
+                    "type": "string",
+                    "description": "Also write the YAML to this file path.",
+                },
+            },
+        },
+    })
+}
+
+fn run_definition() -> Value {
+    json!({
+        "name": "run",
+        "description": "Runs case files or directories and returns the same JSON report `da --output json run` prints: one object with every case, step, assertion and the summary.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["paths"],
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string"},
+                    "description": "Case files or directories that contain `.yaml` or `.yml` cases.",
+                },
+                "vars": {
+                    "type": "object",
+                    "description": "Case variables that override the ones declared in the case files.",
+                    "additionalProperties": {"type": ["string", "number", "boolean"]},
+                },
+                "jobs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Runs up to N cases at the same time. Defaults to 1.",
+                },
+            },
+        },
+    })
+}
+
+fn session_stop_definition() -> Value {
+    json!({
+        "name": "session_stop",
+        "description": "Closes every resource the session holds and removes its state directory, the same cleanup `da session stop` performs.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+            },
+        },
+    })
 }
 
 /// Describes `tools/list`, including `select_ref`, `locate`, `judge`, `extract`,
@@ -275,128 +299,173 @@ pub fn definitions_for(include_model_hooks: bool) -> Vec<Value> {
     base
 }
 
+fn insert_model_call_properties(properties: &mut Map<String, Value>, timeout_description: &str) {
+    properties.insert(
+        "hook".to_string(),
+        json!({"type": "string", "description": "Per-call model hook executable override."}),
+    );
+    properties.insert(
+        "hook_args".to_string(),
+        json!({"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."}),
+    );
+    properties.insert(
+        "model".to_string(),
+        json!({"type": "string", "description": "Per-call built-in `genai` model override."}),
+    );
+    properties.insert(
+        "adapter".to_string(),
+        json!({"type": "string", "description": "Optional `genai` adapter override for `model`."}),
+    );
+    properties.insert(
+        "endpoint".to_string(),
+        json!({"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."}),
+    );
+    properties.insert(
+        "api_key_env".to_string(),
+        json!({"type": "string", "description": "Optional environment variable name holding the API key for `model`."}),
+    );
+    properties.insert(
+        "reasoning_effort".to_string(),
+        json!({"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."}),
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        json!({"type": "integer", "minimum": 1, "description": timeout_description}),
+    );
+}
+
+fn model_tool_definition(
+    name: &str,
+    description: &str,
+    required: &[&str],
+    extra_properties: Value,
+    timeout_description: &str,
+) -> Value {
+    let mut properties = match extra_properties {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    insert_model_call_properties(&mut properties, timeout_description);
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": required,
+            "properties": properties,
+        },
+    })
+}
+
+fn select_ref_definition() -> Value {
+    let mut def = model_tool_definition(
+        "select_ref",
+        "Invokes `model/select_ref` (built-in `genai` model or external JSON-RPC 2.0 hook) over the session's active snapshot candidates, verifies the chosen `ref`, and returns its deterministic `synthesized_locator`.",
+        &["session_id", "query"],
+        json!({
+            "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+            "query": {"type": "string", "description": "Natural-language target description (redacted via `Secrets`)."},
+            "ref": {"type": "string", "description": "Optional snapshot `ref` to scope candidates within."},
+            "max_depth": {"type": "integer", "minimum": 1, "description": "Maximum snapshot traversal depth."},
+            "max_nodes": {"type": "integer", "minimum": 1, "description": "Maximum snapshot nodes."},
+        }),
+        "Hook timeout in milliseconds (default 30000).",
+    );
+    if let Some(props) = def
+        .pointer_mut("/inputSchema/properties")
+        .and_then(Value::as_object_mut)
+    {
+        props.insert(
+            "act".to_string(),
+            json!({"type": "string", "description": "Optional step name (such as `browser.click`) to execute immediately with the selected `ref`."}),
+        );
+        props.insert(
+            "with".to_string(),
+            json!({"type": "object", "description": "Optional step arguments merged when `act` is set."}),
+        );
+    }
+    def
+}
+
+fn locate_definition() -> Value {
+    let mut def = model_tool_definition(
+        "locate",
+        "Captures an input-masked PNG screenshot, invokes `model/locate` for `(x, y)` coordinates, and reverse-queries the live DOM/UI tree to return a deterministic `synthesized_locator` (falling back to `at` on `<canvas>`).",
+        &["session_id", "query"],
+        json!({
+            "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+            "query": {"type": "string", "description": "Visual grounding query (redacted via `Secrets`)."},
+        }),
+        "Hook timeout in milliseconds (default 30000).",
+    );
+    if let Some(props) = def
+        .pointer_mut("/inputSchema/properties")
+        .and_then(Value::as_object_mut)
+    {
+        props.insert(
+            "click".to_string(),
+            json!({"type": "boolean", "description": "Immediately click the located target and record the step for export."}),
+        );
+    }
+    def
+}
+
+fn judge_definition() -> Value {
+    model_tool_definition(
+        "judge",
+        "Invokes `model/judge` over redacted session evidence (and an optional masked screenshot when `screenshot` is `true`) and returns `{ passed, rationale, model, ... }`; recorded in `steps.jsonl` and omitted from `export`.",
+        &["session_id", "rubric"],
+        json!({
+            "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+            "rubric": {"type": "string", "description": "Evaluation rubric (redacted via `Secrets`)."},
+            "evidence": {"description": "Optional custom JSON evidence; defaults to redacted session steps and variables."},
+            "screenshot": {"type": "boolean", "description": "Attach an input-masked PNG viewport/window screenshot from the active visual session (default false)."},
+        }),
+        "Hook timeout in milliseconds (default 30000).",
+    )
+}
+
+fn extract_definition() -> Value {
+    model_tool_definition(
+        "extract",
+        "Invokes `model/extract` over redacted session evidence (and an optional masked screenshot when `screenshot` is `true`), returns structured `data` (optionally constrained by `schema`), and optionally saves to session variable `save`; omitted from `export`.",
+        &["session_id", "query"],
+        json!({
+            "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+            "query": {"type": "string", "description": "What structured information to extract (redacted via `Secrets`)."},
+            "schema": {"type": "object", "description": "Optional JSON Schema object describing the expected `data` shape."},
+            "evidence": {"description": "Optional custom JSON evidence; defaults to redacted session steps and variables."},
+            "screenshot": {"type": "boolean", "description": "Attach an input-masked PNG viewport/window screenshot from the active visual session (default false)."},
+            "save": {"type": "string", "description": "Optional session variable name in which to store the extracted value for subsequent `${var}` steps."},
+        }),
+        "Hook timeout in milliseconds (default 30000).",
+    )
+}
+
+fn act_definition() -> Value {
+    model_tool_definition(
+        "act",
+        "Runs a bounded observe → decide (`model/act_step`) → execute loop up to `max_steps` (default 8) toward `goal`, recording real deterministic UI steps (plus synthesized locators for visual actions) that export cleanly to YAML.",
+        &["session_id", "goal"],
+        json!({
+            "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+            "goal": {"type": "string", "description": "Autonomous goal description (redacted via `Secrets`)."},
+            "max_steps": {"type": "integer", "minimum": 1, "maximum": MAX_ACT_MAX_STEPS, "description": "Maximum autonomous steps before stopping (default 8)."},
+            "evidence": {"description": "Optional extra JSON context made available to every iteration."},
+            "screenshot": {"type": "boolean", "description": "Capture and attach an input-masked PNG screenshot on every iteration (default false)."},
+        }),
+        "Per-iteration model/hook timeout in milliseconds (default 30000).",
+    )
+}
+
 fn model_hook_definitions() -> Vec<Value> {
     vec![
-        json!({
-            "name": "select_ref",
-            "description": "Invokes `model/select_ref` (built-in `genai` model or external JSON-RPC 2.0 hook) over the session's active snapshot candidates, verifies the chosen `ref`, and returns its deterministic `synthesized_locator`.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id", "query"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                    "query": {"type": "string", "description": "Natural-language target description (redacted via `Secrets`)."},
-                    "ref": {"type": "string", "description": "Optional snapshot `ref` to scope candidates within."},
-                    "max_depth": {"type": "integer", "minimum": 1, "description": "Maximum snapshot traversal depth."},
-                    "max_nodes": {"type": "integer", "minimum": 1, "description": "Maximum snapshot nodes."},
-                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
-                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
-                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
-                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
-                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
-                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
-                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
-                    "act": {"type": "string", "description": "Optional step name (such as `browser.click`) to execute immediately with the selected `ref`."},
-                    "with": {"type": "object", "description": "Optional step arguments merged when `act` is set."},
-                },
-            },
-        }),
-        json!({
-            "name": "locate",
-            "description": "Captures an input-masked PNG screenshot, invokes `model/locate` for `(x, y)` coordinates, and reverse-queries the live DOM/UI tree to return a deterministic `synthesized_locator` (falling back to `at` on `<canvas>`).",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id", "query"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                    "query": {"type": "string", "description": "Visual grounding query (redacted via `Secrets`)."},
-                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
-                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
-                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
-                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
-                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
-                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
-                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
-                    "click": {"type": "boolean", "description": "Immediately click the located target and record the step for export."},
-                },
-            },
-        }),
-        json!({
-            "name": "judge",
-            "description": "Invokes `model/judge` over redacted session evidence (and an optional masked screenshot when `screenshot` is `true`) and returns `{ passed, rationale, model, ... }`; recorded in `steps.jsonl` and omitted from `export`.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id", "rubric"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                    "rubric": {"type": "string", "description": "Evaluation rubric (redacted via `Secrets`)."},
-                    "evidence": {"description": "Optional custom JSON evidence; defaults to redacted session steps and variables."},
-                    "screenshot": {"type": "boolean", "description": "Attach an input-masked PNG viewport/window screenshot from the active visual session (default false)."},
-                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
-                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
-                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
-                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
-                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
-                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
-                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
-                },
-            },
-        }),
-        json!({
-            "name": "extract",
-            "description": "Invokes `model/extract` over redacted session evidence (and an optional masked screenshot when `screenshot` is `true`), returns structured `data` (optionally constrained by `schema`), and optionally saves to session variable `save`; omitted from `export`.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id", "query"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                    "query": {"type": "string", "description": "What structured information to extract (redacted via `Secrets`)."},
-                    "schema": {"type": "object", "description": "Optional JSON Schema object describing the expected `data` shape."},
-                    "evidence": {"description": "Optional custom JSON evidence; defaults to redacted session steps and variables."},
-                    "screenshot": {"type": "boolean", "description": "Attach an input-masked PNG viewport/window screenshot from the active visual session (default false)."},
-                    "save": {"type": "string", "description": "Optional session variable name in which to store the extracted value for subsequent `${var}` steps."},
-                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
-                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
-                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
-                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
-                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
-                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
-                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
-                },
-            },
-        }),
-        json!({
-            "name": "act",
-            "description": "Runs a bounded observe → decide (`model/act_step`) → execute loop up to `max_steps` (default 8) toward `goal`, recording real deterministic UI steps (plus synthesized locators for visual actions) that export cleanly to YAML.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["session_id", "goal"],
-                "properties": {
-                    "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
-                    "goal": {"type": "string", "description": "Autonomous goal description (redacted via `Secrets`)."},
-                    "max_steps": {"type": "integer", "minimum": 1, "maximum": MAX_ACT_MAX_STEPS, "description": "Maximum autonomous steps before stopping (default 8)."},
-                    "evidence": {"description": "Optional extra JSON context made available to every iteration."},
-                    "screenshot": {"type": "boolean", "description": "Capture and attach an input-masked PNG screenshot on every iteration (default false)."},
-                    "hook": {"type": "string", "description": "Per-call model hook executable override."},
-                    "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
-                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
-                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
-                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
-                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
-                    "reasoning_effort": {"type": "string", "enum": ["none", "zero", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning effort level for the built-in `genai` model."},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "description": "Per-iteration model/hook timeout in milliseconds (default 30000)."},
-                },
-            },
-        }),
+        select_ref_definition(),
+        locate_definition(),
+        judge_definition(),
+        extract_definition(),
+        act_definition(),
     ]
 }
 

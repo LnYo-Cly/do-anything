@@ -215,14 +215,18 @@ impl DesktopBackend {
         )?;
         ensure_accessibility_trusted().map_err(|e| step_error_message(&e).to_string())?;
 
-        let win = find_macos_window_by_pid_and_hwnd(parsed.pid, parsed.hwnd)
-            .map_err(|e| step_error_message(&e).to_string())?
-            .ok_or_else(|| {
-                format!(
-                    "desktop window closed: no active AXWindow for PID {}",
-                    parsed.pid
-                )
-            })?;
+        let win = find_macos_window_by_pid_and_hwnd(
+            parsed.pid,
+            parsed.hwnd,
+            (!parsed.title.is_empty()).then_some(parsed.title.as_str()),
+        )
+        .map_err(|e| step_error_message(&e).to_string())?
+        .ok_or_else(|| {
+            format!(
+                "desktop window closed: no active AXWindow for PID {}",
+                parsed.pid
+            )
+        })?;
 
         Ok(Self {
             child: None,
@@ -797,7 +801,12 @@ impl DesktopBackend {
         }
         ensure_accessibility_trusted()?;
 
-        let win = find_macos_window_by_pid_and_hwnd(self.pid, self.hwnd)?.ok_or_else(|| {
+        let win = find_macos_window_by_pid_and_hwnd(
+            self.pid,
+            self.hwnd,
+            (!self.title.is_empty()).then_some(self.title.as_str()),
+        )?
+        .ok_or_else(|| {
             StepError::Environment(format!(
                 "desktop window closed: no active AXWindow for PID {}",
                 self.pid
@@ -936,9 +945,52 @@ fn candidate_windows_for_app(app: &AXUIElement) -> Result<Vec<AXUIElement>, AXEr
     Ok(out)
 }
 
+fn inspect_macos_window(pid: u32, win_el: AXUIElement) -> Option<(FoundMacWindow, bool, bool)> {
+    let _ = win_el.set_timeout(5.0);
+    if win_el.bool_attribute("AXMinimized").ok().flatten() == Some(true) {
+        return None;
+    }
+    let size = win_el.size_attribute("AXSize").ok().flatten()?;
+    let w = size.width.round() as i32;
+    let h = size.height.round() as i32;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let hwnd = win_el
+        .i64_attribute("AXWindowNumber")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let title = win_el
+        .string_attribute("AXTitle")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let is_standard = win_el
+        .string_attribute("AXSubrole")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("AXStandardWindow");
+    let is_main = win_el.bool_attribute("AXMain").ok().flatten() == Some(true);
+    Some((
+        FoundMacWindow {
+            pid,
+            hwnd,
+            win_el,
+            title,
+            width: w as u32,
+            height: h as u32,
+        },
+        is_standard,
+        is_main,
+    ))
+}
+
 fn find_macos_window_by_pid_and_hwnd(
     pid: u32,
     preferred_hwnd: i64,
+    preferred_title: Option<&str>,
 ) -> Result<Option<FoundMacWindow>, StepError> {
     let pid_i32 = i32::try_from(pid)
         .map_err(|_| StepError::Environment(format!("PID {pid} exceeds macOS pid_t range")))?;
@@ -947,54 +999,36 @@ fn find_macos_window_by_pid_and_hwnd(
     };
     let _ = app.set_timeout(5.0);
 
-    let windows = match candidate_windows_for_app(&app) {
+    let mut windows = match candidate_windows_for_app(&app) {
         Ok(list) => list,
         Err(AXError::CannotComplete | AXError::AttributeUnsupported(_) | AXError::NoValue) => {
             return Ok(None);
         }
         Err(err) => return Err(classify_ax_error(pid, &err)),
     };
+    if let Ok(Some(main_win)) = app.element_attribute("AXMainWindow") {
+        windows.push(main_win);
+    }
 
-    let mut fallback: Option<FoundMacWindow> = None;
+    let mut best: Option<((bool, bool, bool), FoundMacWindow)> = None;
     for win_el in windows {
-        let _ = win_el.set_timeout(5.0);
-        if win_el.bool_attribute("AXMinimized").ok().flatten() == Some(true) {
-            continue;
-        }
-        let Some(size) = win_el.size_attribute("AXSize").ok().flatten() else {
+        let Some((candidate, is_standard, is_main)) = inspect_macos_window(pid, win_el) else {
             continue;
         };
-        let w = size.width.round() as i32;
-        let h = size.height.round() as i32;
-        if w <= 0 || h <= 0 {
-            continue;
-        }
-        let hwnd = win_el
-            .i64_attribute("AXWindowNumber")
-            .ok()
-            .flatten()
-            .unwrap_or(0);
-        let title = win_el
-            .string_attribute("AXTitle")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let candidate = FoundMacWindow {
-            pid,
-            hwnd,
-            win_el,
-            title,
-            width: w as u32,
-            height: h as u32,
-        };
-        if preferred_hwnd > 0 && hwnd == preferred_hwnd {
+        if preferred_hwnd > 0 && candidate.hwnd == preferred_hwnd {
             return Ok(Some(candidate));
         }
-        if fallback.is_none() {
-            fallback = Some(candidate);
+        let title_matches = preferred_title
+            .is_some_and(|expected| !expected.is_empty() && candidate.title == expected);
+        // `AXWindowNumber` is often unavailable (`0`) on AppKit windows; rank by title,
+        // standard-window subrole, and `AXMain` so transient AutoFill/input popovers
+        // placed in front of `AXWindows` never shadow the target window.
+        let rank = (title_matches, is_standard, is_main);
+        if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+            best = Some((rank, candidate));
         }
     }
-    Ok(fallback)
+    Ok(best.map(|(_, win)| win))
 }
 
 fn find_macos_window(
@@ -1025,42 +1059,23 @@ fn find_macos_window(
             Err(_) => continue,
         };
 
+        let mut best: Option<((bool, bool), FoundMacWindow)> = None;
         for win_el in windows {
-            let _ = win_el.set_timeout(5.0);
-            if win_el.bool_attribute("AXMinimized").ok().flatten() == Some(true) {
-                continue;
-            }
-            let Some(size) = win_el.size_attribute("AXSize").ok().flatten() else {
+            let Some((candidate, is_standard, is_main)) = inspect_macos_window(pid, win_el) else {
                 continue;
             };
-            let w = size.width.round() as i32;
-            let h = size.height.round() as i32;
-            if w <= 0 || h <= 0 {
-                continue;
-            }
-            let title = win_el
-                .string_attribute("AXTitle")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
             if let Some(needle) = &title_lower
-                && !title.to_ascii_lowercase().contains(needle)
+                && !candidate.title.to_ascii_lowercase().contains(needle)
             {
                 continue;
             }
-            let hwnd = win_el
-                .i64_attribute("AXWindowNumber")
-                .ok()
-                .flatten()
-                .unwrap_or(0);
-            return Ok(Some(FoundMacWindow {
-                pid,
-                hwnd,
-                win_el,
-                title,
-                width: w as u32,
-                height: h as u32,
-            }));
+            let rank = (is_standard, is_main);
+            if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+                best = Some((rank, candidate));
+            }
+        }
+        if let Some((_, win)) = best {
+            return Ok(Some(win));
         }
     }
     Ok(None)
