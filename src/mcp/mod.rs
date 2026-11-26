@@ -21,6 +21,7 @@
 
 pub mod tools;
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -30,7 +31,8 @@ use crate::core::case;
 use crate::core::registry::Registry;
 use crate::core::secrets::Secrets;
 use crate::exit::ExitCode;
-use crate::session::model_hook::ModelHookSpec;
+use crate::session;
+use crate::session::model_hook::{BuiltinModelSpec, ModelHookSpec};
 
 use self::tools::{Context, ToolOutcome};
 
@@ -43,6 +45,8 @@ pub struct Options {
     pub idle_timeout_ms: u64,
     /// Optional external model hook configured for sessions started by this server.
     pub model_hook: Option<ModelHookSpec>,
+    /// Optional built-in model access configuration for sessions started by this server.
+    pub model: Option<BuiltinModelSpec>,
     /// Absolute paths of the explicit plugins this server was started with.
     pub plugins: Vec<String>,
 }
@@ -93,6 +97,7 @@ pub fn serve(registry: &Registry, options: Options) -> ExitCode {
         options,
         secrets: Secrets::new(),
     };
+    server.observe_startup_options();
 
     loop {
         let frame = match read_frame(&mut reader) {
@@ -338,7 +343,7 @@ impl Server<'_> {
             "ping" => Some(success(id, json!({}))),
             "tools/list" => Some(success(
                 id,
-                json!({"tools": tools::definitions_for(self.options.model_hook.is_some())}),
+                json!({"tools": tools::definitions_for(self.has_model_access())}),
             )),
             "tools/call" => Some(self.call_tool(id, &params)),
             "notifications/initialized" => {
@@ -392,13 +397,14 @@ impl Server<'_> {
                 sessions_dir: self.options.sessions_dir.as_path(),
                 idle_timeout_ms: self.options.idle_timeout_ms,
                 model_hook: self.options.model_hook.as_ref(),
+                model: self.options.model.as_ref(),
                 plugins: &self.options.plugins,
             };
             tools::call(&context, name, &arguments)
         };
 
         let Some(outcome) = outcome else {
-            let exposed = if self.options.model_hook.is_some() {
+            let exposed = if self.has_model_access() {
                 tools::ALL_NAMES.join(", ")
             } else {
                 tools::NAMES.join(", ")
@@ -425,6 +431,35 @@ impl Server<'_> {
         })
     }
 
+    fn has_model_access(&self) -> bool {
+        self.options.model_hook.is_some()
+            || self.options.model.is_some()
+            || (cfg!(feature = "ai") && session::builtin_model_from_env().is_some())
+    }
+
+    fn record_model_spec_secrets(&mut self, spec: &BuiltinModelSpec) {
+        let mut names = BTreeSet::new();
+        session::collect_builtin_model_env_names(spec, &mut names);
+        for name in names {
+            if let Ok(value) = std::env::var(&name) {
+                self.secrets.record(&value);
+            }
+        }
+    }
+
+    fn observe_startup_options(&mut self) {
+        if let Some(hook) = self.options.model_hook.clone() {
+            self.observe_environment(&json!([hook.command, hook.args]));
+        }
+        if let Some(model) = self.options.model.clone() {
+            self.record_model_spec_secrets(&model);
+        } else if cfg!(feature = "ai")
+            && let Some(env_model) = session::builtin_model_from_env()
+        {
+            self.record_model_spec_secrets(&env_model);
+        }
+    }
+
     /// Records the values of every `${env:NAME}` a request mentions.
     ///
     /// Session state already knows the names its steps used, so this is a
@@ -436,6 +471,41 @@ impl Server<'_> {
             if let Ok(value) = std::env::var(&name) {
                 self.secrets.record(&value);
             }
+        }
+        for key in ["api_key_env", "model_api_key_env"] {
+            if let Some(name) = arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                && let Ok(value) = std::env::var(name)
+            {
+                self.secrets.record(&value);
+            }
+        }
+        if let Some(model) = arguments
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let opt = |keys: [&str; 2]| {
+                keys.into_iter().find_map(|k| {
+                    arguments
+                        .get(k)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+            };
+            let spec = BuiltinModelSpec {
+                model: model.to_string(),
+                adapter: opt(["adapter", "model_adapter"]),
+                endpoint: opt(["endpoint", "model_endpoint"]),
+                api_key_env: opt(["api_key_env", "model_api_key_env"]),
+            };
+            self.record_model_spec_secrets(&spec);
         }
     }
 
@@ -551,7 +621,7 @@ mod tests {
         write_frame(&mut lines, Framing::Lines, &response).expect("writing must succeed");
         assert_eq!(
             String::from_utf8(lines).expect("a response is UTF-8"),
-            "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{}}\n"
+            format!("{response}\n")
         );
 
         let mut framed = Vec::new();

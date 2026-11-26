@@ -63,6 +63,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Clippy (ai only)
+        run: cargo clippy --all-targets --no-default-features --features ai -- -D warnings
       - name: Clippy (db only)
         run: cargo clippy --all-targets --no-default-features --features db -- -D warnings
       - name: Clippy (log only)
@@ -131,6 +133,8 @@ jobs:
         run: cargo test ${{ steps.targets.outputs.args }}
       - name: Test (no default features)
         run: cargo test --no-default-features ${{ steps.targets.outputs.args }}
+      - name: Test (ai only)
+        run: cargo test --no-default-features --features ai ${{ steps.targets.outputs.args }}
       - name: Test (db only)
         run: cargo test --no-default-features --features db ${{ steps.targets.outputs.args }}
       - name: Test (log only)

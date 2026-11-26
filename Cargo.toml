@@ -17,7 +17,9 @@ name = "da"
 path = "src/main.rs"
 
 [features]
-default = ["http", "cli", "log", "db", "browser", "mcp", "plugin", "proc", "fs"]
+default = ["http", "cli", "log", "db", "browser", "mcp", "plugin", "proc", "fs", "ai"]
+# Built-in multi-provider model access (`genai`) for `da session` and `da mcp`.
+ai = ["dep:genai", "dep:reqwest", "dep:rustls", "dep:tokio"]
 # The `http.request` step and the HTTP client it needs.
 http = ["dep:schemars", "dep:ureq"]
 # The `cli.run` step and the child-process timeout it needs.
@@ -79,9 +81,16 @@ wait-timeout = { version = "0.2", optional = true }
 rusqlite = { version = "0.43", features = ["bundled", "hooks"], optional = true }
 postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
 tokio-postgres-rustls = { version = "0.14", features = ["ring", "webpki-roots"], optional = true }
-# Only to install the crypto provider `tokio-postgres-rustls` asks for; this is
-# the same crate and version `ureq` already builds with.
+# Only to install the crypto provider `tokio-postgres-rustls` and `reqwest` ask
+# for; this is the same crate and version `ureq` already builds with.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# Multi-provider LLM/VLM client for `da session` and `da mcp`; TLS is injected
+# through `reqwest` with `ring` rather than `aws-lc-rs`.
+genai = { version = "0.7", default-features = false, optional = true }
+# Injected HTTP client for `genai` using the workspace `ring` rustls provider.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy"], optional = true }
+# Single-threaded runtime and deadline timer used only inside `ai` model calls.
+tokio = { version = "1", default-features = false, features = ["rt", "time"], optional = true }
 # The synchronous WebSocket client the DevTools Protocol connection speaks.
 # Only the plain `ws://` handshake is used, so no TLS feature is enabled.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }

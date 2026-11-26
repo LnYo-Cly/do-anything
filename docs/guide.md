@@ -15,6 +15,7 @@ The complete reference for `da`: installation options, building from source, the
     - [Observers and parallel runs](#observers-and-parallel-runs)
   - [Sessions](#sessions)
   - [Interactive sessions (`da session`)](#interactive-sessions-da-session)
+    - [Built-in model access (`ai`)](#built-in-model-access-ai)
     - [External model hooks](#external-model-hooks)
   - [Model Context Protocol (`da mcp`)](#model-context-protocol-da-mcp)
   - [External plugins](#external-plugins)
@@ -93,8 +94,9 @@ The `http` feature provides the `http.request` step, `cli` provides `cli.run`,
 `proc` provides the `proc.*` process-session steps, `log` provides the
 `log.file` observer, `fs` provides the `fs.watch` observer, `db` provides
 `db.query`, `browser` provides the `browser.*` steps, `mcp` provides `da mcp`,
-and `plugin` provides the [external plugin host](#external-plugins); these nine
-are enabled by default. The `android` feature provides the [`android.*`
+`plugin` provides the [external plugin host](#external-plugins), and `ai`
+provides the [built-in multi-provider model access layer](#built-in-model-access-ai)
+(`genai`) for `da session` and `da mcp`; these ten are enabled by default. The `android` feature provides the [`android.*`
 steps](#android-steps) and is off by default, because it is only useful on a
 machine with an Android device: build it with `cargo build --features android`.
 The `desktop` feature provides the [`desktop.*` steps](#desktop-steps) and is
@@ -106,7 +108,10 @@ downloads a browser. The `mcp` feature adds about 54 KiB to a build with no
 drivers and about 82 KiB to the default build; it has no dependency and no
 async runtime. The `plugin` feature reuses an optional dependency the drivers
 already build with, so it adds no new crate and no async runtime; plugins are
-loaded only from explicit `--plugin` flags. Build a subset with
+loaded only from explicit `--plugin` flags. The `ai` feature brings `genai`,
+`reqwest` (on the shared `ring` rustls provider), and a per-call `tokio` runtime
+exclusively behind `da session` / `da mcp`; `da run` never invokes models, and
+`--no-default-features` still builds with zero model or async dependencies. Build a subset with
 `--no-default-features --features http,cli,log,db`, build only one driver with
 `--no-default-features --features cli`, or build nothing extra with
 `--no-default-features`.
@@ -533,12 +538,12 @@ on the session directory rejects concurrent operations on the same session ID.
 
 | Subcommand | Purpose & Key Options |
 | --- | --- |
-| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), optionally attach declared read-only observers (`--observe SPEC`) or a persisted JSON-RPC model hook (`--model-hook <exe>`, `--model-hook-arg <arg>`), print `session_id` |
+| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), optionally attach declared read-only observers (`--observe SPEC`), a built-in model (`--model`, `--model-adapter`, `--model-endpoint`, `--model-api-key-env`), or a JSON-RPC model hook (`--model-hook <exe>`, `--model-hook-arg <arg>`), print `session_id` |
 | `da session step <id> ...` | Reattach resources, run one step (`<step> --arg k=v`, `--use` + `--with`, `--step`, or `-f <file\|->`, optional `--save name=jsonpath`), update state, detach; returns `snapshot` after browser steps |
 | `da session snapshot <id>` | Capture the current accessibility tree without running a step (`--ref <id>`, `--max-depth`, `--max-nodes`) |
-| `da session select-ref <id>` | Ask a `model/select_ref` hook (such as Jev) to pick a candidate `ref` (`--query <text>`, optional `--act <step>`, `--hook <exe>`, `--timeout-ms <ms>`) and synthesize its deterministic locator |
-| `da session locate <id>` | Send an input-masked PNG + viewport to a `model/locate` VLM hook (`--query <text>`, optional `--click`, `--hook <exe>`, `--timeout-ms <ms>`) and reverse-query the live DOM/UI tree for a deterministic locator |
-| `da session judge <id>` | Send redacted session evidence to a `model/judge` LLM/vLLM hook (`--rubric <text>`, optional `--evidence <yaml\|json>`, `--hook <exe>`, `--timeout-ms <ms>`); exits `0` when `passed` is `true` and `1` when `false` |
+| `da session select-ref <id>` | Ask a built-in model or `model/select_ref` hook to pick a candidate `ref` (`--query <text>`, optional `--act <step>`, per-call `--model` / `--adapter` / `--endpoint` / `--api-key-env` or `--hook <exe>`, `--timeout-ms <ms>`) and synthesize its deterministic locator |
+| `da session locate <id>` | Send an input-masked PNG + viewport to a built-in model or `model/locate` VLM hook (`--query <text>`, optional `--click`, `--model` / `--hook`, `--timeout-ms <ms>`) and reverse-query the live DOM/UI tree for a deterministic locator |
+| `da session judge <id>` | Send redacted session evidence (plus a 1:1 input-masked screenshot when `--screenshot` is passed) to a built-in model or `model/judge` hook (`--rubric <text>`, optional `--evidence <yaml\|json>`, `--screenshot`, `--model` / `--hook`, `--timeout-ms <ms>`); exits `0` when `passed` is `true` and `1` when `false` |
 | `da session export <id>` | Emit deterministic, model-free YAML case (`-o <file>`, `--name <title>`, `--include-reads`, `--yaml`); skips pure `browser.read` without `expect`/`save` and exploration-only `model.*` diagnostics |
 | `da session stop <id>` | Close all resources in the session and remove `.da/sessions/<id>/` and any temporary browser profile |
 | `da session list` | List active sessions and reap any session idle beyond `--idle-timeout-ms` (`0` reaps all idle sessions) |
@@ -722,12 +727,51 @@ $ da session stop s-1794974416388-44376-0
   and idle reaping close detached Chrome instances and delete both
   `.da/sessions/<id>/` and Chrome's temporary profile directory.
 
+#### Built-in model access (`ai`)
+
+With default features (`ai` enabled), `da session` and `da mcp` can call
+OpenAI, OpenAI Responses, Anthropic, Gemini, DeepSeek, Groq, xAI, Ollama,
+Omlx, OpenRouter, vLLM, or custom endpoints directly through `genai` — without
+configuring an external hook script:
+
+- **Session default**: pass `--model <MODEL>` (plus optional `--model-adapter`,
+  `--model-endpoint <URL>`, `--model-api-key-env <VAR>`) on `da session start`
+  or `da mcp`. Examples: `--model openai::gpt-4o-mini`, `--model deepseek::deepseek-chat`,
+  `--model gemini::gemini-2.5-flash`, `--model anthropic::claude-sonnet-4-5`, or
+  a local VLM server with `--model qwen2.5-vl --model-adapter omlx --model-endpoint http://127.0.0.1:8000/v1`.
+- **Per-call override**: pass `--model <MODEL>`, `--adapter` (`--model-adapter`),
+  `--endpoint` (`--model-endpoint`), and `--api-key-env` (`--model-api-key-env`)
+  on `select-ref`, `locate`, or `judge` (`--model` and `--hook` are mutually
+  exclusive).
+- **Environment fallback**: when neither `--model` nor `--model-hook` is set on
+  the call or session, `da` reads `DA_MODEL` (plus optional `DA_MODEL_ADAPTER`,
+  `DA_MODEL_ENDPOINT`, `DA_MODEL_API_KEY_ENV`). Adapter default key variables
+  (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+  etc.) are used automatically unless an explicit `--api-key-env` is given;
+  anonymous custom/local `/v1` OpenAI-compatible servers work with no key via
+  `omlx` or `--endpoint`.
+- **Custom protocols (`genai_<n>`)**: custom OpenAI-compatible or local adapters
+  such as Jev models can target `genai_1::model-name` (through `GENAI_1_ENDPOINT`
+  and optional `GENAI_1_API_KEY`, or `--endpoint`).
+- **Secret and structured-output handling**: literal API keys are never accepted
+  as CLI flags or written to disk; `state.json` stores only environment variable
+  names and unexpanded `${env:NAME}` templates in `--model-endpoint`. Every
+  resolved key and secret is registered with `Secrets` and redacted across prompts
+  and responses. Structured requests use JSON Schema (`JsonSpec`), automatically
+  fall back to plain JSON extraction on HTTP 400/422 `response_format`
+  rejections, and enforce `--timeout-ms` (`ExitCode::Timeout` `5`).
+- **Visual judge (`--screenshot`)**: `da session judge --screenshot` (and MCP
+  `judge` with `"screenshot": true`) captures the active browser viewport or
+  desktop window through the same 1:1 input-masked screenshot pipeline as `locate`
+  and attaches it as a `data:image/png;base64,...` image part (or fails with
+  `ExitCode::Environment` `4` if no visual session is active).
+
 #### External model hooks
 
-When an accessibility tree has many similar controls, an opaque `<canvas>` has no
-DOM nodes, or an agent needs an exploration-time semantic check, `da session`
-can invoke an external model adapter over synchronous stdin/stdout JSON-RPC 2.0
-without adding model SDKs to `da` or calling any model during `da run`.
+When you need custom transport, custom authentication, or a non-`genai`
+protocol (or build with `--no-default-features`), `da session` can invoke an
+external model adapter over synchronous stdin/stdout JSON-RPC 2.0 without calling
+any model during `da run`.
 
 Configure a default hook for a session with `da session start --model-hook <exe>`
 (plus repeatable `--model-hook-arg <arg>`), or pass `--hook <exe>` (and
@@ -818,7 +862,7 @@ Three atomic methods are standardized:
    viewport-pinned `at: { x, y, viewport }` with the `da lint` coordinate
    warning.
 
-3. **`model/judge`** (open-ended exploration verdicts via vLLM / Ollama / OpenAI-compatible adapters):
+3. **`model/judge`** (open-ended exploration verdicts):
 
    ```json
    {
@@ -834,6 +878,10 @@ Three atomic methods are standardized:
      }
    }
    ```
+
+   When `--screenshot` is passed (`"screenshot": true` in MCP), `params` also
+   includes `"image_base64"`, `"mime_type": "image/png"`, and `"viewport"`
+   captured from the active browser or desktop session with inputs masked.
 
    Response `result`:
 
@@ -855,7 +903,8 @@ Three atomic methods are standardized:
 
 Boundary and replay guarantees:
 
-- **Input masking & secret scrubbing**: `model/locate` always captures a 1:1
+- **Input masking & secret scrubbing**: `model/locate` — and `model/judge` when
+  `--screenshot` is enabled — captures a 1:1
   CSS-viewport PNG through the session's input-masked screenshot path: every
   accessible `<input>`, `<textarea>`, `<select>`, and `[contenteditable]` field —
   including controls inside browser top-layer elements (modal `<dialog>` via
@@ -920,7 +969,7 @@ speaks only one of them needs no negotiation.
 | `initialize` | `protocolVersion` (echoed when this server knows it, otherwise the newest one it speaks), `capabilities.tools`, `serverInfo` and `instructions` |
 | `notifications/initialized` | Nothing: JSON-RPC forbids answering a notification |
 | `ping` | `{}` |
-| `tools/list` | The fixed six tools with their compact `inputSchema` |
+| `tools/list` | The six base tools (or nine when `--model` / `DA_MODEL` or `--model-hook` is configured) with their compact `inputSchema` |
 | `tools/call` | The result of one tool |
 
 An unknown method answers `-32601`, a body that is not JSON answers `-32700`,
@@ -934,17 +983,21 @@ model's context on descriptions it cannot use.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `session_start` | optional `model_hook`, `model_hook_args` | `session_id` of a new session |
+| `session_start` | optional `model`, `model_adapter`, `model_endpoint`, `model_api_key_env`, or `model_hook`, `model_hook_args` | `session_id` of a new session |
 | `step` | `session_id`, `use`, optional `with`, `expect`, `save` | The step result, its assertions and, after a browser step, a fresh `snapshot` |
 | `snapshot` | `session_id`, optional `ref`, `max_depth`, `max_nodes` | The accessibility tree without running a step |
 | `export` | `session_id`, optional `name`, `include_reads`, `out` | The YAML case, byte for byte what `da session export --yaml` writes |
 | `run` | `paths`, optional `vars`, `jobs` | The same JSON report `da --output json run` prints |
 | `session_stop` | `session_id` | Closes every resource and removes the session directory |
 
-When `da mcp` is started with `--model-hook <exe>` (plus optional
+When `da mcp` is started with `--model <MODEL>` (plus optional `--model-adapter`,
+`--model-endpoint`, `--model-api-key-env`), with `DA_MODEL` set in the
+environment, or with `--model-hook <exe>` (plus optional
 `--model-hook-arg <arg>`), `tools/list` also advertises `select_ref`, `locate`,
-and `judge` backed by the same [External model hooks](#external-model-hooks)
-contract (`tools/call` also accepts per-call `hook` / `hook_args`).
+and `judge` backed by the same built-in model layer and
+[External model hooks](#external-model-hooks) contract (`judge` also accepts
+`"screenshot": true`, and all three accept per-call `model` / `adapter` /
+`endpoint` / `api_key_env` or `hook` / `hook_args`).
 
 `step` is the only generic step tool: `use` names a registered step, `with`
 holds the arguments a case file nests under that name, and `expect` and `save`

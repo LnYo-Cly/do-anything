@@ -18,12 +18,12 @@ use crate::core::registry::Registry;
 use crate::core::report::RunOutcome;
 use crate::core::secrets::Secrets;
 use crate::session::export::ExportOptions;
-use crate::session::model_hook::{DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
+use crate::session::model_hook::{BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
 use crate::session::{
     self, JudgeRequest, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
 };
 
-/// Names of the base tools, in the order `tools/list` reports them without `--model-hook`.
+/// Names of the base tools, in the order `tools/list` reports them without server model config.
 pub const NAMES: [&str; 6] = [
     "session_start",
     "step",
@@ -33,7 +33,7 @@ pub const NAMES: [&str; 6] = [
     "session_stop",
 ];
 
-/// Names of all tools exposed when `--model-hook` is configured on `da mcp`.
+/// Names of all tools exposed when `--model-hook` or `--model` is configured on `da mcp`.
 pub const ALL_NAMES: [&str; 9] = [
     "session_start",
     "step",
@@ -56,6 +56,8 @@ pub struct Context<'a> {
     pub idle_timeout_ms: u64,
     /// Optional server-default model hook configured on `da mcp`.
     pub model_hook: Option<&'a ModelHookSpec>,
+    /// Optional server-default built-in model access configuration on `da mcp`.
+    pub model: Option<&'a BuiltinModelSpec>,
     /// Absolute paths of the explicit plugins this server was started with.
     pub plugins: &'a [String],
 }
@@ -100,6 +102,22 @@ pub fn definitions() -> Vec<Value> {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Optional arguments passed to `model_hook`.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional built-in `genai` model identifier (`openai::gpt-4o-mini`, `deepseek::deepseek-chat`, `omlx::ui-tars-1.5-7b`, ...).",
+                    },
+                    "model_adapter": {
+                        "type": "string",
+                        "description": "Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).",
+                    },
+                    "model_endpoint": {
+                        "type": "string",
+                        "description": "Optional custom HTTP endpoint URL for `model` (supports `${env:NAME}`).",
+                    },
+                    "model_api_key_env": {
+                        "type": "string",
+                        "description": "Optional environment variable name holding the API key for `model`.",
                     },
                 },
             },
@@ -230,7 +248,7 @@ pub fn definitions() -> Vec<Value> {
 }
 
 /// Describes `tools/list`, including `select_ref`, `locate`, and `judge` when
-/// `--model-hook` is configured on `da mcp`.
+/// `--model-hook` or `--model` is configured on `da mcp`.
 pub fn definitions_for(include_model_hooks: bool) -> Vec<Value> {
     let mut base = definitions();
     if !include_model_hooks {
@@ -246,7 +264,7 @@ fn model_hook_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "select_ref",
-            "description": "Invokes the `model/select_ref` JSON-RPC 2.0 hook over the session's active snapshot candidates, verifies the chosen `ref`, and returns its deterministic `synthesized_locator`.",
+            "description": "Invokes `model/select_ref` (built-in `genai` model or external JSON-RPC 2.0 hook) over the session's active snapshot candidates, verifies the chosen `ref`, and returns its deterministic `synthesized_locator`.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -259,6 +277,10 @@ fn model_hook_definitions() -> Vec<Value> {
                     "max_nodes": {"type": "integer", "minimum": 1, "description": "Maximum snapshot nodes."},
                     "hook": {"type": "string", "description": "Per-call model hook executable override."},
                     "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
+                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
+                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
+                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
                     "act": {"type": "string", "description": "Optional step name (such as `browser.click`) to execute immediately with the selected `ref`."},
                     "with": {"type": "object", "description": "Optional step arguments merged when `act` is set."},
@@ -277,6 +299,10 @@ fn model_hook_definitions() -> Vec<Value> {
                     "query": {"type": "string", "description": "Visual grounding query (redacted via `Secrets`)."},
                     "hook": {"type": "string", "description": "Per-call model hook executable override."},
                     "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
+                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
+                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
+                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
                     "click": {"type": "boolean", "description": "Immediately click the located target and record the step for export."},
                 },
@@ -284,7 +310,7 @@ fn model_hook_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "judge",
-            "description": "Invokes `model/judge` over redacted session evidence and returns `{ passed, rationale, model, ... }`; recorded in `steps.jsonl` and omitted from `export`.",
+            "description": "Invokes `model/judge` over redacted session evidence (and an optional masked screenshot when `screenshot` is `true`) and returns `{ passed, rationale, model, ... }`; recorded in `steps.jsonl` and omitted from `export`.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -293,8 +319,13 @@ fn model_hook_definitions() -> Vec<Value> {
                     "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
                     "rubric": {"type": "string", "description": "Evaluation rubric (redacted via `Secrets`)."},
                     "evidence": {"description": "Optional custom JSON evidence; defaults to redacted session steps and variables."},
+                    "screenshot": {"type": "boolean", "description": "Attach an input-masked PNG viewport/window screenshot from the active visual session (default false)."},
                     "hook": {"type": "string", "description": "Per-call model hook executable override."},
                     "hook_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to `hook`."},
+                    "model": {"type": "string", "description": "Per-call built-in `genai` model override."},
+                    "adapter": {"type": "string", "description": "Optional `genai` adapter override for `model`."},
+                    "endpoint": {"type": "string", "description": "Optional custom endpoint URL override for `model` (supports `${env:NAME}`)."},
+                    "api_key_env": {"type": "string", "description": "Optional environment variable name holding the API key for `model`."},
                     "timeout_ms": {"type": "integer", "minimum": 1, "description": "Hook timeout in milliseconds (default 30000)."},
                 },
             },
@@ -325,12 +356,21 @@ pub fn call(context: &Context, name: &str, arguments: &Map<String, Value>) -> Op
 
 /// Starts one session and reports the identifier to use from now on.
 fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
-    if let Err(message) = only(arguments, &["model_hook", "model_hook_args"]) {
+    if let Err(message) = only(
+        arguments,
+        &[
+            "model_hook",
+            "model_hook_args",
+            "model",
+            "model_adapter",
+            "model_endpoint",
+            "model_api_key_env",
+        ],
+    ) {
         return ToolOutcome::failed(refusal(message));
     }
-    let model_hook = match optional_hook_spec(arguments, "model_hook", "model_hook_args") {
-        Ok(Some(spec)) => Some(spec),
-        Ok(None) => context.model_hook.cloned(),
+    let (model_hook, model) = match resolve_tool_models(context, arguments, &START_MODEL_KEYS) {
+        Ok(pair) => pair,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
     from_response(session::handle(
@@ -339,6 +379,7 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
             idle_timeout_ms: context.idle_timeout_ms,
             observe: Vec::new(),
             model_hook,
+            model,
             plugins: context.plugins.to_vec(),
         },
         context.registry,
@@ -452,6 +493,10 @@ fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome 
             "max_nodes",
             "hook",
             "hook_args",
+            "model",
+            "adapter",
+            "endpoint",
+            "api_key_env",
             "timeout_ms",
             "act",
             "with",
@@ -479,11 +524,11 @@ fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome 
         Ok(value) => value,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let hook_override = match optional_hook_spec(arguments, "hook", "hook_args") {
-        Ok(Some(spec)) => Some(spec),
-        Ok(None) => context.model_hook.cloned(),
-        Err(message) => return ToolOutcome::failed(refusal(message)),
-    };
+    let (hook_override, model_override) =
+        match resolve_tool_models(context, arguments, &CALL_MODEL_KEYS) {
+            Ok(pair) => pair,
+            Err(message) => return ToolOutcome::failed(refusal(message)),
+        };
     let timeout_ms = match optional_timeout_ms(arguments) {
         Ok(ms) => ms,
         Err(message) => return ToolOutcome::failed(refusal(message)),
@@ -517,6 +562,7 @@ fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome 
             max_depth,
             max_nodes,
             hook_override,
+            model_override,
             timeout_ms,
             act,
         }),
@@ -533,6 +579,10 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             "query",
             "hook",
             "hook_args",
+            "model",
+            "adapter",
+            "endpoint",
+            "api_key_env",
             "timeout_ms",
             "click",
         ],
@@ -547,11 +597,11 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
         Ok(value) => value,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let hook_override = match optional_hook_spec(arguments, "hook", "hook_args") {
-        Ok(Some(spec)) => Some(spec),
-        Ok(None) => context.model_hook.cloned(),
-        Err(message) => return ToolOutcome::failed(refusal(message)),
-    };
+    let (hook_override, model_override) =
+        match resolve_tool_models(context, arguments, &CALL_MODEL_KEYS) {
+            Ok(pair) => pair,
+            Err(message) => return ToolOutcome::failed(refusal(message)),
+        };
     let timeout_ms = match optional_timeout_ms(arguments) {
         Ok(ms) => ms,
         Err(message) => return ToolOutcome::failed(refusal(message)),
@@ -568,6 +618,7 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             base_directory,
             query,
             hook_override,
+            model_override,
             timeout_ms,
             click,
         }),
@@ -575,7 +626,7 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
     ))
 }
 
-/// Invokes `model/judge` over redacted session evidence.
+/// Invokes `model/judge` over redacted session evidence and optional screenshot.
 fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
     if let Err(message) = only(
         arguments,
@@ -583,8 +634,13 @@ fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
             "session_id",
             "rubric",
             "evidence",
+            "screenshot",
             "hook",
             "hook_args",
+            "model",
+            "adapter",
+            "endpoint",
+            "api_key_env",
             "timeout_ms",
         ],
     ) {
@@ -599,22 +655,30 @@ fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
     let evidence = arguments.get("evidence").filter(|v| !v.is_null()).cloned();
-    let hook_override = match optional_hook_spec(arguments, "hook", "hook_args") {
-        Ok(Some(spec)) => Some(spec),
-        Ok(None) => context.model_hook.cloned(),
+    let screenshot = match optional_flag(arguments, "screenshot") {
+        Ok(flag) => flag.unwrap_or(false),
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
+    let (hook_override, model_override) =
+        match resolve_tool_models(context, arguments, &CALL_MODEL_KEYS) {
+            Ok(pair) => pair,
+            Err(message) => return ToolOutcome::failed(refusal(message)),
+        };
     let timeout_ms = match optional_timeout_ms(arguments) {
         Ok(ms) => ms,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
+    let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     from_response(session::handle(
         SessionRequest::Judge(JudgeRequest {
             sessions_dir: context.sessions_dir.to_path_buf(),
             id: session_id,
+            base_directory,
             rubric,
             evidence,
+            screenshot,
             hook_override,
+            model_override,
             timeout_ms,
         }),
         context.registry,
@@ -828,6 +892,33 @@ fn optional_timeout_ms(arguments: &Map<String, Value>) -> Result<u64, String> {
     }
 }
 
+struct ModelOptionKeys<'a> {
+    hook: &'a str,
+    hook_args: &'a str,
+    model: &'a str,
+    adapter: &'a str,
+    endpoint: &'a str,
+    api_key_env: &'a str,
+}
+
+const START_MODEL_KEYS: ModelOptionKeys<'static> = ModelOptionKeys {
+    hook: "model_hook",
+    hook_args: "model_hook_args",
+    model: "model",
+    adapter: "model_adapter",
+    endpoint: "model_endpoint",
+    api_key_env: "model_api_key_env",
+};
+
+const CALL_MODEL_KEYS: ModelOptionKeys<'static> = ModelOptionKeys {
+    hook: "hook",
+    hook_args: "hook_args",
+    model: "model",
+    adapter: "adapter",
+    endpoint: "endpoint",
+    api_key_env: "api_key_env",
+};
+
 fn optional_hook_spec(
     arguments: &Map<String, Value>,
     cmd_key: &str,
@@ -852,6 +943,56 @@ fn optional_hook_spec(
         Some(command) => Ok(Some(ModelHookSpec { command, args })),
         None if args.is_empty() => Ok(None),
         None => Err(format!("`{args_key}` requires `{cmd_key}`")),
+    }
+}
+
+fn optional_model_spec(
+    arguments: &Map<String, Value>,
+    keys: &ModelOptionKeys<'_>,
+) -> Result<Option<BuiltinModelSpec>, String> {
+    let model = optional_text(arguments, keys.model)?;
+    let adapter = optional_text(arguments, keys.adapter)?;
+    let endpoint = optional_text(arguments, keys.endpoint)?;
+    let api_key_env = optional_text(arguments, keys.api_key_env)?;
+    match model {
+        Some(model) => Ok(Some(BuiltinModelSpec {
+            model,
+            adapter,
+            endpoint,
+            api_key_env,
+        })),
+        None => {
+            for (present, name) in [
+                (adapter.is_some(), keys.adapter),
+                (endpoint.is_some(), keys.endpoint),
+                (api_key_env.is_some(), keys.api_key_env),
+            ] {
+                if present {
+                    return Err(format!("`{name}` requires `{}`", keys.model));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_tool_models(
+    context: &Context,
+    arguments: &Map<String, Value>,
+    keys: &ModelOptionKeys<'_>,
+) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
+    let hook = optional_hook_spec(arguments, keys.hook, keys.hook_args)?;
+    let model = optional_model_spec(arguments, keys)?;
+    if hook.is_some() && model.is_some() {
+        return Err(format!(
+            "pass either `{}` or `{}`, not both",
+            keys.hook, keys.model
+        ));
+    }
+    if hook.is_some() || model.is_some() {
+        Ok((hook, model))
+    } else {
+        Ok((context.model_hook.cloned(), context.model.cloned()))
     }
 }
 
@@ -1010,6 +1151,7 @@ mod tests {
             sessions_dir: Path::new(".da/sessions"),
             idle_timeout_ms: 60_000,
             model_hook: None,
+            model: None,
             plugins: &[],
         }
     }
@@ -1063,7 +1205,7 @@ mod tests {
         let registry = registry();
         let context = context(&registry);
 
-        for name in NAMES {
+        for name in ALL_NAMES {
             let mut arguments = Map::new();
             arguments.insert("surprise".to_string(), json!(1));
             let outcome = call(&context, name, &arguments).expect("the tool must be routed");
@@ -1212,5 +1354,38 @@ mod tests {
 
         arguments.insert("jobs".to_string(), json!("three"));
         assert!(optional_count(&arguments, "jobs").is_err());
+    }
+
+    #[test]
+    fn model_and_hook_overrides_are_mutually_exclusive_and_override_server_defaults() {
+        let registry = registry();
+        let default_model = BuiltinModelSpec {
+            model: "openai::gpt-4o-mini".to_string(),
+            adapter: None,
+            endpoint: None,
+            api_key_env: None,
+        };
+        let mut ctx = context(&registry);
+        ctx.model = Some(&default_model);
+
+        let mut both = Map::new();
+        both.insert("hook".to_string(), json!("./hook"));
+        both.insert("model".to_string(), json!("deepseek::deepseek-chat"));
+        let err = resolve_tool_models(&ctx, &both, &CALL_MODEL_KEYS)
+            .expect_err("hook and model together must fail");
+        assert!(err.contains("not both"), "got: {err}");
+
+        let mut hook_only = Map::new();
+        hook_only.insert("hook".to_string(), json!("./hook"));
+        let (hook, model) = resolve_tool_models(&ctx, &hook_only, &CALL_MODEL_KEYS)
+            .expect("hook override suppresses server default model");
+        assert!(hook.is_some());
+        assert!(model.is_none());
+
+        let mut orphan_endpoint = Map::new();
+        orphan_endpoint.insert("endpoint".to_string(), json!("http://127.0.0.1:8000/v1"));
+        let err = resolve_tool_models(&ctx, &orphan_endpoint, &CALL_MODEL_KEYS)
+            .expect_err("endpoint without model must fail");
+        assert!(err.contains("requires `model`"), "got: {err}");
     }
 }

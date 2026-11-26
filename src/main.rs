@@ -22,7 +22,7 @@ use do_anything::drivers;
 use do_anything::exit::ExitCode as DaExitCode;
 use do_anything::report as html_report;
 use do_anything::session::export::ExportOptions;
-use do_anything::session::model_hook::{DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
+use do_anything::session::model_hook::{BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
 use do_anything::session::{
     self, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR, JudgeRequest, LocateRequest,
     SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
@@ -186,6 +186,18 @@ enum Command {
             allow_hyphen_values = true
         )]
         model_hook_args: Vec<String>,
+        /// Optional built-in `genai` model identifier exposed to MCP clients (e.g. `openai::gpt-4o-mini`, `omlx::ui-tars-1.5-7b`).
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).
+        #[arg(long, value_name = "ADAPTER")]
+        model_adapter: Option<String>,
+        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+        #[arg(long, value_name = "URL")]
+        model_endpoint: Option<String>,
+        /// Environment variable name holding the API key for `--model`.
+        #[arg(long, value_name = "NAME")]
+        model_api_key_env: Option<String>,
     },
     /// Manage persistent interactive sessions for step-by-step exploration.
     Session {
@@ -217,6 +229,18 @@ enum SessionCommand {
             allow_hyphen_values = true
         )]
         model_hook_args: Vec<String>,
+        /// Configure a built-in `genai` model identifier for `select-ref`, `locate`, and `judge`.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).
+        #[arg(long, value_name = "ADAPTER")]
+        model_adapter: Option<String>,
+        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+        #[arg(long, value_name = "URL")]
+        model_endpoint: Option<String>,
+        /// Environment variable name holding the API key for `--model`.
+        #[arg(long, value_name = "NAME")]
+        model_api_key_env: Option<String>,
     },
     /// Execute one step in an existing session.
     Step {
@@ -257,7 +281,7 @@ enum SessionCommand {
         #[arg(long, value_name = "N")]
         max_nodes: Option<usize>,
     },
-    /// Choose a candidate `ref` from the active snapshot using a `model/select_ref` JSON-RPC hook.
+    /// Choose a candidate `ref` from the active snapshot using the built-in model or an external `model/select_ref` hook.
     SelectRef {
         /// Session identifier returned by `da session start`.
         id: String,
@@ -279,7 +303,19 @@ enum SessionCommand {
         /// Pass an argument to `--hook`. Repeat for more than one.
         #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
         hook_args: Vec<String>,
-        /// Maximum hook runtime in milliseconds. Defaults to 30000.
+        /// Override with a built-in `genai` model identifier for this call.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Optional `genai` adapter override for `--model`.
+        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
+        adapter: Option<String>,
+        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+        #[arg(long, alias = "model-endpoint", value_name = "URL")]
+        endpoint: Option<String>,
+        /// Environment variable name holding the API key for `--model`.
+        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
         timeout_ms: u64,
         /// Immediately execute a step (such as `browser.click`) using the selected `ref`.
@@ -308,14 +344,26 @@ enum SessionCommand {
         /// Pass an argument to `--hook`. Repeat for more than one.
         #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
         hook_args: Vec<String>,
-        /// Maximum hook runtime in milliseconds. Defaults to 30000.
+        /// Override with a built-in `genai` model identifier for this call.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Optional `genai` adapter override for `--model`.
+        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
+        adapter: Option<String>,
+        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+        #[arg(long, alias = "model-endpoint", value_name = "URL")]
+        endpoint: Option<String>,
+        /// Environment variable name holding the API key for `--model`.
+        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
         timeout_ms: u64,
         /// Immediately click the located target and record the step for `da session export`.
         #[arg(long)]
         click: bool,
     },
-    /// Invoke `model/judge` over redacted session evidence and exit 1 if `passed` is false.
+    /// Invoke `model/judge` over redacted session evidence (and optional masked screenshot) and exit 1 if `passed` is false.
     Judge {
         /// Session identifier returned by `da session start`.
         id: String,
@@ -325,13 +373,28 @@ enum SessionCommand {
         /// Custom evidence as YAML or JSON; defaults to redacted session steps and variables.
         #[arg(long, value_name = "YAML_OR_JSON")]
         evidence: Option<String>,
+        /// Attach an input-masked PNG screenshot from the active visual session.
+        #[arg(long)]
+        screenshot: bool,
         /// Override the session's model hook executable for this call.
         #[arg(long, value_name = "EXECUTABLE")]
         hook: Option<String>,
         /// Pass an argument to `--hook`. Repeat for more than one.
         #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
         hook_args: Vec<String>,
-        /// Maximum hook runtime in milliseconds. Defaults to 30000.
+        /// Override with a built-in `genai` model identifier for this call.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Optional `genai` adapter override for `--model`.
+        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
+        adapter: Option<String>,
+        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+        #[arg(long, alias = "model-endpoint", value_name = "URL")]
+        endpoint: Option<String>,
+        /// Environment variable name holding the API key for `--model`.
+        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
+        api_key_env: Option<String>,
+        /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
         #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
         timeout_ms: u64,
     },
@@ -551,16 +614,28 @@ fn main() -> ExitCode {
             idle_timeout_ms,
             model_hook,
             model_hook_args,
+            model,
+            model_adapter,
+            model_endpoint,
+            model_api_key_env,
         } => {
-            let hook_spec = match build_cli_hook_spec(
+            let (hook_spec, model_spec) = match resolve_cli_model_config(
                 model_hook,
                 model_hook_args,
-                "--model-hook",
-                "--model-hook-arg",
+                model,
+                model_adapter,
+                model_endpoint,
+                model_api_key_env,
+                &START_CLI_MODEL_FLAGS,
             ) {
-                Ok(spec) => spec,
+                Ok(pair) => pair,
                 Err(message) => return usage_error(&message),
             };
+            if let Some(spec) = &model_spec
+                && let Err(message) = session::validate_builtin_model(spec)
+            {
+                return usage_error(&message);
+            }
             do_anything::mcp::serve(
                 &registry,
                 do_anything::mcp::Options {
@@ -568,6 +643,7 @@ fn main() -> ExitCode {
                         .unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
                     idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
                     model_hook: hook_spec,
+                    model: model_spec,
                     plugins: activated_plugins.clone(),
                 },
             )
@@ -588,6 +664,33 @@ fn main() -> ExitCode {
     }
 }
 
+struct CliModelFlags<'a> {
+    hook_flag: &'a str,
+    hook_arg_flag: &'a str,
+    model_flag: &'a str,
+    adapter_flag: &'a str,
+    endpoint_flag: &'a str,
+    api_key_env_flag: &'a str,
+}
+
+const START_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
+    hook_flag: "--model-hook",
+    hook_arg_flag: "--model-hook-arg",
+    model_flag: "--model",
+    adapter_flag: "--model-adapter",
+    endpoint_flag: "--model-endpoint",
+    api_key_env_flag: "--model-api-key-env",
+};
+
+const CALL_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
+    hook_flag: "--hook",
+    hook_arg_flag: "--hook-arg",
+    model_flag: "--model",
+    adapter_flag: "--adapter",
+    endpoint_flag: "--endpoint",
+    api_key_env_flag: "--api-key-env",
+};
+
 fn build_cli_hook_spec(
     command: Option<String>,
     args: Vec<String>,
@@ -606,6 +709,71 @@ fn build_cli_hook_spec(
     }
 }
 
+fn build_cli_model_spec(
+    model: Option<String>,
+    adapter: Option<String>,
+    endpoint: Option<String>,
+    api_key_env: Option<String>,
+    flags: &CliModelFlags<'_>,
+) -> Result<Option<BuiltinModelSpec>, String> {
+    for (value, flag) in [
+        (&adapter, flags.adapter_flag),
+        (&endpoint, flags.endpoint_flag),
+        (&api_key_env, flags.api_key_env_flag),
+    ] {
+        if let Some(raw) = value
+            && raw.trim().is_empty()
+        {
+            return Err(format!("`{flag}` must not be empty"));
+        }
+    }
+    match model {
+        Some(m) => {
+            if m.trim().is_empty() {
+                return Err(format!("`{}` must not be empty", flags.model_flag));
+            }
+            Ok(Some(BuiltinModelSpec {
+                model: m,
+                adapter,
+                endpoint,
+                api_key_env,
+            }))
+        }
+        None => {
+            for (present, flag) in [
+                (adapter.is_some(), flags.adapter_flag),
+                (endpoint.is_some(), flags.endpoint_flag),
+                (api_key_env.is_some(), flags.api_key_env_flag),
+            ] {
+                if present {
+                    return Err(format!("`{flag}` requires `{} <MODEL>`", flags.model_flag));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_cli_model_config(
+    hook_cmd: Option<String>,
+    hook_args: Vec<String>,
+    model: Option<String>,
+    adapter: Option<String>,
+    endpoint: Option<String>,
+    api_key_env: Option<String>,
+    flags: &CliModelFlags<'_>,
+) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
+    let hook_spec = build_cli_hook_spec(hook_cmd, hook_args, flags.hook_flag, flags.hook_arg_flag)?;
+    let model_spec = build_cli_model_spec(model, adapter, endpoint, api_key_env, flags)?;
+    if hook_spec.is_some() && model_spec.is_some() {
+        return Err(format!(
+            "pass either `{}` or `{}`, not both",
+            flags.hook_flag, flags.model_flag
+        ));
+    }
+    Ok((hook_spec, model_spec))
+}
+
 fn run_session(
     format: OutputFormat,
     registry: &Registry,
@@ -622,18 +790,25 @@ fn run_session(
             observe,
             model_hook,
             model_hook_args,
+            model,
+            model_adapter,
+            model_endpoint,
+            model_api_key_env,
         } => {
             let parsed_observe = match session::parse_observe_specs(&observe, registry) {
                 Ok(items) => items,
                 Err(message) => return session_usage_error(format, &message),
             };
-            let hook_spec = match build_cli_hook_spec(
+            let (hook_spec, model_spec) = match resolve_cli_model_config(
                 model_hook,
                 model_hook_args,
-                "--model-hook",
-                "--model-hook-arg",
+                model,
+                model_adapter,
+                model_endpoint,
+                model_api_key_env,
+                &START_CLI_MODEL_FLAGS,
             ) {
-                Ok(spec) => spec,
+                Ok(pair) => pair,
                 Err(message) => return session_usage_error(format, &message),
             };
             SessionRequest::Start {
@@ -641,6 +816,7 @@ fn run_session(
                 idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
                 observe: parsed_observe,
                 model_hook: hook_spec,
+                model: model_spec,
                 plugins: session_plugins.to_vec(),
             }
         }
@@ -687,14 +863,26 @@ fn run_session(
             max_nodes,
             hook,
             hook_args,
+            model,
+            adapter,
+            endpoint,
+            api_key_env,
             timeout_ms,
             act,
             with,
             args,
             save,
         } => {
-            let hook_override = match build_cli_hook_spec(hook, hook_args, "--hook", "--hook-arg") {
-                Ok(spec) => spec,
+            let (hook_override, model_override) = match resolve_cli_model_config(
+                hook,
+                hook_args,
+                model,
+                adapter,
+                endpoint,
+                api_key_env,
+                &CALL_CLI_MODEL_FLAGS,
+            ) {
+                Ok(pair) => pair,
                 Err(message) => return session_usage_error(format, &message),
             };
             if (with.is_some() || !args.is_empty() || !save.is_empty()) && act.is_none() {
@@ -719,6 +907,7 @@ fn run_session(
                 max_depth,
                 max_nodes,
                 hook_override,
+                model_override,
                 timeout_ms,
                 act: act_spec,
             })
@@ -728,11 +917,23 @@ fn run_session(
             query,
             hook,
             hook_args,
+            model,
+            adapter,
+            endpoint,
+            api_key_env,
             timeout_ms,
             click,
         } => {
-            let hook_override = match build_cli_hook_spec(hook, hook_args, "--hook", "--hook-arg") {
-                Ok(spec) => spec,
+            let (hook_override, model_override) = match resolve_cli_model_config(
+                hook,
+                hook_args,
+                model,
+                adapter,
+                endpoint,
+                api_key_env,
+                &CALL_CLI_MODEL_FLAGS,
+            ) {
+                Ok(pair) => pair,
                 Err(message) => return session_usage_error(format, &message),
             };
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -742,6 +943,7 @@ fn run_session(
                 base_directory,
                 query,
                 hook_override,
+                model_override,
                 timeout_ms,
                 click,
             })
@@ -750,12 +952,25 @@ fn run_session(
             id,
             rubric,
             evidence,
+            screenshot,
             hook,
             hook_args,
+            model,
+            adapter,
+            endpoint,
+            api_key_env,
             timeout_ms,
         } => {
-            let hook_override = match build_cli_hook_spec(hook, hook_args, "--hook", "--hook-arg") {
-                Ok(spec) => spec,
+            let (hook_override, model_override) = match resolve_cli_model_config(
+                hook,
+                hook_args,
+                model,
+                adapter,
+                endpoint,
+                api_key_env,
+                &CALL_CLI_MODEL_FLAGS,
+            ) {
+                Ok(pair) => pair,
                 Err(message) => return session_usage_error(format, &message),
             };
             let parsed_evidence = match evidence {
@@ -770,12 +985,16 @@ fn run_session(
                 },
                 None => None,
             };
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             SessionRequest::Judge(JudgeRequest {
                 sessions_dir,
                 id,
+                base_directory,
                 rubric,
                 evidence: parsed_evidence,
+                screenshot,
                 hook_override,
+                model_override,
                 timeout_ms,
             })
         }

@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::core::paths;
 use crate::core::registry::Registry;
 use crate::core::secrets::Secrets;
-use crate::session::model_hook::ModelHookSpec;
+use crate::session::model_hook::{BuiltinModelSpec, ModelHookSpec};
 
 pub const STATE_FILE: &str = "state.json";
 pub const STEPS_FILE: &str = "steps.jsonl";
@@ -52,6 +52,8 @@ pub struct SessionState {
     pub plugins: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_hook: Option<ModelHookSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<BuiltinModelSpec>,
 }
 
 /// One expectation stored in the step log for deterministic YAML export.
@@ -244,6 +246,18 @@ pub fn save_state(
         hook.command = secrets.redact(&hook.command);
         for arg in &mut hook.args {
             *arg = secrets.redact(arg);
+        }
+    }
+    if let Some(model) = &mut sanitized.model {
+        model.model = secrets.redact(&model.model);
+        if let Some(adapter) = &mut model.adapter {
+            *adapter = secrets.redact(adapter);
+        }
+        if let Some(endpoint) = &mut model.endpoint {
+            *endpoint = secrets.redact(endpoint);
+        }
+        if let Some(api_key_env) = &mut model.api_key_env {
+            *api_key_env = secrets.redact(api_key_env);
         }
     }
     let path = session_dir.join(STATE_FILE);
@@ -769,6 +783,7 @@ mod tests {
             observe: Vec::new(),
             plugins: Vec::new(),
             model_hook: None,
+            model: None,
         };
         let mut secrets = Secrets::new();
         secrets.record("tok-secret-999");

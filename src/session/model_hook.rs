@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::core::secrets::Secrets;
+use crate::core::session::MaskedViewportCapture;
 use crate::exit::ExitCode;
 use crate::report::base64_encode;
 
@@ -58,6 +59,22 @@ pub struct ModelHookSpec {
     /// Optional arguments passed directly to `command`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+}
+
+/// Configuration for the built-in `genai` model access layer (`ai` feature).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltinModelSpec {
+    /// Model name, optionally namespaced (`openai::gpt-4o-mini`, `deepseek::deepseek-chat`, `omlx::ui-tars-1.5-7b`, `genai_1::custom`).
+    pub model: String,
+    /// Optional explicit `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `gemini_ix`, `deepseek`, `ollama`, `omlx`, `open_router`, `genai_<n>`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    /// Optional custom endpoint URL (supports `${env:NAME}`; persisted unexpanded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Optional environment variable name storing the API key (never the literal secret).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 /// Categorized failure from invoking or validating an external model hook.
@@ -137,6 +154,7 @@ pub struct JudgeParams<'a> {
     pub rubric: &'a str,
     pub snapshot: Option<&'a Value>,
     pub evidence: Option<&'a Value>,
+    pub masked_capture: Option<&'a MaskedViewportCapture>,
 }
 
 /// Validated response from [`METHOD_JUDGE`].
@@ -228,12 +246,7 @@ pub fn call_select_ref(
         secrets,
     )?;
     let obj = expect_result_object(&result, METHOD_SELECT_REF, secrets)?;
-    let selected_ref = required_non_empty_str(obj, "ref", METHOD_SELECT_REF, secrets)?;
-    if !valid_refs.contains(selected_ref.as_str()) {
-        return Err(HookError::Environment(secrets.redact(&format!(
-            "model hook `{METHOD_SELECT_REF}` returned ref `{selected_ref}`, which is not in the active snapshot candidates"
-        ))));
-    }
+    let selected_ref = validate_select_ref_choice(obj, &valid_refs, secrets)?;
     let audit = parse_audit(obj, METHOD_SELECT_REF, elapsed_ms, secrets)?;
     Ok(SelectRefOutcome {
         selected_ref,
@@ -269,25 +282,12 @@ pub fn call_locate(
     let (result, elapsed_ms) =
         invoke_jsonrpc(hook, timeout_ms, METHOD_LOCATE, rpc_params, secrets)?;
     let obj = expect_result_object(&result, METHOD_LOCATE, secrets)?;
-    let x = required_finite_f64(obj, "x", METHOD_LOCATE)?;
-    let y = required_finite_f64(obj, "y", METHOD_LOCATE)?;
-    if x < 0.0 || y < 0.0 || x >= f64::from(params.width) || y >= f64::from(params.height) {
-        return Err(HookError::Environment(format!(
-            "model hook `{METHOD_LOCATE}` returned coordinates ({x}, {y}) outside the {}x{} viewport",
-            params.width, params.height
-        )));
-    }
+    let (x, y) = validate_locate_coords(obj, params.width, params.height)?;
     let audit = parse_audit(obj, METHOD_LOCATE, elapsed_ms, secrets)?;
     Ok(LocateOutcome { x, y, audit })
 }
 
-/// Invokes `model/judge` over redacted session evidence and parses the verdict.
-pub fn call_judge(
-    hook: &ModelHookSpec,
-    timeout_ms: u64,
-    params: JudgeParams<'_>,
-    secrets: &Secrets,
-) -> Result<JudgeOutcome, HookError> {
+pub(crate) fn build_judge_payload(params: &JudgeParams<'_>, secrets: &Secrets) -> Value {
     let mut map = Map::new();
     map.insert(
         "session_id".to_string(),
@@ -307,14 +307,89 @@ pub fn call_judge(
     if let Some(ev) = params.evidence {
         map.insert("evidence".to_string(), ev.clone());
     }
-    let redacted_params = secrets.redact_json(&Value::Object(map));
+    secrets.redact_json(&Value::Object(map))
+}
+
+/// Invokes `model/judge` over redacted session evidence and parses the verdict.
+pub fn call_judge(
+    hook: &ModelHookSpec,
+    timeout_ms: u64,
+    params: JudgeParams<'_>,
+    secrets: &Secrets,
+) -> Result<JudgeOutcome, HookError> {
+    if let Some(capture) = params.masked_capture
+        && (capture.width == 0 || capture.height == 0)
+    {
+        return Err(HookError::Environment(
+            "cannot call `model/judge` with a zero-sized viewport".to_string(),
+        ));
+    }
+    let mut redacted_params = build_judge_payload(&params, secrets);
+    if let Some(capture) = params.masked_capture
+        && let Value::Object(obj) = &mut redacted_params
+    {
+        obj.insert(
+            "image_base64".to_string(),
+            Value::String(base64_encode(&capture.png)),
+        );
+        obj.insert(
+            "mime_type".to_string(),
+            Value::String("image/png".to_string()),
+        );
+        obj.insert(
+            "viewport".to_string(),
+            json!({ "width": capture.width, "height": capture.height }),
+        );
+    }
 
     let (result, elapsed_ms) =
         invoke_jsonrpc(hook, timeout_ms, METHOD_JUDGE, redacted_params, secrets)?;
     let obj = expect_result_object(&result, METHOD_JUDGE, secrets)?;
+    let (passed, rationale) = validate_judge_fields(obj, secrets)?;
+    let audit = parse_audit(obj, METHOD_JUDGE, elapsed_ms, secrets)?;
+    Ok(JudgeOutcome {
+        passed,
+        rationale,
+        audit,
+    })
+}
+
+pub(crate) fn validate_select_ref_choice(
+    obj: &Map<String, Value>,
+    valid_refs: &BTreeSet<&str>,
+    secrets: &Secrets,
+) -> Result<String, HookError> {
+    let selected_ref = required_non_empty_str(obj, "ref", METHOD_SELECT_REF, secrets)?;
+    if !valid_refs.contains(selected_ref.as_str()) {
+        return Err(HookError::Environment(secrets.redact(&format!(
+            "model `{METHOD_SELECT_REF}` returned ref `{selected_ref}`, which is not in the active snapshot candidates"
+        ))));
+    }
+    Ok(selected_ref)
+}
+
+pub(crate) fn validate_locate_coords(
+    obj: &Map<String, Value>,
+    width: u32,
+    height: u32,
+) -> Result<(f64, f64), HookError> {
+    let x = required_finite_f64(obj, "x", METHOD_LOCATE)?;
+    let y = required_finite_f64(obj, "y", METHOD_LOCATE)?;
+    if x < 0.0 || y < 0.0 || x >= f64::from(width) || y >= f64::from(height) {
+        return Err(HookError::Environment(format!(
+            "model `{METHOD_LOCATE}` returned coordinates ({x}, {y}) outside the {width}x{height} viewport"
+        )));
+    }
+    Ok((x, y))
+}
+
+pub(crate) fn validate_judge_fields(
+    obj: &Map<String, Value>,
+    secrets: &Secrets,
+) -> Result<(bool, String), HookError> {
     let passed = obj.get("passed").and_then(Value::as_bool).ok_or_else(|| {
         HookError::Environment(format!(
-            "model hook `{METHOD_JUDGE}` response must carry boolean `passed`"
+            "model `{METHOD_JUDGE}` response must carry boolean `passed`"
         ))
     })?;
     let rationale = obj
@@ -322,15 +397,32 @@ pub fn call_judge(
         .and_then(Value::as_str)
         .ok_or_else(|| {
             HookError::Environment(format!(
-                "model hook `{METHOD_JUDGE}` response must carry string `rationale`"
+                "model `{METHOD_JUDGE}` response must carry string `rationale`"
             ))
         })?;
-    let audit = parse_audit(obj, METHOD_JUDGE, elapsed_ms, secrets)?;
-    Ok(JudgeOutcome {
-        passed,
-        rationale: secrets.redact(rationale),
-        audit,
-    })
+    Ok((passed, secrets.redact(rationale)))
+}
+
+pub(crate) fn extract_confidence(
+    obj: &Map<String, Value>,
+    method: &str,
+) -> Result<Option<f64>, HookError> {
+    match obj.get("confidence") {
+        None | Some(Value::Null) => Ok(None),
+        Some(val) => {
+            let num = val.as_f64().filter(|n| n.is_finite()).ok_or_else(|| {
+                HookError::Environment(format!(
+                    "model `{method}` field `confidence` must be a number in 0.0..=1.0"
+                ))
+            })?;
+            if !(0.0..=1.0).contains(&num) {
+                return Err(HookError::Environment(format!(
+                    "model `{method}` field `confidence` ({num}) must be in 0.0..=1.0"
+                )));
+            }
+            Ok(Some(num))
+        }
+    }
 }
 
 fn expect_result_object<'a>(
@@ -381,23 +473,7 @@ fn parse_audit(
     secrets: &Secrets,
 ) -> Result<ModelAudit, HookError> {
     let model = required_non_empty_str(obj, "model", method, secrets)?;
-
-    let confidence = match obj.get("confidence") {
-        None | Some(Value::Null) => None,
-        Some(val) => {
-            let num = val.as_f64().filter(|n| n.is_finite()).ok_or_else(|| {
-                HookError::Environment(format!(
-                    "model hook `{method}` field `confidence` must be a number in 0.0..=1.0"
-                ))
-            })?;
-            if !(0.0..=1.0).contains(&num) {
-                return Err(HookError::Environment(format!(
-                    "model hook `{method}` field `confidence` ({num}) must be in 0.0..=1.0"
-                )));
-            }
-            Some(num)
-        }
-    };
+    let confidence = extract_confidence(obj, method)?;
 
     let latency_ms = match obj.get("latency_ms") {
         None | Some(Value::Null) => fallback_latency_ms,
