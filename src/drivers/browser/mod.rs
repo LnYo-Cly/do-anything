@@ -24,7 +24,7 @@
 //! [`network`]; this module turns their messages into step results and step
 //! errors.
 
-mod cdp;
+pub(crate) mod cdp;
 mod connect;
 mod launch;
 mod network;

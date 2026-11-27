@@ -4354,3 +4354,179 @@ mod ai_browser_tests {
         assert_eq!(replay.status.code(), Some(0), "{replay:?}");
     }
 }
+
+#[test]
+fn session_preview_frames_and_pause_resume_lifecycle() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let dir = TempDir::new("browser-session-preview-frames");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind http");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().unwrap().port();
+    let stop_http = Arc::new(AtomicBool::new(false));
+    let stop_http_srv = Arc::clone(&stop_http);
+    let page_html = r#"<!doctype html><html><head><title>Preview Page</title><style>body{margin:0;background:#ffffff;}#pw{position:fixed;left:10px;top:10px;width:240px;height:60px;background:#ffffff;color:#000000;border:2px solid #00ff00;}#go{position:fixed;left:10px;top:120px;width:160px;height:48px;}</style></head><body><input id="pw" type="password" value="TOP_SECRET_PW"/><button id="go" onclick="this.textContent='CLICKED'">Click Me</button></body></html>"#;
+    let http_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page_html}",
+        page_html.len()
+    );
+    let http_thread = thread::spawn(move || {
+        use std::io::Read;
+        while !stop_http_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(http_resp.as_bytes());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let url = format!("http://127.0.0.1:{port}/preview");
+
+    // 1. Default session (without --preview-frames) writes no preview files.
+    let plain_start = run_da_in(dir.path(), &["session", "start"]);
+    assert_eq!(plain_start.status.code(), Some(0), "{plain_start:?}");
+    let plain_id = json_stdout(&plain_start)["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &plain_id,
+            "browser.open",
+            "--arg",
+            &format!("url={url}"),
+        ],
+    );
+    assert_eq!(plain_open.status.code(), Some(0), "{plain_open:?}");
+    let plain_dir = dir.path().join(".da").join("sessions").join(&plain_id);
+    assert!(!plain_dir.join("preview.png").exists());
+    assert!(!plain_dir.join("preview.json").exists());
+    let _ = run_da_in(dir.path(), &["session", "stop", &plain_id]);
+
+    // 2. Opt-in session (--preview-frames) atomically writes masked preview.png + preview.json.
+    let start = run_da_in(dir.path(), &["session", "start", "--preview-frames"]);
+    assert_eq!(start.status.code(), Some(0), "{start:?}");
+    let start_json = json_stdout(&start);
+    assert_eq!(start_json["preview_frames"], json!(true));
+    assert_eq!(start_json["paused_for_human"], json!(false));
+    let id = start_json["session_id"].as_str().unwrap().to_string();
+    let session_dir = dir.path().join(".da").join("sessions").join(&id);
+    let preview_png = session_dir.join("preview.png");
+    let preview_json_path = session_dir.join("preview.json");
+
+    let open = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.open",
+            "--arg",
+            &format!("url={url}"),
+        ],
+    );
+    assert_eq!(open.status.code(), Some(0), "{open:?}");
+    let open_stdout = String::from_utf8_lossy(&open.stdout);
+    assert!(
+        !open_stdout.contains("data:image/png"),
+        "preview_frames must stay side-channel, not base64 in stdout"
+    );
+    let open_json = json_stdout(&open);
+    assert!(open_json["preview_path"].as_str().is_some(), "{open_json}");
+    assert!(
+        open_json["preview_meta_path"].as_str().is_some(),
+        "{open_json}"
+    );
+
+    let png_bytes = fs::read(&preview_png).expect("preview.png must exist");
+    assert!(
+        png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "valid PNG magic"
+    );
+    let meta1: Value = serde_json::from_str(
+        &fs::read_to_string(&preview_json_path).expect("preview.json must exist"),
+    )
+    .expect("valid preview.json");
+    assert_eq!(meta1["schema_version"], json!(1));
+    assert_eq!(meta1["session_id"], json!(id));
+    assert_eq!(meta1["url"], json!(url));
+    assert_eq!(meta1["title"], json!("Preview Page"));
+    assert_eq!(meta1["step_seq"], json!(1));
+    assert_eq!(meta1["action"], json!("browser.open"));
+    assert_eq!(meta1["status"], json!("passed"));
+    assert_eq!(meta1["paused_for_human"], json!(false));
+    assert!(meta1["viewport"]["width"].as_u64().unwrap_or(0) > 0);
+    assert!(meta1["viewport"]["height"].as_u64().unwrap_or(0) > 0);
+
+    // 3. Click updates preview.png + preview.json with target_bounds and incremented step_seq.
+    let click = run_da_in(
+        dir.path(),
+        &["session", "step", &id, "browser.click", "--arg", "css=#go"],
+    );
+    assert_eq!(click.status.code(), Some(0), "{click:?}");
+    let meta2: Value =
+        serde_json::from_str(&fs::read_to_string(&preview_json_path).unwrap()).unwrap();
+    assert_eq!(meta2["step_seq"], json!(2));
+    assert_eq!(meta2["action"], json!("browser.click"));
+    assert!(
+        meta2["target_bounds"].is_object(),
+        "click preview.json should record target_bounds: {meta2}"
+    );
+
+    // 4. Pause gates queued agent steps and updates preview.json immediately.
+    let paused = run_da_in(
+        dir.path(),
+        &["session", "pause", &id, "--reason", "2FA verification"],
+    );
+    assert_eq!(paused.status.code(), Some(0), "{paused:?}");
+    assert_eq!(json_stdout(&paused)["paused_for_human"], json!(true));
+    let meta_paused: Value =
+        serde_json::from_str(&fs::read_to_string(&preview_json_path).unwrap()).unwrap();
+    assert_eq!(meta_paused["paused_for_human"], json!(true));
+    assert_eq!(meta_paused["paused_reason"], json!("2FA verification"));
+
+    let blocked = run_da_in(
+        dir.path(),
+        &["session", "step", &id, "browser.read", "--arg", "css=#go"],
+    );
+    assert_ne!(blocked.status.code(), Some(0), "paused step must fail");
+    let blocked_json = json_stdout(&blocked);
+    assert_eq!(blocked_json["paused_for_human"], json!(true));
+    assert_eq!(blocked_json["error"]["kind"], json!("paused_for_human"));
+
+    // 5. Resume re-enables agent steps and clears paused_for_human in preview.json.
+    let resumed = run_da_in(dir.path(), &["session", "resume", &id]);
+    assert_eq!(resumed.status.code(), Some(0), "{resumed:?}");
+    assert_eq!(json_stdout(&resumed)["paused_for_human"], json!(false));
+    let meta_resumed: Value =
+        serde_json::from_str(&fs::read_to_string(&preview_json_path).unwrap()).unwrap();
+    assert_eq!(meta_resumed["paused_for_human"], json!(false));
+    assert!(meta_resumed.get("paused_reason").is_none());
+
+    let read_ok = run_da_in(
+        dir.path(),
+        &["session", "step", &id, "browser.read", "--arg", "css=#go"],
+    );
+    assert_eq!(read_ok.status.code(), Some(0), "{read_ok:?}");
+    assert_eq!(
+        json_stdout(&read_ok)["step"]["result"]["text"],
+        json!("CLICKED")
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+
+    stop_http.store(true, Ordering::Relaxed);
+    let _ = http_thread.join();
+}

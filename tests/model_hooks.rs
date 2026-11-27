@@ -758,6 +758,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             model_hook: Some(hook_spec.clone()),
             model: None,
             plugins: Vec::new(),
+            preview_frames: false,
         },
         &registry,
     );
@@ -1107,6 +1108,7 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
             model_hook: None,
             model: None,
             plugins: Vec::new(),
+            preview_frames: false,
         },
         &registry,
     );
@@ -1301,6 +1303,7 @@ fn judge_screenshot_attaches_masked_png_to_hook_and_requires_visual_session() {
             model_hook: Some(hook_spec),
             model: None,
             plugins: Vec::new(),
+            preview_frames: false,
         },
         &registry,
     );
@@ -1409,6 +1412,7 @@ fn hook_extract_and_act_record_deterministic_steps_and_omit_model_diagnostics() 
             }),
             model: None,
             plugins: Vec::new(),
+            preview_frames: false,
         },
         &registry,
     );
@@ -2169,6 +2173,7 @@ mod ai_tests {
                 model_hook: None,
                 model: Some(model_spec),
                 plugins: Vec::new(),
+                preview_frames: false,
             },
             &registry,
         );
@@ -2564,6 +2569,7 @@ mod ai_tests {
                 model_hook: None,
                 model: Some(model_spec),
                 plugins: Vec::new(),
+                preview_frames: false,
             },
             &registry,
         );
@@ -2717,6 +2723,7 @@ mod ai_tests {
                     reasoning_effort: Some("low".to_string()),
                 }),
                 plugins: Vec::new(),
+                preview_frames: false,
             },
             &registry,
         );

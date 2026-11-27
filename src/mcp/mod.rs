@@ -8,13 +8,15 @@
 //! `Content-Length` framing of the Language Server Protocol, and every response
 //! mirrors the framing of the request it answers.
 //!
-//! The base tool set is fixed at six, so its shape never depends on which
+//! The base tool set is fixed at eight, so its shape never depends on which
 //! driver features a build enabled: `session_start`, `step`, `snapshot`,
-//! `export`, `run` and `session_stop`. When model access is configured on
-//! `da mcp` (`--model`, `--model-hook`, or `DA_MODEL`), `tools/list` also
-//! exposes `select_ref`, `locate`, `judge`, `extract`, and `act` (eleven tools
-//! total). `step` is the single generic step tool and takes the same
-//! `use`/`with`/`expect`/`save` step a case file holds.
+//! `pause_for_human`, `resume`, `export`, `run` and `session_stop`. When model
+//! access is configured on `da mcp` (`--model`, `--model-hook`, or `DA_MODEL`),
+//! `tools/list` also exposes `select_ref`, `locate`, `judge`, `extract`, and
+//! `act` (thirteen tools total). `step` is the single generic step tool and
+//! takes the same `use`/`with`/`expect`/`save` step a case file holds. Every
+//! `tools/call` response emits standard MCP `structuredContent` alongside
+//! backward-compatible text `content`.
 //!
 //! Standard output carries responses and nothing else, so a host can parse it
 //! without stripping diagnostics. Everything written back passes through
@@ -78,14 +80,14 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// What the client is told about driving `da` before it calls the first tool.
 const INSTRUCTIONS: &str = "\
 `da` is a declarative test runner for HTTP APIs, command-line programs, SQL databases and browsers.\n\
-Drive one interactive session: call `session_start` once, then `step` for every action \
+Drive one interactive session: call `session_start` once (pass `preview_frames: true` to atomically write input-masked `preview.png` and `preview.json` after UI steps without adding images to LLM `content`), then `step` for every action \
 (`use` names the step, `with` holds its arguments, `expect` and `save` work as in a case file), \
-`snapshot` to inspect a browser without running a step, `export` to turn the passed steps into a \
+`snapshot` to inspect a browser without running a step, `pause_for_human` / `resume` to gate agent steps during human takeover, `export` to turn the passed steps into a \
 replayable YAML case, and `session_stop` when the session is done. `run` executes existing case \
 files or directories.\n\
 An invalid `step` returns the step's JSON Schema; fix `with` and call `step` again with the same \
-`session_id`. Every result is redacted like the `da` command line, so a value read through \
-`${env:NAME}` never appears in a response.";
+`session_id`. Every `tools/call` result populates standard MCP `structuredContent` alongside `content` text, and every value read through \
+`${env:NAME}` is redacted before leaving the server.";
 
 /// Runs the server until standard input reaches end of file.
 ///
@@ -425,11 +427,14 @@ impl Server<'_> {
     ///
     /// The payload is redacted as a JSON tree, not as text: a secret that
     /// contains `"` or `\` is escaped in the serialized form, so a textual
-    /// replacement would miss it.
+    /// replacement would miss it. Both backward-compatible `content` text and
+    /// standard MCP `structuredContent` are populated from the redacted tree.
     fn tool_result(&mut self, outcome: ToolOutcome) -> Value {
         let payload = self.secrets.redact_json(&outcome.payload);
+        let structured = build_structured_content(&payload);
         json!({
             "content": [{"type": "text", "text": payload.to_string()}],
+            "structuredContent": structured,
             "isError": outcome.is_error,
         })
     }
@@ -542,6 +547,61 @@ fn success(id: Value, result: Value) -> Value {
 fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
     let message = message.into();
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// Builds the standard MCP `structuredContent` object from a redacted tool payload.
+///
+/// Preserves every redacted tool field while promoting canonical host-UI fields
+/// (`url`, `title`, `target_bounds`, `step_result`, `report_path`) to the top
+/// level when available so desktop/IDE hosts never have to parse `content[0].text`.
+fn build_structured_content(payload: &Value) -> Value {
+    let mut obj = match payload {
+        Value::Object(map) => map.clone(),
+        other => {
+            let mut map = Map::new();
+            map.insert("value".to_string(), other.clone());
+            map
+        }
+    };
+    if !obj.contains_key("url")
+        && let Some(url) = payload
+            .pointer("/snapshot/url")
+            .or_else(|| payload.pointer("/step/result/url"))
+            .and_then(Value::as_str)
+    {
+        obj.insert("url".to_string(), Value::String(url.to_string()));
+    }
+    if !obj.contains_key("title")
+        && let Some(title) = payload
+            .pointer("/snapshot/title")
+            .or_else(|| payload.pointer("/step/result/title"))
+            .and_then(Value::as_str)
+    {
+        obj.insert("title".to_string(), Value::String(title.to_string()));
+    }
+    if !obj.contains_key("target_bounds")
+        && let Some(bounds) = payload
+            .pointer("/step/target_bounds")
+            .or_else(|| payload.pointer("/step/result/target_bounds"))
+            .filter(|v| !v.is_null())
+            .cloned()
+    {
+        obj.insert("target_bounds".to_string(), bounds);
+    }
+    if !obj.contains_key("step_result")
+        && let Some(result) = payload
+            .pointer("/step/result")
+            .filter(|v| !v.is_null())
+            .cloned()
+    {
+        obj.insert("step_result".to_string(), result);
+    }
+    if !obj.contains_key("report_path")
+        && let Some(path) = payload.pointer("/report/path").and_then(Value::as_str)
+    {
+        obj.insert("report_path".to_string(), Value::String(path.to_string()));
+    }
+    Value::Object(obj)
 }
 
 #[cfg(test)]

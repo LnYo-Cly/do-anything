@@ -101,7 +101,10 @@ steps](#android-steps) and is off by default, because it is only useful on a
 machine with an Android device: build it with `cargo build --features android`.
 The `desktop` feature provides the [`desktop.*` steps](#desktop-steps) and is
 also off by default, because it drives a local graphical desktop session: build
-it with `cargo build --features desktop`.
+it with `cargo build --features desktop`. The `live-preview` feature (`browser`
+required) adds the opt-in `127.0.0.1` loopback CDP Screencast & human-takeover
+bridge (`da session preview-bridge`) and is also off by default to keep the
+default binary surface unchanged: build it with `cargo build --features live-preview`.
 The `browser` feature adds about 0.5 MiB to the release
 binary and needs a Chrome or Chromium installed on the machine; it never
 downloads a browser. The `mcp` feature adds about 54 KiB to a build with no
@@ -1020,13 +1023,13 @@ speaks only one of them needs no negotiation.
 | `initialize` | `protocolVersion` (echoed when this server knows it, otherwise the newest one it speaks), `capabilities.tools`, `serverInfo` and `instructions` |
 | `notifications/initialized` | Nothing: JSON-RPC forbids answering a notification |
 | `ping` | `{}` |
-| `tools/list` | The six base tools (or eleven when `--model` / `DA_MODEL` or `--model-hook` is configured) with their compact `inputSchema` |
-| `tools/call` | The result of one tool |
+| `tools/list` | The eight base tools (or thirteen when `--model` / `DA_MODEL` or `--model-hook` is configured) with their compact `inputSchema` |
+| `tools/call` | The result of one tool, carrying both backward-compatible `content` text and standard MCP `structuredContent` |
 
 An unknown method answers `-32601`, a body that is not JSON answers `-32700`,
 and a `tools/call` that names no tool answers `-32602`.
 
-#### The six tools
+#### The eight tools
 
 The list never changes with the build. One tool per registered step would grow
 with every driver and would differ between feature combinations, which spends a
@@ -1034,9 +1037,11 @@ model's context on descriptions it cannot use.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `session_start` | optional `model`, `model_adapter`, `model_endpoint`, `model_api_key_env`, `model_reasoning_effort`, or `model_hook`, `model_hook_args` | `session_id` of a new session |
+| `session_start` | optional `preview_frames`, `model`, `model_adapter`, `model_endpoint`, `model_api_key_env`, `model_reasoning_effort`, or `model_hook`, `model_hook_args` | `session_id` of a new session (plus `preview_path` / `preview_meta_path` when `preview_frames: true`) |
 | `step` | `session_id`, `use`, optional `with`, `expect`, `save` | The step result, its assertions and, after a browser step, a fresh `snapshot` |
 | `snapshot` | `session_id`, optional `ref`, `max_depth`, `max_nodes` | The accessibility tree without running a step |
+| `pause_for_human` | `session_id`, optional `reason` | Marks `paused_for_human: true` (atomically via `paused.json` + `state.json` + `preview.json`) and immediately refuses queued agent steps |
+| `resume` | `session_id` | Clears `paused_for_human` so agent steps can proceed again |
 | `export` | `session_id`, optional `name`, `include_reads`, `out` | The YAML case, byte for byte what `da session export --yaml` writes |
 | `run` | `paths`, optional `vars`, `jobs` | The same JSON report `da --output json run` prints |
 | `session_stop` | `session_id` | Closes every resource and removes the session directory |
@@ -1082,9 +1087,50 @@ also tells a host why a step is missing:
 #### Secrets
 
 Every tool output passes through the same `Secrets` redaction as the command
-line: a value read through `${env:NAME}` becomes `***`, in results, in error
-messages and in the exported case, including its percent-encoded and base64
-forms. The exported YAML keeps the `${env:NAME}` reference, never the value.
+line: a value read through `${env:NAME}` becomes `***`, in both `content` text
+and `structuredContent`, in error messages, in `preview.json`, and in the
+exported case, including its percent-encoded and base64 forms. The exported YAML
+keeps the `${env:NAME}` reference, never the value.
+
+#### Host UI live preview and human takeover
+
+IDE and desktop MCP hosts can observe an interactive session without asking the
+model to spend extra tokens on `browser.screenshot` calls:
+
+1. **Opt-in side-channel masked frames (`preview_frames: true` / `--preview-frames`):**
+   Pass `"preview_frames": true` to MCP `session_start` (or `--preview-frames`
+   to `da session start`). After every mutating UI step (`browser.*`, `desktop.*`,
+   `android.*`, `locate --click`, `act`), `da` atomically writes
+   `.da/sessions/<id>/preview.png` (captured through the `#000000` input-masked
+   screenshot path so passwords, `<input>` fields, and cross-origin iframes are
+   blacked out) followed by `.da/sessions/<id>/preview.json` (`schema_version`,
+   `session_id`, `url`, `title`, `viewport`, `step_seq`, `action`,
+   `target_bounds`, `status`, `paused_for_human`, `updated_at_ms`). No base64
+   image data is added to LLM `content`.
+2. **Standard MCP `structuredContent`:**
+   Every `da mcp` `tools/call` response keeps `content[0].text` for backward
+   compatibility while populating `structuredContent` with the redacted JSON
+   object and promoting canonical host fields (`session_id`, `url`, `title`,
+   `preview_path`, `preview_meta_path`, `target_bounds`, `report_path`,
+   `step_result`, `paused_for_human`).
+3. **Human takeover gating (`pause_for_human` / `resume`):**
+   Call MCP `pause_for_human` (or `da session pause <id> [--reason TEXT]`) when
+   a human clicks **Stop** for login, 2FA, CAPTCHA, or visual review. `da` writes
+   a lock-free `paused.json` marker so in-flight `act` loops and queued agent
+   steps are immediately refused (`error.kind = "paused_for_human"`). Call MCP
+   `resume` (or `da session resume <id>`) to hand control back to the agent.
+4. **Opt-in loopback CDP screencast & input bridge (`--features live-preview`):**
+   Compiled only when `--features live-preview` is enabled (`da session
+   preview-bridge <id> [--port 0] [--format jpeg|png] [--quality 80]`), the
+   bridge binds strictly to `127.0.0.1` (remote IDE setups must tunnel over
+   SSH/TLS), requires `Authorization: Bearer <token>` on every HTTP and
+   WebSocket request, refuses non-loopback `Origin` headers with `403`, streams
+   `Page.startScreencast` frames over `/ws`, forwards `mouse`/`key`/`insert_text`
+   strictly to the session's owned CDP `target_id` (refusing arbitrary raw CDP
+   methods), and exposes `GET /status`, `POST /pause`, and `POST /resume`.
+   *Security boundary:* secrets typed manually by a human during takeover do not
+   originate from `${env:NAME}` and cannot be retroactively redacted by
+   `Secrets`, matching the same trust boundary as `browser.open(connect)`.
 
 ### External plugins
 

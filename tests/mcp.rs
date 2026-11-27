@@ -255,7 +255,6 @@ fn failed(response: &Value) -> bool {
 }
 
 /// Asserts no captured output carries the secret in any form `Secrets` knows.
-#[cfg(feature = "cli")]
 fn assert_no_leak(seen: &str) {
     for form in [
         SECRET.to_string(),
@@ -399,6 +398,8 @@ fn the_handshake_lists_the_six_tools_and_answers_ping() {
             "session_start",
             "step",
             "snapshot",
+            "pause_for_human",
+            "resume",
             "export",
             "run",
             "session_stop"
@@ -481,7 +482,7 @@ fn content_length_frames_are_answered_with_content_length_frames() {
         listed["result"]["tools"]
             .as_array()
             .map(|tools| tools.len()),
-        Some(6)
+        Some(8)
     );
 
     // The next message can still be line framed: the stream is not switched.
@@ -914,6 +915,8 @@ fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export
             "session_start",
             "step",
             "snapshot",
+            "pause_for_human",
+            "resume",
             "select_ref",
             "locate",
             "judge",
@@ -1231,6 +1234,8 @@ mod ai_mcp_tests {
                 "session_start",
                 "step",
                 "snapshot",
+                "pause_for_human",
+                "resume",
                 "select_ref",
                 "locate",
                 "judge",
@@ -1362,7 +1367,7 @@ mod ai_mcp_tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names.len(), 11, "{names:?}");
+        assert_eq!(names.len(), 13, "{names:?}");
         assert!(names.contains(&"judge"));
         assert!(names.contains(&"extract"));
         assert!(names.contains(&"act"));
@@ -1674,4 +1679,120 @@ mod ai_mcp_tests {
         assert_no_leak(&server.seen);
         server.finish();
     }
+}
+
+#[test]
+fn mcp_tools_emit_structured_content_and_enforce_pause_for_human_gating() {
+    let dir = TempDir::new("mcp-structured-pause");
+    let mut server = Server::start(dir.path());
+    server.initialize();
+
+    // 1. session_start with preview_frames: true populates both content and structuredContent.
+    let start_resp = server.call_tool(1, "session_start", json!({ "preview_frames": true }));
+    assert!(!failed(&start_resp), "{start_resp}");
+    let start_payload = payload(&start_resp);
+    let start_structured = &start_resp["result"]["structuredContent"];
+    assert!(
+        start_structured.is_object(),
+        "tools/call must emit structuredContent object: {start_resp}"
+    );
+    assert_eq!(start_structured["ok"], json!(true));
+    assert_eq!(start_structured["preview_frames"], json!(true));
+    assert_eq!(start_structured["paused_for_human"], json!(false));
+    assert_eq!(start_structured["session_id"], start_payload["session_id"]);
+    assert!(
+        start_structured["preview_path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("preview.png")),
+        "{start_structured}"
+    );
+    assert!(
+        start_structured["preview_meta_path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("preview.json")),
+        "{start_structured}"
+    );
+    let session_id = start_structured["session_id"].as_str().unwrap().to_string();
+
+    // 2. pause_for_human marks session paused and redacts secrets mentioned via ${env:...}.
+    let pause_resp = server.call_tool(
+        2,
+        "pause_for_human",
+        json!({
+            "session_id": session_id,
+            "reason": format!("manual login ${{env:{SECRET_VARIABLE}}} {SECRET}"),
+        }),
+    );
+    assert!(!failed(&pause_resp), "{pause_resp}");
+    let pause_structured = &pause_resp["result"]["structuredContent"];
+    assert_eq!(pause_structured["paused_for_human"], json!(true));
+    assert_eq!(pause_structured["session_id"], json!(session_id));
+    assert!(
+        pause_structured["paused_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("***") && !r.contains(SECRET)),
+        "paused_reason must redact recorded secrets: {pause_structured}"
+    );
+
+    // 3. While paused, queued agent steps are refused immediately.
+    #[cfg(feature = "cli")]
+    {
+        let blocked_step = server.call_tool(
+            3,
+            "step",
+            json!({
+                "session_id": session_id,
+                "use": "cli.run",
+                "with": { "command": da(), "args": ["--version"] },
+            }),
+        );
+        assert!(
+            failed(&blocked_step),
+            "paused step must fail: {blocked_step}"
+        );
+        let blocked_structured = &blocked_step["result"]["structuredContent"];
+        assert_eq!(blocked_structured["paused_for_human"], json!(true));
+        assert_eq!(
+            blocked_structured["error"]["kind"],
+            json!("paused_for_human")
+        );
+    }
+
+    // 4. resume clears paused_for_human so steps can proceed again.
+    let resume_resp = server.call_tool(4, "resume", json!({ "session_id": session_id }));
+    assert!(!failed(&resume_resp), "{resume_resp}");
+    let resume_structured = &resume_resp["result"]["structuredContent"];
+    assert_eq!(resume_structured["paused_for_human"], json!(false));
+
+    #[cfg(feature = "cli")]
+    {
+        let resumed_step = server.call_tool(
+            5,
+            "step",
+            json!({
+                "session_id": session_id,
+                "use": "cli.run",
+                "with": {
+                    "command": da(),
+                    "args": ["--version"],
+                    "env": { "DA_TEST_TOKEN": format!("${{env:{SECRET_VARIABLE}}}") }
+                },
+            }),
+        );
+        assert!(!failed(&resumed_step), "{resumed_step}");
+        let step_structured = &resumed_step["result"]["structuredContent"];
+        assert_eq!(step_structured["ok"], json!(true));
+        assert_eq!(step_structured["paused_for_human"], json!(false));
+        assert!(
+            step_structured["step_result"].is_object(),
+            "structuredContent must promote step_result: {step_structured}"
+        );
+    }
+
+    let stop_resp = server.call_tool(6, "session_stop", json!({ "session_id": session_id }));
+    assert!(!failed(&stop_resp), "{stop_resp}");
+    assert_eq!(stop_resp["result"]["structuredContent"]["ok"], json!(true));
+
+    assert_no_leak(&server.seen);
+    server.finish();
 }

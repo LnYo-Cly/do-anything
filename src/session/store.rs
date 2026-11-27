@@ -18,6 +18,20 @@ use crate::session::model_hook::{BuiltinModelSpec, ModelHookSpec};
 pub const STATE_FILE: &str = "state.json";
 pub const STEPS_FILE: &str = "steps.jsonl";
 pub const LOCK_FILE: &str = "lock";
+pub const PREVIEW_IMAGE_FILE: &str = "preview.png";
+pub const PREVIEW_META_FILE: &str = "preview.json";
+pub const PAUSE_FILE: &str = "paused.json";
+
+/// Lock-free atomic emergency-stop marker stored in `paused.json` so a human
+/// takeover pause takes effect immediately even while a long-running `act` loop
+/// holds `SessionLock`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PauseFlag {
+    pub paused_for_human: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub paused_at_ms: u64,
+}
 
 /// Persistent metadata of one interactive session stored in `state.json`.
 /// One declared observer persisted in `state.json` for `da session step`.
@@ -54,6 +68,17 @@ pub struct SessionState {
     pub model_hook: Option<ModelHookSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<BuiltinModelSpec>,
+    /// Opt-in side-channel masked preview frames (`preview.png` + `preview.json`)
+    /// written atomically after UI steps without adding images to LLM `content`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview_frames: bool,
+    /// When true, queued agent steps are immediately refused so a human can take over.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused_for_human: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at_ms: Option<u64>,
 }
 
 /// One expectation stored in the step log for deterministic YAML export.
@@ -266,15 +291,179 @@ pub fn save_state(
             *effort = secrets.redact(effort);
         }
     }
+    if let Some(reason) = &mut sanitized.paused_reason {
+        *reason = secrets.redact(reason);
+    }
     let path = session_dir.join(STATE_FILE);
     let json = serde_json::to_string_pretty(&sanitized)
         .map_err(|error| format!("could not serialize session state: {error}"))?;
-    fs::write(&path, format!("{json}\n")).map_err(|error| {
+    atomic_write_bytes(&path, format!("{json}\n").as_bytes()).map_err(|error| {
         format!(
             "could not write session state `{}`: {error}",
             paths::display(&path)
         )
     })
+}
+
+/// Atomically writes `bytes` to `path` via a sibling temporary file + flush + rename,
+/// so host UI watchers never observe truncated or half-written files.
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path `{}` has no parent directory", paths::display(path)))?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error.to_string());
+    }
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// Atomically writes input-masked `preview.png` first, then redacted `preview.json`
+/// second, so any watcher triggered by `preview.json` sees the matching image ready.
+pub fn write_preview_frame(
+    session_dir: &Path,
+    png_bytes: &[u8],
+    meta: &Value,
+    secrets: &Secrets,
+) -> Result<(PathBuf, PathBuf), String> {
+    let image_path = session_dir.join(PREVIEW_IMAGE_FILE);
+    let meta_path = session_dir.join(PREVIEW_META_FILE);
+    atomic_write_bytes(&image_path, png_bytes).map_err(|error| {
+        format!(
+            "could not write preview image `{}`: {error}",
+            paths::display(&image_path)
+        )
+    })?;
+    let redacted_meta = secrets.redact_json(meta);
+    let json_text = serde_json::to_string_pretty(&redacted_meta)
+        .map_err(|error| format!("could not serialize preview metadata: {error}"))?;
+    atomic_write_bytes(&meta_path, format!("{json_text}\n").as_bytes()).map_err(|error| {
+        format!(
+            "could not write preview metadata `{}`: {error}",
+            paths::display(&meta_path)
+        )
+    })?;
+    Ok((image_path, meta_path))
+}
+
+/// Updates `paused_for_human`, `paused_reason`, and `updated_at_ms` atomically in
+/// `preview.json` when a preview metadata file already exists.
+pub fn update_preview_paused(
+    session_dir: &Path,
+    paused_for_human: bool,
+    paused_reason: Option<&str>,
+    updated_at_ms: u64,
+    secrets: &Secrets,
+) -> Result<(), String> {
+    let meta_path = session_dir.join(PREVIEW_META_FILE);
+    if !meta_path.exists() {
+        return Ok(());
+    }
+    let text = fs::read_to_string(&meta_path).map_err(|error| {
+        format!(
+            "could not read preview metadata `{}`: {error}",
+            paths::display(&meta_path)
+        )
+    })?;
+    let mut meta: Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "could not parse preview metadata `{}`: {error}",
+            paths::display(&meta_path)
+        )
+    })?;
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert(
+            "paused_for_human".to_string(),
+            Value::Bool(paused_for_human),
+        );
+        match paused_reason {
+            Some(reason) if paused_for_human => {
+                obj.insert(
+                    "paused_reason".to_string(),
+                    Value::String(secrets.redact(reason)),
+                );
+            }
+            _ => {
+                obj.remove("paused_reason");
+            }
+        }
+        obj.insert("updated_at_ms".to_string(), Value::from(updated_at_ms));
+    }
+    let redacted = secrets.redact_json(&meta);
+    let json_text = serde_json::to_string_pretty(&redacted)
+        .map_err(|error| format!("could not serialize preview metadata: {error}"))?;
+    atomic_write_bytes(&meta_path, format!("{json_text}\n").as_bytes()).map_err(|error| {
+        format!(
+            "could not write preview metadata `{}`: {error}",
+            paths::display(&meta_path)
+        )
+    })
+}
+
+/// Atomically writes `paused.json` without requiring `SessionLock`, enabling
+/// immediate human-takeover interruption even during an active `act` loop.
+pub fn write_pause_flag(
+    session_dir: &Path,
+    reason: Option<&str>,
+    paused_at_ms: u64,
+    secrets: &Secrets,
+) -> Result<PauseFlag, String> {
+    let flag = PauseFlag {
+        paused_for_human: true,
+        reason: reason
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| secrets.redact(s)),
+        paused_at_ms,
+    };
+    let path = session_dir.join(PAUSE_FILE);
+    let json_text = serde_json::to_string_pretty(&flag)
+        .map_err(|error| format!("could not serialize pause flag: {error}"))?;
+    atomic_write_bytes(&path, format!("{json_text}\n").as_bytes()).map_err(|error| {
+        format!(
+            "could not write pause flag `{}`: {error}",
+            paths::display(&path)
+        )
+    })?;
+    Ok(flag)
+}
+
+/// Removes `paused.json` if present.
+pub fn clear_pause_flag(session_dir: &Path) -> Result<(), String> {
+    let path = session_dir.join(PAUSE_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove pause flag `{}`: {error}",
+            paths::display(&path)
+        )),
+    }
+}
+
+/// Reads `paused.json` if present.
+pub fn read_pause_flag(session_dir: &Path) -> Option<PauseFlag> {
+    let path = session_dir.join(PAUSE_FILE);
+    let text = fs::read_to_string(&path).ok()?;
+    let flag: PauseFlag = serde_json::from_str(&text).ok()?;
+    flag.paused_for_human.then_some(flag)
 }
 
 /// Reads all recorded steps from `steps.jsonl`.
@@ -795,6 +984,10 @@ mod tests {
             plugins: Vec::new(),
             model_hook: None,
             model: None,
+            preview_frames: false,
+            paused_for_human: false,
+            paused_reason: None,
+            paused_at_ms: None,
         };
         let mut secrets = Secrets::new();
         secrets.record("tok-secret-999");
