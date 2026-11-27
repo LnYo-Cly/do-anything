@@ -4579,3 +4579,104 @@ fn session_allowed_origins_blocks_switch_tab_and_redirect_across_detached_reatta
     stop_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
     stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
 }
+
+#[test]
+fn session_allowed_origins_blocks_delayed_async_navigation_during_step_poll() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let dir = TempDir::new("session-allowed-origins-delayed-nav");
+
+    let secret_html = "<!doctype html><html><head><title>Secret</title></head><body><p id=\"secret\">DISALLOWED_ORIGIN_SECRET_DATA</p></body></html>";
+    let secret_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{secret_html}",
+        secret_html.len()
+    );
+    let (disallowed_origin, stop_disallowed) =
+        spawn_session_mini_http(vec![("/secret".to_string(), secret_resp)]);
+
+    let home_html = format!(
+        r#"<!doctype html><html><head><title>Home</title></head><body><p id="home-marker">ALLOWED_HOME</p><button id="js-delayed" onclick="setTimeout(() => {{ location.href = '{disallowed_origin}/secret'; }}, 250);">Delayed Escape</button></body></html>"#
+    );
+    let home_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{home_html}",
+        home_html.len()
+    );
+    let (allowed_origin, stop_allowed) =
+        spawn_session_mini_http(vec![("/home".to_string(), home_resp)]);
+
+    let start = run_da_in(dir.path(), &["session", "start"]);
+    assert_eq!(start.status.code(), Some(0), "{start:?}");
+    let id = json_stdout(&start)["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let open_step = json!({
+        "browser.open": {
+            "url": format!("{allowed_origin}/home"),
+            "allowed_origins": [allowed_origin]
+        }
+    })
+    .to_string();
+    let open_out = run_da_in(dir.path(), &["session", "step", &id, "--step", &open_step]);
+    assert_eq!(open_out.status.code(), Some(0), "{open_out:?}");
+
+    let click_out = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.click",
+            "--arg",
+            "css=#js-delayed",
+        ],
+    );
+    assert_eq!(click_out.status.code(), Some(0), "{click_out:?}");
+
+    let read_out = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.read",
+            "--arg",
+            "css=#secret",
+        ],
+    );
+    assert_ne!(
+        read_out.status.code(),
+        Some(0),
+        "delayed async nav during session step poll must fail closed: {read_out:?}"
+    );
+    let read_stdout = String::from_utf8_lossy(&read_out.stdout);
+    let read_json = json_stdout(&read_out);
+    assert_eq!(read_json["ok"], json!(false), "{read_stdout}");
+    assert!(
+        read_stdout.contains("allowed_origins"),
+        "expected allowed_origins error: {read_stdout}"
+    );
+    assert!(
+        !read_stdout.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "disallowed secret must never leak: {read_stdout}"
+    );
+
+    let snap_out = run_da_in(dir.path(), &["session", "snapshot", &id]);
+    assert_ne!(
+        snap_out.status.code(),
+        Some(0),
+        "snapshot after neutralized delayed nav must fail closed: {snap_out:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&snap_out.stdout).contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "disallowed secret leaked in snapshot"
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+
+    stop_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
+}

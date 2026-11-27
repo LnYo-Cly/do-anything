@@ -196,11 +196,7 @@ impl Endpoint {
             .ok_or_else(|| {
                 self.explain("the answer has no `webSocketDebuggerUrl`; it is not a Chrome DevTools endpoint")
             })?;
-        if !url.starts_with("ws://") {
-            return Err(self.explain(format!(
-                "the answer names `{url}`, which is not a ws:// DevTools URL"
-            )));
-        }
+        validate_loopback_ws_url(url).map_err(|detail| self.explain(detail))?;
         Ok(url.to_string())
     }
 
@@ -368,6 +364,42 @@ fn default_active_port_files() -> Vec<PathBuf> {
     paths
 }
 
+/// Validates that a Chrome DevTools WebSocket URL uses `ws://` on a loopback host.
+pub(super) fn validate_loopback_ws_url(url: &str) -> Result<(), String> {
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!("the answer names invalid DevTools URL `{url}`"));
+    }
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return Err(format!(
+            "the answer names `{url}`, which is not a ws:// DevTools URL"
+        ));
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Err(format!(
+            "the answer names `{url}`, which is missing a DevTools WebSocket path"
+        ));
+    };
+    if path.is_empty() {
+        return Err(format!(
+            "the answer names `{url}`, which is missing a DevTools WebSocket path"
+        ));
+    }
+    let Some((host, port_str)) = authority.rsplit_once(':') else {
+        return Err(format!("the answer names `{url}`, which is missing a port"));
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err(format!(
+            "the answer names `{url}`, which must use a loopback host"
+        ));
+    }
+    if !port_str.parse::<u16>().is_ok_and(|port| port > 0) {
+        return Err(format!(
+            "the answer names `{url}`, which has an invalid port"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +538,30 @@ mod tests {
             .expect_err("must error when no endpoint is discovered");
         assert!(err.contains("--remote-debugging-port=9222"), "{err}");
         assert!(err.contains(CONNECT_ENV_VAR), "{err}");
+    }
+
+    #[test]
+    fn websocket_url_rejects_non_loopback_ws_target() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 512];
+                let _ = stream.read(&mut buf);
+                let body =
+                    r#"{"webSocketDebuggerUrl":"ws://192.0.2.1:9222/devtools/browser/evil"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let err = endpoint
+            .websocket_url(Duration::from_secs(2))
+            .expect_err("non-loopback webSocketDebuggerUrl must be rejected");
+        let _ = server.join();
+        assert!(err.contains("loopback"), "{err}");
     }
 }

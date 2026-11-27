@@ -11412,6 +11412,179 @@ steps:
     stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[test]
+fn allowed_origins_blocks_delayed_async_navigation_during_poll_for_read_and_click() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-allowed-origins-delayed-nav");
+
+    let evil_clicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let evil_clicked_srv = std::sync::Arc::clone(&evil_clicked);
+    let stop_disallowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_disallowed_srv = std::sync::Arc::clone(&stop_disallowed);
+    let disallowed_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind disallowed");
+    disallowed_listener
+        .set_nonblocking(true)
+        .expect("nonblocking disallowed");
+    let disallowed_port = disallowed_listener.local_addr().unwrap().port();
+    let disallowed_origin = format!("http://127.0.0.1:{disallowed_port}");
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let secret_html = r#"<!doctype html><html><head><title>Secret</title></head><body><p id="secret">DISALLOWED_ORIGIN_SECRET_DATA</p><button id="evil-btn" onclick="fetch('/clicked').then(() => { this.textContent = 'EVIL_CLICKED'; })">Evil</button></body></html>"#;
+        let secret_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{secret_html}",
+            secret_html.len()
+        );
+        let clicked_resp =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string();
+        while !stop_disallowed_srv.load(std::sync::atomic::Ordering::Relaxed) {
+            match disallowed_listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req_path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if req_path == "/clicked" {
+                        evil_clicked_srv.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = stream.write_all(clicked_resp.as_bytes());
+                    } else {
+                        let _ = stream.write_all(secret_resp.as_bytes());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let home_html = format!(
+        r#"<!doctype html><html><head><title>Home</title></head><body><p id="home-marker">ALLOWED_HOME</p><button id="js-delayed" onclick="setTimeout(() => {{ location.href = '{disallowed_origin}/secret'; }}, 250);">Delayed Escape</button></body></html>"#
+    );
+    let home_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{home_html}",
+        home_html.len()
+    );
+    let (allowed_origin, stop_allowed) = spawn_mini_http(vec![("/home".to_string(), home_resp)]);
+
+    // 1. Delayed JS navigation committing while `browser.read` is polling must fail closed
+    //    without returning disallowed text or leaking disallowed DOM into failure evidence.
+    let read_case = dir.write(
+        "delayed-read.yaml",
+        &format!(
+            r##"name: delayed async nav blocked during browser.read poll
+steps:
+  - browser.open:
+      allowed_origins:
+        - "{allowed_origin}"
+      url: "{allowed_origin}/home"
+  - browser.click:
+      css: "#js-delayed"
+  - browser.read:
+      css: "#secret"
+"##
+        ),
+    );
+    let record_dir = dir.path().join("delayed-read-record");
+    let read_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&read_case),
+            "--record",
+            path_str(&record_dir),
+        ],
+    );
+    assert_ne!(
+        exit_code(&read_out),
+        Some(0),
+        "delayed async nav must fail browser.read: stdout={}\nstderr={}",
+        stdout(&read_out),
+        stderr(&read_out)
+    );
+    let read_stdout = stdout(&read_out);
+    assert!(
+        read_stdout.contains("allowed_origins"),
+        "expected allowed_origins refusal: {read_stdout}"
+    );
+    assert!(
+        !read_stdout.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "disallowed secret leaked into stdout: {read_stdout}"
+    );
+    for entry in walk_files(&record_dir) {
+        if entry.extension().and_then(|e| e.to_str()) == Some("html") {
+            let text = fs::read_to_string(&entry).unwrap_or_default();
+            assert!(
+                !text.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+                "failure bundle {} leaked disallowed origin DOM",
+                entry.display()
+            );
+        }
+    }
+
+    // 2. Delayed JS navigation committing while `browser.click` is polling must fail closed
+    //    before clicking any element on the disallowed origin.
+    let click_case = dir.write(
+        "delayed-click.yaml",
+        &format!(
+            r##"name: delayed async nav blocked during browser.click poll
+steps:
+  - browser.open:
+      allowed_origins:
+        - "{allowed_origin}"
+      url: "{allowed_origin}/home"
+  - browser.click:
+      css: "#js-delayed"
+  - browser.click:
+      css: "#evil-btn"
+"##
+        ),
+    );
+    let click_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&click_case),
+            "--no-bundle",
+        ],
+    );
+    assert_ne!(
+        exit_code(&click_out),
+        Some(0),
+        "delayed async nav must fail browser.click: stdout={}\nstderr={}",
+        stdout(&click_out),
+        stderr(&click_out)
+    );
+    let click_stdout = stdout(&click_out);
+    assert!(
+        click_stdout.contains("allowed_origins"),
+        "expected allowed_origins refusal: {click_stdout}"
+    );
+    assert!(
+        !click_stdout.contains("EVIL_CLICKED"),
+        "disallowed button text leaked: {click_stdout}"
+    );
+    assert!(
+        !evil_clicked.load(std::sync::atomic::Ordering::SeqCst),
+        "browser.click must not interact with elements on a disallowed origin"
+    );
+
+    stop_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(root) else {

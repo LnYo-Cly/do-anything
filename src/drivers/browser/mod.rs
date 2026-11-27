@@ -3567,18 +3567,27 @@ impl BrowserSession {
 
     /// Verifies that the active tab's live `location.href` is within `allowed_origins`.
     ///
-    /// Fails closed (clearing `snapshot_pending`) if the page has drifted onto a
-    /// disallowed origin via redirect, link click, or script navigation, or if
-    /// the live URL cannot be read.
+    /// Fails closed (neutralizing any disallowed page to `about:blank` and clearing
+    /// `snapshot_pending`) if the page has drifted onto a disallowed origin via
+    /// redirect, link click, or script navigation, or if the live URL cannot be read.
     fn ensure_current_page_origin_allowed(&mut self) -> Result<(), StepError> {
+        let mut dialog = DialogContext::fail_fast();
+        self.ensure_current_page_origin_allowed_with_dialog(&mut dialog)
+    }
+
+    /// Same as [`Self::ensure_current_page_origin_allowed`], honoring the active step's
+    /// JavaScript dialog policy so expected dialogs are not disrupted while verifying origin.
+    fn ensure_current_page_origin_allowed_with_dialog(
+        &mut self,
+        dialog: &mut DialogContext,
+    ) -> Result<(), StepError> {
         if self.allowed_origins.is_empty() {
             return Ok(());
         }
         let scope = self.scope();
         let deadline = Deadline::after(TAB_QUERY_TIMEOUT);
-        let mut dialog = DialogContext::fail_fast();
         let connection = self.connection_mut()?;
-        let current = page_evaluate(connection, &scope, "location.href", deadline, &mut dialog)
+        let current = page_evaluate(connection, &scope, "location.href", deadline, dialog)
             .map_err(|failure| {
                 self.snapshot_pending = false;
                 failure
@@ -3588,7 +3597,13 @@ impl BrowserSession {
             .unwrap_or_default()
             .to_string();
         if let Err(err) = self.ensure_origin_allowed(&current) {
-            self.snapshot_pending = false;
+            if current == "about:blank" {
+                self.snapshot_pending = false;
+                self.refs = snapshot::RefStore::default();
+                self.step_metadata = None;
+            } else {
+                self.neutralize_disallowed_page();
+            }
             return Err(err);
         }
         Ok(())
@@ -4197,6 +4212,7 @@ impl BrowserSession {
         let target_desc = format!("ref `{ref_id}`");
         let object_id = self.resolve_and_synthesize_ref(ref_id, deadline, dialog)?;
         loop {
+            self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             match self.call_function_poll(
                 &target_desc,
                 &object_id,
@@ -4205,7 +4221,10 @@ impl BrowserSession {
                 deadline,
                 dialog,
             ) {
-                Ok(Value::Bool(true)) => return Ok(Located(object_id)),
+                Ok(Value::Bool(true)) => {
+                    self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+                    return Ok(Located(object_id));
+                }
                 Ok(_) => {
                     if deadline.passed() {
                         return Err(pending_timeout_error(
@@ -4267,6 +4286,7 @@ impl BrowserSession {
         let mut previous_rect: Option<ElementRect> = None;
         let mut last_reason = PendingReason::Hidden;
         loop {
+            self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             match self.inspect_actionable_once(
                 target_desc,
                 object_id.clone(),
@@ -4274,7 +4294,10 @@ impl BrowserSession {
                 deadline,
                 dialog,
             ) {
-                Ok(Ok(ready)) => return Ok(ready),
+                Ok(Ok(ready)) => {
+                    self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+                    return Ok(ready);
+                }
                 Ok(Err(reason)) => {
                     last_reason = reason;
                     if deadline.passed() {
@@ -4338,6 +4361,7 @@ impl BrowserSession {
         let target_desc = target.describe_with(&self.testid_attribute);
         let mut last_pending = (target_desc.clone(), PendingReason::Missing);
         loop {
+            self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             // Every terminal return names the same pending reason, including the
             // timeout that ends the last poll, so a closed shadow root is
             // explained however the wait happened to expire.
@@ -4356,7 +4380,10 @@ impl BrowserSession {
             match poll {
                 ResolvePoll::Found(object_id) => match check(self, &target_desc, object_id, dialog)
                 {
-                    Ok(Ok(ready)) => return Ok(ready),
+                    Ok(Ok(ready)) => {
+                        self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+                        return Ok(ready);
+                    }
                     Ok(Err(reason)) => {
                         last_pending = (target_desc.clone(), reason);
                     }
@@ -4942,6 +4969,7 @@ impl BrowserSession {
         deadline: Deadline,
         dialog: &mut DialogContext,
     ) -> Result<Value, StepError> {
+        self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
         let scope = self.scope();
         let function = format!("function () {{ var el = this; {body} }}");
         let connection = self.connection_mut()?;
@@ -4959,6 +4987,7 @@ impl BrowserSession {
         deadline: Deadline,
         dialog: &mut DialogContext,
     ) -> Result<(), StepError> {
+        self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
         let scope = self.scope();
         let connection = self.connection_mut()?;
         page_call(connection, &scope, method, params, deadline, dialog)
@@ -6552,42 +6581,9 @@ fn validate_launched_ws_url(url: &str, port: u16) -> Result<(), String> {
 }
 
 fn validate_connected_ws_url(url: &str) -> Result<(), String> {
-    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
-        return Err(format!(
-            "connected browser session handle has invalid `websocket_url` `{url}`"
-        ));
-    }
-    let Some(rest) = url.strip_prefix("ws://") else {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` must use `ws://`"
-        ));
-    };
-    let Some((authority, path)) = rest.split_once('/') else {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` is missing a path"
-        ));
-    };
-    if path.is_empty() {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` is missing a path"
-        ));
-    }
-    let Some((host, port_str)) = authority.rsplit_once(':') else {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` is missing a port"
-        ));
-    };
-    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` must use a loopback host"
-        ));
-    }
-    if !port_str.parse::<u16>().is_ok_and(|port| port > 0) {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` has an invalid port"
-        ));
-    }
-    Ok(())
+    connect::validate_loopback_ws_url(url).map_err(|detail| {
+        format!("connected browser session handle `websocket_url` invalid: {detail}")
+    })
 }
 
 #[allow(
@@ -8443,6 +8439,7 @@ fn click_actionable(
         Some(text) if !text.trim().is_empty() => json!({ "text": text.trim() }),
         _ => json!({}),
     };
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(result, dialog))
 }
 
@@ -8524,6 +8521,7 @@ fn type_actionable(
         deadline,
         dialog,
     )?;
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(json!({}), dialog))
 }
 
@@ -8705,6 +8703,7 @@ fn upload_to_located(
             names.len()
         )));
     }
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(json!({ "files": names.len(), "names": names }))
 }
 
@@ -8851,6 +8850,7 @@ fn click_at(
         }));
     }
     dispatch_pointer_click(session, at, deadline, dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
 
@@ -8882,6 +8882,7 @@ fn type_at(
         deadline,
         dialog,
     )?;
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
 
@@ -8991,6 +8992,7 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     let session = session(sessions)?;
     let scope = session.scope();
     for params in [key.down_params(), key.up_params()] {
+        session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
         let connection = session.connection_mut()?;
         page_call(
             connection,
@@ -9013,6 +9015,7 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             failure.step(&prefix, timeout_or_execution)
         })?;
     }
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     Ok(attach_dialog(json!({}), &mut dialog))
 }
 
@@ -9036,7 +9039,11 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
             .map_err(|failure| failure.environment("could not read the current URL"))?;
         let url_text = url.as_str().unwrap_or_default();
         if let Err(err) = session.ensure_origin_allowed(url_text) {
-            session.snapshot_pending = false;
+            if url_text == "about:blank" {
+                session.snapshot_pending = false;
+            } else {
+                session.neutralize_disallowed_page();
+            }
             return Err(err);
         }
         return Ok(json!({ "url": url_text }));
@@ -9059,7 +9066,11 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     };
     let url_text = url.as_str().unwrap_or_default();
     if let Err(err) = session.ensure_origin_allowed(url_text) {
-        session.snapshot_pending = false;
+        if url_text == "about:blank" {
+            session.snapshot_pending = false;
+        } else {
+            session.neutralize_disallowed_page();
+        }
         return Err(err);
     }
     Ok(attach_dialog(json!({ "url": url_text }), &mut dialog))
@@ -9077,7 +9088,16 @@ fn wait_for_url(
         let connection = session.connection_mut()?;
         match page_evaluate(connection, &scope, "location.href", deadline, dialog) {
             Ok(value) => {
-                if value.as_str().is_some_and(|url| url.contains(wanted)) {
+                let url_text = value.as_str().unwrap_or_default();
+                if let Err(err) = session.ensure_origin_allowed(url_text) {
+                    if url_text == "about:blank" {
+                        session.snapshot_pending = false;
+                    } else {
+                        session.neutralize_disallowed_page();
+                    }
+                    return Err(err);
+                }
+                if url_text.contains(wanted) {
                     return Ok(value);
                 }
                 if deadline.passed() {
@@ -9111,6 +9131,7 @@ fn run_screenshot(args: &Value, sessions: &mut Sessions) -> Result<Value, StepEr
     let path = resolve_path(&args.path, sessions);
     let session = session(sessions)?;
     let png = session.capture_masked_png(Deadline::after(SCREENSHOT_TIMEOUT))?;
+    session.ensure_current_page_origin_allowed()?;
     write_png(&path, &png)?;
     Ok(json!({
         "path": paths::display(&path),
@@ -9234,6 +9255,7 @@ fn read_located(
         )?;
         result["value"] = value;
     }
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(result)
 }
 
@@ -9631,6 +9653,7 @@ fn run_save_state(args: &Value, sessions: &mut Sessions) -> Result<Value, StepEr
     }
     let mut dialog = DialogContext::fail_fast();
     let state = session.capture_storage_state(Deadline::after(SCREENSHOT_TIMEOUT), &mut dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let cookies = state.cookies.len();
     let local_storage: usize = state.local_storage.values().map(BTreeMap::len).sum();
     write_storage_state(&path, &state)?;
@@ -10051,6 +10074,7 @@ return {{ ok: true }};"#
         }
         flush_scroll_frames(session, deadline, dialog)?;
         let (sx, sy) = read_window_scroll(session, deadline, dialog)?;
+        session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
         return Ok(attach_dialog(
             json!({
                 "scrolled": true,
@@ -10156,6 +10180,7 @@ return {{ status: 'wheel', x: mapped.x, y: mapped.y }};"#
                 .get("scroll_top")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
+            session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             Ok(attach_dialog(
                 json!({
                     "scrolled": true,
@@ -10187,6 +10212,7 @@ return {{ status: 'wheel', x: mapped.x, y: mapped.y }};"#
             )?;
             flush_scroll_frames(session, deadline, dialog)?;
             let (sx, sy) = read_window_scroll(session, deadline, dialog)?;
+            session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             Ok(attach_dialog(
                 json!({
                     "scrolled": true,
@@ -10270,6 +10296,7 @@ fn run_scroll(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
         )?;
         flush_scroll_frames(session, deadline, &mut dialog)?;
         let (sx, sy) = read_window_scroll(session, deadline, &mut dialog)?;
+        session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
         let mut result = coordinate_result(at, width, height);
         result["scrolled"] = json!(true);
         result["scroll_x"] = coordinate_number(sx);
@@ -10320,6 +10347,7 @@ fn run_scroll(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
     }
     flush_scroll_frames(session, deadline, &mut dialog)?;
     let (sx, sy) = read_window_scroll(session, deadline, &mut dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     Ok(attach_dialog(
         json!({
             "scrolled": true,
@@ -10366,6 +10394,7 @@ fn hover_actionable(
     {
         result["text"] = json!(text.trim());
     }
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(result, dialog))
 }
 
@@ -10404,6 +10433,7 @@ fn run_hover(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             &mut dialog,
         )?;
         flush_scroll_frames(session, deadline, &mut dialog)?;
+        session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
         let mut result = coordinate_result(at, width, height);
         result["hovered"] = json!(true);
         return Ok(attach_dialog(result, &mut dialog));
@@ -10826,6 +10856,7 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     }
 
     dispatch_drag_gesture(session, &from, &mut to, mid_drag_to, deadline, &mut dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
 
     let mut result = json!({
         "dragged": true,
@@ -10975,6 +11006,7 @@ fn run_set_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, Ste
     let script = format!(
         "(async () => {{ await navigator.clipboard.writeText({encoded_text}); return true; }})()"
     );
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let scope = session.scope();
     let connection = session.connection_mut()?;
     page_evaluate_async(connection, &scope, &script, true, deadline, &mut dialog).map_err(
@@ -10985,6 +11017,7 @@ fn run_set_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, Ste
             )
         },
     )?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     Ok(json!({ "characters": args.text.chars().count() }))
 }
 
@@ -10996,6 +11029,7 @@ fn run_read_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, St
     let session = session(sessions)?;
     ensure_clipboard_ready(session, STEP_NAMES[15], deadline, &mut dialog)?;
 
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let scope = session.scope();
     let connection = session.connection_mut()?;
     let value = page_evaluate_async(
@@ -11012,6 +11046,7 @@ fn run_read_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, St
             timeout_or_execution,
         )
     })?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let text = value.as_str().unwrap_or_default().to_string();
     Ok(json!({ "text": text }))
 }
