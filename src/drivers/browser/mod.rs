@@ -3565,6 +3565,59 @@ impl BrowserSession {
         check_origin_against_allowlist(url, &self.allowed_origins)
     }
 
+    /// Verifies that the active tab's live `location.href` is within `allowed_origins`.
+    ///
+    /// Fails closed (clearing `snapshot_pending`) if the page has drifted onto a
+    /// disallowed origin via redirect, link click, or script navigation, or if
+    /// the live URL cannot be read.
+    fn ensure_current_page_origin_allowed(&mut self) -> Result<(), StepError> {
+        if self.allowed_origins.is_empty() {
+            return Ok(());
+        }
+        let scope = self.scope();
+        let deadline = Deadline::after(TAB_QUERY_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        let connection = self.connection_mut()?;
+        let current = page_evaluate(connection, &scope, "location.href", deadline, &mut dialog)
+            .map_err(|failure| {
+                self.snapshot_pending = false;
+                failure
+                    .environment("could not verify the current page URL against `allowed_origins`")
+            })?
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if let Err(err) = self.ensure_origin_allowed(&current) {
+            self.snapshot_pending = false;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Leaves a disallowed destination by parking the active tab on `about:blank`
+    /// and clearing cached refs / pending snapshots so no disallowed DOM leaks.
+    fn neutralize_disallowed_page(&mut self) {
+        self.snapshot_pending = false;
+        self.refs = snapshot::RefStore::default();
+        self.step_metadata = None;
+        let scope = self.scope();
+        let deadline = Deadline::after(TAB_DETACH_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        if let Some(connection) = self.connection.as_mut() {
+            let _ = page_call(
+                connection,
+                &scope,
+                "Page.navigate",
+                json!({ "url": "about:blank" }),
+                deadline,
+                &mut dialog,
+            );
+            let _ = connection.poll_messages();
+        }
+        let current_target = self.tabs.current().to_string();
+        self.tabs.set_current(&current_target, "about:blank", "");
+    }
+
     /// Navigates the session's page and returns its current URL and title.
     fn navigate(
         &mut self,
@@ -3646,12 +3699,15 @@ impl BrowserSession {
         if let Some(origin) = loaded_origin {
             self.cleanup_pending_local_storage_scripts(&origin, deadline, dialog);
         }
+        if let Err(err) = self.ensure_origin_allowed(&current) {
+            self.neutralize_disallowed_page();
+            return Err(err);
+        }
         // The page is what `browser.switch_tab` reports for this tab and what a
         // `url_contains` or `title_contains` filter matches, so it is recorded
         // without waiting for the browser to report the same change again.
         let current_target = self.tabs.current().to_string();
         self.tabs.set_current(&current_target, &current, &title);
-        self.ensure_origin_allowed(&current)?;
         Ok((current, title))
     }
 
@@ -3671,7 +3727,6 @@ impl BrowserSession {
     ) -> Result<Value, StepError> {
         let index = self.await_tab(selector, deadline)?;
         let (url, title) = self.activate_tab(index, deadline)?;
-        self.ensure_origin_allowed(&url)?;
         Ok(json!({ "url": url, "title": title }))
     }
 
@@ -3745,7 +3800,17 @@ impl BrowserSession {
         // Switching to the tab the session already drives changes nothing; it
         // must not detach and re-attach the same page.
         if target_id == self.tabs.current() {
+            self.ensure_current_page_origin_allowed()?;
             return Ok(self.tabs.info(index).unwrap_or_default());
+        }
+        let tracked = self.tabs.info(index).unwrap_or_default();
+        if !self.allowed_origins.is_empty()
+            && !tracked.0.is_empty()
+            && tracked.0 != "about:blank"
+            && let Err(err) = self.ensure_origin_allowed(&tracked.0)
+        {
+            self.snapshot_pending = false;
+            return Err(err);
         }
         let connection = self.connection_mut()?;
         let page = attach_existing_target(
@@ -3756,8 +3821,21 @@ impl BrowserSession {
             ATTACH_ENABLE_TIMEOUT,
         )
         .map_err(|failure| StepError::Execution(failure.message))?;
-        let tracked = self.tabs.info(index).unwrap_or_default();
         let (url, title) = self.read_ready_tab(&target_id, &page, tracked, deadline);
+        if let Err(err) = self.ensure_origin_allowed(&url) {
+            self.snapshot_pending = false;
+            if let Some(connection) = self.connection.as_mut() {
+                let _ = connection.call(
+                    "Target.detachFromTarget",
+                    json!({ "sessionId": page }),
+                    None,
+                    deadline.capped(TAB_DETACH_TIMEOUT),
+                );
+                let _ = connection.poll_messages();
+                self.tabs.absorb(connection);
+            }
+            return Err(err);
+        }
         let previous = std::mem::replace(&mut self.page, page);
         self.tabs.set_current(&target_id, &url, &title);
         // The observer of the tab being left keeps nothing: `browser.network`
@@ -6731,6 +6809,8 @@ impl Session for BrowserSession {
         max_nodes: Option<usize>,
     ) -> Result<Option<Value>, String> {
         self.ensure_target_ready().map_err(step_error_text)?;
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let scope = self.scope();
         let existing_refs = self.refs.clone();
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
@@ -6763,6 +6843,8 @@ impl Session for BrowserSession {
     }
 
     fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
         let mut dialog = DialogContext::fail_fast();
         let clip = self
@@ -6777,6 +6859,8 @@ impl Session for BrowserSession {
     }
 
     fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
         let mut dialog = DialogContext::fail_fast();
         let scope = self.scope();
@@ -6802,6 +6886,8 @@ impl Session for BrowserSession {
     }
 
     fn synthesize_at_point(&mut self, x: f64, y: f64) -> Result<Option<SynthesizedTarget>, String> {
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
         let mut dialog = DialogContext::fail_fast();
         let synth =
@@ -6825,6 +6911,8 @@ impl Session for BrowserSession {
                 "the browser session is already closed; no evidence was collected".to_string(),
             );
         }
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(EVIDENCE_TIMEOUT);
         let mut files = Vec::new();
         let mut errors = Vec::new();
@@ -8186,6 +8274,7 @@ fn raw_session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError
 fn session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
     let browser = raw_session(sessions)?;
     browser.ensure_target_ready()?;
+    browser.ensure_current_page_origin_allowed()?;
     Ok(browser)
 }
 
@@ -8945,7 +9034,12 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         let connection = session.connection_mut()?;
         let url = page_evaluate(connection, &scope, "location.href", deadline, &mut dialog)
             .map_err(|failure| failure.environment("could not read the current URL"))?;
-        return Ok(json!({ "url": url.as_str().unwrap_or_default() }));
+        let url_text = url.as_str().unwrap_or_default();
+        if let Err(err) = session.ensure_origin_allowed(url_text) {
+            session.snapshot_pending = false;
+            return Err(err);
+        }
+        return Ok(json!({ "url": url_text }));
     }
     let args: WaitArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
@@ -8963,10 +9057,12 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         }
         WaitTarget::Url(wanted) => wait_for_url(session, &wanted, deadline, &mut dialog)?,
     };
-    Ok(attach_dialog(
-        json!({ "url": url.as_str().unwrap_or_default() }),
-        &mut dialog,
-    ))
+    let url_text = url.as_str().unwrap_or_default();
+    if let Err(err) = session.ensure_origin_allowed(url_text) {
+        session.snapshot_pending = false;
+        return Err(err);
+    }
+    Ok(attach_dialog(json!({ "url": url_text }), &mut dialog))
 }
 
 /// Waits until the page's URL contains `wanted`.
@@ -9209,6 +9305,24 @@ fn run_set_cookies(args: &Value, sessions: &mut Sessions) -> Result<Value, StepE
     let session = sessions
         .get_or_create(SESSION_KIND, || BrowserSession::open_default(interactive))
         .map_err(StepError::Environment)?;
+
+    if !session.allowed_origins.is_empty() {
+        session.ensure_current_page_origin_allowed()?;
+        if let Some(cookies) = &args.cookies {
+            for cookie in cookies {
+                if let Some(url) = &cookie.url {
+                    session.ensure_origin_allowed(url)?;
+                }
+            }
+        }
+        if let Some(storage) = &args.local_storage {
+            for raw_origin in storage.keys() {
+                if !raw_origin.eq_ignore_ascii_case("current") {
+                    session.ensure_origin_allowed(raw_origin)?;
+                }
+            }
+        }
+    }
 
     let deadline = Deadline::after(Duration::from_millis(DEFAULT_NAVIGATION_TIMEOUT_MS));
     let mut dialog = DialogContext::fail_fast();

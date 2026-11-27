@@ -2937,9 +2937,13 @@ files and loopback debug ports `9222` / `9229` via `GET /json/version`.
 
 Use `allowed_origins` (an array of canonical `http://host[:port]` /
 `https://host[:port]` origins) to bound an attached session to specific origins:
-`browser.open` refuses disallowed initial URLs before calling CDP, rejects
-cross-origin redirects after load, and rejects `browser.switch_tab` onto a tab
-outside the allowlist. `allowed_origins` is persisted across detached
+`browser.open` refuses disallowed initial URLs before calling CDP and
+neutralizes cross-origin redirects back to `about:blank` after load,
+`browser.switch_tab` refuses tabs outside the allowlist without committing the
+tab switch, and all active-page steps (`browser.click`, `browser.wait`,
+`browser.read`, `browser.screenshot`, `browser.set_cookies`, snapshots, and
+failure evidence) verify the live page URL against `allowed_origins` before
+accessing page state. `allowed_origins` is persisted across detached
 `da session` steps.
 
 Attached sessions (`connect` explicit or `"auto"`) are always marked
@@ -2948,8 +2952,9 @@ clipboard isolation (`browser.set_clipboard` and `browser.read_clipboard` fail
 closed with exit code `4`). Only the tab this case opened is closed when the
 case ends; the user's browser and its other tabs keep running. `connect` cannot
 be combined with `headless`, `width`, `height`, `profile`, or `storage_state`,
-and a second `browser.open` in the same case must keep the same `connect` and
-`allowed_origins` values.
+and a second `browser.open` in the same case must keep the same `connect` value
+and either repeat the same `allowed_origins` list or omit it (inheriting the
+initial allowlist; changing `allowed_origins` is refused).
 
 A debug port is full control of the browser: every cookie, every signed-in
 session and every page it can reach. Keep it on loopback, do not expose it on a

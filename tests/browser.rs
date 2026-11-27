@@ -11215,3 +11215,215 @@ steps:
         stderr(&clip_out)
     );
 }
+
+fn spawn_mini_http(
+    routes: Vec<(String, String)>,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mini http server");
+    let addr = listener.local_addr().expect("mini http local_addr");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking on mini http");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let response = routes
+                        .iter()
+                        .find(|(p, _)| p == path)
+                        .map(|(_, r)| r.as_str())
+                        .unwrap_or("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{}", addr.port()), stop)
+}
+
+#[test]
+fn allowed_origins_blocks_in_tab_click_navigation_and_switch_tab_without_leaking_state() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let dir = TempDir::new("browser-allowed-origins-guardrails");
+
+    let secret_html = "<!doctype html><html><head><title>Secret</title></head><body><p id=\"secret\">DISALLOWED_ORIGIN_SECRET_DATA</p></body></html>";
+    let secret_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        secret_html.len(),
+        secret_html
+    );
+    let (disallowed_origin, stop_disallowed) =
+        spawn_mini_http(vec![("/secret".to_string(), secret_resp)]);
+
+    let home_html = format!(
+        "<!doctype html><html><head><title>Home</title></head><body><p id=\"home-marker\">ALLOWED_HOME</p><a id=\"same-tab\" href=\"{disallowed_origin}/secret\">Go Same Tab</a><a id=\"new-tab\" target=\"_blank\" href=\"{disallowed_origin}/secret\">Go Popup</a></body></html>"
+    );
+    let home_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        home_html.len(),
+        home_html
+    );
+    let redirect_resp = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {disallowed_origin}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let (allowed_origin, stop_allowed) = spawn_mini_http(vec![
+        ("/home".to_string(), home_resp),
+        ("/redirect".to_string(), redirect_resp),
+    ]);
+
+    // 1. In-tab link click to disallowed origin must fail closed on subsequent wait/read
+    //    and must not leak disallowed DOM into failure evidence.
+    let escape_case = dir.write(
+        "click-escape.yaml",
+        &format!(
+            r##"name: allowed_origins blocks in-tab click escape
+steps:
+  - browser.open:
+      allowed_origins:
+        - "{allowed_origin}"
+      url: "{allowed_origin}/home"
+  - browser.click:
+      css: "#same-tab"
+  - browser.wait:
+      url_contains: "/secret"
+  - browser.read:
+      css: "#secret"
+"##
+        ),
+    );
+    let record_dir = dir.path().join("escape-record");
+    let escape_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&escape_case),
+            "--record",
+            path_str(&record_dir),
+        ],
+    );
+    assert_ne!(
+        exit_code(&escape_out),
+        Some(0),
+        "in-tab click to disallowed origin must not pass: stdout={}\nstderr={}",
+        stdout(&escape_out),
+        stderr(&escape_out)
+    );
+    let escape_stdout = stdout(&escape_out);
+    assert!(
+        !escape_stdout.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "disallowed page text must never leak to stdout: {escape_stdout}"
+    );
+    assert!(
+        escape_stdout.contains("allowed_origins"),
+        "expected allowed_origins refusal: {escape_stdout}"
+    );
+    // Failure evidence must not contain the disallowed page's DOM.
+    for entry in walk_files(&record_dir) {
+        if entry.extension().and_then(|e| e.to_str()) == Some("html") {
+            let text = fs::read_to_string(&entry).unwrap_or_default();
+            assert!(
+                !text.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+                "failure bundle {} leaked disallowed origin DOM",
+                entry.display()
+            );
+        }
+    }
+
+    // 2. Rejected `browser.switch_tab` onto a `_blank` disallowed origin must NOT mutate
+    //    active tab state: a subsequent `browser.read` in the same case stays on the allowed tab.
+    let switch_case = dir.write(
+        "switch-tab-isolation.yaml",
+        &format!(
+            r##"name: allowed_origins switch_tab does not commit disallowed tab
+steps:
+  - browser.open:
+      allowed_origins:
+        - "{allowed_origin}"
+      url: "{allowed_origin}/home"
+  - browser.click:
+      css: "#new-tab"
+  - browser.switch_tab:
+      index: 1
+    optional: true
+  - browser.read:
+      css: "#home-marker"
+    expect:
+      - path: $.text
+        equals: "ALLOWED_HOME"
+"##
+        ),
+    );
+    let switch_out = run_da_in(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&switch_case),
+            "--no-bundle",
+        ],
+    );
+    assert_eq!(
+        exit_code(&switch_out),
+        Some(0),
+        "after rejected optional switch_tab, active tab must remain on allowed origin: stdout={}\nstderr={}",
+        stdout(&switch_out),
+        stderr(&switch_out)
+    );
+    let switch_json = json_stdout(&switch_out);
+    assert_eq!(
+        switch_json["cases"][0]["steps"][2]["status"],
+        json!("skipped")
+    );
+    assert_eq!(
+        switch_json["cases"][0]["steps"][3]["result"]["text"],
+        json!("ALLOWED_HOME")
+    );
+    assert!(!stdout(&switch_out).contains("DISALLOWED_ORIGIN_SECRET_DATA"));
+
+    stop_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
