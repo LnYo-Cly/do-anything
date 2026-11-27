@@ -1675,3 +1675,437 @@ steps:
     assert!(shtml.contains("Exploration Run (da session)"));
     assert!(shtml.contains("Target geometry:"));
 }
+
+#[test]
+fn session_launched_temp_profile_is_not_local_only_while_named_profile_and_connect_are() {
+    let dir = TempDir::new("report-session-temp-profile");
+
+    // 1) Normal launched browser: `profile` holds da's temp profile dir, `profile_name` is null.
+    let temp_sess = dir.path().join("sess-temp-profile");
+    fs::create_dir_all(&temp_sess).unwrap();
+    fs::write(temp_sess.join("preview.png"), PNG).unwrap();
+    fs::write(
+        temp_sess.join("state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "id": "sess-temp-profile",
+            "created_at_ms": 1_700_000_000_000_u64,
+            "last_active_ms": 1_700_000_001_000_u64,
+            "idle_timeout_ms": 1_800_000_u64,
+            "handles": {
+                "browser": {
+                    "mode": "launched",
+                    "profile": "/tmp/da-browser-temp-1234",
+                    "profile_name": null,
+                    "connect": null,
+                    "port": 9222,
+                    "websocket_url": "ws://127.0.0.1:9222/devtools/browser/abc",
+                    "target_id": "t1",
+                    "headless": true,
+                    "width": 1280,
+                    "height": 720,
+                    "testid_attribute": "data-testid"
+                }
+            },
+            "vars": {},
+            "env_names": [],
+            "observe": [],
+            "plugins": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        temp_sess.join("steps.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "index": 1,
+                "action": "browser.open",
+                "raw_args": { "url": "http://127.0.0.1:8080" },
+                "status": "passed",
+                "started_at_ms": 1_700_000_000_100_u64,
+                "duration_ms": 40
+            })
+        ),
+    )
+    .unwrap();
+
+    let out_html = dir.path().join("temp-profile.html");
+    let out = run_da(&[
+        "--output",
+        "json",
+        "report",
+        path_str(&temp_sess),
+        "-o",
+        path_str(&out_html),
+    ]);
+    assert_eq!(exit_code(&out), Some(0), "stderr: {}", stderr(&out));
+    let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["images_embedded"], 1, "temp profile must embed PNG");
+    assert_eq!(
+        summary["images_omitted"], 0,
+        "temp profile must not omit PNG"
+    );
+    let html = read(&out_html);
+    assert!(html.contains("data:image/png;base64,"));
+    assert!(!html.contains("browser used a persistent local profile"));
+
+    // 2) Named persistent profile (`profile_name: "staging"`) MUST be marked local_only.
+    let named_sess = dir.path().join("sess-named-profile");
+    fs::create_dir_all(&named_sess).unwrap();
+    fs::write(named_sess.join("preview.png"), PNG).unwrap();
+    fs::write(
+        named_sess.join("state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "id": "sess-named-profile",
+            "created_at_ms": 1_700_000_000_000_u64,
+            "last_active_ms": 1_700_000_001_000_u64,
+            "idle_timeout_ms": 1_800_000_u64,
+            "handles": {
+                "browser": {
+                    "mode": "launched",
+                    "profile": "/home/user/.da/profiles/staging",
+                    "profile_name": "staging",
+                    "connect": null,
+                    "port": 9223,
+                    "websocket_url": "ws://127.0.0.1:9223/devtools/browser/def",
+                    "target_id": "t2",
+                    "headless": true,
+                    "width": 1280,
+                    "height": 720,
+                    "testid_attribute": "data-testid"
+                }
+            },
+            "vars": {},
+            "env_names": [],
+            "observe": [],
+            "plugins": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(named_sess.join("steps.jsonl"), "").unwrap();
+
+    let named_html = dir.path().join("named-profile.html");
+    let named_out = run_da(&[
+        "--output",
+        "json",
+        "report",
+        path_str(&named_sess),
+        "-o",
+        path_str(&named_html),
+    ]);
+    assert_eq!(
+        exit_code(&named_out),
+        Some(0),
+        "stderr: {}",
+        stderr(&named_out)
+    );
+    let named_summary: Value = serde_json::from_slice(&named_out.stdout).unwrap();
+    assert_eq!(named_summary["images_embedded"], 0);
+    assert_eq!(named_summary["images_omitted"], 1);
+    let named_text = read(&named_html);
+    assert!(!named_text.contains("data:image/png;base64,"));
+    assert!(named_text.contains("browser used a persistent local profile"));
+
+    // 3) External connected browser (`connect: ...`) MUST be marked local_only.
+    let conn_sess = dir.path().join("sess-connected");
+    fs::create_dir_all(&conn_sess).unwrap();
+    fs::write(conn_sess.join("preview.png"), PNG).unwrap();
+    fs::write(
+        conn_sess.join("state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "id": "sess-connected",
+            "created_at_ms": 1_700_000_000_000_u64,
+            "last_active_ms": 1_700_000_001_000_u64,
+            "idle_timeout_ms": 1_800_000_u64,
+            "handles": {
+                "browser": {
+                    "mode": "connected",
+                    "profile": null,
+                    "profile_name": null,
+                    "connect": "http://127.0.0.1:9222",
+                    "port": 9222,
+                    "websocket_url": "ws://127.0.0.1:9222/devtools/browser/ghi",
+                    "target_id": "t3",
+                    "headless": false,
+                    "width": 1280,
+                    "height": 720,
+                    "testid_attribute": "data-testid"
+                }
+            },
+            "vars": {},
+            "env_names": [],
+            "observe": [],
+            "plugins": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(conn_sess.join("steps.jsonl"), "").unwrap();
+
+    let conn_html = dir.path().join("connected.html");
+    let conn_out = run_da(&[
+        "--output",
+        "json",
+        "report",
+        path_str(&conn_sess),
+        "-o",
+        path_str(&conn_html),
+    ]);
+    assert_eq!(
+        exit_code(&conn_out),
+        Some(0),
+        "stderr: {}",
+        stderr(&conn_out)
+    );
+    let conn_summary: Value = serde_json::from_slice(&conn_out.stdout).unwrap();
+    assert_eq!(conn_summary["images_embedded"], 0);
+    assert_eq!(conn_summary["images_omitted"], 1);
+    assert!(read(&conn_html).contains("attached to an external browser endpoint"));
+}
+
+#[test]
+fn session_act_and_synthesized_step_telemetry_does_not_double_count() {
+    let dir = TempDir::new("report-session-act-telemetry");
+
+    // Case A: `act` completes Done after 3 calls (25 ms, 25 ms, 25 ms = 75 ms total; 2 UI steps + 1 model.act)
+    // plus a `select_ref --act` (40 ms) whose synthesized `browser.click` also carries provenance audit.
+    let done_sess = dir.path().join("sess-act-done");
+    fs::create_dir_all(&done_sess).unwrap();
+    fs::write(
+        done_sess.join("state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "id": "sess-act-done",
+            "created_at_ms": 1_700_000_000_000_u64,
+            "last_active_ms": 1_700_000_005_000_u64,
+            "idle_timeout_ms": 1_800_000_u64,
+            "handles": {},
+            "vars": {},
+            "env_names": [],
+            "observe": [],
+            "plugins": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let done_steps = [
+        json!({
+            "index": 1,
+            "action": "browser.type",
+            "raw_args": { "ref": "e1", "text": "hello" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_100_u64,
+            "duration_ms": 30,
+            "model": "specai-hy/hy4",
+            "latency_ms": 25,
+            "usage": { "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120 }
+        }),
+        json!({
+            "index": 2,
+            "action": "browser.click",
+            "raw_args": { "ref": "e2" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_200_u64,
+            "duration_ms": 28,
+            "model": "specai-hy/hy4",
+            "latency_ms": 25,
+            "usage": { "prompt_tokens": 110, "completion_tokens": 20, "total_tokens": 130 }
+        }),
+        json!({
+            "index": 3,
+            "action": "model.act",
+            "raw_args": { "goal": "fill and submit", "max_steps": 5 },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_050_u64,
+            "duration_ms": 200,
+            "result": {
+                "status": "done",
+                "steps_taken": 2,
+                "max_steps": 5,
+                "model_calls": 3,
+                "latency_ms": 75,
+                "max_model_latency_ms": 25
+            },
+            "model": "specai-hy/hy4",
+            "latency_ms": 75,
+            "usage": { "prompt_tokens": 310, "completion_tokens": 50, "total_tokens": 360 }
+        }),
+        json!({
+            "index": 4,
+            "action": "model.select_ref",
+            "raw_args": { "query": "confirm" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_400_u64,
+            "duration_ms": 45,
+            "result": { "selected_ref": "e3" },
+            "model": "specai-hy/hy4",
+            "latency_ms": 40,
+            "usage": { "prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100 }
+        }),
+        json!({
+            "index": 5,
+            "action": "browser.click",
+            "raw_args": { "ref": "e3" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_450_u64,
+            "duration_ms": 12,
+            "model": "specai-hy/hy4",
+            "latency_ms": 40,
+            "usage": { "prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100 }
+        }),
+    ];
+    let done_jsonl: String = done_steps
+        .iter()
+        .map(|s| format!("{}\n", serde_json::to_string(s).unwrap()))
+        .collect();
+    fs::write(done_sess.join("steps.jsonl"), done_jsonl).unwrap();
+
+    let done_html = dir.path().join("act-done.html");
+    let done_out = run_da(&["report", path_str(&done_sess), "-o", path_str(&done_html)]);
+    assert_eq!(
+        exit_code(&done_out),
+        Some(0),
+        "stderr: {}",
+        stderr(&done_out)
+    );
+    let html = read(&done_html);
+    // Calls = 3 (model.act) + 1 (model.select_ref) = 4 (NOT 7)
+    assert!(
+        html.contains("<strong>4</strong><span>model calls</span>"),
+        "unexpected call count in HTML"
+    );
+    // Total latency = 75 + 40 = 115 ms (NOT 205 ms); avg = 115 / 4 = 28 ms; max = 40 ms
+    assert!(
+        html.contains("<strong>115 ms</strong><span>total model latency</span>"),
+        "expected exact 115 ms total model latency"
+    );
+    assert!(
+        html.contains("<strong>28 / 40 ms</strong><span>avg / max latency</span>"),
+        "expected exact 28 / 40 ms avg / max"
+    );
+    // Total tokens = 360 + 100 = 460 (NOT 810)
+    assert!(
+        html.contains("<strong>460</strong><span>total tokens</span>"),
+        "expected exact 460 total tokens"
+    );
+    // Telemetry chips list only authoritative model actions, never UI steps
+    assert!(html.contains("model.act: 3"));
+    assert!(html.contains("model.select_ref: 1"));
+    assert!(!html.contains("browser.type: 1"));
+    assert!(!html.contains("browser.click: 1"));
+
+    // Case B: `act` hits `max_steps_exceeded` after 2 calls (30 ms + 45 ms = 75 ms; 2 UI steps + 1 model.act)
+    let max_sess = dir.path().join("sess-act-max-steps");
+    fs::create_dir_all(&max_sess).unwrap();
+    fs::write(
+        max_sess.join("state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "id": "sess-act-max-steps",
+            "created_at_ms": 1_700_000_000_000_u64,
+            "last_active_ms": 1_700_000_005_000_u64,
+            "idle_timeout_ms": 1_800_000_u64,
+            "handles": {},
+            "vars": {},
+            "env_names": [],
+            "observe": [],
+            "plugins": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let max_steps = [
+        json!({
+            "index": 1,
+            "action": "browser.click",
+            "raw_args": { "ref": "e1" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_100_u64,
+            "duration_ms": 10,
+            "model": "specai-hy/hy4",
+            "latency_ms": 30,
+            "usage": { "prompt_tokens": 200, "completion_tokens": 30, "total_tokens": 230 }
+        }),
+        json!({
+            "index": 2,
+            "action": "browser.click",
+            "raw_args": { "ref": "e2" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_200_u64,
+            "duration_ms": 10,
+            "model": "specai-hy/hy4",
+            "latency_ms": 45,
+            "usage": { "prompt_tokens": 220, "completion_tokens": 40, "total_tokens": 260 }
+        }),
+        json!({
+            "index": 3,
+            "action": "model.act",
+            "raw_args": { "goal": "loop", "max_steps": 2 },
+            "status": "failed",
+            "error": "reached `--max-steps` limit (2) without completing goal",
+            "started_at_ms": 1_700_000_000_050_u64,
+            "duration_ms": 120,
+            "result": {
+                "status": "max_steps_exceeded",
+                "steps_taken": 2,
+                "max_steps": 2,
+                "model_calls": 2,
+                "latency_ms": 75,
+                "max_model_latency_ms": 45
+            },
+            "model": "specai-hy/hy4",
+            "latency_ms": 75,
+            "usage": { "prompt_tokens": 420, "completion_tokens": 70, "total_tokens": 490 }
+        }),
+    ];
+    let max_jsonl: String = max_steps
+        .iter()
+        .map(|s| format!("{}\n", serde_json::to_string(s).unwrap()))
+        .collect();
+    fs::write(max_sess.join("steps.jsonl"), max_jsonl).unwrap();
+
+    let max_html = dir.path().join("act-max.html");
+    let max_out = run_da(&["report", path_str(&max_sess), "-o", path_str(&max_html)]);
+    assert_eq!(exit_code(&max_out), Some(0), "stderr: {}", stderr(&max_out));
+    let mhtml = read(&max_html);
+    assert!(
+        mhtml.contains("<strong>2</strong><span>model calls</span>"),
+        "max_steps_exceeded must report exactly 2 model calls"
+    );
+    assert!(
+        mhtml.contains("<strong>75 ms</strong><span>total model latency</span>"),
+        "max_steps_exceeded must report 75 ms total latency, not 150 ms"
+    );
+    assert!(
+        mhtml.contains("<strong>37 / 45 ms</strong><span>avg / max latency</span>"),
+        "max_steps_exceeded must report 37 / 45 ms avg / max"
+    );
+    assert!(
+        mhtml.contains("<strong>490</strong><span>total tokens</span>"),
+        "max_steps_exceeded must report 490 total tokens"
+    );
+    assert!(mhtml.contains("model.act: 2"));
+    assert!(!mhtml.contains("browser.click: 2"));
+}
+
+#[test]
+fn locate_target_bounds_sample_validates_against_schema() {
+    let schema = do_anything::core::report::target_bounds_schema();
+    let validator = jsonschema::validator_for(&schema).expect("valid target_bounds schema");
+    let locate_bounds = json!({
+        "x": 640.5,
+        "y": 360.0,
+        "width": 0,
+        "height": 0,
+        "point": { "x": 640.5, "y": 360.0 },
+        "viewport": { "width": 1280, "height": 720 }
+    });
+    assert!(validator.is_valid(&locate_bounds));
+    assert!(do_anything::core::report::validate_target_bounds(&locate_bounds).is_ok());
+}

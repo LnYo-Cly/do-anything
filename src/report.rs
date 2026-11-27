@@ -212,23 +212,33 @@ impl ModelTelemetry {
     }
 
     fn collect_from_step(&mut self, step: &Value) {
+        let Some(action) = step.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        // Only authoritative model diagnostic records (`model.*` / `model/*`)
+        // contribute to aggregate telemetry; synthesized UI steps (`browser.*`,
+        // `desktop.*`) may carry provenance fields copied from the model call
+        // that chose them and must not be double-counted.
+        if !is_model_diagnostic_action(action) {
+            return;
+        }
         let meta = extract_step_model_meta(step);
         let Some(meta) = meta else {
             return;
         };
-        self.calls += 1;
-        let action = step
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("model")
-            .to_string();
-        *self.calls_by_action.entry(action).or_insert(0) += 1;
+        let call_count = model_call_count(action, step);
+        self.calls = self.calls.saturating_add(call_count);
+        *self.calls_by_action.entry(action.to_string()).or_insert(0) += call_count;
         if let Some(model) = meta.model {
             self.models.insert(model);
         }
         if let Some(lat) = meta.latency_ms {
             self.total_latency_ms = self.total_latency_ms.saturating_add(lat);
-            self.max_latency_ms = self.max_latency_ms.max(lat);
+            let step_max = step
+                .pointer("/result/max_model_latency_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(lat);
+            self.max_latency_ms = self.max_latency_ms.max(step_max);
         }
         if let Some(usage) = meta.usage.as_ref() {
             let counts = parse_usage_counts(usage);
@@ -253,6 +263,35 @@ impl ModelTelemetry {
             self.total_latency_ms / u64::try_from(self.calls).unwrap_or(1)
         }
     }
+}
+
+fn is_model_diagnostic_action(action: &str) -> bool {
+    action.starts_with("model.") || action.starts_with("model/")
+}
+
+fn model_call_count(action: &str, step: &Value) -> usize {
+    if let Some(calls) = step
+        .pointer("/result/model_calls")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
+    {
+        return calls;
+    }
+    if matches!(action, "model.act" | "model/act")
+        && let Some(steps_taken) = step
+            .pointer("/result/steps_taken")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+    {
+        let status = step.pointer("/result/status").and_then(Value::as_str);
+        return if status == Some("max_steps_exceeded") {
+            steps_taken.max(1)
+        } else {
+            steps_taken.saturating_add(1)
+        };
+    }
+    1
 }
 
 #[derive(Debug, Default)]
@@ -810,7 +849,7 @@ fn detect_session_local_only(state: &Value) -> (bool, Option<String>) {
             {
                 reasons.push(format!("{kind} attached to an external browser endpoint"));
             } else if handle
-                .get("profile")
+                .get("profile_name")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty())
             {
