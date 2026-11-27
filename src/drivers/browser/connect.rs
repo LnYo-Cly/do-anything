@@ -10,15 +10,50 @@
 //! browser, so it must never be reachable from another host.
 
 use std::fmt;
+use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How long the endpoint may take to answer.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fast probe timeout used while auto-discovering a local DevTools endpoint.
+const AUTO_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Default loopback ports checked during `connect: "auto"` when no `DevToolsActivePort` answers.
+const AUTO_PROBE_PORTS: [u16; 2] = [9222, 9229];
+/// Environment variable overriding `connect: "auto"` discovery with a loopback endpoint.
+pub const CONNECT_ENV_VAR: &str = "DA_BROWSER_CONNECT";
 
 /// The largest response accepted; `/json/version` is a few hundred bytes.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+/// Parsed form of `browser.open`'s `connect` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectTarget {
+    /// Explicit loopback endpoint (`http://127.0.0.1:9222`, `http://localhost:...`, `http://[::1]:...`).
+    Explicit(Endpoint),
+    /// Discover a live loopback DevTools endpoint (`DA_BROWSER_CONNECT`, `DevToolsActivePort`, or ports 9222/9229).
+    Auto,
+}
+
+impl ConnectTarget {
+    /// Parses `"auto"` or an explicit loopback `http://<host>:<port>` endpoint.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value.trim().eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        Endpoint::parse(value).map(Self::Explicit)
+    }
+
+    /// Resolves this target into a concrete loopback [`Endpoint`].
+    pub fn resolve(&self) -> Result<Endpoint, String> {
+        match self {
+            Self::Explicit(endpoint) => Ok(endpoint.clone()),
+            Self::Auto => Endpoint::discover_auto(),
+        }
+    }
+}
 
 /// A loopback DevTools HTTP endpoint named by `browser.open`'s `connect`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +110,74 @@ impl Endpoint {
         self.port
     }
 
+    /// Discovers an active loopback DevTools endpoint for `connect: "auto"`.
+    pub fn discover_auto() -> Result<Self, String> {
+        let env_override = std::env::var(CONNECT_ENV_VAR)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let active_port_files = default_active_port_files();
+        Self::discover_from(
+            env_override.as_deref(),
+            &active_port_files,
+            &AUTO_PROBE_PORTS,
+            AUTO_PROBE_TIMEOUT,
+        )
+    }
+
+    /// Testable core of `discover_auto`.
+    fn discover_from(
+        env_override: Option<&str>,
+        active_port_files: &[PathBuf],
+        probe_ports: &[u16],
+        probe_timeout: Duration,
+    ) -> Result<Self, String> {
+        if let Some(raw) = env_override {
+            let endpoint = Self::parse(raw).map_err(|err| {
+                format!("`{CONNECT_ENV_VAR}` is not a valid loopback DevTools endpoint: {err}")
+            })?;
+            return Ok(endpoint);
+        }
+
+        let mut seen_ports = Vec::new();
+        for path in active_port_files {
+            if let Some(port) = read_active_port_file(path)
+                && !seen_ports.contains(&port)
+            {
+                seen_ports.push(port);
+                let candidate = Self {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                };
+                if candidate.websocket_url(probe_timeout).is_ok() {
+                    return Ok(candidate);
+                }
+            }
+        }
+        for &port in probe_ports {
+            if port == 0 || seen_ports.contains(&port) {
+                continue;
+            }
+            seen_ports.push(port);
+            let candidate = Self {
+                host: "127.0.0.1".to_string(),
+                port,
+            };
+            if candidate.websocket_url(probe_timeout).is_ok() {
+                return Ok(candidate);
+            }
+        }
+
+        Err(format!(
+            "could not auto-discover a local Chrome/Edge DevTools endpoint (checked `{CONNECT_ENV_VAR}`, Chrome/Edge `DevToolsActivePort`, and loopback ports {}); start Chrome or Edge with `--remote-debugging-port=9222`, or set `{CONNECT_ENV_VAR}=http://127.0.0.1:<port>`",
+            probe_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
     /// Reads `/json/version` and returns its `webSocketDebuggerUrl`.
     pub fn websocket_url(&self, timeout: Duration) -> Result<String, String> {
         let (status, body) = self
@@ -93,11 +196,7 @@ impl Endpoint {
             .ok_or_else(|| {
                 self.explain("the answer has no `webSocketDebuggerUrl`; it is not a Chrome DevTools endpoint")
             })?;
-        if !url.starts_with("ws://") {
-            return Err(self.explain(format!(
-                "the answer names `{url}`, which is not a ws:// DevTools URL"
-            )));
-        }
+        validate_loopback_ws_url(url).map_err(|detail| self.explain(detail))?;
         Ok(url.to_string())
     }
 
@@ -231,6 +330,76 @@ fn content_length(header: &str) -> Option<usize> {
     })
 }
 
+/// Reads line 1 of a Chrome/Edge `DevToolsActivePort` file as a non-zero TCP port.
+fn read_active_port_file(path: &Path) -> Option<u16> {
+    let text = fs::read_to_string(path).ok()?;
+    let port: u16 = text.lines().next()?.trim().parse().ok()?;
+    (port > 0).then_some(port)
+}
+
+/// Well-known Chrome/Edge/Chromium `DevToolsActivePort` file locations for the current OS.
+fn default_active_port_files() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(windows)]
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let root = PathBuf::from(local_app_data);
+        paths.push(root.join("Google/Chrome/User Data/DevToolsActivePort"));
+        paths.push(root.join("Microsoft/Edge/User Data/DevToolsActivePort"));
+        paths.push(root.join("Chromium/User Data/DevToolsActivePort"));
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME") {
+        let root = PathBuf::from(home).join("Library/Application Support");
+        paths.push(root.join("Google/Chrome/DevToolsActivePort"));
+        paths.push(root.join("Microsoft Edge/DevToolsActivePort"));
+        paths.push(root.join("Chromium/DevToolsActivePort"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Ok(home) = std::env::var("HOME") {
+        let root = PathBuf::from(home).join(".config");
+        paths.push(root.join("google-chrome/DevToolsActivePort"));
+        paths.push(root.join("microsoft-edge/DevToolsActivePort"));
+        paths.push(root.join("chromium/DevToolsActivePort"));
+    }
+    paths
+}
+
+/// Validates that a Chrome DevTools WebSocket URL uses `ws://` on a loopback host.
+pub(super) fn validate_loopback_ws_url(url: &str) -> Result<(), String> {
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!("the answer names invalid DevTools URL `{url}`"));
+    }
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return Err(format!(
+            "the answer names `{url}`, which is not a ws:// DevTools URL"
+        ));
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Err(format!(
+            "the answer names `{url}`, which is missing a DevTools WebSocket path"
+        ));
+    };
+    if path.is_empty() {
+        return Err(format!(
+            "the answer names `{url}`, which is missing a DevTools WebSocket path"
+        ));
+    }
+    let Some((host, port_str)) = authority.rsplit_once(':') else {
+        return Err(format!("the answer names `{url}`, which is missing a port"));
+    };
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return Err(format!(
+            "the answer names `{url}`, which must use a loopback host"
+        ));
+    }
+    if !port_str.parse::<u16>().is_ok_and(|port| port > 0) {
+        return Err(format!(
+            "the answer names `{url}`, which has an invalid port"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +456,112 @@ mod tests {
             Some(42)
         );
         assert_eq!(content_length("HTTP/1.1 404 Not Found\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn connect_target_accepts_auto_and_explicit_loopback() {
+        assert_eq!(ConnectTarget::parse("auto").unwrap(), ConnectTarget::Auto);
+        assert_eq!(
+            ConnectTarget::parse("  AUTO ").unwrap(),
+            ConnectTarget::Auto
+        );
+        let explicit = ConnectTarget::parse("http://127.0.0.1:9222").unwrap();
+        assert_eq!(
+            explicit,
+            ConnectTarget::Explicit(Endpoint::parse("http://127.0.0.1:9222").unwrap())
+        );
+        assert!(ConnectTarget::parse("http://192.168.1.2:9222").is_err());
+    }
+
+    #[test]
+    fn discover_from_uses_env_override_and_refuses_non_loopback() {
+        let ep = Endpoint::discover_from(
+            Some("http://127.0.0.1:9333"),
+            &[],
+            &[],
+            Duration::from_millis(100),
+        )
+        .expect("loopback override must succeed");
+        assert_eq!(ep.name(), "http://127.0.0.1:9333");
+
+        let err = Endpoint::discover_from(
+            Some("http://10.0.0.5:9222"),
+            &[],
+            &[],
+            Duration::from_millis(100),
+        )
+        .expect_err("non-loopback override must fail");
+        assert!(err.contains(CONNECT_ENV_VAR), "{err}");
+    }
+
+    #[test]
+    fn discover_from_reads_active_port_file_and_probes_json_version() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 512];
+                let _ = stream.read(&mut buf);
+                let body = format!(
+                    r#"{{"webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/test"}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let active_port = std::env::temp_dir().join(format!(
+            "da-test-devtools-active-port-{}-{port}",
+            std::process::id()
+        ));
+        fs::write(&active_port, format!("{port}\n/devtools/browser/test\n")).unwrap();
+
+        let discovered = Endpoint::discover_from(
+            None,
+            std::slice::from_ref(&active_port),
+            &[],
+            Duration::from_secs(2),
+        )
+        .expect("must discover loopback endpoint from DevToolsActivePort");
+        let _ = fs::remove_file(&active_port);
+        let _ = server.join();
+        assert_eq!(discovered.port(), port);
+        assert_eq!(discovered.name(), format!("http://127.0.0.1:{port}"));
+    }
+
+    #[test]
+    fn discover_from_reports_actionable_error_when_nothing_answers() {
+        let err = Endpoint::discover_from(None, &[], &[], Duration::from_millis(50))
+            .expect_err("must error when no endpoint is discovered");
+        assert!(err.contains("--remote-debugging-port=9222"), "{err}");
+        assert!(err.contains(CONNECT_ENV_VAR), "{err}");
+    }
+
+    #[test]
+    fn websocket_url_rejects_non_loopback_ws_target() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 512];
+                let _ = stream.read(&mut buf);
+                let body =
+                    r#"{"webSocketDebuggerUrl":"ws://192.0.2.1:9222/devtools/browser/evil"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let err = endpoint
+            .websocket_url(Duration::from_secs(2))
+            .expect_err("non-loopback webSocketDebuggerUrl must be rejected");
+        let _ = server.join();
+        assert!(err.contains("loopback"), "{err}");
     }
 }

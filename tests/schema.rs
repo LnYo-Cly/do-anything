@@ -1721,6 +1721,46 @@ fn fs_watch_schema_agrees_with_validate() {
     }
 }
 
+#[cfg(feature = "browser")]
+#[test]
+fn browser_open_allowed_origins_and_connect_auto_match_schema_and_validate() {
+    let validator = validator(schema());
+    let valid = json!({
+        "name": "Authenticated browser attach with origin allowlist",
+        "steps": [{
+            "browser.open": {
+                "connect": "auto",
+                "allowed_origins": ["https://app.example.com", "http://127.0.0.1:8080"],
+                "url": "https://app.example.com/dashboard"
+            }
+        }]
+    });
+    assert!(
+        validator.is_valid(&valid),
+        "schema must accept connect: auto + allowed_origins"
+    );
+
+    for bad in [
+        json!({
+            "name": "empty allowlist",
+            "steps": [{"browser.open": {"url": "http://127.0.0.1/", "allowed_origins": []}}]
+        }),
+        json!({
+            "name": "path in allowlist",
+            "steps": [{"browser.open": {"url": "http://127.0.0.1/", "allowed_origins": ["https://app.example.com/orders"]}}]
+        }),
+        json!({
+            "name": "ftp scheme in allowlist",
+            "steps": [{"browser.open": {"url": "http://127.0.0.1/", "allowed_origins": ["ftp://app.example.com"]}}]
+        }),
+    ] {
+        assert!(
+            !validator.is_valid(&bad),
+            "schema must reject invalid allowed_origins: {bad}"
+        );
+    }
+}
+
 /// Every file directly inside `dir` with the given extension, sorted by path.
 #[cfg(feature = "cli")]
 fn files_with_extension(dir: PathBuf, extension: &str) -> Vec<PathBuf> {

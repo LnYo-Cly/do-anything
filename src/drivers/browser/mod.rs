@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 use self::cdp::{
     CdpError, Connection, Deadline, DialogPolicy, DialogWatch, OpenedDialog, RemoteResult,
 };
-use self::connect::Endpoint;
+use self::connect::{ConnectTarget, Endpoint};
 use self::launch::Launched;
 use crate::core::paths;
 use crate::core::registry::{
@@ -156,6 +156,7 @@ fn open_step() -> Result<StepDefinition, String> {
     string_property(&mut definition.args_schema, "profile");
     string_property(&mut definition.args_schema, "storage_state");
     string_property(&mut definition.args_schema, "testid_attribute");
+    apply_allowed_origins_schema(&mut definition.args_schema);
     apply_dialog_schema(&mut definition.args_schema);
     if let Value::Object(entries) = &mut definition.args_schema {
         entries.insert(
@@ -650,6 +651,33 @@ fn within_schema(step_name: &str) -> Value {
 }
 
 /// Replaces `dialog` with a self-contained schema that rejects `null`.
+fn apply_allowed_origins_schema(schema: &mut Value) {
+    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let description = properties
+        .get("allowed_origins")
+        .and_then(|v| v.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or(
+            "Optional allowlist of origins (`http://<host>[:<port>]` or `https://<host>[:<port>]`) this browser session may open, redirect to, or switch tabs into.",
+        )
+        .to_string();
+    properties.insert(
+        "allowed_origins".to_string(),
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^https?://[^/?#@\\s]+/?$",
+            },
+            "description": description,
+        }),
+    );
+}
+
 fn apply_dialog_schema(schema: &mut Value) {
     if let Value::Object(entries) = schema {
         entries.remove("$defs");
@@ -934,11 +962,19 @@ struct OpenArgs {
     #[schemars(extend("minLength" = 1))]
     url: String,
     /// Loopback DevTools endpoint of a browser the user already runs, for
-    /// example `http://127.0.0.1:9222`. The case opens a new tab there and
-    /// closes only that tab. Cannot be combined with `headless`, `width`,
-    /// `height`, or `profile`.
+    /// example `http://127.0.0.1:9222`, or `"auto"` to discover a local
+    /// Chrome/Edge debug port (`DA_BROWSER_CONNECT`, `DevToolsActivePort`, or
+    /// loopback ports 9222/9229). The case opens a new tab there and closes
+    /// only that tab. Cannot be combined with `headless`, `width`, `height`,
+    /// `profile`, or `storage_state`.
     #[serde(default)]
     connect: Option<String>,
+    /// Optional allowlist of origins (`http://<host>[:<port>]` or
+    /// `https://<host>[:<port>]`) this browser session may open, redirect to,
+    /// or switch tabs into. Recommended when attaching to an authenticated
+    /// local browser (`connect`).
+    #[serde(default)]
+    allowed_origins: Option<Vec<String>>,
     /// Named persistent browser profile directory under `.da/profiles/<name>`,
     /// preserved across runs. Cannot be combined with `connect`.
     #[schemars(extend("minLength" = 1, "pattern" = "^[A-Za-z0-9_-]+$"))]
@@ -3185,6 +3221,9 @@ struct BrowserSession {
     /// Origins granted clipboard access during this session so `da session` can
     /// restore permissions and focus emulation across detached CLI commands.
     clipboard_origins: Vec<String>,
+    /// Canonical origin allowlist (`http://host[:port]` / `https://host[:port]`)
+    /// enforced on navigation, redirects, and tab switches when non-empty.
+    allowed_origins: Vec<String>,
 }
 
 /// One element resolved from a target, held as a CDP DOM `objectId`.
@@ -3192,10 +3231,17 @@ struct Located(String);
 
 impl BrowserSession {
     /// Creates the session described by `browser.open`.
-    fn open(args: &OpenArgs, connect: Option<&Endpoint>, detached: bool) -> Result<Self, String> {
+    fn open(
+        args: &OpenArgs,
+        connect: Option<&Endpoint>,
+        allowed_origins: Vec<String>,
+        detached: bool,
+    ) -> Result<Self, String> {
         match connect {
-            Some(endpoint) => Self::connect_to(endpoint, args.testid_attribute.as_deref()),
-            None => Self::launch(args, detached),
+            Some(endpoint) => {
+                Self::connect_to(endpoint, args.testid_attribute.as_deref(), allowed_origins)
+            }
+            None => Self::launch(args, allowed_origins, detached),
         }
     }
 
@@ -3205,6 +3251,7 @@ impl BrowserSession {
         let defaults = OpenArgs {
             url: "about:blank".to_string(),
             connect: None,
+            allowed_origins: None,
             profile: None,
             storage_state: None,
             headless: default_headless(),
@@ -3214,11 +3261,15 @@ impl BrowserSession {
             testid_attribute: None,
             dialog: None,
         };
-        Self::launch(&defaults, detached)
+        Self::launch(&defaults, Vec::new(), detached)
     }
 
     /// Starts the browser described by `browser.open` and attaches its page.
-    fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
+    fn launch(
+        args: &OpenArgs,
+        allowed_origins: Vec<String>,
+        detached: bool,
+    ) -> Result<Self, String> {
         let deadline = Deadline::after(launch_timeout());
         let (browser, (connection, page, tabs)) = launch_browser_with_retry(
             deadline,
@@ -3276,11 +3327,16 @@ impl BrowserSession {
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
+            allowed_origins,
         })
     }
 
     /// Attaches a page in a browser the user already runs.
-    fn connect_to(endpoint: &Endpoint, testid_attribute: Option<&str>) -> Result<Self, String> {
+    fn connect_to(
+        endpoint: &Endpoint,
+        testid_attribute: Option<&str>,
+        allowed_origins: Vec<String>,
+    ) -> Result<Self, String> {
         let websocket_url = endpoint.websocket_url(connect::CONNECT_TIMEOUT)?;
         let mut connection = Connection::connect(&websocket_url, Deadline::after(launch_timeout()))
             .map_err(|error| {
@@ -3318,6 +3374,7 @@ impl BrowserSession {
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
+            allowed_origins,
         })
     }
 
@@ -3414,6 +3471,7 @@ impl BrowserSession {
             snapshot_pending: false,
             clipboard_focus_page,
             clipboard_origins: parsed.clipboard_origins,
+            allowed_origins: parsed.allowed_origins,
         })
     }
 
@@ -3445,6 +3503,7 @@ impl BrowserSession {
         &self,
         args: &OpenArgs,
         connect: Option<&Endpoint>,
+        allowed_origins: Option<&[String]>,
     ) -> Result<(), StepError> {
         let mut changes = Vec::new();
         let wanted_connect = connect.map(Endpoint::name);
@@ -3454,6 +3513,11 @@ impl BrowserSession {
                 self.connect.as_deref().unwrap_or("none"),
                 wanted_connect.as_deref().unwrap_or("none")
             ));
+        }
+        if let Some(wanted_origins) = allowed_origins
+            && wanted_origins != self.allowed_origins.as_slice()
+        {
+            changes.push("`allowed_origins`".to_string());
         }
         if args.profile.as_deref() != self.profile.as_deref() {
             changes.push(format!(
@@ -3512,6 +3576,79 @@ impl BrowserSession {
         self.network.take_step(dropped_baseline)
     }
 
+    /// Refuses navigation or tab activation outside `allowed_origins` when configured.
+    fn ensure_origin_allowed(&self, url: &str) -> Result<(), StepError> {
+        check_origin_against_allowlist(url, &self.allowed_origins)
+    }
+
+    /// Verifies that the active tab's live `location.href` is within `allowed_origins`.
+    ///
+    /// Fails closed (neutralizing any disallowed page to `about:blank` and clearing
+    /// `snapshot_pending`) if the page has drifted onto a disallowed origin via
+    /// redirect, link click, or script navigation, or if the live URL cannot be read.
+    fn ensure_current_page_origin_allowed(&mut self) -> Result<(), StepError> {
+        let mut dialog = DialogContext::fail_fast();
+        self.ensure_current_page_origin_allowed_with_dialog(&mut dialog)
+    }
+
+    /// Same as [`Self::ensure_current_page_origin_allowed`], honoring the active step's
+    /// JavaScript dialog policy so expected dialogs are not disrupted while verifying origin.
+    fn ensure_current_page_origin_allowed_with_dialog(
+        &mut self,
+        dialog: &mut DialogContext,
+    ) -> Result<(), StepError> {
+        if self.allowed_origins.is_empty() {
+            return Ok(());
+        }
+        let scope = self.scope();
+        let deadline = Deadline::after(TAB_QUERY_TIMEOUT);
+        let connection = self.connection_mut()?;
+        let current = page_evaluate(connection, &scope, "location.href", deadline, dialog)
+            .map_err(|failure| {
+                self.snapshot_pending = false;
+                failure
+                    .environment("could not verify the current page URL against `allowed_origins`")
+            })?
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if let Err(err) = self.ensure_origin_allowed(&current) {
+            if current == "about:blank" {
+                self.snapshot_pending = false;
+                self.refs = snapshot::RefStore::default();
+                self.step_metadata = None;
+            } else {
+                self.neutralize_disallowed_page();
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Leaves a disallowed destination by parking the active tab on `about:blank`
+    /// and clearing cached refs / pending snapshots so no disallowed DOM leaks.
+    fn neutralize_disallowed_page(&mut self) {
+        self.snapshot_pending = false;
+        self.refs = snapshot::RefStore::default();
+        self.step_metadata = None;
+        let scope = self.scope();
+        let deadline = Deadline::after(TAB_DETACH_TIMEOUT);
+        let mut dialog = DialogContext::fail_fast();
+        if let Some(connection) = self.connection.as_mut() {
+            let _ = page_call(
+                connection,
+                &scope,
+                "Page.navigate",
+                json!({ "url": "about:blank" }),
+                deadline,
+                &mut dialog,
+            );
+            let _ = connection.poll_messages();
+        }
+        let current_target = self.tabs.current().to_string();
+        self.tabs.set_current(&current_target, "about:blank", "");
+    }
+
     /// Navigates the session's page and returns its current URL and title.
     fn navigate(
         &mut self,
@@ -3519,6 +3656,7 @@ impl BrowserSession {
         timeout: Duration,
         dialog: &mut DialogContext,
     ) -> Result<(String, String), StepError> {
+        self.ensure_origin_allowed(url)?;
         let scope = self.scope();
         let deadline = Deadline::after(timeout);
         // A preload script can only be retired after the page that runs it
@@ -3591,6 +3729,10 @@ impl BrowserSession {
         };
         if let Some(origin) = loaded_origin {
             self.cleanup_pending_local_storage_scripts(&origin, deadline, dialog);
+        }
+        if let Err(err) = self.ensure_origin_allowed(&current) {
+            self.neutralize_disallowed_page();
+            return Err(err);
         }
         // The page is what `browser.switch_tab` reports for this tab and what a
         // `url_contains` or `title_contains` filter matches, so it is recorded
@@ -3689,7 +3831,17 @@ impl BrowserSession {
         // Switching to the tab the session already drives changes nothing; it
         // must not detach and re-attach the same page.
         if target_id == self.tabs.current() {
+            self.ensure_current_page_origin_allowed()?;
             return Ok(self.tabs.info(index).unwrap_or_default());
+        }
+        let tracked = self.tabs.info(index).unwrap_or_default();
+        if !self.allowed_origins.is_empty()
+            && !tracked.0.is_empty()
+            && tracked.0 != "about:blank"
+            && let Err(err) = self.ensure_origin_allowed(&tracked.0)
+        {
+            self.snapshot_pending = false;
+            return Err(err);
         }
         let connection = self.connection_mut()?;
         let page = attach_existing_target(
@@ -3700,8 +3852,21 @@ impl BrowserSession {
             ATTACH_ENABLE_TIMEOUT,
         )
         .map_err(|failure| StepError::Execution(failure.message))?;
-        let tracked = self.tabs.info(index).unwrap_or_default();
         let (url, title) = self.read_ready_tab(&target_id, &page, tracked, deadline);
+        if let Err(err) = self.ensure_origin_allowed(&url) {
+            self.snapshot_pending = false;
+            if let Some(connection) = self.connection.as_mut() {
+                let _ = connection.call(
+                    "Target.detachFromTarget",
+                    json!({ "sessionId": page }),
+                    None,
+                    deadline.capped(TAB_DETACH_TIMEOUT),
+                );
+                let _ = connection.poll_messages();
+                self.tabs.absorb(connection);
+            }
+            return Err(err);
+        }
         let previous = std::mem::replace(&mut self.page, page);
         self.tabs.set_current(&target_id, &url, &title);
         // The observer of the tab being left keeps nothing: `browser.network`
@@ -4071,6 +4236,7 @@ impl BrowserSession {
         let target_desc = format!("ref `{ref_id}`");
         let object_id = self.resolve_and_synthesize_ref(ref_id, deadline, dialog)?;
         loop {
+            self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             match self.call_function_poll(
                 &target_desc,
                 &object_id,
@@ -4079,7 +4245,10 @@ impl BrowserSession {
                 deadline,
                 dialog,
             ) {
-                Ok(Value::Bool(true)) => return Ok(Located(object_id)),
+                Ok(Value::Bool(true)) => {
+                    self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+                    return Ok(Located(object_id));
+                }
                 Ok(_) => {
                     if deadline.passed() {
                         return Err(pending_timeout_error(
@@ -4141,6 +4310,7 @@ impl BrowserSession {
         let mut previous_rect: Option<ElementRect> = None;
         let mut last_reason = PendingReason::Hidden;
         loop {
+            self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             match self.inspect_actionable_once(
                 target_desc,
                 object_id.clone(),
@@ -4148,7 +4318,10 @@ impl BrowserSession {
                 deadline,
                 dialog,
             ) {
-                Ok(Ok(ready)) => return Ok(ready),
+                Ok(Ok(ready)) => {
+                    self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+                    return Ok(ready);
+                }
                 Ok(Err(reason)) => {
                     last_reason = reason;
                     if deadline.passed() {
@@ -4212,6 +4385,7 @@ impl BrowserSession {
         let target_desc = target.describe_with(&self.testid_attribute);
         let mut last_pending = (target_desc.clone(), PendingReason::Missing);
         loop {
+            self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             // Every terminal return names the same pending reason, including the
             // timeout that ends the last poll, so a closed shadow root is
             // explained however the wait happened to expire.
@@ -4230,7 +4404,10 @@ impl BrowserSession {
             match poll {
                 ResolvePoll::Found(object_id) => match check(self, &target_desc, object_id, dialog)
                 {
-                    Ok(Ok(ready)) => return Ok(ready),
+                    Ok(Ok(ready)) => {
+                        self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+                        return Ok(ready);
+                    }
                     Ok(Err(reason)) => {
                         last_pending = (target_desc.clone(), reason);
                     }
@@ -4816,6 +4993,7 @@ impl BrowserSession {
         deadline: Deadline,
         dialog: &mut DialogContext,
     ) -> Result<Value, StepError> {
+        self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
         let scope = self.scope();
         let function = format!("function () {{ var el = this; {body} }}");
         let connection = self.connection_mut()?;
@@ -4833,6 +5011,7 @@ impl BrowserSession {
         deadline: Deadline,
         dialog: &mut DialogContext,
     ) -> Result<(), StepError> {
+        self.ensure_current_page_origin_allowed_with_dialog(dialog)?;
         let scope = self.scope();
         let connection = self.connection_mut()?;
         page_call(connection, &scope, method, params, deadline, dialog)
@@ -6325,6 +6504,9 @@ struct DetachedBrowserHandle {
     /// Origins granted clipboard permissions in this session, re-applied across `da session` reattach.
     #[serde(default)]
     clipboard_origins: Vec<String>,
+    /// Canonical origin allowlist persisted across detached `da session` commands.
+    #[serde(default)]
+    allowed_origins: Vec<String>,
 }
 
 /// The tabs a handle lists, as one entry per owned target.
@@ -6464,42 +6646,9 @@ fn validate_launched_ws_url(url: &str, port: u16) -> Result<(), String> {
 }
 
 fn validate_connected_ws_url(url: &str) -> Result<(), String> {
-    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
-        return Err(format!(
-            "connected browser session handle has invalid `websocket_url` `{url}`"
-        ));
-    }
-    let Some(rest) = url.strip_prefix("ws://") else {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` must use `ws://`"
-        ));
-    };
-    let Some((authority, path)) = rest.split_once('/') else {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` is missing a path"
-        ));
-    };
-    if path.is_empty() {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` is missing a path"
-        ));
-    }
-    let Some((host, port_str)) = authority.rsplit_once(':') else {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` is missing a port"
-        ));
-    };
-    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` must use a loopback host"
-        ));
-    }
-    if !port_str.parse::<u16>().is_ok_and(|port| port > 0) {
-        return Err(format!(
-            "connected browser session handle `websocket_url` `{url}` has an invalid port"
-        ));
-    }
-    Ok(())
+    connect::validate_loopback_ws_url(url).map_err(|detail| {
+        format!("connected browser session handle `websocket_url` invalid: {detail}")
+    })
 }
 
 #[allow(
@@ -6692,6 +6841,7 @@ impl Session for BrowserSession {
             pending_local_storage_scripts: self.pending_local_storage_scripts.clone(),
             tabs: self.tabs.ids(),
             clipboard_origins: self.clipboard_origins.clone(),
+            allowed_origins: self.allowed_origins.clone(),
         };
         serde_json::to_value(handle)
             .map(Some)
@@ -6720,6 +6870,8 @@ impl Session for BrowserSession {
         max_nodes: Option<usize>,
     ) -> Result<Option<Value>, String> {
         self.ensure_target_ready().map_err(step_error_text)?;
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let scope = self.scope();
         let existing_refs = self.refs.clone();
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
@@ -6756,6 +6908,8 @@ impl Session for BrowserSession {
     }
 
     fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
         let mut dialog = DialogContext::fail_fast();
         let clip = self
@@ -6770,6 +6924,8 @@ impl Session for BrowserSession {
     }
 
     fn synthesize_ref(&mut self, ref_id: &str) -> Result<Option<SynthesizedTarget>, String> {
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
         let mut dialog = DialogContext::fail_fast();
         let scope = self.scope();
@@ -6795,6 +6951,8 @@ impl Session for BrowserSession {
     }
 
     fn synthesize_at_point(&mut self, x: f64, y: f64) -> Result<Option<SynthesizedTarget>, String> {
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(SCREENSHOT_TIMEOUT);
         let mut dialog = DialogContext::fail_fast();
         let synth =
@@ -6818,6 +6976,8 @@ impl Session for BrowserSession {
                 "the browser session is already closed; no evidence was collected".to_string(),
             );
         }
+        self.ensure_current_page_origin_allowed()
+            .map_err(step_error_text)?;
         let deadline = Deadline::after(EVIDENCE_TIMEOUT);
         let mut files = Vec::new();
         let mut errors = Vec::new();
@@ -7186,7 +7346,10 @@ fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
                 ));
             }
         }
-        Endpoint::parse(connect)?;
+        ConnectTarget::parse(connect)?;
+    }
+    if let Some(origins) = &args.allowed_origins {
+        normalize_allowed_origins(origins)?;
     }
     if let Some(profile) = &args.profile {
         launch::validate_profile_name(profile)?;
@@ -7206,6 +7369,123 @@ fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
         return Err("invalid arguments: `height` must be at least 1".to_string());
     }
     check_timeout(args.timeout_ms)
+}
+
+/// Normalizes one allowed origin (`http://<host>[:<port>]` or `https://<host>[:<port>]`).
+fn normalize_allowed_origin(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || raw.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "invalid arguments: `allowed_origins` entry `{raw}` must be an `http://` or `https://` origin without whitespace"
+        ));
+    }
+    let stripped = raw.strip_suffix('/').unwrap_or(raw);
+    let (scheme, authority) = if let Some(rest) = stripped.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = stripped.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        return Err(format!(
+            "invalid arguments: `allowed_origins` entry `{raw}` must start with `http://` or `https://`"
+        ));
+    };
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|ch| matches!(ch, '/' | '?' | '#' | '@'))
+    {
+        return Err(format!(
+            "invalid arguments: `allowed_origins` entry `{raw}` must be an origin without path, query, fragment, or userinfo"
+        ));
+    }
+    let (host, port) = split_origin_authority(authority).ok_or_else(|| {
+        format!("invalid arguments: `allowed_origins` entry `{raw}` has an invalid host or port")
+    })?;
+    let host_lower = host.to_ascii_lowercase();
+    match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => {
+            Ok(format!("{scheme}://{host_lower}"))
+        }
+        (_, Some(p)) => Ok(format!("{scheme}://{host_lower}:{p}")),
+    }
+}
+
+fn normalize_allowed_origins(origins: &[String]) -> Result<Vec<String>, String> {
+    if origins.is_empty() {
+        return Err(
+            "invalid arguments: `allowed_origins` must contain at least one origin".to_string(),
+        );
+    }
+    let mut out = Vec::with_capacity(origins.len());
+    for entry in origins {
+        let normalized = normalize_allowed_origin(entry)?;
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
+/// Extracts a canonical `scheme://host[:port]` origin from an `http://` or `https://` URL.
+fn url_origin(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        ("https", trimmed.strip_prefix("https://")?)
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let (host, port) = split_origin_authority(authority)?;
+    let host_lower = host.to_ascii_lowercase();
+    match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => {
+            Some(format!("{scheme}://{host_lower}"))
+        }
+        (_, Some(p)) => Some(format!("{scheme}://{host_lower}:{p}")),
+    }
+}
+
+fn split_origin_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let host = &authority[..=close];
+        let rest = &authority[close + 1..];
+        if rest.is_empty() {
+            return Some((host, None));
+        }
+        let port_str = rest.strip_prefix(':')?;
+        let port: u16 = port_str.parse().ok()?;
+        return (port > 0).then_some((host, Some(port)));
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        return (port > 0).then_some((host, Some(port)));
+    }
+    (!authority.is_empty()).then_some((authority, None))
+}
+
+fn check_origin_against_allowlist(url: &str, allowed_origins: &[String]) -> Result<(), StepError> {
+    if allowed_origins.is_empty() {
+        return Ok(());
+    }
+    let origin = url_origin(url);
+    if origin
+        .as_deref()
+        .is_some_and(|o| allowed_origins.iter().any(|allowed| allowed == o))
+    {
+        return Ok(());
+    }
+    let actual = origin.as_deref().unwrap_or("<non-http(s) origin>");
+    Err(StepError::Execution(format!(
+        "origin `{actual}` for `{url}` is not permitted by `allowed_origins` ({}); add the origin explicitly to `browser.open.allowed_origins` if navigation there is intended",
+        allowed_origins.join(", ")
+    )))
 }
 
 fn validate_open(raw: &Value) -> Result<(), String> {
@@ -8059,6 +8339,7 @@ fn raw_session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError
 fn session(sessions: &mut Sessions) -> Result<&mut BrowserSession, StepError> {
     let browser = raw_session(sessions)?;
     browser.ensure_target_ready()?;
+    browser.ensure_current_page_origin_allowed()?;
     Ok(browser)
 }
 
@@ -8066,12 +8347,21 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let raw = args;
     let args: OpenArgs = parse(raw)?;
     check_open(raw, &args).map_err(StepError::InvalidArguments)?;
-    let connect = args
+    let connect_target = args
         .connect
         .as_deref()
-        .map(Endpoint::parse)
+        .map(ConnectTarget::parse)
         .transpose()
         .map_err(StepError::InvalidArguments)?;
+    let normalized_origins = args
+        .allowed_origins
+        .as_deref()
+        .map(normalize_allowed_origins)
+        .transpose()
+        .map_err(StepError::InvalidArguments)?;
+    if let Some(origins) = &normalized_origins {
+        check_origin_against_allowlist(&args.url, origins)?;
+    }
     // The state file is read before the browser starts, so a missing or
     // malformed file fails closed without leaving a browser behind.
     let storage_state = match args.storage_state.as_deref() {
@@ -8081,18 +8371,27 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         }
         None => None,
     };
-    let existing = sessions
+    let existing_connect = sessions
         .get::<BrowserSession>(SESSION_KIND)
         .map_err(StepError::Execution)?
-        .is_some();
+        .map(|s| s.connect.clone());
+    let existing = existing_connect.is_some();
+    let connect = match (&connect_target, &existing_connect) {
+        (Some(ConnectTarget::Auto), Some(Some(already))) => {
+            Some(Endpoint::parse(already).map_err(StepError::Environment)?)
+        }
+        (Some(target), _) => Some(target.resolve().map_err(StepError::Environment)?),
+        (None, _) => None,
+    };
     let interactive = sessions.is_interactive();
+    let initial_origins = normalized_origins.clone().unwrap_or_default();
     let session = sessions
         .get_or_create(SESSION_KIND, || {
-            BrowserSession::open(&args, connect.as_ref(), interactive)
+            BrowserSession::open(&args, connect.as_ref(), initial_origins, interactive)
         })
         .map_err(StepError::Environment)?;
     if existing {
-        session.ensure_same_options(&args, connect.as_ref())?;
+        session.ensure_same_options(&args, connect.as_ref(), normalized_origins.as_deref())?;
         session.ensure_target_ready()?;
         if let Some(attribute) = &args.testid_attribute {
             session.testid_attribute = attribute.clone();
@@ -8211,6 +8510,7 @@ fn click_actionable(
         Some(text) if !text.trim().is_empty() => json!({ "text": text.trim() }),
         _ => json!({}),
     };
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(result, dialog))
 }
 
@@ -8298,6 +8598,7 @@ fn type_actionable(
         deadline,
         dialog,
     )?;
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(json!({}), dialog))
 }
 
@@ -8479,6 +8780,7 @@ fn upload_to_located(
             names.len()
         )));
     }
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(json!({ "files": names.len(), "names": names }))
 }
 
@@ -8625,6 +8927,7 @@ fn click_at(
         }));
     }
     dispatch_pointer_click(session, at, deadline, dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     session.last_target_bounds = Some(bounds_from_point(at.x, at.y, width, height));
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
@@ -8657,6 +8960,7 @@ fn type_at(
         deadline,
         dialog,
     )?;
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     session.last_target_bounds = Some(bounds_from_point(at.x, at.y, width, height));
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
@@ -8767,6 +9071,7 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
     let session = session(sessions)?;
     let scope = session.scope();
     for params in [key.down_params(), key.up_params()] {
+        session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
         let connection = session.connection_mut()?;
         page_call(
             connection,
@@ -8789,6 +9094,7 @@ fn run_press(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             failure.step(&prefix, timeout_or_execution)
         })?;
     }
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     Ok(attach_dialog(json!({}), &mut dialog))
 }
 
@@ -8810,7 +9116,16 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         let connection = session.connection_mut()?;
         let url = page_evaluate(connection, &scope, "location.href", deadline, &mut dialog)
             .map_err(|failure| failure.environment("could not read the current URL"))?;
-        return Ok(json!({ "url": url.as_str().unwrap_or_default() }));
+        let url_text = url.as_str().unwrap_or_default();
+        if let Err(err) = session.ensure_origin_allowed(url_text) {
+            if url_text == "about:blank" {
+                session.snapshot_pending = false;
+            } else {
+                session.neutralize_disallowed_page();
+            }
+            return Err(err);
+        }
+        return Ok(json!({ "url": url_text }));
     }
     let args: WaitArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
@@ -8828,10 +9143,16 @@ fn run_wait(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         }
         WaitTarget::Url(wanted) => wait_for_url(session, &wanted, deadline, &mut dialog)?,
     };
-    Ok(attach_dialog(
-        json!({ "url": url.as_str().unwrap_or_default() }),
-        &mut dialog,
-    ))
+    let url_text = url.as_str().unwrap_or_default();
+    if let Err(err) = session.ensure_origin_allowed(url_text) {
+        if url_text == "about:blank" {
+            session.snapshot_pending = false;
+        } else {
+            session.neutralize_disallowed_page();
+        }
+        return Err(err);
+    }
+    Ok(attach_dialog(json!({ "url": url_text }), &mut dialog))
 }
 
 /// Waits until the page's URL contains `wanted`.
@@ -8846,7 +9167,16 @@ fn wait_for_url(
         let connection = session.connection_mut()?;
         match page_evaluate(connection, &scope, "location.href", deadline, dialog) {
             Ok(value) => {
-                if value.as_str().is_some_and(|url| url.contains(wanted)) {
+                let url_text = value.as_str().unwrap_or_default();
+                if let Err(err) = session.ensure_origin_allowed(url_text) {
+                    if url_text == "about:blank" {
+                        session.snapshot_pending = false;
+                    } else {
+                        session.neutralize_disallowed_page();
+                    }
+                    return Err(err);
+                }
+                if url_text.contains(wanted) {
                     return Ok(value);
                 }
                 if deadline.passed() {
@@ -8880,6 +9210,7 @@ fn run_screenshot(args: &Value, sessions: &mut Sessions) -> Result<Value, StepEr
     let path = resolve_path(&args.path, sessions);
     let session = session(sessions)?;
     let png = session.capture_masked_png(Deadline::after(SCREENSHOT_TIMEOUT))?;
+    session.ensure_current_page_origin_allowed()?;
     write_png(&path, &png)?;
     Ok(json!({
         "path": paths::display(&path),
@@ -9003,6 +9334,7 @@ fn read_located(
         )?;
         result["value"] = value;
     }
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(result)
 }
 
@@ -9074,6 +9406,24 @@ fn run_set_cookies(args: &Value, sessions: &mut Sessions) -> Result<Value, StepE
     let session = sessions
         .get_or_create(SESSION_KIND, || BrowserSession::open_default(interactive))
         .map_err(StepError::Environment)?;
+
+    if !session.allowed_origins.is_empty() {
+        session.ensure_current_page_origin_allowed()?;
+        if let Some(cookies) = &args.cookies {
+            for cookie in cookies {
+                if let Some(url) = &cookie.url {
+                    session.ensure_origin_allowed(url)?;
+                }
+            }
+        }
+        if let Some(storage) = &args.local_storage {
+            for raw_origin in storage.keys() {
+                if !raw_origin.eq_ignore_ascii_case("current") {
+                    session.ensure_origin_allowed(raw_origin)?;
+                }
+            }
+        }
+    }
 
     let deadline = Deadline::after(Duration::from_millis(DEFAULT_NAVIGATION_TIMEOUT_MS));
     let mut dialog = DialogContext::fail_fast();
@@ -9382,6 +9732,7 @@ fn run_save_state(args: &Value, sessions: &mut Sessions) -> Result<Value, StepEr
     }
     let mut dialog = DialogContext::fail_fast();
     let state = session.capture_storage_state(Deadline::after(SCREENSHOT_TIMEOUT), &mut dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let cookies = state.cookies.len();
     let local_storage: usize = state.local_storage.values().map(BTreeMap::len).sum();
     write_storage_state(&path, &state)?;
@@ -9802,6 +10153,7 @@ return {{ ok: true }};"#
         }
         flush_scroll_frames(session, deadline, dialog)?;
         let (sx, sy) = read_window_scroll(session, deadline, dialog)?;
+        session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
         return Ok(attach_dialog(
             json!({
                 "scrolled": true,
@@ -9907,6 +10259,7 @@ return {{ status: 'wheel', x: mapped.x, y: mapped.y }};"#
                 .get("scroll_top")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
+            session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             Ok(attach_dialog(
                 json!({
                     "scrolled": true,
@@ -9938,6 +10291,7 @@ return {{ status: 'wheel', x: mapped.x, y: mapped.y }};"#
             )?;
             flush_scroll_frames(session, deadline, dialog)?;
             let (sx, sy) = read_window_scroll(session, deadline, dialog)?;
+            session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
             Ok(attach_dialog(
                 json!({
                     "scrolled": true,
@@ -10021,6 +10375,7 @@ fn run_scroll(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
         )?;
         flush_scroll_frames(session, deadline, &mut dialog)?;
         let (sx, sy) = read_window_scroll(session, deadline, &mut dialog)?;
+        session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
         let mut result = coordinate_result(at, width, height);
         result["scrolled"] = json!(true);
         result["scroll_x"] = coordinate_number(sx);
@@ -10072,6 +10427,7 @@ fn run_scroll(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
     }
     flush_scroll_frames(session, deadline, &mut dialog)?;
     let (sx, sy) = read_window_scroll(session, deadline, &mut dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     Ok(attach_dialog(
         json!({
             "scrolled": true,
@@ -10120,6 +10476,7 @@ fn hover_actionable(
     {
         result["text"] = json!(text.trim());
     }
+    session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
     Ok(attach_dialog(result, dialog))
 }
 
@@ -10158,6 +10515,7 @@ fn run_hover(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
             &mut dialog,
         )?;
         flush_scroll_frames(session, deadline, &mut dialog)?;
+        session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
         let mut result = coordinate_result(at, width, height);
         result["hovered"] = json!(true);
         session.last_target_bounds = Some(bounds_from_point(at.x, at.y, width, height));
@@ -10593,6 +10951,7 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     }
 
     dispatch_drag_gesture(session, &from, &mut to, mid_drag_to, deadline, &mut dialog)?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
 
     let min_x = from.x.min(to.x);
     let min_y = from.y.min(to.y);
@@ -10781,6 +11140,7 @@ fn run_set_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, Ste
     let script = format!(
         "(async () => {{ await navigator.clipboard.writeText({encoded_text}); return true; }})()"
     );
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let scope = session.scope();
     let connection = session.connection_mut()?;
     page_evaluate_async(connection, &scope, &script, true, deadline, &mut dialog).map_err(
@@ -10791,6 +11151,7 @@ fn run_set_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, Ste
             )
         },
     )?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     Ok(json!({ "characters": args.text.chars().count() }))
 }
 
@@ -10802,6 +11163,7 @@ fn run_read_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, St
     let session = session(sessions)?;
     ensure_clipboard_ready(session, STEP_NAMES[15], deadline, &mut dialog)?;
 
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let scope = session.scope();
     let connection = session.connection_mut()?;
     let value = page_evaluate_async(
@@ -10818,6 +11180,7 @@ fn run_read_clipboard(args: &Value, sessions: &mut Sessions) -> Result<Value, St
             timeout_or_execution,
         )
     })?;
+    session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
     let text = value.as_str().unwrap_or_default().to_string();
     Ok(json!({ "text": text }))
 }
@@ -13091,6 +13454,7 @@ mod tests {
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
+            allowed_origins: Vec::new(),
         }
     }
 
@@ -14481,6 +14845,7 @@ mod tests {
             pending_local_storage_scripts: Vec::new(),
             tabs: Vec::new(),
             clipboard_origins: Vec::new(),
+            allowed_origins: Vec::new(),
         };
 
         assert!(matches!(
@@ -14553,6 +14918,7 @@ mod tests {
             pending_local_storage_scripts: Vec::new(),
             tabs: Vec::new(),
             clipboard_origins: Vec::new(),
+            allowed_origins: Vec::new(),
         };
 
         assert!(matches!(
@@ -15554,6 +15920,143 @@ mod tests {
         assert!(container_and_page.contains("scrolled the page from (0, 0) to (0, 29)"));
         assert!(container_and_page.contains("div#panel from (0, 0) to (0, 520)"));
         assert!(container_and_page.contains("invalidating the fixed `to.at` viewport coordinates"));
+    }
+
+    #[test]
+    fn allowed_origins_and_connect_auto_validation_and_normalization() {
+        assert!(
+            validate_open(&json!({
+                "url": "https://app.example.com/dashboard",
+                "connect": "auto",
+                "allowed_origins": ["https://App.Example.com:443/", "http://127.0.0.1:8080"]
+            }))
+            .is_ok()
+        );
+        for bad in [
+            json!({ "url": "http://127.0.0.1/", "connect": "auto", "headless": false }),
+            json!({ "url": "http://127.0.0.1/", "connect": "auto", "profile": "work" }),
+            json!({ "url": "http://127.0.0.1/", "connect": "auto", "storage_state": "s.json" }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": [] }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": ["https://app.example.com/path"] }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": ["ftp://app.example.com"] }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": ["http://user@127.0.0.1:8080"] }),
+        ] {
+            assert!(
+                validate_open(&bad).is_err(),
+                "expected validate_open to reject {bad}"
+            );
+        }
+
+        let normalized = normalize_allowed_origins(&[
+            "https://App.Example.com:443/".to_string(),
+            "http://LOCALHOST:80".to_string(),
+            "http://127.0.0.1:8080/".to_string(),
+            "https://app.example.com".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            normalized,
+            vec![
+                "https://app.example.com".to_string(),
+                "http://localhost".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ]
+        );
+        assert!(
+            check_origin_against_allowlist("https://app.example.com/orders?id=1", &normalized)
+                .is_ok()
+        );
+        assert!(check_origin_against_allowlist("http://localhost:80/login", &normalized).is_ok());
+        let err = step_error_text(
+            check_origin_against_allowlist("https://evil.example/phish", &normalized)
+                .expect_err("disallowed origin must be rejected"),
+        );
+        assert!(err.contains("allowed_origins"), "{err}");
+        let non_http = step_error_text(
+            check_origin_against_allowlist("file:///etc/passwd", &normalized)
+                .expect_err("non-http scheme must be rejected when allowlist is active"),
+        );
+        assert!(non_http.contains("allowed_origins"), "{non_http}");
+    }
+
+    #[test]
+    fn navigate_blocks_disallowed_initial_url_and_cross_origin_redirect_under_allowed_origins() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            if let Ok(msg) = socket.read() {
+                panic!("unexpected CDP message when initial origin is disallowed: {msg:?}");
+            }
+        });
+        let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("connect mock CDP");
+        let mut sess = mock_session(conn, "target-1", "session-1");
+        sess.allowed_origins = vec!["http://127.0.0.1:8080".to_string()];
+        assert!(sess.local_only_reason().is_some());
+        assert!(ensure_clipboard_isolated(&sess, "browser.read_clipboard").is_err());
+
+        let mut dialog = DialogContext::fail_fast();
+        let err = step_error_text(
+            sess.navigate(
+                "https://evil.example/steal",
+                Duration::from_secs(2),
+                &mut dialog,
+            )
+            .expect_err("disallowed initial URL must fail closed"),
+        );
+        assert!(err.contains("allowed_origins"), "{err}");
+        sess.origin = None;
+        drop(sess);
+        let _ = server.join();
+
+        let (ws_url2, server2) = spawn_mock_cdp(|mut socket| {
+            let nav = read_cdp_request(&mut socket);
+            assert_eq!(nav["method"], "Page.navigate");
+            let id = nav["id"].clone();
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": id, "result": {} }).to_string(),
+                ))
+                .unwrap();
+            let href = read_cdp_request(&mut socket);
+            assert_eq!(href["method"], "Runtime.evaluate");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": href["id"],
+                        "result": { "result": { "type": "string", "value": "https://attacker.example/sso" } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let title = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": title["id"],
+                        "result": { "result": { "type": "string", "value": "SSO" } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            while socket.read().is_ok() {}
+        });
+        let conn2 = Connection::connect(&ws_url2, Deadline::after(Duration::from_secs(2)))
+            .expect("connect mock CDP 2");
+        let mut sess2 = mock_session(conn2, "target-1", "session-1");
+        sess2.allowed_origins = vec!["http://127.0.0.1:8080".to_string()];
+        let err2 = step_error_text(
+            sess2
+                .navigate(
+                    "http://127.0.0.1:8080/redirect",
+                    Duration::from_secs(2),
+                    &mut dialog,
+                )
+                .expect_err("cross-origin redirect must fail closed"),
+        );
+        assert!(err2.contains("https://attacker.example"), "{err2}");
+        assert!(err2.contains("allowed_origins"), "{err2}");
+        sess2.origin = None;
+        drop(sess2);
+        let _ = server2.join();
     }
 }
 
