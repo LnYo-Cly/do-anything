@@ -2917,7 +2917,9 @@ Start Chrome with a debug port, then name that endpoint in `browser.open`:
 name: Use the browser I am already signed in to
 steps:
   - browser.open:
-      connect: "http://127.0.0.1:9222"
+      connect: "auto"
+      allowed_origins:
+        - "http://127.0.0.1:8080"
       url: http://127.0.0.1:8080/orders
   - browser.click:
       role: button
@@ -2926,15 +2928,28 @@ steps:
       text: "Order created"
 ```
 
-`connect` must be `http://<host>:<port>` and the host must be `127.0.0.1`,
-`localhost` or `[::1]`; any other host is an argument error, because a remote
-debug port would hand the browser to another machine. The step reads
-`GET /json/version` at that address to find the browser's DevTools WebSocket,
-opens a new tab and drives it like a browser the case started itself. Only the
-tab this case opened is closed when the case ends; the user's browser and its
-other tabs keep running. `connect` cannot be combined with `headless`, `width`
-or `height`, and a second `browser.open` in the same case must give the same
-`connect` value.
+`connect` accepts either `"auto"` or an explicit `http://<host>:<port>` where
+the host is `127.0.0.1`, `localhost`, or `[::1]`; any non-loopback host is an
+argument error, because a remote debug port would hand the browser to another
+machine. When `connect: "auto"` is used, `da` checks `DA_BROWSER_CONNECT` (if
+set; loopback only), then probes local Chrome/Edge/Chromium `DevToolsActivePort`
+files and loopback debug ports `9222` / `9229` via `GET /json/version`.
+
+Use `allowed_origins` (an array of canonical `http://host[:port]` /
+`https://host[:port]` origins) to bound an attached session to specific origins:
+`browser.open` refuses disallowed initial URLs before calling CDP, rejects
+cross-origin redirects after load, and rejects `browser.switch_tab` onto a tab
+outside the allowlist. `allowed_origins` is persisted across detached
+`da session` steps.
+
+Attached sessions (`connect` explicit or `"auto"`) are always marked
+`local_only: true` (so `da report` never embeds their screenshots) and enforce
+clipboard isolation (`browser.set_clipboard` and `browser.read_clipboard` fail
+closed with exit code `4`). Only the tab this case opened is closed when the
+case ends; the user's browser and its other tabs keep running. `connect` cannot
+be combined with `headless`, `width`, `height`, `profile`, or `storage_state`,
+and a second `browser.open` in the same case must keep the same `connect` and
+`allowed_origins` values.
 
 A debug port is full control of the browser: every cookie, every signed-in
 session and every page it can reach. Keep it on loopback, do not expose it on a

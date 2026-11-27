@@ -11075,3 +11075,143 @@ img.src = 'data:image/png;base64,{png_b64}';
         stderr(&inspect_out)
     );
 }
+
+#[test]
+fn connect_auto_enforces_allowed_origins_local_only_and_clipboard_isolation() {
+    let server = TestServer::start();
+    let Some(_guard) = chrome_test(&server) else {
+        return;
+    };
+    let mut external = UserBrowser::start();
+    let dir = TempDir::new("browser-connect-auto-guardrails");
+    let allowed_origin = server.url("").trim_end_matches('/').to_string();
+    let allowed_url = server.url("/browser/form?case=auto-ok");
+
+    // 1. `connect: "auto"` via `DA_BROWSER_CONNECT` succeeds on allowed origin, marks
+    //    the run `local_only: true`, and leaves the external browser alive.
+    let ok_case = dir.write(
+        "auto-ok.yaml",
+        &format!(
+            r##"name: connect auto with allowed_origins
+steps:
+  - browser.open:
+      connect: "auto"
+      allowed_origins:
+        - "{allowed_origin}"
+      url: "{allowed_url}"
+    expect:
+      - path: $.url
+        contains: "case=auto-ok"
+"##
+        ),
+    );
+    let record = dir.path().join("record");
+    let ok_out = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&ok_case),
+            "--record",
+            path_str(&record),
+        ],
+        &[("DA_BROWSER_CONNECT", external.connect_url())],
+    );
+    assert_eq!(
+        exit_code(&ok_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&ok_out),
+        stderr(&ok_out)
+    );
+    let ok_json = json_stdout(&ok_out);
+    assert_eq!(
+        ok_json["cases"][0]["local_only"],
+        json!(true),
+        "connect: auto must mark case local_only: {ok_json}"
+    );
+    assert!(
+        external
+            .child
+            .try_wait()
+            .expect("the test must watch the browser process")
+            .is_none(),
+        "connect: auto must never close the user's external browser"
+    );
+
+    // 2. Disallowed origin fails closed before navigation.
+    let blocked_case = dir.write(
+        "auto-blocked.yaml",
+        &format!(
+            r##"name: connect auto blocks disallowed origin
+steps:
+  - browser.open:
+      connect: "auto"
+      allowed_origins:
+        - "{allowed_origin}"
+      url: "https://disallowed.example/secret"
+"##
+        ),
+    );
+    let blocked_out = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&blocked_case),
+            "--no-bundle",
+        ],
+        &[("DA_BROWSER_CONNECT", external.connect_url())],
+    );
+    assert_eq!(
+        exit_code(&blocked_out),
+        Some(1),
+        "disallowed origin must fail closed: stdout={}\nstderr={}",
+        stdout(&blocked_out),
+        stderr(&blocked_out)
+    );
+    let blocked_json = json_stdout(&blocked_out);
+    let msg = blocked_json["cases"][0]["error"]["message"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        msg.contains("allowed_origins"),
+        "expected allowed_origins error, got: {blocked_json}"
+    );
+
+    // 3. Clipboard isolation still refuses `browser.read_clipboard` on `connect: "auto"`.
+    let clip_case = dir.write(
+        "auto-clip.yaml",
+        &format!(
+            r##"name: connect auto keeps clipboard isolated
+steps:
+  - browser.open:
+      connect: "auto"
+      allowed_origins:
+        - "{allowed_origin}"
+      url: "{allowed_url}"
+  - browser.read_clipboard: {{}}
+"##
+        ),
+    );
+    let clip_out = run_da_with_env(
+        dir.path(),
+        &[
+            "--output",
+            "json",
+            "run",
+            path_str(&clip_case),
+            "--no-bundle",
+        ],
+        &[("DA_BROWSER_CONNECT", external.connect_url())],
+    );
+    assert_eq!(
+        exit_code(&clip_out),
+        Some(4),
+        "clipboard must remain isolated on connect: auto: stdout={}\nstderr={}",
+        stdout(&clip_out),
+        stderr(&clip_out)
+    );
+}

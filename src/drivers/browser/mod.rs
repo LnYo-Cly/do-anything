@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 use self::cdp::{
     CdpError, Connection, Deadline, DialogPolicy, DialogWatch, OpenedDialog, RemoteResult,
 };
-use self::connect::Endpoint;
+use self::connect::{ConnectTarget, Endpoint};
 use self::launch::Launched;
 use crate::core::paths;
 use crate::core::registry::{
@@ -156,6 +156,7 @@ fn open_step() -> Result<StepDefinition, String> {
     string_property(&mut definition.args_schema, "profile");
     string_property(&mut definition.args_schema, "storage_state");
     string_property(&mut definition.args_schema, "testid_attribute");
+    apply_allowed_origins_schema(&mut definition.args_schema);
     apply_dialog_schema(&mut definition.args_schema);
     if let Value::Object(entries) = &mut definition.args_schema {
         entries.insert(
@@ -650,6 +651,33 @@ fn within_schema(step_name: &str) -> Value {
 }
 
 /// Replaces `dialog` with a self-contained schema that rejects `null`.
+fn apply_allowed_origins_schema(schema: &mut Value) {
+    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let description = properties
+        .get("allowed_origins")
+        .and_then(|v| v.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or(
+            "Optional allowlist of origins (`http://<host>[:<port>]` or `https://<host>[:<port>]`) this browser session may open, redirect to, or switch tabs into.",
+        )
+        .to_string();
+    properties.insert(
+        "allowed_origins".to_string(),
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^https?://[^/?#@\\s]+/?$",
+            },
+            "description": description,
+        }),
+    );
+}
+
 fn apply_dialog_schema(schema: &mut Value) {
     if let Value::Object(entries) = schema {
         entries.remove("$defs");
@@ -934,11 +962,19 @@ struct OpenArgs {
     #[schemars(extend("minLength" = 1))]
     url: String,
     /// Loopback DevTools endpoint of a browser the user already runs, for
-    /// example `http://127.0.0.1:9222`. The case opens a new tab there and
-    /// closes only that tab. Cannot be combined with `headless`, `width`,
-    /// `height`, or `profile`.
+    /// example `http://127.0.0.1:9222`, or `"auto"` to discover a local
+    /// Chrome/Edge debug port (`DA_BROWSER_CONNECT`, `DevToolsActivePort`, or
+    /// loopback ports 9222/9229). The case opens a new tab there and closes
+    /// only that tab. Cannot be combined with `headless`, `width`, `height`,
+    /// `profile`, or `storage_state`.
     #[serde(default)]
     connect: Option<String>,
+    /// Optional allowlist of origins (`http://<host>[:<port>]` or
+    /// `https://<host>[:<port>]`) this browser session may open, redirect to,
+    /// or switch tabs into. Recommended when attaching to an authenticated
+    /// local browser (`connect`).
+    #[serde(default)]
+    allowed_origins: Option<Vec<String>>,
     /// Named persistent browser profile directory under `.da/profiles/<name>`,
     /// preserved across runs. Cannot be combined with `connect`.
     #[schemars(extend("minLength" = 1, "pattern" = "^[A-Za-z0-9_-]+$"))]
@@ -3172,6 +3208,9 @@ struct BrowserSession {
     /// Origins granted clipboard access during this session so `da session` can
     /// restore permissions and focus emulation across detached CLI commands.
     clipboard_origins: Vec<String>,
+    /// Canonical origin allowlist (`http://host[:port]` / `https://host[:port]`)
+    /// enforced on navigation, redirects, and tab switches when non-empty.
+    allowed_origins: Vec<String>,
 }
 
 /// One element resolved from a target, held as a CDP DOM `objectId`.
@@ -3179,10 +3218,17 @@ struct Located(String);
 
 impl BrowserSession {
     /// Creates the session described by `browser.open`.
-    fn open(args: &OpenArgs, connect: Option<&Endpoint>, detached: bool) -> Result<Self, String> {
+    fn open(
+        args: &OpenArgs,
+        connect: Option<&Endpoint>,
+        allowed_origins: Vec<String>,
+        detached: bool,
+    ) -> Result<Self, String> {
         match connect {
-            Some(endpoint) => Self::connect_to(endpoint, args.testid_attribute.as_deref()),
-            None => Self::launch(args, detached),
+            Some(endpoint) => {
+                Self::connect_to(endpoint, args.testid_attribute.as_deref(), allowed_origins)
+            }
+            None => Self::launch(args, allowed_origins, detached),
         }
     }
 
@@ -3192,6 +3238,7 @@ impl BrowserSession {
         let defaults = OpenArgs {
             url: "about:blank".to_string(),
             connect: None,
+            allowed_origins: None,
             profile: None,
             storage_state: None,
             headless: default_headless(),
@@ -3201,11 +3248,15 @@ impl BrowserSession {
             testid_attribute: None,
             dialog: None,
         };
-        Self::launch(&defaults, detached)
+        Self::launch(&defaults, Vec::new(), detached)
     }
 
     /// Starts the browser described by `browser.open` and attaches its page.
-    fn launch(args: &OpenArgs, detached: bool) -> Result<Self, String> {
+    fn launch(
+        args: &OpenArgs,
+        allowed_origins: Vec<String>,
+        detached: bool,
+    ) -> Result<Self, String> {
         let deadline = Deadline::after(launch_timeout());
         let (browser, (connection, page, tabs)) = launch_browser_with_retry(
             deadline,
@@ -3262,11 +3313,16 @@ impl BrowserSession {
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
+            allowed_origins,
         })
     }
 
     /// Attaches a page in a browser the user already runs.
-    fn connect_to(endpoint: &Endpoint, testid_attribute: Option<&str>) -> Result<Self, String> {
+    fn connect_to(
+        endpoint: &Endpoint,
+        testid_attribute: Option<&str>,
+        allowed_origins: Vec<String>,
+    ) -> Result<Self, String> {
         let websocket_url = endpoint.websocket_url(connect::CONNECT_TIMEOUT)?;
         let mut connection = Connection::connect(&websocket_url, Deadline::after(launch_timeout()))
             .map_err(|error| {
@@ -3303,6 +3359,7 @@ impl BrowserSession {
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
+            allowed_origins,
         })
     }
 
@@ -3398,6 +3455,7 @@ impl BrowserSession {
             snapshot_pending: false,
             clipboard_focus_page,
             clipboard_origins: parsed.clipboard_origins,
+            allowed_origins: parsed.allowed_origins,
         })
     }
 
@@ -3429,6 +3487,7 @@ impl BrowserSession {
         &self,
         args: &OpenArgs,
         connect: Option<&Endpoint>,
+        allowed_origins: Option<&[String]>,
     ) -> Result<(), StepError> {
         let mut changes = Vec::new();
         let wanted_connect = connect.map(Endpoint::name);
@@ -3438,6 +3497,11 @@ impl BrowserSession {
                 self.connect.as_deref().unwrap_or("none"),
                 wanted_connect.as_deref().unwrap_or("none")
             ));
+        }
+        if let Some(wanted_origins) = allowed_origins
+            && wanted_origins != self.allowed_origins.as_slice()
+        {
+            changes.push("`allowed_origins`".to_string());
         }
         if args.profile.as_deref() != self.profile.as_deref() {
             changes.push(format!(
@@ -3496,6 +3560,11 @@ impl BrowserSession {
         self.network.take_step(dropped_baseline)
     }
 
+    /// Refuses navigation or tab activation outside `allowed_origins` when configured.
+    fn ensure_origin_allowed(&self, url: &str) -> Result<(), StepError> {
+        check_origin_against_allowlist(url, &self.allowed_origins)
+    }
+
     /// Navigates the session's page and returns its current URL and title.
     fn navigate(
         &mut self,
@@ -3503,6 +3572,7 @@ impl BrowserSession {
         timeout: Duration,
         dialog: &mut DialogContext,
     ) -> Result<(String, String), StepError> {
+        self.ensure_origin_allowed(url)?;
         let scope = self.scope();
         let deadline = Deadline::after(timeout);
         // A preload script can only be retired after the page that runs it
@@ -3581,6 +3651,7 @@ impl BrowserSession {
         // without waiting for the browser to report the same change again.
         let current_target = self.tabs.current().to_string();
         self.tabs.set_current(&current_target, &current, &title);
+        self.ensure_origin_allowed(&current)?;
         Ok((current, title))
     }
 
@@ -3600,6 +3671,7 @@ impl BrowserSession {
     ) -> Result<Value, StepError> {
         let index = self.await_tab(selector, deadline)?;
         let (url, title) = self.activate_tab(index, deadline)?;
+        self.ensure_origin_allowed(&url)?;
         Ok(json!({ "url": url, "title": title }))
     }
 
@@ -6260,6 +6332,9 @@ struct DetachedBrowserHandle {
     /// Origins granted clipboard permissions in this session, re-applied across `da session` reattach.
     #[serde(default)]
     clipboard_origins: Vec<String>,
+    /// Canonical origin allowlist persisted across detached `da session` commands.
+    #[serde(default)]
+    allowed_origins: Vec<String>,
 }
 
 /// The tabs a handle lists, as one entry per owned target.
@@ -6627,6 +6702,7 @@ impl Session for BrowserSession {
             pending_local_storage_scripts: self.pending_local_storage_scripts.clone(),
             tabs: self.tabs.ids(),
             clipboard_origins: self.clipboard_origins.clone(),
+            allowed_origins: self.allowed_origins.clone(),
         };
         serde_json::to_value(handle)
             .map(Some)
@@ -7117,7 +7193,10 @@ fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
                 ));
             }
         }
-        Endpoint::parse(connect)?;
+        ConnectTarget::parse(connect)?;
+    }
+    if let Some(origins) = &args.allowed_origins {
+        normalize_allowed_origins(origins)?;
     }
     if let Some(profile) = &args.profile {
         launch::validate_profile_name(profile)?;
@@ -7137,6 +7216,123 @@ fn check_open(raw: &Value, args: &OpenArgs) -> Result<(), String> {
         return Err("invalid arguments: `height` must be at least 1".to_string());
     }
     check_timeout(args.timeout_ms)
+}
+
+/// Normalizes one allowed origin (`http://<host>[:<port>]` or `https://<host>[:<port>]`).
+fn normalize_allowed_origin(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || raw.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(format!(
+            "invalid arguments: `allowed_origins` entry `{raw}` must be an `http://` or `https://` origin without whitespace"
+        ));
+    }
+    let stripped = raw.strip_suffix('/').unwrap_or(raw);
+    let (scheme, authority) = if let Some(rest) = stripped.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = stripped.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        return Err(format!(
+            "invalid arguments: `allowed_origins` entry `{raw}` must start with `http://` or `https://`"
+        ));
+    };
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|ch| matches!(ch, '/' | '?' | '#' | '@'))
+    {
+        return Err(format!(
+            "invalid arguments: `allowed_origins` entry `{raw}` must be an origin without path, query, fragment, or userinfo"
+        ));
+    }
+    let (host, port) = split_origin_authority(authority).ok_or_else(|| {
+        format!("invalid arguments: `allowed_origins` entry `{raw}` has an invalid host or port")
+    })?;
+    let host_lower = host.to_ascii_lowercase();
+    match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => {
+            Ok(format!("{scheme}://{host_lower}"))
+        }
+        (_, Some(p)) => Ok(format!("{scheme}://{host_lower}:{p}")),
+    }
+}
+
+fn normalize_allowed_origins(origins: &[String]) -> Result<Vec<String>, String> {
+    if origins.is_empty() {
+        return Err(
+            "invalid arguments: `allowed_origins` must contain at least one origin".to_string(),
+        );
+    }
+    let mut out = Vec::with_capacity(origins.len());
+    for entry in origins {
+        let normalized = normalize_allowed_origin(entry)?;
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
+/// Extracts a canonical `scheme://host[:port]` origin from an `http://` or `https://` URL.
+fn url_origin(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        ("https", trimmed.strip_prefix("https://")?)
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let (host, port) = split_origin_authority(authority)?;
+    let host_lower = host.to_ascii_lowercase();
+    match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => {
+            Some(format!("{scheme}://{host_lower}"))
+        }
+        (_, Some(p)) => Some(format!("{scheme}://{host_lower}:{p}")),
+    }
+}
+
+fn split_origin_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let host = &authority[..=close];
+        let rest = &authority[close + 1..];
+        if rest.is_empty() {
+            return Some((host, None));
+        }
+        let port_str = rest.strip_prefix(':')?;
+        let port: u16 = port_str.parse().ok()?;
+        return (port > 0).then_some((host, Some(port)));
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        return (port > 0).then_some((host, Some(port)));
+    }
+    (!authority.is_empty()).then_some((authority, None))
+}
+
+fn check_origin_against_allowlist(url: &str, allowed_origins: &[String]) -> Result<(), StepError> {
+    if allowed_origins.is_empty() {
+        return Ok(());
+    }
+    let origin = url_origin(url);
+    if origin
+        .as_deref()
+        .is_some_and(|o| allowed_origins.iter().any(|allowed| allowed == o))
+    {
+        return Ok(());
+    }
+    let actual = origin.as_deref().unwrap_or("<non-http(s) origin>");
+    Err(StepError::Execution(format!(
+        "origin `{actual}` for `{url}` is not permitted by `allowed_origins` ({}); add the origin explicitly to `browser.open.allowed_origins` if navigation there is intended",
+        allowed_origins.join(", ")
+    )))
 }
 
 fn validate_open(raw: &Value) -> Result<(), String> {
@@ -7997,12 +8193,21 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let raw = args;
     let args: OpenArgs = parse(raw)?;
     check_open(raw, &args).map_err(StepError::InvalidArguments)?;
-    let connect = args
+    let connect_target = args
         .connect
         .as_deref()
-        .map(Endpoint::parse)
+        .map(ConnectTarget::parse)
         .transpose()
         .map_err(StepError::InvalidArguments)?;
+    let normalized_origins = args
+        .allowed_origins
+        .as_deref()
+        .map(normalize_allowed_origins)
+        .transpose()
+        .map_err(StepError::InvalidArguments)?;
+    if let Some(origins) = &normalized_origins {
+        check_origin_against_allowlist(&args.url, origins)?;
+    }
     // The state file is read before the browser starts, so a missing or
     // malformed file fails closed without leaving a browser behind.
     let storage_state = match args.storage_state.as_deref() {
@@ -8012,18 +8217,27 @@ fn run_open(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         }
         None => None,
     };
-    let existing = sessions
+    let existing_connect = sessions
         .get::<BrowserSession>(SESSION_KIND)
         .map_err(StepError::Execution)?
-        .is_some();
+        .map(|s| s.connect.clone());
+    let existing = existing_connect.is_some();
+    let connect = match (&connect_target, &existing_connect) {
+        (Some(ConnectTarget::Auto), Some(Some(already))) => {
+            Some(Endpoint::parse(already).map_err(StepError::Environment)?)
+        }
+        (Some(target), _) => Some(target.resolve().map_err(StepError::Environment)?),
+        (None, _) => None,
+    };
     let interactive = sessions.is_interactive();
+    let initial_origins = normalized_origins.clone().unwrap_or_default();
     let session = sessions
         .get_or_create(SESSION_KIND, || {
-            BrowserSession::open(&args, connect.as_ref(), interactive)
+            BrowserSession::open(&args, connect.as_ref(), initial_origins, interactive)
         })
         .map_err(StepError::Environment)?;
     if existing {
-        session.ensure_same_options(&args, connect.as_ref())?;
+        session.ensure_same_options(&args, connect.as_ref(), normalized_origins.as_deref())?;
         session.ensure_target_ready()?;
         if let Some(attribute) = &args.testid_attribute {
             session.testid_attribute = attribute.clone();
@@ -12956,6 +13170,7 @@ mod tests {
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
+            allowed_origins: Vec::new(),
         }
     }
 
@@ -14346,6 +14561,7 @@ mod tests {
             pending_local_storage_scripts: Vec::new(),
             tabs: Vec::new(),
             clipboard_origins: Vec::new(),
+            allowed_origins: Vec::new(),
         };
 
         assert!(matches!(
@@ -14418,6 +14634,7 @@ mod tests {
             pending_local_storage_scripts: Vec::new(),
             tabs: Vec::new(),
             clipboard_origins: Vec::new(),
+            allowed_origins: Vec::new(),
         };
 
         assert!(matches!(
@@ -15419,6 +15636,143 @@ mod tests {
         assert!(container_and_page.contains("scrolled the page from (0, 0) to (0, 29)"));
         assert!(container_and_page.contains("div#panel from (0, 0) to (0, 520)"));
         assert!(container_and_page.contains("invalidating the fixed `to.at` viewport coordinates"));
+    }
+
+    #[test]
+    fn allowed_origins_and_connect_auto_validation_and_normalization() {
+        assert!(
+            validate_open(&json!({
+                "url": "https://app.example.com/dashboard",
+                "connect": "auto",
+                "allowed_origins": ["https://App.Example.com:443/", "http://127.0.0.1:8080"]
+            }))
+            .is_ok()
+        );
+        for bad in [
+            json!({ "url": "http://127.0.0.1/", "connect": "auto", "headless": false }),
+            json!({ "url": "http://127.0.0.1/", "connect": "auto", "profile": "work" }),
+            json!({ "url": "http://127.0.0.1/", "connect": "auto", "storage_state": "s.json" }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": [] }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": ["https://app.example.com/path"] }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": ["ftp://app.example.com"] }),
+            json!({ "url": "http://127.0.0.1/", "allowed_origins": ["http://user@127.0.0.1:8080"] }),
+        ] {
+            assert!(
+                validate_open(&bad).is_err(),
+                "expected validate_open to reject {bad}"
+            );
+        }
+
+        let normalized = normalize_allowed_origins(&[
+            "https://App.Example.com:443/".to_string(),
+            "http://LOCALHOST:80".to_string(),
+            "http://127.0.0.1:8080/".to_string(),
+            "https://app.example.com".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            normalized,
+            vec![
+                "https://app.example.com".to_string(),
+                "http://localhost".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ]
+        );
+        assert!(
+            check_origin_against_allowlist("https://app.example.com/orders?id=1", &normalized)
+                .is_ok()
+        );
+        assert!(check_origin_against_allowlist("http://localhost:80/login", &normalized).is_ok());
+        let err = step_error_text(
+            check_origin_against_allowlist("https://evil.example/phish", &normalized)
+                .expect_err("disallowed origin must be rejected"),
+        );
+        assert!(err.contains("allowed_origins"), "{err}");
+        let non_http = step_error_text(
+            check_origin_against_allowlist("file:///etc/passwd", &normalized)
+                .expect_err("non-http scheme must be rejected when allowlist is active"),
+        );
+        assert!(non_http.contains("allowed_origins"), "{non_http}");
+    }
+
+    #[test]
+    fn navigate_blocks_disallowed_initial_url_and_cross_origin_redirect_under_allowed_origins() {
+        let (ws_url, server) = spawn_mock_cdp(|mut socket| {
+            if let Ok(msg) = socket.read() {
+                panic!("unexpected CDP message when initial origin is disallowed: {msg:?}");
+            }
+        });
+        let conn = Connection::connect(&ws_url, Deadline::after(Duration::from_secs(2)))
+            .expect("connect mock CDP");
+        let mut sess = mock_session(conn, "target-1", "session-1");
+        sess.allowed_origins = vec!["http://127.0.0.1:8080".to_string()];
+        assert!(sess.local_only_reason().is_some());
+        assert!(ensure_clipboard_isolated(&sess, "browser.read_clipboard").is_err());
+
+        let mut dialog = DialogContext::fail_fast();
+        let err = step_error_text(
+            sess.navigate(
+                "https://evil.example/steal",
+                Duration::from_secs(2),
+                &mut dialog,
+            )
+            .expect_err("disallowed initial URL must fail closed"),
+        );
+        assert!(err.contains("allowed_origins"), "{err}");
+        sess.origin = None;
+        drop(sess);
+        let _ = server.join();
+
+        let (ws_url2, server2) = spawn_mock_cdp(|mut socket| {
+            let nav = read_cdp_request(&mut socket);
+            assert_eq!(nav["method"], "Page.navigate");
+            let id = nav["id"].clone();
+            socket
+                .send(tungstenite::Message::text(
+                    json!({ "id": id, "result": {} }).to_string(),
+                ))
+                .unwrap();
+            let href = read_cdp_request(&mut socket);
+            assert_eq!(href["method"], "Runtime.evaluate");
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": href["id"],
+                        "result": { "result": { "type": "string", "value": "https://attacker.example/sso" } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let title = read_cdp_request(&mut socket);
+            socket
+                .send(tungstenite::Message::text(
+                    json!({
+                        "id": title["id"],
+                        "result": { "result": { "type": "string", "value": "SSO" } }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            while socket.read().is_ok() {}
+        });
+        let conn2 = Connection::connect(&ws_url2, Deadline::after(Duration::from_secs(2)))
+            .expect("connect mock CDP 2");
+        let mut sess2 = mock_session(conn2, "target-1", "session-1");
+        sess2.allowed_origins = vec!["http://127.0.0.1:8080".to_string()];
+        let err2 = step_error_text(
+            sess2
+                .navigate(
+                    "http://127.0.0.1:8080/redirect",
+                    Duration::from_secs(2),
+                    &mut dialog,
+                )
+                .expect_err("cross-origin redirect must fail closed"),
+        );
+        assert!(err2.contains("https://attacker.example"), "{err2}");
+        assert!(err2.contains("allowed_origins"), "{err2}");
+        sess2.origin = None;
+        drop(sess2);
+        let _ = server2.join();
     }
 }
 
