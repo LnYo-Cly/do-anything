@@ -661,6 +661,7 @@ mod tests {
             started_at_ms: 1,
             duration_ms: 1,
             result: None,
+            target_bounds: None,
             model: None,
             latency_ms: None,
             usage: None,

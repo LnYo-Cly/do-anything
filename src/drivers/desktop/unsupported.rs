@@ -138,6 +138,10 @@ impl DesktopBackend {
         None
     }
 
+    pub fn take_target_bounds(&mut self) -> Option<Value> {
+        None
+    }
+
     pub fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
         Err(UNSUPPORTED_PLATFORM_ERROR.to_string())
     }

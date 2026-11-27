@@ -641,6 +641,7 @@ fn run_case(
                 duration: Duration::ZERO,
                 args: None,
                 result: None,
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: None,
@@ -801,12 +802,14 @@ fn run_one_step(
         name: step.action.clone(),
     });
     let step_started = Instant::now();
+    let _ = sessions.take_target_bounds();
     let mut report = StepReport {
         name: step.action.clone(),
         status: StepStatus::Passed,
         duration: Duration::ZERO,
         args: None,
         result: None,
+        target_bounds: None,
         saved: BTreeMap::new(),
         assertions: Vec::new(),
         error: None,
@@ -841,6 +844,10 @@ fn run_one_step(
             report.error = Some(problem);
         }
     }
+    report.target_bounds = sessions
+        .take_target_bounds()
+        .map(|bounds| lock(ctx.secrets).redact_json(&bounds))
+        .filter(|bounds| crate::core::report::validate_target_bounds(bounds).is_ok());
 
     // An optional step that ran (or could not expand an un-saved variable)
     // is allowed to be absent: it becomes `skipped` and the case continues.
@@ -1164,12 +1171,14 @@ pub fn run_single_step_with_observations(
     sessions: &mut Sessions,
 ) -> StepReport {
     let started = Instant::now();
+    let _ = sessions.take_target_bounds();
     let mut report = StepReport {
         name: step.action.clone(),
         status: StepStatus::Passed,
         duration: Duration::ZERO,
         args: None,
         result: None,
+        target_bounds: None,
         saved: BTreeMap::new(),
         assertions: Vec::new(),
         error: None,
@@ -1246,6 +1255,10 @@ pub fn run_single_step_with_observations(
             report.error = Some(problem);
         }
     }
+    report.target_bounds = sessions
+        .take_target_bounds()
+        .map(|bounds| secrets.redact_json(&bounds))
+        .filter(|bounds| crate::core::report::validate_target_bounds(bounds).is_ok());
     apply_optional_skip(&mut report, step.optional);
 
     report.duration = started.elapsed();

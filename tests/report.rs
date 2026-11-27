@@ -373,9 +373,15 @@ fn the_report_escapes_content_neutralizes_schemes_and_renders_every_layer() {
     );
     assert!(!html.contains("http://"), "no cleartext scheme may remain");
     assert!(!html.contains("https://"), "no cleartext scheme may remain");
-    assert!(
-        !html.contains("</script>"),
-        "the report must not contain a script end tag"
+    assert_eq!(
+        html.matches("<script>").count(),
+        1,
+        "the report must contain only the single static offline viewer script"
+    );
+    assert_eq!(
+        html.matches("</script>").count(),
+        1,
+        "no user-injected script end tag may appear"
     );
     assert!(
         !html.contains("<img src=\"https://evil.example/x\">"),
@@ -758,7 +764,8 @@ steps:
     );
     assert!(!normal_html.contains("https://evil.example/x"));
     assert!(!normal_html.contains("<img src=\"https"));
-    assert!(!normal_html.contains("</script>"));
+    assert_eq!(normal_html.matches("<script>").count(), 1);
+    assert_eq!(normal_html.matches("</script>").count(), 1);
 
     let shareable = dir.path().join("shareable.html");
     let output = run_da(&[
@@ -780,7 +787,8 @@ steps:
     assert!(!shareable_html.contains(&support::base64_encode(secret.as_bytes())));
     assert!(!shareable_html.contains("https://evil.example/x"));
     assert!(!shareable_html.contains("<img src=\"https"));
-    assert!(!shareable_html.contains("</script>"));
+    assert_eq!(shareable_html.matches("<script>").count(), 1);
+    assert_eq!(shareable_html.matches("</script>").count(), 1);
 }
 
 #[test]
@@ -1080,4 +1088,590 @@ fn step_trace_artifacts_args_saved_and_shareable_local_only_budget_render_safely
         bhtml.contains("2 MiB single-image limit"),
         "expected single-image limit note"
     );
+}
+
+#[test]
+fn target_bounds_schema_and_validator_agree_on_valid_and_invalid_shapes() {
+    let schema = do_anything::core::report::target_bounds_schema();
+    let validator = jsonschema::validator_for(&schema).expect("target_bounds schema must compile");
+
+    let valid_samples = [
+        json!({
+            "x": 120,
+            "y": 44,
+            "width": 88,
+            "height": 32,
+            "point": { "x": 164, "y": 60 },
+            "viewport": { "width": 1280, "height": 720 }
+        }),
+        json!({
+            "x": 50.5,
+            "y": 90.25,
+            "width": 0,
+            "height": 0,
+            "point": { "x": 50.5, "y": 90.25 },
+            "viewport": { "width": 800, "height": 600 }
+        }),
+        json!({
+            "x": 20,
+            "y": 30,
+            "width": 200,
+            "height": 110,
+            "from": { "x": 20, "y": 30 },
+            "to": { "x": 220, "y": 140 },
+            "from_bounds": { "x": 10, "y": 20, "width": 20, "height": 20 },
+            "to_bounds": { "x": 200, "y": 120, "width": 40, "height": 40 },
+            "viewport": { "width": 1280, "height": 720 }
+        }),
+    ];
+    for sample in &valid_samples {
+        assert!(
+            validator.is_valid(sample),
+            "schema should accept valid sample: {sample}"
+        );
+        assert!(
+            do_anything::core::report::validate_target_bounds(sample).is_ok(),
+            "validator should accept valid sample: {sample}"
+        );
+    }
+
+    let invalid_samples = [
+        json!("not-an-object"),
+        json!({ "x": 10, "y": 20 }),
+        json!({ "x": 10, "y": 20, "width": -1, "height": 10 }),
+        json!({ "x": 10, "y": 20, "width": 10, "height": 10, "viewport": { "width": 0, "height": 100 } }),
+        json!({ "x": 10, "y": 20, "width": 10, "height": 10, "extra": true }),
+        json!({ "x": 10, "y": 20, "width": 10, "height": 10, "from": { "x": 1 } }),
+    ];
+    for sample in &invalid_samples {
+        assert!(
+            !validator.is_valid(sample),
+            "schema should reject invalid sample: {sample}"
+        );
+        assert!(
+            do_anything::core::report::validate_target_bounds(sample).is_err(),
+            "validator should reject invalid sample: {sample}"
+        );
+    }
+}
+
+#[test]
+fn interactive_report_renders_svg_overlays_timeline_controls_and_cross_layer_tabs() {
+    let dir = TempDir::new("report-interactive-overlays");
+    let record = dir.path().join("record");
+    let report = json!({
+        "name": "Interactive UI flow",
+        "status": "failed",
+        "duration_ms": 90,
+        "steps": [
+            {
+                "name": "browser.click",
+                "status": "passed",
+                "duration_ms": 25,
+                "args": { "role": "button", "name": "Submit" },
+                "target_bounds": {
+                    "x": 100,
+                    "y": 50,
+                    "width": 140,
+                    "height": 40,
+                    "point": { "x": 170, "y": 70 },
+                    "viewport": { "width": 1280, "height": 720 }
+                },
+                "saved": { "label": "Submit" },
+                "result": {
+                    "text": "Submit",
+                    "observed": {
+                        "fs_events": {
+                            "events": [
+                                { "kind": "created", "path": "out/receipt.json", "size": 128 }
+                            ],
+                            "truncated": false
+                        }
+                    }
+                },
+                "assertions": [],
+                "error": null
+            },
+            {
+                "name": "browser.drag",
+                "status": "failed",
+                "duration_ms": 65,
+                "args": { "from": { "css": "#a" }, "to": { "css": "#b" } },
+                "target_bounds": {
+                    "x": 40,
+                    "y": 60,
+                    "width": 260,
+                    "height": 120,
+                    "from": { "x": 40, "y": 60 },
+                    "to": { "x": 300, "y": 180 },
+                    "from_bounds": { "x": 20, "y": 40, "width": 40, "height": 40 },
+                    "to_bounds": { "x": 280, "y": 160, "width": 40, "height": 40 },
+                    "viewport": { "width": 1280, "height": 720 }
+                },
+                "saved": {},
+                "result": {
+                    "dragged": true,
+                    "rows": [{ "id": 1, "state": "open" }],
+                    "columns": ["id", "state"],
+                    "row_count": 1,
+                    "truncated": false
+                },
+                "assertions": [{
+                    "path": "$.state",
+                    "comparison": "equals",
+                    "expected": "done",
+                    "actual": "open",
+                    "passed": false,
+                    "message": "expected done"
+                }],
+                "error": { "kind": "assertion", "message": "1 of 1 assertions failed" }
+            }
+        ],
+        "finally": []
+    });
+    let case = write_case(
+        &record,
+        "0-ui",
+        &malicious_meta("Interactive UI flow"),
+        &report,
+        PNG,
+    );
+    let _ = fs::remove_dir_all(case.join("browser"));
+    fs::create_dir_all(case.join("trace/steps/0/browser")).unwrap();
+    fs::write(case.join("trace/steps/0/browser/screenshot.png"), PNG).unwrap();
+    fs::create_dir_all(case.join("trace/steps/1/browser")).unwrap();
+    fs::write(case.join("trace/steps/1/browser/screenshot.png"), PNG).unwrap();
+
+    let normal = dir.path().join("interactive.html");
+    let out = run_da(&["report", path_str(&record), "-o", path_str(&normal)]);
+    assert_eq!(exit_code(&out), Some(0), "stderr: {}", stderr(&out));
+    let html = read(&normal);
+
+    // Offline & zero external schemes
+    assert!(!html.contains("http://"), "unexpected http:// scheme");
+    assert!(!html.contains("https://"), "unexpected https:// scheme");
+    assert_eq!(html.matches("<script>").count(), 1);
+    assert_eq!(html.matches("</script>").count(), 1);
+
+    // Deterministic 0-token badge for da run
+    assert!(
+        html.contains("Deterministic Replay · 0 tokens (da run)"),
+        "expected 0-token deterministic replay badge"
+    );
+
+    // Timeline playback controls + keyboard shortcuts
+    assert!(html.contains("data-action=\"prev\""));
+    assert!(html.contains("data-action=\"play\""));
+    assert!(html.contains("data-action=\"next\""));
+    assert!(html.contains("data-action=\"filter-failed\""));
+    assert!(html.contains("data-action=\"toggle-overlays\""));
+    assert!(html.contains("ArrowLeft") && html.contains("ArrowRight"));
+
+    // SVG overlays: click box + reticle AND drag arrow + endpoints
+    assert!(html.contains("<svg class=\"shot-overlay\" viewBox=\"0 0 1280 720\""));
+    assert!(html.contains("class=\"tb-box\""));
+    assert!(html.contains("class=\"tb-ring\""));
+    assert!(html.contains("class=\"tb-drag-line\""));
+    assert!(html.contains("class=\"tb-drag-arrow\""));
+
+    // Cross-layer tabs & fs.watch table
+    assert!(html.contains("class=\"step-tabs\""));
+    assert!(html.contains("data-tab=\"assertions\""));
+    assert!(html.contains("data-tab=\"observed\""));
+    assert!(html.contains("data-tab=\"data\""));
+    assert!(html.contains("Filesystem watch"));
+    assert!(html.contains("out/receipt.json"));
+
+    // --shareable strips screenshots while retaining target geometry summary and timeline
+    let shareable = dir.path().join("shareable.html");
+    let sout = run_da(&[
+        "report",
+        path_str(&record),
+        "-o",
+        path_str(&shareable),
+        "--shareable",
+    ]);
+    assert_eq!(exit_code(&sout), Some(0), "stderr: {}", stderr(&sout));
+    let shtml = read(&shareable);
+    assert!(!shtml.contains("data:image/"));
+    assert!(!shtml.contains("<svg class=\"shot-overlay\""));
+    assert!(shtml.contains("Target geometry:"));
+    assert!(shtml.contains("drag (40, 60)"));
+}
+
+#[test]
+fn report_renders_session_exploration_directory_with_model_telemetry_and_shareable_stripping() {
+    let dir = TempDir::new("report-session-telemetry");
+    let session_dir = dir.path().join("sess-explore-01");
+    fs::create_dir_all(session_dir.join("trace/steps/1/browser")).unwrap();
+    fs::write(
+        session_dir.join("trace/steps/1/browser/screenshot.png"),
+        PNG,
+    )
+    .unwrap();
+
+    fs::write(
+        session_dir.join("state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "id": "sess-explore-01",
+            "created_at_ms": 1_700_000_000_000_u64,
+            "last_active_ms": 1_700_000_005_000_u64,
+            "idle_timeout_ms": 1_800_000_u64,
+            "handles": {},
+            "vars": {},
+            "env_names": [],
+            "observe": [],
+            "plugins": [],
+            "model": { "model": "specai-hy/hy4" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let steps = [
+        json!({
+            "index": 1,
+            "action": "model/select_ref",
+            "raw_args": { "query": "find <script>checkout</script>" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_100_u64,
+            "duration_ms": 210,
+            "result": { "ref": "e12", "model": "specai-hy/hy4" },
+            "model": "specai-hy/hy4",
+            "latency_ms": 205,
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 120,
+                "total_tokens": 1120,
+                "prompt_tokens_details": { "cached_tokens": 400 }
+            },
+            "trace_id": "tr-001",
+            "confidence": 0.94
+        }),
+        json!({
+            "index": 2,
+            "action": "model/locate",
+            "raw_args": { "query": "submit icon" },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_400_u64,
+            "duration_ms": 350,
+            "result": { "x": 640, "y": 360 },
+            "target_bounds": {
+                "x": 640,
+                "y": 360,
+                "width": 0,
+                "height": 0,
+                "point": { "x": 640, "y": 360 },
+                "viewport": { "width": 1280, "height": 720 }
+            },
+            "model": "specai-hy/hy4",
+            "latency_ms": 345,
+            "usage": {
+                "input_tokens": 1500,
+                "output_tokens": 80,
+                "cache_read_tokens": 600,
+                "reasoning_tokens": 50
+            },
+            "trace_id": "tr-002",
+            "confidence": 0.88
+        }),
+        json!({
+            "index": 3,
+            "action": "model/judge",
+            "raw_args": { "rubric": "checkout succeeded", "screenshot": true },
+            "status": "passed",
+            "started_at_ms": 1_700_000_000_900_u64,
+            "duration_ms": 190,
+            "result": { "pass": true, "reason": "confirmation banner visible" },
+            "model": "specai-hy/hy4",
+            "latency_ms": 180,
+            "usage": {
+                "prompt_tokens": 900,
+                "completion_tokens": 40,
+                "total_tokens": 940
+            },
+            "trace_id": "tr-003"
+        }),
+    ];
+    let mut jsonl = String::new();
+    for s in &steps {
+        jsonl.push_str(&serde_json::to_string(s).unwrap());
+        jsonl.push('\n');
+    }
+    fs::write(session_dir.join("steps.jsonl"), jsonl).unwrap();
+
+    let out_html = dir.path().join("session-report.html");
+    let out = run_da(&[
+        "--output",
+        "json",
+        "report",
+        path_str(&session_dir),
+        "-o",
+        path_str(&out_html),
+    ]);
+    assert_eq!(exit_code(&out), Some(0), "stderr: {}", stderr(&out));
+    let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["ok"], true);
+    assert_eq!(summary["cases"], 1);
+    assert_eq!(summary["steps"], 3);
+    assert_eq!(summary["images_embedded"], 1);
+
+    let html = read(&out_html);
+    assert!(html.contains("Exploration Run (da session)"));
+    assert!(html.contains("Model exploration telemetry"));
+    assert!(html.contains("specai-hy/hy4"));
+    assert!(html.contains("tr-001") && html.contains("tr-002") && html.contains("tr-003"));
+    // Total latency = 205 + 345 + 180 = 730 ms
+    assert!(html.contains("730 ms"), "missing aggregated model latency");
+    // Total tokens = 1120 + 1580 + 940 = 3,640; cached = 1,000; reasoning = 50
+    assert!(html.contains("3,640"), "missing aggregated total tokens");
+    assert!(
+        html.contains("1,000 cached"),
+        "missing aggregated cached tokens"
+    );
+    assert!(html.contains("50 reasoning"), "missing reasoning tokens");
+    assert!(html.contains("<svg class=\"shot-overlay\" viewBox=\"0 0 1280 720\""));
+    assert!(!html.contains("<script>checkout</script>"));
+    assert!(html.contains("&lt;script&gt;checkout&lt;/script&gt;"));
+    assert!(!html.contains(path_str(dir.path())));
+
+    // --shareable omits screenshots from session reports too
+    let share_html = dir.path().join("session-shareable.html");
+    let sout = run_da(&[
+        "report",
+        path_str(&session_dir),
+        "-o",
+        path_str(&share_html),
+        "--shareable",
+    ]);
+    assert_eq!(exit_code(&sout), Some(0), "stderr: {}", stderr(&sout));
+    let shtml = read(&share_html);
+    assert!(!shtml.contains("data:image/"));
+    assert!(shtml.contains("Model exploration telemetry"));
+}
+
+#[cfg(feature = "browser")]
+#[test]
+fn browser_run_and_session_record_schema_valid_target_bounds_and_drag_endpoints() {
+    let server = support::TestServer::start();
+    if !browser_ready(&server) {
+        return;
+    }
+    let dir = TempDir::new("report-browser-bounds");
+    let case = dir.write(
+        "bounds.yaml",
+        &format!(
+            r##"name: Browser target bounds
+steps:
+  - browser.open:
+      url: "{base}/browser/locators"
+      width: 1000
+      height: 700
+  - browser.click:
+      testid: "solo-btn"
+  - browser.hover:
+      css: "#qa-btn"
+  - browser.type:
+      css: "#qa-input"
+      value: "hello"
+  - browser.drag:
+      from: {{ css: "#solo-btn" }}
+      to: {{ css: "#qa-btn" }}
+  - browser.click:
+      at: {{ x: 120, y: 80 }}
+"##,
+            base = server.url("")
+        ),
+    );
+    let record = dir.path().join("record");
+    let output = Command::new(da())
+        .current_dir(dir.path())
+        .args([
+            "run",
+            path_str(&case),
+            "--record",
+            path_str(&record),
+            "--trace-steps",
+        ])
+        .output()
+        .expect("failed to run da");
+    assert_eq!(
+        exit_code(&output),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let cases: Vec<PathBuf> = fs::read_dir(&record)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("meta.json").is_file())
+        .collect();
+    assert_eq!(cases.len(), 1);
+    let report_json: Value = serde_json::from_str(&read(&cases[0].join("report.json"))).unwrap();
+
+    let schema = do_anything::core::report::target_bounds_schema();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+
+    // Step 0 is browser.open (no target_bounds); steps 1..=5 are UI interactions with valid target_bounds.
+    assert!(report_json["steps"][0].get("target_bounds").is_none());
+    let live_vp = &report_json["steps"][5]["result"]["viewport"];
+    let live_w = live_vp["width"]
+        .as_u64()
+        .expect("at-click must report live viewport width");
+    let live_h = live_vp["height"]
+        .as_u64()
+        .expect("at-click must report live viewport height");
+    assert!(live_w > 0 && live_h > 0);
+    for idx in [1, 2, 3, 4, 5] {
+        let tb = report_json["steps"][idx]
+            .get("target_bounds")
+            .unwrap_or_else(|| {
+                panic!(
+                    "step {idx} missing target_bounds: {}",
+                    report_json["steps"][idx]
+                )
+            });
+        assert!(
+            validator.is_valid(tb),
+            "step {idx} target_bounds failed schema validation: {tb}"
+        );
+        assert_eq!(tb["viewport"]["width"], live_w);
+        assert_eq!(tb["viewport"]["height"], live_h);
+    }
+    assert!(
+        report_json["steps"][1]["target_bounds"]["width"]
+            .as_f64()
+            .unwrap_or(0.0)
+            > 0.0,
+        "located click should record non-zero element width"
+    );
+    assert!(
+        report_json["steps"][4]["target_bounds"]
+            .get("from")
+            .is_some()
+            && report_json["steps"][4]["target_bounds"].get("to").is_some(),
+        "drag step must record from/to endpoints: {}",
+        report_json["steps"][4]["target_bounds"]
+    );
+    assert_eq!(report_json["steps"][5]["target_bounds"]["x"], 120);
+    assert_eq!(report_json["steps"][5]["target_bounds"]["y"], 80);
+
+    let report_html = dir.path().join("report.html");
+    let rep_out = run_da(&["report", path_str(&record), "-o", path_str(&report_html)]);
+    assert_eq!(exit_code(&rep_out), Some(0), "stderr: {}", stderr(&rep_out));
+    let html = read(&report_html);
+    assert!(html.contains(&format!(
+        "<svg class=\"shot-overlay\" viewBox=\"0 0 {live_w} {live_h}\""
+    )));
+    assert!(html.contains("class=\"tb-box\""));
+    assert!(html.contains("class=\"tb-ring\""));
+    assert!(html.contains("class=\"tb-drag-line\""));
+    assert!(html.contains("class=\"tb-drag-arrow\""));
+
+    // Verify `da session` also persists schema-valid `target_bounds` in `steps.jsonl`
+    // and `da report` renders the session directory directly.
+    let sessions_dir = dir.path().join("sessions");
+    let start_out = Command::new(da())
+        .current_dir(dir.path())
+        .args([
+            "--output",
+            "json",
+            "session",
+            "start",
+            "--sessions-dir",
+            path_str(&sessions_dir),
+        ])
+        .output()
+        .expect("session start");
+    assert_eq!(exit_code(&start_out), Some(0), "{}", stderr(&start_out));
+    let start_json: Value = serde_json::from_slice(&start_out.stdout).unwrap();
+    let sid = start_json["session_id"].as_str().unwrap().to_string();
+
+    let open_step = json!({
+        "browser.open": {
+            "url": server.url("/browser/locators"),
+            "width": 1000,
+            "height": 700
+        }
+    })
+    .to_string();
+    let open_out = Command::new(da())
+        .current_dir(dir.path())
+        .args([
+            "session",
+            "step",
+            &sid,
+            "--sessions-dir",
+            path_str(&sessions_dir),
+            "--step",
+            &open_step,
+        ])
+        .output()
+        .expect("session open");
+    assert_eq!(
+        exit_code(&open_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&open_out),
+        stderr(&open_out)
+    );
+
+    let click_step = json!({ "browser.click": { "testid": "solo-btn" } }).to_string();
+    let click_out = Command::new(da())
+        .current_dir(dir.path())
+        .args([
+            "session",
+            "step",
+            &sid,
+            "--sessions-dir",
+            path_str(&sessions_dir),
+            "--step",
+            &click_step,
+        ])
+        .output()
+        .expect("session click");
+    assert_eq!(
+        exit_code(&click_out),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        stdout(&click_out),
+        stderr(&click_out)
+    );
+
+    let _ = Command::new(da())
+        .current_dir(dir.path())
+        .args([
+            "session",
+            "close",
+            &sid,
+            "--sessions-dir",
+            path_str(&sessions_dir),
+        ])
+        .output();
+
+    let sess_dir = sessions_dir.join(&sid);
+    let steps_text = read(&sess_dir.join("steps.jsonl"));
+    let lines: Vec<Value> = steps_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    let sess_tb = lines[1]
+        .get("target_bounds")
+        .expect("session browser.click must persist target_bounds in steps.jsonl");
+    assert!(
+        validator.is_valid(sess_tb),
+        "invalid session target_bounds: {sess_tb}"
+    );
+
+    let sess_html = dir.path().join("sess-report.html");
+    let srep = run_da(&["report", path_str(&sess_dir), "-o", path_str(&sess_html)]);
+    assert_eq!(exit_code(&srep), Some(0), "stderr: {}", stderr(&srep));
+    let shtml = read(&sess_html);
+    assert!(shtml.contains("Exploration Run (da session)"));
+    assert!(shtml.contains("Target geometry:"));
 }

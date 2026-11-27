@@ -493,6 +493,7 @@ mod tests {
                 duration: Duration::from_millis(2),
                 args: None,
                 result: Some(json!({"exit_code": 0})),
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: None,

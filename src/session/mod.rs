@@ -1137,6 +1137,7 @@ fn build_model_diagnostic_record(spec: ModelDiagnosticSpec<'_>, audit: &ModelAud
         started_at_ms: spec.started_at_ms,
         duration_ms: spec.duration_ms,
         result: Some(spec.result),
+        target_bounds: None,
         model: Some(audit.model.clone()),
         latency_ms: Some(audit.latency_ms),
         usage: audit.usage.clone(),
@@ -1626,7 +1627,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
     });
 
     let existing_steps = store::load_steps(&session_dir).unwrap_or_default();
-    let diag_record = build_model_diagnostic_record(
+    let mut diag_record = build_model_diagnostic_record(
         ModelDiagnosticSpec {
             index: existing_steps.len() + 1,
             action: STEP_ACTION_LOCATE,
@@ -1643,6 +1644,14 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         },
         &outcome.audit,
     );
+    diag_record.target_bounds = Some(json!({
+        "x": x_val,
+        "y": y_val,
+        "width": 0,
+        "height": 0,
+        "point": { "x": x_val, "y": y_val },
+        "viewport": viewport,
+    }));
 
     let mut click_outcome_opt: Option<(StepReport, Option<Value>, StepRecord)> = None;
     if req.click {
@@ -3361,6 +3370,7 @@ fn build_step_record(
         started_at_ms,
         duration_ms: u64::try_from(report.duration.as_millis()).unwrap_or(u64::MAX),
         result: report.result.clone(),
+        target_bounds: report.target_bounds.clone(),
         model: None,
         latency_ms: None,
         usage: None,

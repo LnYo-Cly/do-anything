@@ -3926,25 +3926,49 @@ can therefore appear in both places, written from the same collected evidence.
 An error while writing either copy is listed in `bundle_errors`, printed on
 standard error, and does not change the run's exit code.
 
-`da report <directory>` reads only complete case directories, meaning a
-directory whose `meta.json` exists. Incomplete staging directories are ignored
-and the cases are ordered by the numeric prefix of their directory names. It
-writes `<directory>/report.html` by default, or the file named by
+`da report <directory>` reads either:
+
+- complete recorded case directories (any subdirectory containing `meta.json`,
+  written last by `da run --record` or `.da/failures/<run>`; incomplete staging
+  directories are ignored and cases are ordered by their numeric prefix), or
+- interactive exploration session directories (`.da/sessions/<id>/` containing
+  `state.json` and `steps.jsonl`, or a parent directory of sessions).
+
+It writes `<directory>/report.html` by default, or the file named by
 `-o <file.html>`, and reports the path and counts on standard output. Use
 `--output json` for one JSON object. A missing directory, or a directory with no
-complete case, is a usage error (exit 2).
+complete case or session, is a usage error (exit 2).
 
-The report contains an overview, a step timeline for each case (including
-collapsible resolved step arguments, saved variables, and any per-step artifacts
-recorded under `trace/`), the assertions with their expected and actual values,
-and side-by-side cards for the observed HTTP response, database rows, CLI
-output, network requests, log lines, DOM snapshot and interface screenshot.
+UI interaction steps (`browser.click`, `browser.hover`, `browser.type`,
+`browser.drag`, coordinate `at:` steps, `desktop.click`, `desktop.type`,
+`android.tap`, `android.tap_on`, and `da session locate`) persist optional
+schema-validated `target_bounds` (`{ x, y, width, height, point, viewport }`
+plus `from` / `to` and optional `from_bounds` / `to_bounds` for drags) in
+`report.json` and `steps.jsonl`, scrubbed by `Secrets`.
+
+The report is one self-contained offline HTML viewer with:
+
+- an overview clearly distinguishing **0-token deterministic `da run` replays**
+  from **exploration runs (`da session`)**; when model calls (`select_ref`,
+  `locate`, `judge`, `extract`, `act`) are present, a **Model exploration
+  telemetry** panel aggregates call counts, models, total/average/max latency,
+  and prompt/completion/cache/reasoning tokens;
+- a sticky step timeline scrubber with keyboard navigation (`←`/`→` step,
+  `Space` play/pause, `f` failures-only filter, `o` toggle SVG overlays, plus
+  single-step focus mode);
+- toggleable inline SVG target overlays (element bounding box, click/tap
+  reticle, and drag arrows) drawn directly over step/case screenshots without
+  any external assets;
+- tabbed cross-layer detail panes per step covering assertions diff,
+  `observed.*` (`browser.network`, `log.file`, `fs.watch`), `db.query` tables,
+  HTTP/CLI output, model telemetry, DOM snapshots, and raw args/results.
+
 Both case-level screenshots and per-step traced screenshots obey `--shareable`,
 `local_only`, and the 2 MiB / 10 MiB image budgets. An optional step that did not reach its
 assertions appears as `SKIPPED` with the reason, is counted in the report's
-skipped total, and does not stop the rest of the case from being recorded. It is
-one static HTML file: CSS is inline,
-there is no front-end framework, no script and no external reference. The
+skipped total, and does not stop the rest of the case from being recorded. CSS
+and one static viewer `<script>` (which interpolates zero untrusted data) are
+inline, with no front-end framework and no external network reference. The
 document carries this policy, so opening it from disk cannot fetch anything:
 
 ```html

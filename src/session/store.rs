@@ -108,6 +108,9 @@ pub struct StepRecord {
     /// Redacted step output JSON (or `null` when the step produced no result).
     #[serde(default)]
     pub result: Option<Value>,
+    /// Redacted UI action geometry (`{ x, y, width, height, viewport, ... }`), when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bounds: Option<Value>,
     /// Model identifier recorded when an external model hook assisted exploration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -318,6 +321,10 @@ pub fn append_step(
         .map(|loc| secrets.redact_json(loc));
     sanitized.result = sanitized
         .result
+        .as_ref()
+        .map(|value| secrets.redact_json(value));
+    sanitized.target_bounds = sanitized
+        .target_bounds
         .as_ref()
         .map(|value| secrets.redact_json(value));
     sanitized.model = sanitized.model.as_deref().map(|m| secrets.redact(m));
@@ -709,6 +716,7 @@ mod tests {
             result: Some(serde_json::json!({
                 "body": { "echo": "tok-secret-999" }
             })),
+            target_bounds: None,
             model: None,
             latency_ms: None,
             usage: None,
