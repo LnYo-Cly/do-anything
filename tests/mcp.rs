@@ -53,6 +53,10 @@ impl Server {
         let mut child = Command::new(da())
             .arg("mcp")
             .current_dir(dir)
+            .env_remove("DA_MODEL")
+            .env_remove("DA_MODEL_ADAPTER")
+            .env_remove("DA_MODEL_ENDPOINT")
+            .env_remove("DA_MODEL_API_KEY_ENV")
             .env(SECRET_VARIABLE, SECRET)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -944,4 +948,456 @@ fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export
 
     assert_no_leak(&server.seen);
     server.finish();
+}
+
+#[cfg(all(feature = "cli", feature = "ai"))]
+mod ai_mcp_tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    struct McpModelMock {
+        port: u16,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl McpModelMock {
+        fn start(reply_content: Value) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mcp mock model");
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let body = json!({
+                "id": "chatcmpl-mcp-1",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "mcp-builtin-v1",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": reply_content.to_string() },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })
+            .to_string();
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let reqs_c = Arc::clone(&requests);
+            let stop_c = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                while !stop_c.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let reqs = Arc::clone(&reqs_c);
+                            let rep = body.clone();
+                            thread::spawn(move || serve_once(stream, &reqs, &rep));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                port,
+                requests,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://127.0.0.1:{}/v1", self.port)
+        }
+    }
+
+    impl Drop for McpModelMock {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn serve_once(stream: TcpStream, requests: &Mutex<Vec<String>>, body: &str) {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut writer = stream;
+
+        let mut req_line = String::new();
+        if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut len = 0usize;
+        let mut auth = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    len = v.trim().parse().unwrap_or(0);
+                } else if k.trim().eq_ignore_ascii_case("authorization") {
+                    auth = v.trim().to_string();
+                }
+            }
+        }
+        let mut body_buf = vec![0u8; len];
+        if len > 0 {
+            let _ = std::io::Read::read_exact(&mut reader, &mut body_buf);
+        }
+        let raw_req = format!(
+            "{req_line}AUTH={auth}\n{}",
+            String::from_utf8_lossy(&body_buf)
+        );
+        requests.lock().unwrap().push(raw_req);
+
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = writer.write_all(resp.as_bytes());
+        let _ = writer.flush();
+    }
+
+    #[test]
+    fn mcp_with_builtin_model_exposes_tools_runs_judge_and_redacts_secrets() {
+        let dir = TempDir::new("mcp-builtin-model");
+        let api_key_secret = "mcp-model-api-key-918273";
+        let mock = McpModelMock::start(json!({
+            "passed": true,
+            "rationale": format!("verified {SECRET} and {api_key_secret} cleanly"),
+            "confidence": 0.91
+        }));
+
+        let mut child = Command::new(da())
+            .arg("mcp")
+            .arg("--model")
+            .arg("openai::gpt-4o-mini")
+            .arg("--model-endpoint")
+            .arg(mock.endpoint())
+            .arg("--model-api-key-env")
+            .arg("DA_MCP_TEST_KEY")
+            .current_dir(dir.path())
+            .env(SECRET_VARIABLE, SECRET)
+            .env("DA_MCP_TEST_KEY", api_key_secret)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start `da mcp --model`");
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        let mut server = Server {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            seen: String::new(),
+        };
+        server.initialize();
+
+        let listed = server.request(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+        let tools = listed["result"]["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "session_start",
+                "step",
+                "snapshot",
+                "select_ref",
+                "locate",
+                "judge",
+                "export",
+                "run",
+                "session_stop"
+            ]
+        );
+        let judge_schema = tools
+            .iter()
+            .find(|t| t["name"] == "judge")
+            .expect("judge tool schema");
+        assert!(judge_schema["inputSchema"]["properties"]["screenshot"].is_object());
+        assert!(judge_schema["inputSchema"]["properties"]["model"].is_object());
+
+        let started = payload(&server.call_tool(2, "session_start", json!({})));
+        let session_id = started["session_id"].as_str().unwrap().to_string();
+
+        let step_resp = server.call_tool(
+            3,
+            "step",
+            json!({
+                "session_id": session_id,
+                "use": "cli.run",
+                "with": {
+                    "command": da(),
+                    "args": ["--version"],
+                    "env": {"PROBE": format!("${{env:{SECRET_VARIABLE}}}")}
+                },
+                "expect": [{"path": "$.exit_code", "equals": 0}]
+            }),
+        );
+        assert!(!failed(&step_resp), "{step_resp}");
+
+        let judged = server.call_tool(
+            4,
+            "judge",
+            json!({
+                "session_id": session_id,
+                "rubric": format!("Verify ${{env:{SECRET_VARIABLE}}} succeeded")
+            }),
+        );
+        assert!(!failed(&judged), "{judged}");
+        let judged_payload = payload(&judged);
+        assert_eq!(judged_payload["passed"], true);
+        assert_eq!(judged_payload["model"], "mcp-builtin-v1");
+        assert_eq!(judged_payload["rationale"], "verified *** and *** cleanly");
+        assert!(!server.seen.contains(api_key_secret), "{}", server.seen);
+
+        let recorded = mock.requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains(&format!("AUTH=Bearer {api_key_secret}")));
+        assert!(!recorded[0].contains(SECRET), "{}", recorded[0]);
+
+        // `screenshot: true` without an active visual session returns `environment` error.
+        let shot_err = server.call_tool(
+            5,
+            "judge",
+            json!({
+                "session_id": session_id,
+                "rubric": "Check screenshot",
+                "screenshot": true
+            }),
+        );
+        assert!(failed(&shot_err), "{shot_err}");
+        assert_eq!(payload(&shot_err)["error"]["kind"], "environment");
+
+        let _ = server.call_tool(6, "session_stop", json!({"session_id": session_id}));
+        assert_no_leak(&server.seen);
+        server.finish();
+    }
+
+    #[test]
+    fn mcp_with_da_model_env_exposes_model_tools_and_runs_judge() {
+        let dir = TempDir::new("mcp-da-model-env");
+        let mock = McpModelMock::start(json!({
+            "passed": true,
+            "rationale": "Env-configured model verified session",
+            "confidence": 0.88
+        }));
+
+        let mut child = Command::new(da())
+            .arg("mcp")
+            .current_dir(dir.path())
+            .env("DA_MODEL", "qwen-local")
+            .env("DA_MODEL_ADAPTER", "omlx")
+            .env("DA_MODEL_ENDPOINT", mock.endpoint())
+            .env_remove("DA_MODEL_API_KEY_ENV")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start `da mcp` with DA_MODEL");
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        let mut server = Server {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            seen: String::new(),
+        };
+        server.initialize();
+
+        let listed = server.request(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 9, "{names:?}");
+        assert!(names.contains(&"judge"));
+
+        let started = payload(&server.call_tool(2, "session_start", json!({})));
+        let session_id = started["session_id"].as_str().unwrap().to_string();
+
+        let judged = server.call_tool(
+            3,
+            "judge",
+            json!({
+                "session_id": session_id,
+                "rubric": "Verify env fallback",
+                "evidence": {"status": "ready"}
+            }),
+        );
+        assert!(!failed(&judged), "{judged}");
+        let judged_payload = payload(&judged);
+        assert_eq!(judged_payload["passed"], true);
+        assert_eq!(judged_payload["model"], "mcp-builtin-v1");
+
+        let _ = server.call_tool(4, "session_stop", json!({"session_id": session_id}));
+        server.finish();
+    }
+
+    #[test]
+    fn mcp_session_start_model_and_hook_override_server_defaults() {
+        let dir = TempDir::new("mcp-session-model-precedence");
+        let server_mock = McpModelMock::start(json!({
+            "passed": true,
+            "rationale": "from server default",
+            "confidence": 0.9
+        }));
+        let session_mock = McpModelMock::start(json!({
+            "passed": true,
+            "rationale": "from session model",
+            "confidence": 0.95
+        }));
+
+        let hook_src = dir.write("mcp_session_override_hook.rs", MCP_MOCK_HOOK_RS);
+        let hook_bin = dir.path().join(if cfg!(windows) {
+            "mcp_session_override_hook.exe"
+        } else {
+            "mcp_session_override_hook"
+        });
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let status = Command::new(rustc)
+            .arg(&hook_src)
+            .arg("-O")
+            .arg("-o")
+            .arg(&hook_bin)
+            .status()
+            .expect("compile mcp_session_override_hook.rs");
+        assert!(
+            status.success(),
+            "rustc failed for mcp_session_override_hook.rs"
+        );
+
+        let mut child = Command::new(da())
+            .arg("mcp")
+            .arg("--model")
+            .arg("omlx::server-default")
+            .arg("--model-endpoint")
+            .arg(server_mock.endpoint())
+            .current_dir(dir.path())
+            .env(SECRET_VARIABLE, SECRET)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start `da mcp --model`");
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        let mut server = Server {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            seen: String::new(),
+        };
+        server.initialize();
+
+        // 1. Session configured with its own built-in model must NOT be shadowed by server default.
+        let s_model = payload(&server.call_tool(
+            1,
+            "session_start",
+            json!({
+                "model": "omlx::session-custom",
+                "model_endpoint": session_mock.endpoint()
+            }),
+        ));
+        let s_model_id = s_model["session_id"].as_str().unwrap().to_string();
+        let judged_session_model = server.call_tool(
+            2,
+            "judge",
+            json!({
+                "session_id": s_model_id,
+                "rubric": "check session model",
+                "evidence": {"ok": true}
+            }),
+        );
+        assert!(!failed(&judged_session_model), "{judged_session_model}");
+        assert_eq!(
+            payload(&judged_session_model)["rationale"],
+            "from session model"
+        );
+        assert_eq!(session_mock.requests.lock().unwrap().len(), 1);
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 0);
+
+        // 2. Session configured with a `model_hook` must NOT be shadowed by server `--model`.
+        let s_hook = payload(&server.call_tool(
+            3,
+            "session_start",
+            json!({
+                "model_hook": hook_bin.to_string_lossy().to_string()
+            }),
+        ));
+        let s_hook_id = s_hook["session_id"].as_str().unwrap().to_string();
+        let judged_session_hook = server.call_tool(
+            4,
+            "judge",
+            json!({
+                "session_id": s_hook_id,
+                "rubric": "check session hook",
+                "evidence": {"ok": true}
+            }),
+        );
+        assert!(!failed(&judged_session_hook), "{judged_session_hook}");
+        assert_eq!(payload(&judged_session_hook)["model"], "mcp-judge-v1");
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 0);
+
+        // 3. Explicit per-call `model` still overrides the session's `model_hook`.
+        let judged_per_call = server.call_tool(
+            5,
+            "judge",
+            json!({
+                "session_id": s_hook_id,
+                "rubric": "check per-call override",
+                "evidence": {"ok": true},
+                "model": "omlx::call-override",
+                "endpoint": session_mock.endpoint()
+            }),
+        );
+        assert!(!failed(&judged_per_call), "{judged_per_call}");
+        assert_eq!(payload(&judged_per_call)["rationale"], "from session model");
+        assert_eq!(session_mock.requests.lock().unwrap().len(), 2);
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 0);
+
+        // 4. Session with no explicit model inherits the server default persisted at `session_start`.
+        let s_default = payload(&server.call_tool(6, "session_start", json!({})));
+        let s_default_id = s_default["session_id"].as_str().unwrap().to_string();
+        let judged_default = server.call_tool(
+            7,
+            "judge",
+            json!({
+                "session_id": s_default_id,
+                "rubric": "check server default",
+                "evidence": {"ok": true}
+            }),
+        );
+        assert!(!failed(&judged_default), "{judged_default}");
+        assert_eq!(payload(&judged_default)["rationale"], "from server default");
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 1);
+
+        let _ = server.call_tool(8, "session_stop", json!({"session_id": s_model_id}));
+        let _ = server.call_tool(9, "session_stop", json!({"session_id": s_hook_id}));
+        let _ = server.call_tool(10, "session_stop", json!({"session_id": s_default_id}));
+        server.finish();
+    }
 }

@@ -6,6 +6,8 @@
 //! without ever persisting resolved environment secrets.
 
 pub mod export;
+#[cfg(feature = "ai")]
+pub(crate) mod model_ai;
 pub mod model_hook;
 pub mod store;
 
@@ -30,12 +32,14 @@ use crate::exit::ExitCode;
 
 use self::export::ExportOptions;
 use self::model_hook::{
-    JudgeParams, LocateParams, ModelAudit, ModelHookSpec, STEP_ACTION_JUDGE, STEP_ACTION_LOCATE,
-    STEP_ACTION_SELECT_REF, SelectRefParams,
+    BuiltinModelSpec, HookError, JudgeOutcome, JudgeParams, LocateOutcome, LocateParams,
+    ModelAudit, ModelHookSpec, STEP_ACTION_JUDGE, STEP_ACTION_LOCATE, STEP_ACTION_SELECT_REF,
+    SelectRefOutcome, SelectRefParams,
 };
 use self::store::{
     LockError, SessionLock, SessionState, StepRecord, StoredExpectation, StoredObservation,
 };
+use crate::core::session::MaskedViewportCapture;
 
 /// Default directory relative to the working directory for session storage.
 pub const DEFAULT_SESSIONS_DIR: &str = ".da/sessions";
@@ -77,6 +81,7 @@ pub struct SelectRefRequest {
     pub max_depth: Option<usize>,
     pub max_nodes: Option<usize>,
     pub hook_override: Option<ModelHookSpec>,
+    pub model_override: Option<BuiltinModelSpec>,
     pub timeout_ms: u64,
     pub act: Option<SelectRefAction>,
 }
@@ -89,6 +94,7 @@ pub struct LocateRequest {
     pub base_directory: PathBuf,
     pub query: String,
     pub hook_override: Option<ModelHookSpec>,
+    pub model_override: Option<BuiltinModelSpec>,
     pub timeout_ms: u64,
     pub click: bool,
 }
@@ -98,9 +104,12 @@ pub struct LocateRequest {
 pub struct JudgeRequest {
     pub sessions_dir: PathBuf,
     pub id: String,
+    pub base_directory: PathBuf,
     pub rubric: String,
     pub evidence: Option<Value>,
+    pub screenshot: bool,
     pub hook_override: Option<ModelHookSpec>,
+    pub model_override: Option<BuiltinModelSpec>,
     pub timeout_ms: u64,
 }
 
@@ -112,6 +121,7 @@ pub enum SessionRequest {
         idle_timeout_ms: u64,
         observe: Vec<StoredObservation>,
         model_hook: Option<ModelHookSpec>,
+        model: Option<BuiltinModelSpec>,
         plugins: Vec<String>,
     },
     Step {
@@ -165,12 +175,14 @@ pub fn handle(request: SessionRequest, registry: &Registry) -> SessionResponse {
             idle_timeout_ms,
             observe,
             model_hook,
+            model,
             plugins,
         } => handle_start(
             &sessions_dir,
             idle_timeout_ms,
             observe,
             model_hook,
+            model,
             plugins,
             registry,
         ),
@@ -231,9 +243,17 @@ fn handle_start(
     idle_timeout_ms: u64,
     observe: Vec<StoredObservation>,
     model_hook: Option<ModelHookSpec>,
+    model: Option<BuiltinModelSpec>,
     plugins: Vec<String>,
     registry: &Registry,
 ) -> SessionResponse {
+    if model_hook.is_some() && model.is_some() {
+        return error_response(
+            ExitCode::Usage,
+            "usage",
+            "pass either `--model` or `--model-hook`, not both",
+        );
+    }
     if let Some(hook) = &model_hook
         && hook.command.trim().is_empty()
     {
@@ -243,14 +263,22 @@ fn handle_start(
             "`--model-hook` executable path must not be empty",
         );
     }
+    if let Some(spec) = &model
+        && let Err(msg) = validate_builtin_model(spec)
+    {
+        return error_response(ExitCode::Usage, "usage", msg);
+    }
 
     let (observer_names, mut env_names) = match validate_start_observations(&observe, registry) {
         Ok(validated) => validated,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if let Some(hook) = &model_hook {
         env_names.extend(case::env_references(&json!([&hook.command, &hook.args])));
+    }
+    if let Some(spec) = &model {
+        collect_builtin_model_env_names(spec, &mut env_names);
     }
     let mut secrets = store::secrets_from_env_names(&env_names);
     if let Some(hook) = &model_hook {
@@ -270,6 +298,16 @@ fn handle_start(
                 );
             }
         }
+    }
+    if let Some(spec) = &model
+        && let Some(endpoint) = &spec.endpoint
+        && let Err(msg) = case::expand_env(endpoint, &mut secrets)
+    {
+        return error_response(
+            ExitCode::InvalidCase,
+            "invalid_input",
+            secrets.redact(&format!("`--model-endpoint`: {msg}")),
+        );
     }
 
     let list_report = match store::list_and_reap(sessions_dir, None, registry, &secrets) {
@@ -298,6 +336,7 @@ fn handle_start(
 
     let now = store::now_ms();
     let hook_display = model_hook.as_ref().map(|h| secrets.redact(&h.command));
+    let model_display = model.clone();
     let state = SessionState {
         schema_version: 1,
         id: id.clone(),
@@ -310,6 +349,7 @@ fn handle_start(
         observe,
         plugins,
         model_hook,
+        model,
     };
     if let Err(message) = store::save_state(&session_dir, &state, &secrets) {
         let _ = store::remove_session_dir(&session_dir);
@@ -332,6 +372,18 @@ fn handle_start(
     });
     if let Some(cmd) = hook_display {
         payload["model_hook"] = Value::String(cmd);
+    }
+    if let Some(spec) = model_display {
+        payload["model"] = Value::String(secrets.redact(&spec.model));
+        if let Some(adapter) = &spec.adapter {
+            payload["model_adapter"] = Value::String(secrets.redact(adapter));
+        }
+        if let Some(endpoint) = &spec.endpoint {
+            payload["model_endpoint"] = Value::String(secrets.redact(endpoint));
+        }
+        if let Some(api_key_env) = &spec.api_key_env {
+            payload["model_api_key_env"] = Value::String(secrets.redact(api_key_env));
+        }
     }
     SessionResponse {
         exit_code: ExitCode::Success,
@@ -376,38 +428,38 @@ fn resolve_target_session_registry<'a>(
 fn acquire_existing(
     sessions_dir: &Path,
     id: &str,
-) -> Result<(PathBuf, SessionLock, SessionState), SessionResponse> {
+) -> Result<(PathBuf, SessionLock, SessionState), Box<SessionResponse>> {
     if let Err(message) = store::validate_session_id(id) {
-        return Err(error_response(ExitCode::Usage, "usage", message));
+        return Err(Box::new(error_response(ExitCode::Usage, "usage", message)));
     }
     let session_dir = sessions_dir.join(id);
     if !session_dir.join(store::STATE_FILE).exists() {
-        return Err(error_response(
+        return Err(Box::new(error_response(
             ExitCode::Environment,
             "environment",
             format!(
                 "session `{id}` does not exist or has already stopped; start one with `da session start`"
             ),
-        ));
+        )));
     }
     let lock = match SessionLock::try_acquire(&session_dir, id) {
         Ok(lock) => lock,
         Err(LockError::Busy(message)) | Err(LockError::Io(message)) => {
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 ExitCode::Environment,
                 "environment",
                 message,
-            ));
+            )));
         }
     };
     let state = match store::load_state(&session_dir) {
         Ok(state) => state,
         Err(message) => {
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 ExitCode::Environment,
                 "environment",
                 message,
-            ));
+            )));
         }
     };
     Ok((session_dir, lock, state))
@@ -448,7 +500,7 @@ fn handle_step(
 ) -> SessionResponse {
     let (session_dir, _lock, mut state) = match acquire_existing(sessions_dir, id) {
         Ok(found) => found,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
@@ -592,7 +644,7 @@ fn handle_snapshot(
 ) -> SessionResponse {
     let (session_dir, _lock, mut state) = match acquire_existing(sessions_dir, id) {
         Ok(found) => found,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let secrets = store::secrets_from_env_names(&state.env_names);
@@ -662,30 +714,118 @@ fn handle_snapshot(
     }
 }
 
-fn resolve_hook_spec(
+enum ModelBackend {
+    Builtin(BuiltinModelSpec),
+    Hook(ModelHookSpec),
+}
+
+/// Validates a built-in `genai` model specification without making network requests.
+pub fn validate_builtin_model(spec: &BuiltinModelSpec) -> Result<(), String> {
+    #[cfg(feature = "ai")]
+    {
+        model_ai::validate_spec(spec)
+    }
+    #[cfg(not(feature = "ai"))]
+    {
+        let _ = spec;
+        Err(
+            "this build was compiled without the `ai` feature; rebuild with `--features ai` or use `--model-hook` / `--hook`"
+                .to_string(),
+        )
+    }
+}
+
+/// Collects environment variable names referenced by a [`BuiltinModelSpec`] for secret redaction.
+pub fn collect_builtin_model_env_names(spec: &BuiltinModelSpec, env_names: &mut BTreeSet<String>) {
+    #[cfg(feature = "ai")]
+    {
+        model_ai::collect_env_names(spec, env_names);
+    }
+    #[cfg(not(feature = "ai"))]
+    {
+        if let Some(endpoint) = &spec.endpoint {
+            env_names.extend(case::env_references(&Value::String(endpoint.clone())));
+        }
+        if let Some(key_env) = &spec.api_key_env {
+            let trimmed = key_env.trim();
+            if !trimmed.is_empty() {
+                env_names.insert(trimmed.to_string());
+            }
+        }
+    }
+}
+
+/// Reads the `DA_MODEL` environment fallback configuration when present and non-empty.
+pub fn builtin_model_from_env() -> Option<BuiltinModelSpec> {
+    let model = std::env::var("DA_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let read_opt = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    Some(BuiltinModelSpec {
+        model,
+        adapter: read_opt("DA_MODEL_ADAPTER"),
+        endpoint: read_opt("DA_MODEL_ENDPOINT"),
+        api_key_env: read_opt("DA_MODEL_API_KEY_ENV"),
+    })
+}
+
+fn resolve_model_backend(
     hook_override: Option<&ModelHookSpec>,
+    model_override: Option<&BuiltinModelSpec>,
     state: &mut SessionState,
     secrets: &mut Secrets,
-) -> Result<ModelHookSpec, SessionResponse> {
-    let raw = match hook_override.or(state.model_hook.as_ref()) {
-        Some(spec) => spec.clone(),
-        None => {
-            return Err(error_response(
-                ExitCode::Usage,
-                "usage",
-                format!(
-                    "no model hook configured for session `{}`; pass `--hook <executable>` or start the session with `da session start --model-hook <executable>`",
-                    state.id
-                ),
-            ));
-        }
-    };
+) -> Result<ModelBackend, Box<SessionResponse>> {
+    if hook_override.is_some() && model_override.is_some() {
+        return Err(Box::new(error_response(
+            ExitCode::Usage,
+            "usage",
+            "pass either `--hook` or `--model`, not both",
+        )));
+    }
+
+    if let Some(hook) = hook_override {
+        return expand_hook_spec(hook, state, secrets).map(ModelBackend::Hook);
+    }
+    if let Some(model) = model_override {
+        return prepare_builtin_model(model, state, secrets).map(ModelBackend::Builtin);
+    }
+    if let Some(hook) = state.model_hook.clone() {
+        return expand_hook_spec(&hook, state, secrets).map(ModelBackend::Hook);
+    }
+    if let Some(model) = state.model.clone() {
+        return prepare_builtin_model(&model, state, secrets).map(ModelBackend::Builtin);
+    }
+    if let Some(env_model) = builtin_model_from_env() {
+        return prepare_builtin_model(&env_model, state, secrets).map(ModelBackend::Builtin);
+    }
+
+    Err(Box::new(error_response(
+        ExitCode::Usage,
+        "usage",
+        format!(
+            "no model configured for session `{}`; pass `--model <MODEL>` or `--hook <EXECUTABLE>`, set `DA_MODEL`, or configure `--model` / `--model-hook` on `da session start`",
+            state.id
+        ),
+    )))
+}
+
+fn expand_hook_spec(
+    raw: &ModelHookSpec,
+    state: &mut SessionState,
+    secrets: &mut Secrets,
+) -> Result<ModelHookSpec, Box<SessionResponse>> {
     if raw.command.trim().is_empty() {
-        return Err(error_response(
+        return Err(Box::new(error_response(
             ExitCode::Usage,
             "usage",
             "model hook executable path must not be empty",
-        ));
+        )));
     }
     state
         .env_names
@@ -693,24 +833,90 @@ fn resolve_hook_spec(
     *secrets = store::secrets_from_env_names(&state.env_names);
 
     let command = case::expand_env(&raw.command, secrets).map_err(|msg| {
-        error_response(
+        Box::new(error_response(
             ExitCode::InvalidCase,
             "invalid_input",
             secrets.redact(&format!("model hook command: {msg}")),
-        )
+        ))
     })?;
     let mut args = Vec::with_capacity(raw.args.len());
     for arg in &raw.args {
         let expanded = case::expand_env(arg, secrets).map_err(|msg| {
-            error_response(
+            Box::new(error_response(
                 ExitCode::InvalidCase,
                 "invalid_input",
                 secrets.redact(&format!("model hook argument: {msg}")),
-            )
+            ))
         })?;
         args.push(expanded);
     }
     Ok(ModelHookSpec { command, args })
+}
+
+fn prepare_builtin_model(
+    spec: &BuiltinModelSpec,
+    state: &mut SessionState,
+    secrets: &mut Secrets,
+) -> Result<BuiltinModelSpec, Box<SessionResponse>> {
+    if let Err(msg) = validate_builtin_model(spec) {
+        return Err(Box::new(error_response(ExitCode::Usage, "usage", msg)));
+    }
+    collect_builtin_model_env_names(spec, &mut state.env_names);
+    *secrets = store::secrets_from_env_names(&state.env_names);
+    Ok(spec.clone())
+}
+
+#[cfg(not(feature = "ai"))]
+fn ai_feature_disabled_error(spec: &BuiltinModelSpec) -> HookError {
+    HookError::Usage(format!(
+        "model `{}` requires a build with the `ai` feature; rebuild with `--features ai` or use `--hook`",
+        spec.model
+    ))
+}
+
+fn invoke_select_ref(
+    backend: &ModelBackend,
+    timeout_ms: u64,
+    params: SelectRefParams<'_>,
+    secrets: &mut Secrets,
+) -> Result<SelectRefOutcome, HookError> {
+    match backend {
+        ModelBackend::Hook(hook) => model_hook::call_select_ref(hook, timeout_ms, params, secrets),
+        #[cfg(feature = "ai")]
+        ModelBackend::Builtin(spec) => model_ai::call_select_ref(spec, timeout_ms, params, secrets),
+        #[cfg(not(feature = "ai"))]
+        ModelBackend::Builtin(spec) => Err(ai_feature_disabled_error(spec)),
+    }
+}
+
+fn invoke_locate(
+    backend: &ModelBackend,
+    timeout_ms: u64,
+    params: LocateParams<'_>,
+    secrets: &mut Secrets,
+) -> Result<LocateOutcome, HookError> {
+    match backend {
+        ModelBackend::Hook(hook) => model_hook::call_locate(hook, timeout_ms, params, secrets),
+        #[cfg(feature = "ai")]
+        ModelBackend::Builtin(spec) => model_ai::call_locate(spec, timeout_ms, params, secrets),
+        #[cfg(not(feature = "ai"))]
+        ModelBackend::Builtin(spec) => Err(ai_feature_disabled_error(spec)),
+    }
+}
+
+fn invoke_judge(
+    backend: &ModelBackend,
+    timeout_ms: u64,
+    params: JudgeParams<'_>,
+    secrets: &mut Secrets,
+) -> Result<JudgeOutcome, HookError> {
+    match backend {
+        ModelBackend::Hook(hook) => model_hook::call_judge(hook, timeout_ms, params, secrets),
+        #[cfg(feature = "ai")]
+        ModelBackend::Builtin(spec) => model_ai::call_judge(spec, timeout_ms, params, secrets),
+        #[cfg(not(feature = "ai"))]
+        ModelBackend::Builtin(spec) => Err(ai_feature_disabled_error(spec)),
+    }
 }
 
 fn detach_and_persist_handles(
@@ -804,7 +1010,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
 
     let (session_dir, _lock, mut state) = match acquire_existing(&req.sessions_dir, &req.id) {
         Ok(found) => found,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     state
@@ -824,9 +1030,14 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
     }
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
-    let hook = match resolve_hook_spec(req.hook_override.as_ref(), &mut state, &mut secrets) {
-        Ok(spec) => spec,
-        Err(resp) => return resp,
+    let backend = match resolve_model_backend(
+        req.hook_override.as_ref(),
+        req.model_override.as_ref(),
+        &mut state,
+        &mut secrets,
+    ) {
+        Ok(backend) => backend,
+        Err(resp) => return *resp,
     };
     let expanded_query = match case::expand_env(&req.query, &mut secrets) {
         Ok(q) => q,
@@ -897,8 +1108,8 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
         );
     }
 
-    let outcome = match model_hook::call_select_ref(
-        &hook,
+    let outcome = match invoke_select_ref(
+        &backend,
         req.timeout_ms,
         SelectRefParams {
             session_id: &state.id,
@@ -906,7 +1117,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
             query: &expanded_query,
             candidates: &candidates,
         },
-        &secrets,
+        &mut secrets,
     ) {
         Ok(outcome) => outcome,
         Err(hook_err) => {
@@ -1120,16 +1331,21 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
 
     let (session_dir, _lock, mut state) = match acquire_existing(&req.sessions_dir, &req.id) {
         Ok(found) => found,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     state
         .env_names
         .extend(case::env_references(&Value::String(req.query.clone())));
     let mut secrets = store::secrets_from_env_names(&state.env_names);
-    let hook = match resolve_hook_spec(req.hook_override.as_ref(), &mut state, &mut secrets) {
-        Ok(spec) => spec,
-        Err(resp) => return resp,
+    let backend = match resolve_model_backend(
+        req.hook_override.as_ref(),
+        req.model_override.as_ref(),
+        &mut state,
+        &mut secrets,
+    ) {
+        Ok(backend) => backend,
+        Err(resp) => return *resp,
     };
     let expanded_query = match case::expand_env(&req.query, &mut secrets) {
         Ok(q) => q,
@@ -1180,8 +1396,8 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         }
     };
 
-    let outcome = match model_hook::call_locate(
-        &hook,
+    let outcome = match invoke_locate(
+        &backend,
         req.timeout_ms,
         LocateParams {
             session_id: &state.id,
@@ -1191,7 +1407,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
             width: capture.width,
             height: capture.height,
         },
-        &secrets,
+        &mut secrets,
     ) {
         Ok(outcome) => outcome,
         Err(hook_err) => {
@@ -1434,7 +1650,7 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
 
     let (session_dir, _lock, mut state) = match acquire_existing(&req.sessions_dir, &req.id) {
         Ok(found) => found,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     state
@@ -1445,9 +1661,14 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
     }
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
-    let hook = match resolve_hook_spec(req.hook_override.as_ref(), &mut state, &mut secrets) {
-        Ok(spec) => spec,
-        Err(resp) => return resp,
+    let backend = match resolve_model_backend(
+        req.hook_override.as_ref(),
+        req.model_override.as_ref(),
+        &mut state,
+        &mut secrets,
+    ) {
+        Ok(backend) => backend,
+        Err(resp) => return *resp,
     };
     let expanded_rubric = match case::expand_env(&req.rubric, &mut secrets) {
         Ok(r) => r,
@@ -1506,8 +1727,18 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         }
     };
 
+    if req.screenshot && state.handles.is_empty() {
+        return error_response(
+            ExitCode::Environment,
+            "environment",
+            "no active visual session; run `browser.open` or `desktop.launch` before calling `judge` with `--screenshot`",
+        );
+    }
+
     let started_at_ms = store::now_ms();
     let mut detach_errors = Vec::new();
+    let mut local_only_reason: Option<String> = None;
+    let mut masked_capture: Option<MaskedViewportCapture> = None;
     let (session_kind, snapshot) = if state.handles.is_empty() {
         ("session".to_string(), None)
     } else {
@@ -1523,15 +1754,52 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
                 return error_response(code, kind, secrets.redact(&message));
             }
         };
-        match reattach_sessions(&state, Path::new("."), effective_registry.as_ref()) {
+        match reattach_sessions(&state, &req.base_directory, effective_registry.as_ref()) {
             Ok(mut sessions) => {
                 let snap_res = sessions.collect_snapshot(None, None, None);
+                let cap_res = if req.screenshot {
+                    Some(sessions.collect_masked_viewport_capture())
+                } else {
+                    None
+                };
+                local_only_reason = sessions.local_only_reason();
                 let detached = sessions.detach_all();
                 state.handles = detached.handles;
                 detach_errors = detached.errors;
-                match snap_res {
-                    Ok(Some((kind, snap))) => (kind, Some(snap)),
-                    Ok(None) | Err(_) => (fallback_kind, None),
+
+                if let Some(cap_result) = cap_res {
+                    match cap_result {
+                        Ok(Some((cap_kind, cap))) => {
+                            masked_capture = Some(cap);
+                            match snap_res {
+                                Ok(Some((kind, snap))) => (kind, Some(snap)),
+                                Ok(None) | Err(_) => (cap_kind, None),
+                            }
+                        }
+                        Ok(None) => {
+                            state.last_active_ms = store::now_ms();
+                            let _ = store::save_state(&session_dir, &state, &secrets);
+                            return error_response(
+                                ExitCode::Environment,
+                                "environment",
+                                "active session has no visual surface for `--screenshot`",
+                            );
+                        }
+                        Err(message) => {
+                            state.last_active_ms = store::now_ms();
+                            let _ = store::save_state(&session_dir, &state, &secrets);
+                            return error_response(
+                                ExitCode::Environment,
+                                "environment",
+                                secrets.redact(&message),
+                            );
+                        }
+                    }
+                } else {
+                    match snap_res {
+                        Ok(Some((kind, snap))) => (kind, Some(snap)),
+                        Ok(None) | Err(_) => (fallback_kind, None),
+                    }
                 }
             }
             Err(message) => {
@@ -1544,8 +1812,8 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         }
     };
 
-    let outcome = match model_hook::call_judge(
-        &hook,
+    let outcome = match invoke_judge(
+        &backend,
         req.timeout_ms,
         JudgeParams {
             session_id: &state.id,
@@ -1553,8 +1821,9 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
             rubric: &expanded_rubric,
             snapshot: snapshot.as_ref(),
             evidence: resolved_evidence.as_ref(),
+            masked_capture: masked_capture.as_ref(),
         },
-        &secrets,
+        &mut secrets,
     ) {
         Ok(outcome) => outcome,
         Err(hook_err) => {
@@ -1575,11 +1844,16 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         "usage": outcome.audit.usage,
         "trace_id": outcome.audit.trace_id,
     });
+    let raw_args = if req.screenshot {
+        json!({ "rubric": secrets.redact(&req.rubric), "screenshot": true })
+    } else {
+        json!({ "rubric": secrets.redact(&req.rubric) })
+    };
     let diag_record = build_model_diagnostic_record(
         ModelDiagnosticSpec {
             index: existing_steps.len() + 1,
             action: STEP_ACTION_JUDGE,
-            raw_args: json!({ "rubric": secrets.redact(&req.rubric) }),
+            raw_args,
             status: if outcome.passed { "passed" } else { "failed" },
             error: if outcome.passed {
                 None
@@ -1589,7 +1863,12 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
             used_ref: None,
             synthesized_locator: None,
             fragile: false,
-            observed_viewport: None,
+            observed_viewport: masked_capture.as_ref().map(|cap| {
+                json!({
+                    "width": cap.width,
+                    "height": cap.height,
+                })
+            }),
             started_at_ms,
             duration_ms,
             result: diag_result,
@@ -1626,8 +1905,16 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
         "usage": outcome.audit.usage,
         "trace_id": outcome.audit.trace_id,
     });
+    if let Some(cap) = &masked_capture {
+        payload["screenshot"] = json!(true);
+        payload["viewport"] = json!({ "width": cap.width, "height": cap.height });
+    }
     if !detach_errors.is_empty() {
         payload["detach_errors"] = json!(detach_errors);
+    }
+    if let Some(reason) = local_only_reason {
+        payload["local_only"] = json!(true);
+        payload["local_only_reason"] = json!(reason);
     }
 
     let verdict_label = if outcome.passed { "passed" } else { "failed" };
@@ -1658,7 +1945,7 @@ fn handle_export(
 ) -> SessionResponse {
     let (session_dir, _lock, state) = match acquire_existing(sessions_dir, id) {
         Ok(found) => found,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let records = match store::load_steps(&session_dir) {
         Ok(records) => records,
@@ -2180,18 +2467,18 @@ fn parse_observe_kv_args(arg_spec: &str, kind: &str, registry: &Registry) -> Res
 fn validate_start_observations(
     observations: &[StoredObservation],
     registry: &Registry,
-) -> Result<(Vec<String>, BTreeSet<String>), SessionResponse> {
+) -> Result<(Vec<String>, BTreeSet<String>), Box<SessionResponse>> {
     let mut seen = BTreeSet::new();
     let mut env_names = BTreeSet::new();
     for obs in observations {
         case::validate_observation_name(&obs.name)
-            .map_err(|msg| error_response(ExitCode::InvalidCase, "invalid_input", msg))?;
+            .map_err(|msg| Box::new(error_response(ExitCode::InvalidCase, "invalid_input", msg)))?;
         if !seen.insert(obs.name.as_str()) {
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 ExitCode::InvalidCase,
                 "invalid_input",
                 format!("duplicate observation name `{}`", obs.name),
-            ));
+            )));
         }
         env_names.extend(case::env_references(&obs.raw_args));
     }
@@ -2201,28 +2488,28 @@ fn validate_start_observations(
     let mut names = Vec::with_capacity(observations.len());
     for obs in observations {
         let args = case::interpolate(&obs.raw_args, &empty_vars, &mut secrets).map_err(|err| {
-            error_response(
+            Box::new(error_response(
                 ExitCode::InvalidCase,
                 "invalid_input",
                 secrets.redact(&format!("observation `{}`: {}", obs.name, err.message)),
-            )
+            ))
         })?;
         let Some(def) = registry.observer(&obs.kind) else {
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 ExitCode::InvalidCase,
                 "invalid_input",
                 format!(
                     "observation `{}`: `{}` is not a registered observer",
                     obs.name, obs.kind
                 ),
-            ));
+            )));
         };
         def.create(&args).map_err(|error| {
             let (exit_code, kind) = match &error {
                 ObserverError::InvalidArguments(_) => (ExitCode::InvalidCase, "invalid_input"),
                 ObserverError::Environment(_) => (ExitCode::Environment, "environment"),
             };
-            error_response(
+            Box::new(error_response(
                 exit_code,
                 kind,
                 secrets.redact(&format!(
@@ -2231,7 +2518,7 @@ fn validate_start_observations(
                     def.name,
                     error.message()
                 )),
-            )
+            ))
         })?;
         names.push(obs.name.clone());
     }
@@ -2367,6 +2654,7 @@ mod tests {
                     raw_args: json!({ "path": "" }),
                 }],
                 model_hook: None,
+                model: None,
                 plugins: Vec::new(),
             },
             &registry,
@@ -2392,6 +2680,7 @@ mod tests {
                     },
                 ],
                 model_hook: None,
+                model: None,
                 plugins: Vec::new(),
             },
             &registry,

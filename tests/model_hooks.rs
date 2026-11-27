@@ -21,7 +21,7 @@ use do_anything::session::export::ExportOptions;
 use do_anything::session::model_hook::ModelHookSpec;
 use do_anything::session::store;
 use do_anything::session::{
-    self, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
+    self, JudgeRequest, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
 };
 use serde_json::{Value, json};
 use support::TempDir;
@@ -211,7 +211,12 @@ fn mock_hook_exe() -> &'static Path {
 
 fn run_da_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(da());
-    cmd.current_dir(dir).args(args);
+    cmd.current_dir(dir)
+        .args(args)
+        .env_remove("DA_MODEL")
+        .env_remove("DA_MODEL_ADAPTER")
+        .env_remove("DA_MODEL_ENDPOINT")
+        .env_remove("DA_MODEL_API_KEY_ENV");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -649,6 +654,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             idle_timeout_ms: 60_000,
             observe: Vec::new(),
             model_hook: Some(hook_spec.clone()),
+            model: None,
             plugins: Vec::new(),
         },
         &registry,
@@ -685,6 +691,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
                 command: mock_hook_exe().to_string_lossy().into_owned(),
                 args: vec![bad_cfg.to_string_lossy().into_owned()],
             }),
+            model_override: None,
             timeout_ms: 5_000,
             act: None,
         }),
@@ -707,6 +714,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             max_depth: None,
             max_nodes: None,
             hook_override: None,
+            model_override: None,
             timeout_ms: 5_000,
             act: Some(SelectRefAction {
                 action: "browser.click".to_string(),
@@ -744,6 +752,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             base_directory: dir.path().to_path_buf(),
             query: "Click Save Order button".to_string(),
             hook_override: None,
+            model_override: None,
             timeout_ms: 5_000,
             click: true,
         }),
@@ -783,6 +792,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             base_directory: dir.path().to_path_buf(),
             query: "Out of bounds".to_string(),
             hook_override: None,
+            model_override: None,
             timeout_ms: 5_000,
             click: false,
         }),
@@ -808,6 +818,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             base_directory: dir.path().to_path_buf(),
             query: "Click canvas chart node".to_string(),
             hook_override: None,
+            model_override: None,
             timeout_ms: 5_000,
             click: true,
         }),
@@ -987,6 +998,7 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
             idle_timeout_ms: 60_000,
             observe: Vec::new(),
             model_hook: None,
+            model: None,
             plugins: Vec::new(),
         },
         &registry,
@@ -1024,6 +1036,7 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
                 command: hook_exe.to_string(),
                 args: vec![hang_noread_cfg.to_string_lossy().into_owned()],
             }),
+            model_override: None,
             timeout_ms: 1000,
             click: false,
         }),
@@ -1126,4 +1139,908 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
     );
 
     let _ = run_da_env(dir.path(), &["session", "stop", &id], &[]);
+}
+
+#[test]
+fn judge_screenshot_attaches_masked_png_to_hook_and_requires_visual_session() {
+    let dir = TempDir::new("judge-screenshot");
+    let hook_exe = mock_hook_exe().to_string_lossy().into_owned();
+    let req_file = dir.path().join("judge_req.json");
+    let cfg_path = dir.write(
+        "judge.cfg",
+        &format!(
+            "mode=normal\nrequest_file={}\njudge_passed=true\njudge_rationale=Screen verified\nmodel=vlm-judge\nlatency_ms=44\n",
+            req_file.display()
+        ),
+    );
+
+    // 1. CLI `--screenshot` without an active visual session fails with `ExitCode::Environment` (4).
+    let cli_started = json_stdout(&run_da_env(dir.path(), &["session", "start"], &[]));
+    let cli_id = cli_started["session_id"].as_str().unwrap().to_string();
+    let no_visual = run_da_env(
+        dir.path(),
+        &[
+            "session",
+            "judge",
+            &cli_id,
+            "--rubric",
+            "Verify visual state",
+            "--screenshot",
+            "--hook",
+            &hook_exe,
+            "--hook-arg",
+            cfg_path.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(no_visual.status.code(), Some(4), "{no_visual:?}");
+    let no_visual_json = json_stdout(&no_visual);
+    assert_eq!(no_visual_json["error"]["kind"], "environment");
+    let _ = run_da_env(dir.path(), &["session", "stop", &cli_id], &[]);
+
+    // 2. With FakeUiSession: `screenshot: false` omits image, `screenshot: true` attaches masked PNG + viewport.
+    let sessions_dir = dir.path().join(".da/sessions-fake");
+    let registry = fake_ui_registry();
+    let hook_spec = ModelHookSpec {
+        command: hook_exe,
+        args: vec![cfg_path.to_string_lossy().into_owned()],
+    };
+    let started = session::handle(
+        SessionRequest::Start {
+            sessions_dir: sessions_dir.clone(),
+            idle_timeout_ms: 60_000,
+            observe: Vec::new(),
+            model_hook: Some(hook_spec),
+            model: None,
+            plugins: Vec::new(),
+        },
+        &registry,
+    );
+    assert_eq!(started.exit_code, ExitCode::Success);
+    let id = started.payload["session_id"].as_str().unwrap().to_string();
+
+    let opened = session::handle(
+        SessionRequest::Step {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            base_directory: dir.path().to_path_buf(),
+            step: StepInput::Text(
+                r#"{"use":"browser.open","with":{"url":"http://127.0.0.1/app"}}"#.to_string(),
+            ),
+        },
+        &registry,
+    );
+    assert_eq!(opened.exit_code, ExitCode::Success);
+
+    let text_judge = session::handle(
+        SessionRequest::Judge(JudgeRequest {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            base_directory: dir.path().to_path_buf(),
+            rubric: "Text only check".to_string(),
+            evidence: None,
+            screenshot: false,
+            hook_override: None,
+            model_override: None,
+            timeout_ms: 5_000,
+        }),
+        &registry,
+    );
+    assert_eq!(
+        text_judge.exit_code,
+        ExitCode::Success,
+        "{}",
+        text_judge.payload
+    );
+    let text_req: Value =
+        serde_json::from_str(fs::read_to_string(&req_file).unwrap().trim()).unwrap();
+    assert_eq!(text_req["method"], "model/judge");
+    assert!(
+        text_req["params"].get("image_base64").is_none(),
+        "screenshot=false must not attach image: {text_req}"
+    );
+
+    let visual_judge = session::handle(
+        SessionRequest::Judge(JudgeRequest {
+            sessions_dir,
+            id,
+            base_directory: dir.path().to_path_buf(),
+            rubric: "Visual check".to_string(),
+            evidence: None,
+            screenshot: true,
+            hook_override: None,
+            model_override: None,
+            timeout_ms: 5_000,
+        }),
+        &registry,
+    );
+    assert_eq!(
+        visual_judge.exit_code,
+        ExitCode::Success,
+        "{}",
+        visual_judge.payload
+    );
+    let visual_req: Value =
+        serde_json::from_str(fs::read_to_string(&req_file).unwrap().trim()).unwrap();
+    assert_eq!(visual_req["method"], "model/judge");
+    assert_eq!(visual_req["params"]["mime_type"], "image/png");
+    assert_eq!(
+        visual_req["params"]["viewport"],
+        json!({ "width": 800, "height": 600 })
+    );
+    assert_eq!(
+        visual_req["params"]["image_base64"],
+        base64_encode(&large_masked_png())
+    );
+}
+
+#[cfg(not(feature = "ai"))]
+#[test]
+fn builtin_model_without_ai_feature_reports_helpful_usage_error() {
+    let dir = TempDir::new("no-ai-feature");
+    let out = run_da_env(
+        dir.path(),
+        &["session", "start", "--model", "openai::gpt-4o-mini"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let payload = json_stdout(&out);
+    assert_eq!(payload["error"]["kind"], "usage");
+    let msg = payload["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("ai") && msg.contains("--hook"), "{msg}");
+}
+
+#[cfg(feature = "ai")]
+mod ai_tests {
+    use super::*;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use do_anything::core::case;
+    use do_anything::core::events::EventBus;
+    use do_anything::core::filter::Filters;
+    use do_anything::core::runner;
+    use do_anything::core::secrets::Secrets;
+    use do_anything::session::model_hook::BuiltinModelSpec;
+
+    #[derive(Debug, Clone)]
+    struct RecordedHttpRequest {
+        method: String,
+        target: String,
+        headers: BTreeMap<String, String>,
+        body: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockReply {
+        status: u16,
+        reason: &'static str,
+        body: String,
+        delay_ms: u64,
+    }
+
+    impl MockReply {
+        fn chat_json(model: &str, content: Value) -> Self {
+            Self::chat_text(model, &content.to_string())
+        }
+
+        fn chat_text(model: &str, content: &str) -> Self {
+            let body = json!({
+                "id": "chatcmpl-mock-1",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 9,
+                    "total_tokens": 26
+                }
+            })
+            .to_string();
+            Self {
+                status: 200,
+                reason: "OK",
+                body,
+                delay_ms: 0,
+            }
+        }
+
+        fn status_text(status: u16, reason: &'static str, message: &str) -> Self {
+            Self {
+                status,
+                reason,
+                body: json!({ "error": { "message": message, "type": "mock_error" } }).to_string(),
+                delay_ms: 0,
+            }
+        }
+    }
+
+    struct MockModelServer {
+        port: u16,
+        requests: Arc<Mutex<Vec<RecordedHttpRequest>>>,
+        replies: Arc<Mutex<VecDeque<MockReply>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl MockModelServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model server");
+            let port = listener.local_addr().expect("mock local_addr").port();
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking mock listener");
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let replies = Arc::new(Mutex::new(VecDeque::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let reqs_clone = Arc::clone(&requests);
+            let reps_clone = Arc::clone(&replies);
+            let stop_clone = Arc::clone(&stop);
+
+            let handle = thread::spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let reqs = Arc::clone(&reqs_clone);
+                            let reps = Arc::clone(&reps_clone);
+                            thread::spawn(move || handle_http_conn(stream, &reqs, &reps));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                port,
+                requests,
+                replies,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn endpoint(&self, suffix: &str) -> String {
+            format!("http://127.0.0.1:{}{}", self.port, suffix)
+        }
+
+        fn push_reply(&self, reply: MockReply) {
+            self.replies.lock().unwrap().push_back(reply);
+        }
+
+        fn take_requests(&self) -> Vec<RecordedHttpRequest> {
+            let mut guard = self.requests.lock().unwrap();
+            std::mem::take(&mut *guard)
+        }
+    }
+
+    impl Drop for MockModelServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn handle_http_conn(
+        stream: TcpStream,
+        requests: &Mutex<Vec<RecordedHttpRequest>>,
+        replies: &Mutex<VecDeque<MockReply>>,
+    ) {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let mut reader = BufReader::new(match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return,
+        });
+        let mut writer = stream;
+
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let target = parts.next().unwrap_or("").to_string();
+
+        let mut headers = BTreeMap::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let key = k.trim().to_ascii_lowercase();
+                let val = v.trim().to_string();
+                if key == "content-length" {
+                    content_length = val.parse::<usize>().unwrap_or(0);
+                }
+                headers.insert(key, val);
+            }
+        }
+
+        let mut body_bytes = vec![0u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut body_bytes).is_err() {
+            return;
+        }
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
+        requests.lock().unwrap().push(RecordedHttpRequest {
+            method,
+            target,
+            headers,
+            body,
+        });
+
+        let reply = replies.lock().unwrap().pop_front().unwrap_or_else(|| {
+            MockReply::status_text(500, "Internal Server Error", "no mock reply queued")
+        });
+
+        if reply.delay_ms > 0 {
+            thread::sleep(Duration::from_millis(reply.delay_ms));
+        }
+
+        let head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            reply.status,
+            reply.reason,
+            reply.body.len()
+        );
+        let _ = writer.write_all(head.as_bytes());
+        let _ = writer.write_all(reply.body.as_bytes());
+        let _ = writer.flush();
+    }
+
+    #[test]
+    fn builtin_genai_model_cli_session_secrets_fallback_custom_adapter_and_timeout() {
+        let dir = TempDir::new("ai-cli");
+        let server = MockModelServer::start();
+        let api_secret = "sk-live-secret-998877";
+        let url_secret = "tok-url-secret-554433";
+        let step_secret = "step-secret-112233";
+
+        // 1. Start session with `--model`, `--model-endpoint` containing `${env:URL_SECRET}`, and `--model-api-key-env`.
+        let endpoint_template = format!(
+            "{}/v1?token=${{env:DA_TEST_URL_SECRET}}",
+            server.endpoint("")
+        );
+        let start_out = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "start",
+                "--model",
+                "openai::gpt-4o-mini",
+                "--model-endpoint",
+                &endpoint_template,
+                "--model-api-key-env",
+                "DA_TEST_MODEL_KEY",
+            ],
+            &[
+                ("DA_TEST_MODEL_KEY", api_secret),
+                ("DA_TEST_URL_SECRET", url_secret),
+            ],
+        );
+        assert_eq!(start_out.status.code(), Some(0), "{start_out:?}");
+        let start_stdout = String::from_utf8_lossy(&start_out.stdout);
+        assert!(!start_stdout.contains(api_secret), "{start_stdout}");
+        assert!(!start_stdout.contains(url_secret), "{start_stdout}");
+
+        let started = json_stdout(&start_out);
+        let id = started["session_id"].as_str().unwrap().to_string();
+        let session_dir = dir.path().join(started["dir"].as_str().unwrap());
+
+        // `state.json` preserves template `${env:...}` and API key env var name — never raw secret values.
+        let state_raw = fs::read_to_string(session_dir.join(store::STATE_FILE)).unwrap();
+        assert!(!state_raw.contains(api_secret), "{state_raw}");
+        assert!(!state_raw.contains(url_secret), "{state_raw}");
+        assert!(state_raw.contains("DA_TEST_MODEL_KEY"), "{state_raw}");
+        assert!(
+            state_raw.contains("${env:DA_TEST_URL_SECRET}"),
+            "{state_raw}"
+        );
+
+        // Mutual exclusion check (`--model` + `--hook` -> `ExitCode::Usage` 2).
+        let conflict = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "judge",
+                &id,
+                "--rubric",
+                "check",
+                "--model",
+                "openai::gpt-4o-mini",
+                "--hook",
+                "missing-hook",
+            ],
+            &[],
+        );
+        assert_eq!(conflict.status.code(), Some(2), "{conflict:?}");
+
+        // 2. When `cli` is compiled in, run a CLI step carrying `${env:DA_STEP_SECRET}` first;
+        // under `--no-default-features --features ai`, inject the secret via `--evidence`.
+        if cfg!(feature = "cli") {
+            let step_out = run_da_env(
+                dir.path(),
+                &[
+                    "session",
+                    "step",
+                    &id,
+                    "--step",
+                    &json!({
+                        "use": "cli.run",
+                        "with": {
+                            "command": da(),
+                            "args": ["--version"],
+                            "env": { "TOK": "${env:DA_STEP_SECRET}" }
+                        },
+                        "expect": [{ "path": "$.exit_code", "equals": 0 }]
+                    })
+                    .to_string(),
+                ],
+                &[("DA_STEP_SECRET", step_secret)],
+            );
+            assert_eq!(step_out.status.code(), Some(0), "{step_out:?}");
+        }
+
+        server.push_reply(MockReply::chat_json(
+            "gpt-4o-mini-2026",
+            json!({
+                "passed": true,
+                "rationale": format!("Verified cleanly without exposing {api_secret} or {step_secret}"),
+                "confidence": 0.94
+            }),
+        ));
+        let mut judge_args = vec![
+            "session",
+            "judge",
+            &id,
+            "--rubric",
+            "Confirm version printed cleanly without ${env:DA_STEP_SECRET}",
+        ];
+        if !cfg!(feature = "cli") {
+            judge_args.push("--evidence");
+            judge_args.push(r#"{"tok":"${env:DA_STEP_SECRET}"}"#);
+        }
+        let judge_ok = run_da_env(
+            dir.path(),
+            &judge_args,
+            &[
+                ("DA_TEST_MODEL_KEY", api_secret),
+                ("DA_TEST_URL_SECRET", url_secret),
+                ("DA_STEP_SECRET", step_secret),
+            ],
+        );
+        assert_eq!(judge_ok.status.code(), Some(0), "{judge_ok:?}");
+        let judge_json = json_stdout(&judge_ok);
+        assert_eq!(judge_json["passed"], true, "{judge_json}");
+        assert_eq!(judge_json["model"], "gpt-4o-mini-2026");
+        assert_eq!(judge_json["usage"]["total_tokens"], 26);
+        assert_eq!(
+            judge_json["rationale"],
+            "Verified cleanly without exposing *** or ***"
+        );
+
+        let recorded = server.take_requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "POST");
+        assert!(
+            recorded[0].target.starts_with("/v1/chat/completions"),
+            "{}",
+            recorded[0].target
+        );
+        assert_eq!(
+            recorded[0].headers.get("authorization").map(String::as_str),
+            Some("Bearer sk-live-secret-998877")
+        );
+        assert!(
+            !recorded[0].body.contains(step_secret),
+            "{}",
+            recorded[0].body
+        );
+        assert!(
+            !recorded[0].body.contains(api_secret),
+            "{}",
+            recorded[0].body
+        );
+        let req_json: Value = serde_json::from_str(&recorded[0].body).unwrap();
+        assert_eq!(req_json["response_format"]["type"], "json_schema");
+
+        // 3. `JsonSpec` HTTP 400 fallback + fenced JSON recovery (`passed: false` -> ExitCode::TestFailure 1).
+        server.push_reply(MockReply::status_text(
+            400,
+            "Bad Request",
+            "response_format json_schema is unsupported by mock server",
+        ));
+        server.push_reply(MockReply::chat_text(
+            "gpt-4o-mini-2026",
+            "```json\n{\"passed\":false,\"rationale\":\"Banner visible\",\"confidence\":0.75}\n```",
+        ));
+        let judge_fail = run_da_env(
+            dir.path(),
+            &["session", "judge", &id, "--rubric", "Check fallback"],
+            &[
+                ("DA_TEST_MODEL_KEY", api_secret),
+                ("DA_TEST_URL_SECRET", url_secret),
+            ],
+        );
+        assert_eq!(judge_fail.status.code(), Some(1), "{judge_fail:?}");
+        let fail_json = json_stdout(&judge_fail);
+        assert_eq!(fail_json["passed"], false, "{fail_json}");
+        assert_eq!(fail_json["rationale"], "Banner visible");
+        let fallback_reqs = server.take_requests();
+        assert_eq!(fallback_reqs.len(), 2);
+        let second_req: Value = serde_json::from_str(&fallback_reqs[1].body).unwrap();
+        assert!(
+            second_req.get("response_format").is_none(),
+            "retry must drop response_format: {second_req}"
+        );
+
+        // 4. Slow server exceeding `--timeout-ms` returns `ExitCode::Timeout` (5).
+        server.push_reply(MockReply {
+            delay_ms: 1500,
+            ..MockReply::chat_json("gpt-4o-mini", json!({"passed": true, "rationale": "late"}))
+        });
+        let timeout_out = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "judge",
+                &id,
+                "--rubric",
+                "check timeout",
+                "--timeout-ms",
+                "300",
+            ],
+            &[
+                ("DA_TEST_MODEL_KEY", api_secret),
+                ("DA_TEST_URL_SECRET", url_secret),
+            ],
+        );
+        assert_eq!(timeout_out.status.code(), Some(5), "{timeout_out:?}");
+        let _ = server.take_requests();
+
+        // 5. Missing API key env var returns `ExitCode::Environment` (4).
+        let missing_key = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "judge",
+                &id,
+                "--rubric",
+                "check missing key",
+                "--model",
+                "openai::gpt-4o-mini",
+                "--endpoint",
+                &server.endpoint("/v1"),
+                "--api-key-env",
+                "DA_UNSET_TEST_KEY",
+            ],
+            &[],
+        );
+        assert_eq!(missing_key.status.code(), Some(4), "{missing_key:?}");
+        assert!(
+            json_stdout(&missing_key)["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("DA_UNSET_TEST_KEY")
+        );
+
+        // 6. Export omits `model.judge`; disk files contain zero secrets.
+        let exp_out = run_da_env(dir.path(), &["session", "export", &id, "--yaml"], &[]);
+        let exported_yaml = String::from_utf8_lossy(&exp_out.stdout);
+        if cfg!(feature = "cli") {
+            assert_eq!(exp_out.status.code(), Some(0), "{exp_out:?}");
+            assert!(exported_yaml.contains("cli.run"), "{exported_yaml}");
+        } else {
+            assert_eq!(exp_out.status.code(), Some(3), "{exp_out:?}");
+        }
+        assert!(!exported_yaml.contains("model.judge"), "{exported_yaml}");
+        for entry in fs::read_dir(&session_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let text = fs::read_to_string(&path).unwrap();
+                assert!(!text.contains(api_secret), "{}", path.display());
+                assert!(!text.contains(url_secret), "{}", path.display());
+                assert!(!text.contains(step_secret), "{}", path.display());
+            }
+        }
+        let _ = run_da_env(dir.path(), &["session", "stop", &id], &[]);
+
+        // 7. Session without `--model` falls back to `DA_MODEL*` (anonymous `omlx` over `/v1`) AND `genai_1` custom protocol works!
+        let bare_start = json_stdout(&run_da_env(dir.path(), &["session", "start"], &[]));
+        let bare_id = bare_start["session_id"].as_str().unwrap().to_string();
+
+        server.push_reply(MockReply::chat_json(
+            "qwen-local",
+            json!({"passed": true, "rationale": "Env fallback ok"}),
+        ));
+        let env_fallback = run_da_env(
+            dir.path(),
+            &["session", "judge", &bare_id, "--rubric", "Check DA_MODEL"],
+            &[
+                ("DA_MODEL", "qwen-local"),
+                ("DA_MODEL_ADAPTER", "omlx"),
+                ("DA_MODEL_ENDPOINT", &server.endpoint("/v1")),
+            ],
+        );
+        assert_eq!(env_fallback.status.code(), Some(0), "{env_fallback:?}");
+        let env_reqs = server.take_requests();
+        assert_eq!(env_reqs.len(), 1);
+        assert!(
+            !env_reqs[0].headers.contains_key("authorization"),
+            "omlx anonymous request must omit Authorization header: {:?}",
+            env_reqs[0].headers
+        );
+
+        server.push_reply(MockReply::chat_json(
+            "jev-custom-0.2b",
+            json!({"passed": true, "rationale": "Custom genai_1 ok"}),
+        ));
+        let custom_proto = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "judge",
+                &bare_id,
+                "--rubric",
+                "Check custom protocol",
+                "--model",
+                "genai_1::jev-custom-0.2b",
+                "--endpoint",
+                &server.endpoint("/v1"),
+            ],
+            &[],
+        );
+        assert_eq!(custom_proto.status.code(), Some(0), "{custom_proto:?}");
+        assert_eq!(json_stdout(&custom_proto)["model"], "jev-custom-0.2b");
+        let _ = run_da_env(dir.path(), &["session", "stop", &bare_id], &[]);
+    }
+
+    #[test]
+    fn builtin_genai_select_ref_locate_visual_judge_and_model_free_replay() {
+        let dir = TempDir::new("ai-visual-flow");
+        let sessions_dir = dir.path().join(".da/sessions");
+        let registry = fake_ui_registry();
+        let server = Some(MockModelServer::start());
+        let srv = server.as_ref().unwrap();
+        let model_spec = BuiltinModelSpec {
+            model: "local-vlm".to_string(),
+            adapter: Some("omlx".to_string()),
+            endpoint: Some(srv.endpoint("/v1")),
+            api_key_env: None,
+        };
+
+        let started = session::handle(
+            SessionRequest::Start {
+                sessions_dir: sessions_dir.clone(),
+                idle_timeout_ms: 60_000,
+                observe: Vec::new(),
+                model_hook: None,
+                model: Some(model_spec),
+                plugins: Vec::new(),
+            },
+            &registry,
+        );
+        assert_eq!(started.exit_code, ExitCode::Success);
+        let id = started.payload["session_id"].as_str().unwrap().to_string();
+
+        let opened = session::handle(
+            SessionRequest::Step {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                step: StepInput::Text(
+                    r#"{"use":"browser.open","with":{"url":"http://127.0.0.1/app"}}"#.to_string(),
+                ),
+            },
+            &registry,
+        );
+        assert_eq!(opened.exit_code, ExitCode::Success);
+
+        // 1. Hallucinated ref rejected cleanly; valid `e2` synthesized and clicked.
+        srv.push_reply(MockReply::chat_json("jev-v1", json!({ "ref": "e999" })));
+        let bad_sel = session::handle(
+            SessionRequest::SelectRef(SelectRefRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                query: "Save".to_string(),
+                scope_ref: None,
+                max_depth: None,
+                max_nodes: None,
+                hook_override: None,
+                model_override: None,
+                timeout_ms: 5_000,
+                act: None,
+            }),
+            &registry,
+        );
+        assert_eq!(bad_sel.exit_code, ExitCode::Environment, "{bad_sel:?}");
+        let _ = srv.take_requests();
+
+        srv.push_reply(MockReply::chat_json(
+            "jev-v1",
+            json!({ "ref": "e2", "confidence": 0.96, "reason": "Save Order button" }),
+        ));
+        let ok_sel = session::handle(
+            SessionRequest::SelectRef(SelectRefRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                query: "Click Save Order".to_string(),
+                scope_ref: None,
+                max_depth: None,
+                max_nodes: None,
+                hook_override: None,
+                model_override: None,
+                timeout_ms: 5_000,
+                act: Some(SelectRefAction {
+                    action: "browser.click".to_string(),
+                    with_raw: None,
+                    args: Vec::new(),
+                    save: Vec::new(),
+                }),
+            }),
+            &registry,
+        );
+        assert_eq!(ok_sel.exit_code, ExitCode::Success, "{}", ok_sel.payload);
+        assert_eq!(
+            ok_sel.payload["synthesized_locator"],
+            json!({ "testid": "save-order-btn" })
+        );
+        let _ = srv.take_requests();
+
+        // 2. Multimodal `locate` sends `image_url` PNG data URL and synthesizes locator (or `at:` on `<canvas>`).
+        srv.push_reply(MockReply::chat_json(
+            "ui-tars",
+            json!({ "x": 120, "y": 45, "confidence": 0.92 }),
+        ));
+        let ok_loc = session::handle(
+            SessionRequest::Locate(LocateRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                query: "Click Save button".to_string(),
+                hook_override: None,
+                model_override: None,
+                timeout_ms: 5_000,
+                click: true,
+            }),
+            &registry,
+        );
+        assert_eq!(ok_loc.exit_code, ExitCode::Success, "{}", ok_loc.payload);
+        assert_eq!(
+            ok_loc.payload["synthesized_locator"],
+            json!({ "role": "button", "name": "Save Order" })
+        );
+        let expected_data_url = format!(
+            "data:image/png;base64,{}",
+            base64_encode(&large_masked_png())
+        );
+        let loc_reqs = srv.take_requests();
+        assert_eq!(loc_reqs.len(), 1);
+        assert!(
+            loc_reqs[0].body.contains(&expected_data_url),
+            "locate must attach masked PNG image_url data URL"
+        );
+
+        srv.push_reply(MockReply::chat_json(
+            "ui-tars",
+            json!({ "x": 900, "y": 45 }),
+        ));
+        let oob_loc = session::handle(
+            SessionRequest::Locate(LocateRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                query: "Out of bounds".to_string(),
+                hook_override: None,
+                model_override: None,
+                timeout_ms: 5_000,
+                click: false,
+            }),
+            &registry,
+        );
+        assert_eq!(oob_loc.exit_code, ExitCode::Environment, "{oob_loc:?}");
+        let _ = srv.take_requests();
+
+        // 3. Multimodal `judge` with `screenshot: true` ALSO attaches exact `image_url` data URL!
+        srv.push_reply(MockReply::chat_json(
+            "qwen-vl-judge",
+            json!({ "passed": true, "rationale": "Screenshot matches Save Order screen" }),
+        ));
+        let visual_judge = session::handle(
+            SessionRequest::Judge(JudgeRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                rubric: "Verify button state on screen".to_string(),
+                evidence: None,
+                screenshot: true,
+                hook_override: None,
+                model_override: None,
+                timeout_ms: 5_000,
+            }),
+            &registry,
+        );
+        assert_eq!(
+            visual_judge.exit_code,
+            ExitCode::Success,
+            "{}",
+            visual_judge.payload
+        );
+        let judge_reqs = srv.take_requests();
+        assert_eq!(judge_reqs.len(), 1);
+        assert!(
+            judge_reqs[0].body.contains(&expected_data_url),
+            "judge with screenshot=true must send masked PNG image_url"
+        );
+
+        // 4. Export YAML, shut down the mock model server completely, and replay deterministically!
+        let out_case = dir.path().join("ai-exported.yaml");
+        let exported = session::handle(
+            SessionRequest::Export {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                options: ExportOptions {
+                    case_name: Some("AI explored flow".to_string()),
+                    include_reads: false,
+                },
+                out_path: Some(out_case.clone()),
+            },
+            &registry,
+        );
+        assert_eq!(
+            exported.exit_code,
+            ExitCode::Success,
+            "{}",
+            exported.payload
+        );
+        let _ = session::handle(SessionRequest::Stop { sessions_dir, id }, &registry);
+        drop(server);
+
+        let parsed = case::load_file(&out_case).expect("exported YAML parses");
+        let mut secrets = Secrets::new();
+        let preflight_errors =
+            runner::preflight(std::slice::from_ref(&parsed), &registry, &mut secrets);
+        assert!(preflight_errors.is_empty(), "{preflight_errors:?}");
+        let replay = runner::run(
+            &[parsed],
+            &registry,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut secrets,
+            1,
+        );
+        assert!(
+            replay.is_ok(),
+            "replay must pass deterministically after stopping mock model server: {replay:?}"
+        );
+    }
 }

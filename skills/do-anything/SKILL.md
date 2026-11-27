@@ -71,8 +71,11 @@ between commands and prints JSON by default.
      accessibility node; `da lint` warns on every `at` step, and `da session
      export` pins the observed `viewport` automatically.
    - When an accessibility tree is dense, an opaque `<canvas>` has no DOM
-     nodes, or you have a local Jev/VLM/vLLM JSON-RPC adapter (`da session
-     start --model-hook <exe>` or per-call `--hook <exe>`):
+     nodes, or you want an exploration-time verdict, use built-in multi-provider
+     models (`da session start --model <model>` / `--model-endpoint <url>` /
+     `--model-api-key-env <VAR>`, `DA_MODEL*`, or per-call `--model` /
+     `--adapter` / `--endpoint` / `--api-key-env`) or an external JSON-RPC hook
+     (`--model-hook <exe>` or `--hook <exe>`):
      - `da session select-ref <id> --query "Save button" --act browser.click`
        asks `model/select_ref` to pick a snapshot `ref` and synthesizes its
        deterministic locator;
@@ -81,9 +84,10 @@ between commands and prints JSON by default.
        deterministic locator when an HTML/UIA control is hit (`0` lint warnings),
        and falls back to viewport-checked `at: { x, y, viewport }` only on
        opaque `<canvas>`;
-     - `da session judge <id> --rubric "No error banner"` runs an exploration-time
-       `model/judge` check over `Secrets`-redacted evidence (recorded in
-       `steps.jsonl`, never exported to YAML).
+     - `da session judge <id> --rubric "No error banner"` (add `--screenshot` to
+       attach a 1:1 input-masked viewport/window PNG on visual sessions) runs an
+       exploration-time `model/judge` check over `Secrets`-redacted evidence
+       (recorded in `steps.jsonl`, never exported to YAML).
 3. `da session export <id> -o cases/flow.yaml --name "Create a note"` writes a
    100% deterministic, model-free case; transient refs (including both endpoints
    of `browser.drag` and `browser.scroll`/`browser.hover` targets) and

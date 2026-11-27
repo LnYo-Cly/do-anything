@@ -3418,7 +3418,10 @@ img.onload = function () {{
 img.src = 'data:image/png;base64,{img_b64}';
 </script></body></html>"##
     );
-    let px_server = PageServer::start(BTreeMap::from([("/px".to_string(), pixel_check_html)]));
+    let px_server = PageServer::start(BTreeMap::from([(
+        "/px".to_string(),
+        pixel_check_html.clone(),
+    )]));
     let px_case = dir.write(
         "verify-mask.yaml",
         &format!(
@@ -3438,7 +3441,8 @@ img.src = 'data:image/png;base64,{img_b64}';
         String::from_utf8_lossy(&px_run.stderr)
     );
 
-    // 5. `judge` records redacted rationale & audit fields in `steps.jsonl`.
+    // 5. `judge` records redacted rationale & audit fields in `steps.jsonl`:
+    // first without `--screenshot` (omits image), then with `--screenshot` (attaches masked viewport PNG).
     fs::write(
         &cfg_path,
         format!(
@@ -3455,6 +3459,56 @@ img.src = 'data:image/png;base64,{img_b64}';
         "Confirm both buttons appended markers",
     ]);
     assert_eq!(judge_out.status.code(), Some(0), "{judge_out:?}");
+    let judge_no_shot_req: Value =
+        serde_json::from_str(fs::read_to_string(&req_file).unwrap().trim()).unwrap();
+    assert_eq!(judge_no_shot_req["method"], "model/judge");
+    assert!(
+        judge_no_shot_req["params"].get("image_base64").is_none(),
+        "default judge without --screenshot must not attach image_base64"
+    );
+
+    let judge_shot_out = run_env(&[
+        "session",
+        "judge",
+        &id,
+        "--rubric",
+        "Confirm rendered button visual state",
+        "--screenshot",
+    ]);
+    assert_eq!(judge_shot_out.status.code(), Some(0), "{judge_shot_out:?}");
+    let judge_shot_req: Value =
+        serde_json::from_str(fs::read_to_string(&req_file).unwrap().trim()).unwrap();
+    assert_eq!(judge_shot_req["method"], "model/judge");
+    assert_eq!(judge_shot_req["params"]["mime_type"], "image/png");
+    assert_eq!(
+        judge_shot_req["params"]["viewport"],
+        loc_req_val["params"]["viewport"]
+    );
+    let judge_img_b64 = judge_shot_req["params"]["image_base64"]
+        .as_str()
+        .expect("judge --screenshot image_base64");
+    assert!(!judge_img_b64.is_empty());
+    let judge_px_html = pixel_check_html.replace(&img_b64, judge_img_b64);
+    let judge_px_server =
+        PageServer::start(BTreeMap::from([("/px-judge".to_string(), judge_px_html)]));
+    let judge_px_case = dir.write(
+        "verify-judge-mask.yaml",
+        &format!(
+            "name: Verify judge screenshot mask\nsteps:\n  - browser.open:\n      url: \"{}\"\n  - browser.wait:\n      css: \"#px[data-ready='1']\"\n  - browser.read:\n      css: \"#px\"\n    expect:\n      - path: $.text\n        equals: \"1x=true;pw_non_black=0;xorigin_non_black=0;nested_xorigin_non_black=0;btn_green=true\"\n",
+            judge_px_server.url("/px-judge")
+        ),
+    );
+    let judge_px_run = run_da_in(
+        dir.path(),
+        &["run", judge_px_case.to_str().unwrap(), "--no-bundle"],
+    );
+    assert_eq!(
+        judge_px_run.status.code(),
+        Some(0),
+        "password/iframe pixels were not masked in judge --screenshot PNG: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&judge_px_run.stdout),
+        String::from_utf8_lossy(&judge_px_run.stderr)
+    );
 
     // Assert log state `[jev][btn]` and export deterministic button-only case -> 0 lint warnings!
     let read1 = run_da_stdin(
