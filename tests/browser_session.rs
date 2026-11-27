@@ -4681,7 +4681,6 @@ fn session_allowed_origins_blocks_delayed_async_navigation_during_step_poll() {
     stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-
 #[test]
 fn session_preview_frames_and_pause_resume_lifecycle() {
     let Some(_guard) = chrome_guard() else {
