@@ -4355,6 +4355,333 @@ mod ai_browser_tests {
     }
 }
 
+fn spawn_session_mini_http(
+    routes: Vec<(String, String)>,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind session mini http");
+    let addr = listener.local_addr().expect("mini http local_addr");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking on session mini http");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let response = routes
+                        .iter()
+                        .find(|(p, _)| p == path)
+                        .map(|(_, r)| r.as_str())
+                        .unwrap_or("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{}", addr.port()), stop)
+}
+
+#[test]
+fn session_allowed_origins_blocks_switch_tab_and_redirect_across_detached_reattach() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let dir = TempDir::new("browser-session-allowed-origins");
+
+    let secret_html = "<!doctype html><html><head><title>Secret</title></head><body><p id=\"secret\">DISALLOWED_ORIGIN_SECRET_DATA</p></body></html>";
+    let secret_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        secret_html.len(),
+        secret_html
+    );
+    let (disallowed_origin, stop_disallowed) =
+        spawn_session_mini_http(vec![("/secret".to_string(), secret_resp)]);
+
+    let home_html = format!(
+        "<!doctype html><html><head><title>Home</title></head><body><p id=\"home-marker\">ALLOWED_HOME</p><a id=\"new-tab\" target=\"_blank\" href=\"{disallowed_origin}/secret\">Go Popup</a></body></html>"
+    );
+    let home_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        home_html.len(),
+        home_html
+    );
+    let redirect_resp = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {disallowed_origin}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let (allowed_origin, stop_allowed) = spawn_session_mini_http(vec![
+        ("/home".to_string(), home_resp),
+        ("/redirect".to_string(), redirect_resp),
+    ]);
+
+    let started = json_stdout(&run_da_in(dir.path(), &["session", "start"]));
+    let id = started["session_id"].as_str().unwrap().to_string();
+
+    // 1. Open allowed origin with `allowed_origins` guardrail.
+    let open_step = json!({
+        "browser.open": {
+            "url": format!("{allowed_origin}/home"),
+            "allowed_origins": [allowed_origin]
+        }
+    })
+    .to_string();
+    let open_out = run_da_in(dir.path(), &["session", "step", &id, "--step", &open_step]);
+    assert_eq!(open_out.status.code(), Some(0), "{open_out:?}");
+
+    // 2. Open `_blank` tab to disallowed origin, then attempt `browser.switch_tab`:
+    //    must fail with `allowed_origins`, leak NO snapshot of the disallowed tab,
+    //    and keep persisted handle pointed at the original allowed tab.
+    let click_popup = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.click",
+            "--arg",
+            "css=#new-tab",
+        ],
+    );
+    assert_eq!(click_popup.status.code(), Some(0), "{click_popup:?}");
+
+    let switch_out = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.switch_tab",
+            "--arg",
+            "index=1",
+        ],
+    );
+    assert_eq!(switch_out.status.code(), Some(1), "{switch_out:?}");
+    let switch_stdout = String::from_utf8_lossy(&switch_out.stdout);
+    assert!(
+        switch_stdout.contains("allowed_origins"),
+        "expected allowed_origins error: {switch_stdout}"
+    );
+    assert!(
+        !switch_stdout.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "rejected switch_tab leaked disallowed snapshot: {switch_stdout}"
+    );
+
+    // Follow-up detached `browser.read` must still target the original allowed tab.
+    let read_home = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.read",
+            "--arg",
+            "css=#home-marker",
+        ],
+    );
+    assert_eq!(read_home.status.code(), Some(0), "{read_home:?}");
+    let read_home_json = json_stdout(&read_home);
+    assert_eq!(
+        read_home_json["step"]["result"]["text"],
+        json!("ALLOWED_HOME")
+    );
+
+    // 3. Cross-origin 302 redirect on `browser.open` must fail closed, neutralize the tab,
+    //    leak NO snapshot of the disallowed destination, and block follow-up `read` / `snapshot`.
+    let redirect_step = json!({
+        "browser.open": {
+            "url": format!("{allowed_origin}/redirect")
+        }
+    })
+    .to_string();
+    let redir_out = run_da_in(
+        dir.path(),
+        &["session", "step", &id, "--step", &redirect_step],
+    );
+    assert_eq!(redir_out.status.code(), Some(1), "{redir_out:?}");
+    let redir_stdout = String::from_utf8_lossy(&redir_out.stdout);
+    assert!(
+        redir_stdout.contains("allowed_origins"),
+        "expected allowed_origins error on redirect: {redir_stdout}"
+    );
+    assert!(
+        !redir_stdout.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "redirect failure leaked disallowed snapshot: {redir_stdout}"
+    );
+
+    let read_after_redir = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.read",
+            "--arg",
+            "css=#secret",
+        ],
+    );
+    assert_ne!(
+        read_after_redir.status.code(),
+        Some(0),
+        "follow-up read after rejected redirect must fail closed: {read_after_redir:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&read_after_redir.stdout)
+            .contains("DISALLOWED_ORIGIN_SECRET_DATA")
+    );
+
+    let snap_after_redir = run_da_in(dir.path(), &["session", "snapshot", &id]);
+    assert_ne!(
+        snap_after_redir.status.code(),
+        Some(0),
+        "snapshot after rejected redirect must fail closed: {snap_after_redir:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&snap_after_redir.stdout)
+            .contains("DISALLOWED_ORIGIN_SECRET_DATA")
+    );
+
+    // 4. Caller can still recover by navigating back to an allowed origin, then stop cleanly.
+    let recover_step = json!({
+        "browser.open": {
+            "url": format!("{allowed_origin}/home")
+        }
+    })
+    .to_string();
+    let recover_out = run_da_in(
+        dir.path(),
+        &["session", "step", &id, "--step", &recover_step],
+    );
+    assert_eq!(recover_out.status.code(), Some(0), "{recover_out:?}");
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+
+    stop_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn session_allowed_origins_blocks_delayed_async_navigation_during_step_poll() {
+    let Some(_guard) = chrome_guard() else {
+        return;
+    };
+    let dir = TempDir::new("session-allowed-origins-delayed-nav");
+
+    let secret_html = "<!doctype html><html><head><title>Secret</title></head><body><p id=\"secret\">DISALLOWED_ORIGIN_SECRET_DATA</p></body></html>";
+    let secret_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{secret_html}",
+        secret_html.len()
+    );
+    let (disallowed_origin, stop_disallowed) =
+        spawn_session_mini_http(vec![("/secret".to_string(), secret_resp)]);
+
+    let home_html = format!(
+        r#"<!doctype html><html><head><title>Home</title></head><body><p id="home-marker">ALLOWED_HOME</p><button id="js-delayed" onclick="setTimeout(() => {{ location.href = '{disallowed_origin}/secret'; }}, 250);">Delayed Escape</button></body></html>"#
+    );
+    let home_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{home_html}",
+        home_html.len()
+    );
+    let (allowed_origin, stop_allowed) =
+        spawn_session_mini_http(vec![("/home".to_string(), home_resp)]);
+
+    let start = run_da_in(dir.path(), &["session", "start"]);
+    assert_eq!(start.status.code(), Some(0), "{start:?}");
+    let id = json_stdout(&start)["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let open_step = json!({
+        "browser.open": {
+            "url": format!("{allowed_origin}/home"),
+            "allowed_origins": [allowed_origin]
+        }
+    })
+    .to_string();
+    let open_out = run_da_in(dir.path(), &["session", "step", &id, "--step", &open_step]);
+    assert_eq!(open_out.status.code(), Some(0), "{open_out:?}");
+
+    let click_out = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.click",
+            "--arg",
+            "css=#js-delayed",
+        ],
+    );
+    assert_eq!(click_out.status.code(), Some(0), "{click_out:?}");
+
+    let read_out = run_da_in(
+        dir.path(),
+        &[
+            "session",
+            "step",
+            &id,
+            "browser.read",
+            "--arg",
+            "css=#secret",
+        ],
+    );
+    assert_ne!(
+        read_out.status.code(),
+        Some(0),
+        "delayed async nav during session step poll must fail closed: {read_out:?}"
+    );
+    let read_stdout = String::from_utf8_lossy(&read_out.stdout);
+    let read_json = json_stdout(&read_out);
+    assert_eq!(read_json["ok"], json!(false), "{read_stdout}");
+    assert!(
+        read_stdout.contains("allowed_origins"),
+        "expected allowed_origins error: {read_stdout}"
+    );
+    assert!(
+        !read_stdout.contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "disallowed secret must never leak: {read_stdout}"
+    );
+
+    let snap_out = run_da_in(dir.path(), &["session", "snapshot", &id]);
+    assert_ne!(
+        snap_out.status.code(),
+        Some(0),
+        "snapshot after neutralized delayed nav must fail closed: {snap_out:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&snap_out.stdout).contains("DISALLOWED_ORIGIN_SECRET_DATA"),
+        "disallowed secret leaked in snapshot"
+    );
+
+    let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+    assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+
+    stop_allowed.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop_disallowed.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+
 #[test]
 fn session_preview_frames_and_pause_resume_lifecycle() {
     let Some(_guard) = chrome_guard() else {

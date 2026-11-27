@@ -641,7 +641,7 @@ fn handle_step(
             args_location: Location::UNKNOWN,
         })
         .collect();
-    let report = runner::run_single_step_with_observations(
+    let mut report = runner::run_single_step_with_observations(
         &step,
         &observations,
         effective_registry.as_ref(),
@@ -662,7 +662,22 @@ fn handle_step(
             Ok(Some((_kind, snap))) => Some(secrets.redact_json(&snap)),
             Ok(None) => None,
             Err(err) => {
-                snapshot_error = Some(secrets.redact(&err));
+                let redacted = secrets.redact(&err);
+                if is_allowed_origins_error(&redacted)
+                    && matches!(report.status, StepStatus::Passed | StepStatus::Skipped)
+                {
+                    for key in report.saved.keys() {
+                        state.vars.remove(key);
+                    }
+                    report.saved.clear();
+                    report.result = None;
+                    report.status = StepStatus::Failed;
+                    report.error = Some(crate::core::report::Problem {
+                        kind: ProblemKind::Execution,
+                        message: redacted.clone(),
+                    });
+                }
+                snapshot_error = Some(redacted);
                 None
             }
         }
@@ -2343,6 +2358,15 @@ fn capture_snapshot_and_screenshot(
     } else {
         let (kind, snap) = match snap_res {
             Ok(Some((kind, snap))) => (kind, Some(snap)),
+            Err(message) if is_allowed_origins_error(&message) => {
+                state.last_active_ms = store::now_ms();
+                let _ = store::save_state(session_dir, state, secrets);
+                return Err(Box::new(error_response(
+                    ExitCode::Environment,
+                    "environment",
+                    secrets.redact(&message),
+                )));
+            }
             Ok(None) | Err(_) => (fallback_kind, None),
         };
         (kind, snap, None)
@@ -2355,6 +2379,10 @@ fn capture_snapshot_and_screenshot(
         detach_errors: detached.errors,
         local_only_reason,
     })
+}
+
+fn is_allowed_origins_error(message: &str) -> bool {
+    message.contains("allowed_origins")
 }
 
 fn validate_var_name(name: &str) -> Result<String, String> {
@@ -3029,6 +3057,14 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
         }
         let (mut session_kind, snapshot) = match sessions.collect_snapshot(None, None, None) {
             Ok(Some((kind, snap))) => (kind, Some(secrets.redact_json(&snap))),
+            Err(message) if is_allowed_origins_error(&message) => {
+                let _ = detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                return error_response(
+                    ExitCode::Environment,
+                    "environment",
+                    secrets.redact(&message),
+                );
+            }
             Ok(None) | Err(_) => (final_session_kind.clone(), None),
         };
         let masked_capture = if req.screenshot {

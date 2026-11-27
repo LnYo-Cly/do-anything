@@ -325,8 +325,12 @@ Wayland supports semantic AT-SPI2 steps while screenshots, `desktop.press`, and
   it before trusting it.
 - **The service is yours.** `da` starts and stops only the programs a `cli.run`
   step names and the browser a case opens (a Chrome or Chromium already
-  installed; `DA_CHROME` names one). `browser.open` with `connect` drives a
-  browser you started with a debug port instead.
+  installed; `DA_CHROME` names one). `browser.open` with `connect: "auto"` (or
+  an explicit loopback `http://127.0.0.1:<port>`) attaches to a local browser
+  you started with a debug port (or `DA_BROWSER_CONNECT`), always marks the
+  session `local_only: true`, enforces clipboard isolation, and supports
+  `allowed_origins: [...]` to block navigation/redirects outside approved
+  origins.
 
 Details are in `docs/guide.md`: [sessions](../../docs/guide.md#interactive-sessions-da-session),
 [browser steps](../../docs/guide.md#browser-steps), [desktop steps](../../docs/guide.md#desktop-steps),
