@@ -2864,11 +2864,22 @@ for (var k = 0; k < levelChecks.length; k++) {{
 var hit = deepHit(elDoc, lx, ly);
 var hitOk = hit !== null && (hit === el || composedContains(el, hit));
 var blocker = !hitOk && hit ? summarizeNode(hit) : null;
+var vpW = 0;
+var vpH = 0;
+try {{
+  var topWin = window.top || window;
+  vpW = Math.round(topWin.innerWidth || (topWin.document && topWin.document.documentElement ? topWin.document.documentElement.clientWidth : 0) || 0);
+  vpH = Math.round(topWin.innerHeight || (topWin.document && topWin.document.documentElement ? topWin.document.documentElement.clientHeight : 0) || 0);
+}} catch (e) {{
+  vpW = Math.round(window.innerWidth || 0);
+  vpH = Math.round(window.innerHeight || 0);
+}}
 return {{
   status: 'ready_candidate',
   rect: topRect,
   x: topX,
   y: topY,
+  viewport: vpW > 0 && vpH > 0 ? {{ width: vpW, height: vpH }} : null,
   hit_ok: hitOk,
   blocker: blocker
 }};
@@ -3201,6 +3212,8 @@ struct BrowserSession {
     refs: snapshot::RefStore,
     /// Per-step metadata (such as synthesized locator) collected by `da session`.
     step_metadata: Option<Value>,
+    /// UI target geometry captured by the most recent browser interaction step.
+    last_target_bounds: Option<Value>,
     /// Whether a browser step ran during the current interactive command.
     snapshot_pending: bool,
     /// Page session id that already has `Emulation.setFocusEmulationEnabled(true)` set.
@@ -3310,6 +3323,7 @@ impl BrowserSession {
                 .unwrap_or_else(|| DEFAULT_TESTID_ATTRIBUTE.to_string()),
             refs: snapshot::RefStore::default(),
             step_metadata: None,
+            last_target_bounds: None,
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
@@ -3356,6 +3370,7 @@ impl BrowserSession {
                 .to_string(),
             refs: snapshot::RefStore::default(),
             step_metadata: None,
+            last_target_bounds: None,
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),
@@ -3452,6 +3467,7 @@ impl BrowserSession {
             testid_attribute: parsed.testid_attribute,
             refs: parsed.refs,
             step_metadata: None,
+            last_target_bounds: None,
             snapshot_pending: false,
             clipboard_focus_page,
             clipboard_origins: parsed.clipboard_origins,
@@ -4169,6 +4185,12 @@ impl BrowserSession {
             deadline,
             dialog,
         )?;
+        let viewport = raw.get("viewport").and_then(|vp| {
+            Some((
+                viewport_dimension(vp, "width")?,
+                viewport_dimension(vp, "height")?,
+            ))
+        });
         let inspect: ActionableInspect = serde_json::from_value(raw).map_err(|error| {
             LocateError::Step(StepError::Environment(format!(
                 "the browser returned an invalid actionability state for {target_desc}: {error}"
@@ -4179,6 +4201,8 @@ impl BrowserSession {
                 located: Located(object_id),
                 x,
                 y,
+                rect: *previous_rect,
+                viewport,
             })),
             ActionablePoll::Pending(reason) => Ok(Err(reason)),
             ActionablePoll::UnmappableTransform(reason) => {
@@ -6165,6 +6189,47 @@ struct ActionableTarget {
     located: Located,
     x: f64,
     y: f64,
+    rect: Option<ElementRect>,
+    viewport: Option<(u32, u32)>,
+}
+
+fn bounds_from_actionable(target: &ActionableTarget, fallback_vp: (u32, u32)) -> Value {
+    let (x, y, width, height) = match target.rect {
+        Some(rect) => (rect.x, rect.y, rect.width.max(0.0), rect.height.max(0.0)),
+        None => (target.x, target.y, 0.0, 0.0),
+    };
+    let (vw, vh) = target.viewport.unwrap_or(fallback_vp);
+    let mut obj = json!({
+        "x": coordinate_number(x),
+        "y": coordinate_number(y),
+        "width": coordinate_number(width),
+        "height": coordinate_number(height),
+        "point": {
+            "x": coordinate_number(target.x),
+            "y": coordinate_number(target.y),
+        },
+    });
+    if vw > 0 && vh > 0 {
+        obj["viewport"] = json!({ "width": vw, "height": vh });
+    }
+    obj
+}
+
+fn bounds_from_point(x: f64, y: f64, width: u32, height: u32) -> Value {
+    let mut obj = json!({
+        "x": coordinate_number(x),
+        "y": coordinate_number(y),
+        "width": 0,
+        "height": 0,
+        "point": {
+            "x": coordinate_number(x),
+            "y": coordinate_number(y),
+        },
+    });
+    if width > 0 && height > 0 {
+        obj["viewport"] = json!({ "width": width, "height": height });
+    }
+    obj
 }
 
 /// Outcome of one resolution poll for an [`ElementTarget`].
@@ -6836,6 +6901,10 @@ impl Session for BrowserSession {
 
     fn take_step_metadata(&mut self) -> Option<Value> {
         self.step_metadata.take()
+    }
+
+    fn take_target_bounds(&mut self) -> Option<Value> {
+        self.last_target_bounds.take()
     }
 
     fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
@@ -8401,6 +8470,7 @@ fn click_actionable(
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<Value, StepError> {
+    let bounds = bounds_from_actionable(&actionable, (session.width, session.height));
     let located = actionable.located;
     let (x, y) = (actionable.x, actionable.y);
     for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
@@ -8420,6 +8490,7 @@ fn click_actionable(
             dialog,
         )?;
     }
+    session.last_target_bounds = Some(bounds);
     // A click may navigate, which detaches the element. The click itself
     // succeeded, so a text that can no longer be read is not a failure unless
     // an unhandled JavaScript dialog opened.
@@ -8461,14 +8532,17 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
         let session = session(sessions)?;
         let target_desc = format!("ref `{}`", parsed.ref_id);
         let actionable = session.locate_ref_actionable(&parsed.ref_id, deadline, &mut dialog)?;
-        return type_actionable(
+        let bounds = bounds_from_actionable(&actionable, (session.width, session.height));
+        let res = type_actionable(
             session,
             &target_desc,
             &actionable.located,
             &text,
             deadline,
             &mut dialog,
-        );
+        )?;
+        session.last_target_bounds = Some(bounds);
+        return Ok(res);
     }
     let args: TypeArgs = parse(args)?;
     check_timeout(args.timeout_ms).map_err(StepError::InvalidArguments)?;
@@ -8487,14 +8561,17 @@ fn run_type(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let session = session(sessions)?;
     let target_desc = target.describe_with(&session.testid_attribute);
     let actionable = session.locate_actionable_target(&target, deadline, &mut dialog)?;
-    type_actionable(
+    let bounds = bounds_from_actionable(&actionable, (session.width, session.height));
+    let res = type_actionable(
         session,
         &target_desc,
         &actionable.located,
         &text,
         deadline,
         &mut dialog,
-    )
+    )?;
+    session.last_target_bounds = Some(bounds);
+    Ok(res)
 }
 
 fn type_actionable(
@@ -8851,6 +8928,7 @@ fn click_at(
     }
     dispatch_pointer_click(session, at, deadline, dialog)?;
     session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+    session.last_target_bounds = Some(bounds_from_point(at.x, at.y, width, height));
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
 
@@ -8883,6 +8961,7 @@ fn type_at(
         dialog,
     )?;
     session.ensure_current_page_origin_allowed_with_dialog(dialog)?;
+    session.last_target_bounds = Some(bounds_from_point(at.x, at.y, width, height));
     Ok(attach_dialog(coordinate_result(at, width, height), dialog))
 }
 
@@ -10301,6 +10380,7 @@ fn run_scroll(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
         result["scrolled"] = json!(true);
         result["scroll_x"] = coordinate_number(sx);
         result["scroll_y"] = coordinate_number(sy);
+        session.last_target_bounds = Some(bounds_from_point(at.x, at.y, width, height));
         return Ok(attach_dialog(result, &mut dialog));
     }
 
@@ -10365,6 +10445,7 @@ fn hover_actionable(
     deadline: Deadline,
     dialog: &mut DialogContext,
 ) -> Result<Value, StepError> {
+    let bounds = bounds_from_actionable(&actionable, (session.width, session.height));
     let located = actionable.located;
     dispatch_mouse_move(
         session,
@@ -10376,6 +10457,7 @@ fn hover_actionable(
         dialog,
     )?;
     flush_scroll_frames(session, deadline, dialog)?;
+    session.last_target_bounds = Some(bounds);
     let text = match session.run_on(
         target_desc,
         &located,
@@ -10436,6 +10518,7 @@ fn run_hover(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> 
         session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
         let mut result = coordinate_result(at, width, height);
         result["hovered"] = json!(true);
+        session.last_target_bounds = Some(bounds_from_point(at.x, at.y, width, height));
         return Ok(attach_dialog(result, &mut dialog));
     }
 
@@ -10469,6 +10552,8 @@ struct ResolvedDragEndpoint {
     located: Option<Located>,
     x: f64,
     y: f64,
+    rect: Option<ElementRect>,
+    viewport: Option<(u32, u32)>,
     synth: DragEndpointSynth,
 }
 
@@ -10539,6 +10624,8 @@ fn resolve_drag_endpoint(
             located: Some(actionable.located),
             x: actionable.x,
             y: actionable.y,
+            rect: actionable.rect,
+            viewport: actionable.viewport,
             synth: DragEndpointSynth {
                 locator: Some(locator),
                 ref_id: Some(ref_id.clone()),
@@ -10554,6 +10641,8 @@ fn resolve_drag_endpoint(
             located: None,
             x: at.x,
             y: at.y,
+            rect: None,
+            viewport: Some((width, height)),
             synth: DragEndpointSynth {
                 viewport: Some((width, height)),
                 ..DragEndpointSynth::default()
@@ -10578,6 +10667,8 @@ fn resolve_drag_endpoint(
         located: Some(actionable.located),
         x: actionable.x,
         y: actionable.y,
+        rect: actionable.rect,
+        viewport: actionable.viewport,
         synth: DragEndpointSynth::default(),
     })
 }
@@ -10841,6 +10932,8 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
             (refreshed_from.x - from.x).abs() > 0.5 || (refreshed_from.y - from.y).abs() > 0.5;
         from.x = refreshed_from.x;
         from.y = refreshed_from.y;
+        from.rect = refreshed_from.rect.or(from.rect);
+        from.viewport = refreshed_from.viewport.or(from.viewport);
         let scroll_after_refresh = read_drag_scroll_snapshot(session, deadline, &mut dialog)?;
         let scrolled = scroll_after_to
             .as_ref()
@@ -10852,11 +10945,52 @@ fn run_drag(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
                 session.wait_located_actionable(&to.desc, to_loc.0, deadline, &mut dialog)?;
             to.x = refreshed_to.x;
             to.y = refreshed_to.y;
+            to.rect = refreshed_to.rect.or(to.rect);
+            to.viewport = refreshed_to.viewport.or(to.viewport);
         }
     }
 
     dispatch_drag_gesture(session, &from, &mut to, mid_drag_to, deadline, &mut dialog)?;
     session.ensure_current_page_origin_allowed_with_dialog(&mut dialog)?;
+
+    let min_x = from.x.min(to.x);
+    let min_y = from.y.min(to.y);
+    let span_w = (from.x - to.x).abs();
+    let span_h = (from.y - to.y).abs();
+    let mut drag_bounds = json!({
+        "x": coordinate_number(min_x),
+        "y": coordinate_number(min_y),
+        "width": coordinate_number(span_w),
+        "height": coordinate_number(span_h),
+        "from": { "x": coordinate_number(from.x), "y": coordinate_number(from.y) },
+        "to": { "x": coordinate_number(to.x), "y": coordinate_number(to.y) },
+    });
+    if let Some(rect) = from.rect {
+        drag_bounds["from_bounds"] = json!({
+            "x": coordinate_number(rect.x),
+            "y": coordinate_number(rect.y),
+            "width": coordinate_number(rect.width.max(0.0)),
+            "height": coordinate_number(rect.height.max(0.0)),
+        });
+    }
+    if let Some(rect) = to.rect {
+        drag_bounds["to_bounds"] = json!({
+            "x": coordinate_number(rect.x),
+            "y": coordinate_number(rect.y),
+            "width": coordinate_number(rect.width.max(0.0)),
+            "height": coordinate_number(rect.height.max(0.0)),
+        });
+    }
+    let vp = from
+        .viewport
+        .or(to.viewport)
+        .or(from.synth.viewport)
+        .or(to.synth.viewport)
+        .unwrap_or((session.width, session.height));
+    if vp.0 > 0 && vp.1 > 0 {
+        drag_bounds["viewport"] = json!({ "width": vp.0, "height": vp.1 });
+    }
+    session.last_target_bounds = Some(drag_bounds);
 
     let mut result = json!({
         "dragged": true,
@@ -13316,6 +13450,7 @@ mod tests {
             testid_attribute: DEFAULT_TESTID_ATTRIBUTE.to_string(),
             refs: snapshot::RefStore::default(),
             step_metadata: None,
+            last_target_bounds: None,
             snapshot_pending: false,
             clipboard_focus_page: None,
             clipboard_origins: Vec::new(),

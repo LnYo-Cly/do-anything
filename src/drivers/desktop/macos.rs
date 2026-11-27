@@ -81,6 +81,7 @@ pub struct DesktopBackend {
     title: String,
     refs: BTreeMap<String, StoredRef>,
     last_step_meta: Option<Value>,
+    last_target_bounds: Option<Value>,
 }
 
 impl DesktopBackend {
@@ -134,6 +135,7 @@ impl DesktopBackend {
                         title: win.title,
                         refs: BTreeMap::new(),
                         last_step_meta: None,
+                        last_target_bounds: None,
                     };
                     return Ok((backend, result));
                 }
@@ -189,6 +191,7 @@ impl DesktopBackend {
                     title: win.title,
                     refs: BTreeMap::new(),
                     last_step_meta: None,
+                    last_target_bounds: None,
                 };
                 return Ok((backend, result));
             }
@@ -238,6 +241,7 @@ impl DesktopBackend {
             title: win.title,
             refs: parsed.refs,
             last_step_meta: None,
+            last_target_bounds: None,
         })
     }
 
@@ -308,6 +312,10 @@ impl DesktopBackend {
         self.last_step_meta.take()
     }
 
+    pub fn take_target_bounds(&mut self) -> Option<Value> {
+        self.last_target_bounds.take()
+    }
+
     pub fn click(
         &mut self,
         target: Option<&DesktopLocator>,
@@ -357,6 +365,15 @@ impl DesktopBackend {
                                 node.screen_rect.1 + (node.screen_rect.3 - node.screen_rect.1) / 2;
                             enigo_mouse_click(cx, cy, button)?;
                         }
+
+                        self.last_target_bounds = Some(super::desktop_rect_target_bounds(
+                            node.bounds.x,
+                            node.bounds.y,
+                            node.bounds.width,
+                            node.bounds.height,
+                            live.data.win_width,
+                            live.data.win_height,
+                        ));
 
                         return Ok(json!({
                             "clicked": true,
@@ -410,6 +427,13 @@ impl DesktopBackend {
             }));
         }
 
+        self.last_target_bounds = Some(super::desktop_point_target_bounds(
+            point.x,
+            point.y,
+            live.data.win_width,
+            live.data.win_height,
+        ));
+
         Ok(json!({
             "clicked": true,
             "button": click_button_name(button),
@@ -452,6 +476,13 @@ impl DesktopBackend {
                     "fragile": fragile,
                 }));
             }
+
+            self.last_target_bounds = Some(super::desktop_point_target_bounds(
+                point.x,
+                point.y,
+                live.data.win_width,
+                live.data.win_height,
+            ));
 
             return Ok(json!({
                 "typed_chars": text.chars().count(),
@@ -500,6 +531,15 @@ impl DesktopBackend {
                             }
                             enigo_type_text(text, true)?;
                         }
+
+                        self.last_target_bounds = Some(super::desktop_rect_target_bounds(
+                            node.bounds.x,
+                            node.bounds.y,
+                            node.bounds.width,
+                            node.bounds.height,
+                            live.data.win_width,
+                            live.data.win_height,
+                        ));
 
                         return Ok(json!({
                             "typed_chars": text.chars().count(),

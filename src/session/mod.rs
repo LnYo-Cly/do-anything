@@ -1152,6 +1152,7 @@ fn build_model_diagnostic_record(spec: ModelDiagnosticSpec<'_>, audit: &ModelAud
         started_at_ms: spec.started_at_ms,
         duration_ms: spec.duration_ms,
         result: Some(spec.result),
+        target_bounds: None,
         model: Some(audit.model.clone()),
         latency_ms: Some(audit.latency_ms),
         usage: audit.usage.clone(),
@@ -1641,7 +1642,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
     });
 
     let existing_steps = store::load_steps(&session_dir).unwrap_or_default();
-    let diag_record = build_model_diagnostic_record(
+    let mut diag_record = build_model_diagnostic_record(
         ModelDiagnosticSpec {
             index: existing_steps.len() + 1,
             action: STEP_ACTION_LOCATE,
@@ -1658,6 +1659,17 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         },
         &outcome.audit,
     );
+    let locate_bounds = json!({
+        "x": x_val,
+        "y": y_val,
+        "width": 0,
+        "height": 0,
+        "point": { "x": x_val, "y": y_val },
+        "viewport": viewport,
+    });
+    if crate::core::report::validate_target_bounds(&locate_bounds).is_ok() {
+        diag_record.target_bounds = Some(locate_bounds);
+    }
 
     let mut click_outcome_opt: Option<(StepReport, Option<Value>, StepRecord)> = None;
     if req.click {
@@ -2643,7 +2655,10 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
         .unwrap_or_else(|| "session".to_string());
     let mut last_viewport: Option<Value> = None;
     let mut last_audit: Option<ModelAudit> = None;
+    let mut model_calls: usize = 0;
     let mut total_model_latency_ms: u64 = 0;
+    let mut max_model_latency_ms: u64 = 0;
+    let mut usage_totals = ActUsageAccumulator::default();
 
     for step_num in 1..=req.max_steps {
         let (mut session_kind, snapshot) = match sessions.collect_snapshot(None, None, None) {
@@ -2725,7 +2740,12 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
             }
         };
 
+        model_calls += 1;
         total_model_latency_ms = total_model_latency_ms.saturating_add(outcome.audit.latency_ms);
+        max_model_latency_ms = max_model_latency_ms.max(outcome.audit.latency_ms);
+        if let Some(usage) = outcome.audit.usage.as_ref() {
+            usage_totals.add(usage);
+        }
         final_summary = outcome.summary.clone();
         last_audit = Some(outcome.audit.clone());
 
@@ -2925,6 +2945,9 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
         );
     };
     diag_audit.latency_ms = total_model_latency_ms;
+    if let Some(summed_usage) = usage_totals.to_value() {
+        diag_audit.usage = Some(summed_usage);
+    }
 
     let act_passed = final_status == "done";
     let act_duration_ms = store::now_ms().saturating_sub(act_started_ms);
@@ -2943,7 +2966,9 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
         "max_steps": req.max_steps,
         "executed_steps": executed_steps,
         "model": diag_audit.model,
+        "model_calls": model_calls,
         "latency_ms": total_model_latency_ms,
+        "max_model_latency_ms": max_model_latency_ms,
         "confidence": diag_audit.confidence,
         "trace_id": diag_audit.trace_id,
     });
@@ -2996,7 +3021,10 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
         "max_steps": req.max_steps,
         "executed_steps": executed_steps,
         "model": diag_audit.model,
+        "model_calls": model_calls,
         "latency_ms": total_model_latency_ms,
+        "max_model_latency_ms": max_model_latency_ms,
+        "usage": diag_audit.usage,
         "confidence": diag_audit.confidence,
         "trace_id": diag_audit.trace_id,
     });
@@ -3032,6 +3060,126 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
         payload: secrets.redact_json(&payload),
         raw_yaml: None,
         raw_text: Some(secrets.redact(&text)),
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActUsageAccumulator {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cached_tokens: u64,
+    cache_creation_tokens: u64,
+    reasoning_tokens: u64,
+    has_prompt: bool,
+    has_completion: bool,
+    has_total: bool,
+    has_cached: bool,
+    has_cache_creation: bool,
+    has_reasoning: bool,
+    any_present: bool,
+}
+
+impl ActUsageAccumulator {
+    fn add(&mut self, usage: &Value) {
+        let Some(obj) = usage.as_object() else {
+            return;
+        };
+        let read_u64 = |keys: &[&str]| -> Option<u64> {
+            for key in keys {
+                if let Some(v) = obj.get(*key).and_then(Value::as_u64) {
+                    return Some(v);
+                }
+            }
+            None
+        };
+        let prompt = read_u64(&["prompt_tokens", "input_tokens"]);
+        let completion = read_u64(&["completion_tokens", "output_tokens"]);
+        let total = read_u64(&["total_tokens"]).or_else(|| {
+            if prompt.is_some() || completion.is_some() {
+                Some(prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0)))
+            } else {
+                None
+            }
+        });
+        let cached = read_u64(&["cached_tokens", "cache_read_tokens"]).or_else(|| {
+            obj.get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        });
+        let cache_creation = read_u64(&["cache_creation_tokens", "cache_creation_input_tokens"])
+            .or_else(|| {
+                obj.get("prompt_tokens_details")
+                    .and_then(|d| d.get("cache_creation_tokens"))
+                    .and_then(Value::as_u64)
+            });
+        let reasoning = read_u64(&["reasoning_tokens"]).or_else(|| {
+            obj.get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        });
+        if let Some(v) = prompt {
+            self.prompt_tokens = self.prompt_tokens.saturating_add(v);
+            self.has_prompt = true;
+            self.any_present = true;
+        }
+        if let Some(v) = completion {
+            self.completion_tokens = self.completion_tokens.saturating_add(v);
+            self.has_completion = true;
+            self.any_present = true;
+        }
+        if let Some(v) = total {
+            self.total_tokens = self.total_tokens.saturating_add(v);
+            self.has_total = true;
+            self.any_present = true;
+        }
+        if let Some(v) = cached {
+            self.cached_tokens = self.cached_tokens.saturating_add(v);
+            self.has_cached = true;
+            self.any_present = true;
+        }
+        if let Some(v) = cache_creation {
+            self.cache_creation_tokens = self.cache_creation_tokens.saturating_add(v);
+            self.has_cache_creation = true;
+            self.any_present = true;
+        }
+        if let Some(v) = reasoning {
+            self.reasoning_tokens = self.reasoning_tokens.saturating_add(v);
+            self.has_reasoning = true;
+            self.any_present = true;
+        }
+    }
+
+    fn to_value(&self) -> Option<Value> {
+        if !self.any_present {
+            return None;
+        }
+        let mut map = Map::new();
+        if self.has_prompt {
+            map.insert("prompt_tokens".to_string(), json!(self.prompt_tokens));
+        }
+        if self.has_completion {
+            map.insert(
+                "completion_tokens".to_string(),
+                json!(self.completion_tokens),
+            );
+        }
+        if self.has_total {
+            map.insert("total_tokens".to_string(), json!(self.total_tokens));
+        }
+        if self.has_cached {
+            map.insert("cached_tokens".to_string(), json!(self.cached_tokens));
+        }
+        if self.has_cache_creation {
+            map.insert(
+                "cache_creation_tokens".to_string(),
+                json!(self.cache_creation_tokens),
+            );
+        }
+        if self.has_reasoning {
+            map.insert("reasoning_tokens".to_string(), json!(self.reasoning_tokens));
+        }
+        Some(Value::Object(map))
     }
 }
 
@@ -3397,6 +3545,7 @@ fn build_step_record(
         started_at_ms,
         duration_ms: u64::try_from(report.duration.as_millis()).unwrap_or(u64::MAX),
         result: report.result.clone(),
+        target_bounds: report.target_bounds.clone(),
         model: None,
         latency_ms: None,
         usage: None,

@@ -265,6 +265,7 @@ pub struct DesktopBackend {
     title: String,
     refs: BTreeMap<String, StoredRef>,
     last_step_meta: Option<Value>,
+    last_target_bounds: Option<Value>,
 }
 
 impl DesktopBackend {
@@ -356,6 +357,7 @@ impl DesktopBackend {
                         title: win.title,
                         refs: BTreeMap::new(),
                         last_step_meta: None,
+                        last_target_bounds: None,
                     };
                     return Ok((backend, result));
                 }
@@ -421,6 +423,7 @@ impl DesktopBackend {
                     title: win.title,
                     refs: BTreeMap::new(),
                     last_step_meta: None,
+                    last_target_bounds: None,
                 };
                 return Ok((backend, result));
             }
@@ -488,6 +491,7 @@ impl DesktopBackend {
             title: parsed.title,
             refs: parsed.refs,
             last_step_meta: None,
+            last_target_bounds: None,
         })
     }
 
@@ -549,6 +553,10 @@ impl DesktopBackend {
 
     pub fn take_step_metadata(&mut self) -> Option<Value> {
         self.last_step_meta.take()
+    }
+
+    pub fn take_target_bounds(&mut self) -> Option<Value> {
+        self.last_target_bounds.take()
     }
 
     pub fn click(
@@ -622,6 +630,15 @@ impl DesktopBackend {
                         })??;
                     }
 
+                    self.last_target_bounds = Some(super::desktop_rect_target_bounds(
+                        node.bounds.x,
+                        node.bounds.y,
+                        node.bounds.width,
+                        node.bounds.height,
+                        tree_data.win_width,
+                        tree_data.win_height,
+                    ));
+
                     return Ok(json!({
                         "clicked": true,
                         "button": click_button_name(button),
@@ -692,6 +709,10 @@ impl DesktopBackend {
             }));
         }
 
+        self.last_target_bounds = Some(super::desktop_point_target_bounds(
+            point.x, point.y, win_width, win_height,
+        ));
+
         Ok(json!({
             "clicked": true,
             "button": click_button_name(button),
@@ -755,6 +776,10 @@ impl DesktopBackend {
                     "fragile": fragile,
                 }));
             }
+
+            self.last_target_bounds = Some(super::desktop_point_target_bounds(
+                point.x, point.y, win_width, win_height,
+            ));
 
             return Ok(json!({
                 "typed_chars": text.chars().count(),
@@ -855,6 +880,15 @@ impl DesktopBackend {
                                 })
                         })??;
                     }
+
+                    self.last_target_bounds = Some(super::desktop_rect_target_bounds(
+                        node.bounds.x,
+                        node.bounds.y,
+                        node.bounds.width,
+                        node.bounds.height,
+                        tree_data.win_width,
+                        tree_data.win_height,
+                    ));
 
                     return Ok(json!({
                         "typed_chars": text.chars().count(),

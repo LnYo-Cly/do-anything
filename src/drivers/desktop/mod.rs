@@ -724,6 +724,12 @@ impl Session for DesktopSession {
             .and_then(|inner| inner.take_step_metadata())
     }
 
+    fn take_target_bounds(&mut self) -> Option<Value> {
+        self.backend
+            .as_mut()
+            .and_then(|inner| inner.take_target_bounds())
+    }
+
     fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
         let inner = self.backend.as_mut().ok_or_else(|| {
             "no active desktop window; run `desktop.launch` or `desktop.attach` before `locate`"
@@ -745,6 +751,47 @@ impl Session for DesktopSession {
         })?;
         inner.synthesize_at_point(x, y)
     }
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn desktop_rect_target_bounds(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    win_width: u32,
+    win_height: u32,
+) -> Value {
+    let w = width.max(0);
+    let h = height.max(0);
+    let cx = f64::from(x) + f64::from(w) / 2.0;
+    let cy = f64::from(y) + f64::from(h) / 2.0;
+    let mut obj = serde_json::json!({
+        "x": x,
+        "y": y,
+        "width": w,
+        "height": h,
+        "point": { "x": cx, "y": cy },
+    });
+    if win_width > 0 && win_height > 0 {
+        obj["viewport"] = serde_json::json!({ "width": win_width, "height": win_height });
+    }
+    obj
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn desktop_point_target_bounds(x: i32, y: i32, win_width: u32, win_height: u32) -> Value {
+    let mut obj = serde_json::json!({
+        "x": x,
+        "y": y,
+        "width": 0,
+        "height": 0,
+        "point": { "x": x, "y": y },
+    });
+    if win_width > 0 && win_height > 0 {
+        obj["viewport"] = serde_json::json!({ "width": win_width, "height": win_height });
+    }
+    obj
 }
 
 /// Registers every `desktop.*` step definition, session lifecycle handler, and session validator.

@@ -178,9 +178,10 @@ and actual value; `browser/screenshot.png` and `browser/dom.html` show the page;
 `--record <empty-dir>` and render it as one static HTML file:
 
 ```sh
-da run cases/ --record evidence/
-da report evidence/            # writes evidence/report.html
-da report .da/failures/<run>   # or a single failure run
+da run cases/ --record evidence/ --trace-steps
+da report evidence/                 # interactive offline HTML with SVG overlays & timeline
+da report .da/failures/<run>        # or a single failure run
+da report .da/sessions/<session-id> # or an exploration session with model telemetry
 ```
 
 ## RSI loop: verify a repair, not just a green run

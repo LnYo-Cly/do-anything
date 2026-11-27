@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::core::assert::AssertionReport;
 use crate::core::case::{CaseError, CaseErrorKind};
@@ -107,12 +107,176 @@ pub struct StepReport {
     pub args: Option<Value>,
     /// The JSON result, when the step produced one.
     pub result: Option<Value>,
+    /// Redacted UI action geometry (`{ x, y, width, height, viewport, ... }`), when recorded.
+    pub target_bounds: Option<Value>,
     /// Redacted variables saved by `save:` from this step's result.
     pub saved: BTreeMap<String, String>,
     /// Every assertion evaluated for this step.
     pub assertions: Vec<AssertionReport>,
     /// The problem that stopped the case, if this step caused it.
     pub error: Option<Problem>,
+}
+
+/// Returns the Draft 2020-12 JSON Schema for a step's optional `target_bounds` payload.
+pub fn target_bounds_schema() -> Value {
+    json!({
+        "$schema": crate::CASE_SCHEMA_DIALECT,
+        "title": "da step target_bounds",
+        "description": "UI target geometry recorded when a step resolves an element or executes explicit pointer coordinates.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["x", "y", "width", "height"],
+        "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "width": { "type": "number", "minimum": 0 },
+            "height": { "type": "number", "minimum": 0 },
+            "point": { "$ref": "#/$defs/point" },
+            "viewport": { "$ref": "#/$defs/viewport" },
+            "from": { "$ref": "#/$defs/point" },
+            "to": { "$ref": "#/$defs/point" },
+            "from_bounds": { "$ref": "#/$defs/rect" },
+            "to_bounds": { "$ref": "#/$defs/rect" }
+        },
+        "$defs": {
+            "point": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["x", "y"],
+                "properties": {
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                }
+            },
+            "rect": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["x", "y", "width", "height"],
+                "properties": {
+                    "x": { "type": "number" },
+                    "y": { "type": "number" },
+                    "width": { "type": "number", "minimum": 0 },
+                    "height": { "type": "number", "minimum": 0 }
+                }
+            },
+            "viewport": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["width", "height"],
+                "properties": {
+                    "width": { "type": "integer", "minimum": 1 },
+                    "height": { "type": "integer", "minimum": 1 }
+                }
+            }
+        }
+    })
+}
+
+/// Validates a `target_bounds` value against [`target_bounds_schema`].
+pub fn validate_target_bounds(value: &Value) -> Result<(), String> {
+    let Some(obj) = value.as_object() else {
+        return Err("target_bounds must be a JSON object".to_string());
+    };
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "x" | "y"
+                | "width"
+                | "height"
+                | "point"
+                | "viewport"
+                | "from"
+                | "to"
+                | "from_bounds"
+                | "to_bounds"
+        ) {
+            return Err(format!("unexpected target_bounds field `{key}`"));
+        }
+    }
+    validate_rect_fields(obj, "target_bounds")?;
+    for field in ["point", "from", "to"] {
+        if let Some(pt) = obj.get(field) {
+            validate_point_value(pt, field)?;
+        }
+    }
+    for field in ["from_bounds", "to_bounds"] {
+        if let Some(rect) = obj.get(field) {
+            let Some(rect_obj) = rect.as_object() else {
+                return Err(format!("target_bounds.{field} must be an object"));
+            };
+            for key in rect_obj.keys() {
+                if !matches!(key.as_str(), "x" | "y" | "width" | "height") {
+                    return Err(format!("unexpected field `{key}` in target_bounds.{field}"));
+                }
+            }
+            validate_rect_fields(rect_obj, field)?;
+        }
+    }
+    if let Some(viewport) = obj.get("viewport") {
+        let Some(vp) = viewport.as_object() else {
+            return Err("target_bounds.viewport must be an object".to_string());
+        };
+        for key in vp.keys() {
+            if !matches!(key.as_str(), "width" | "height") {
+                return Err(format!(
+                    "unexpected field `{key}` in target_bounds.viewport"
+                ));
+            }
+        }
+        for dim in ["width", "height"] {
+            let Some(v) = vp.get(dim).and_then(Value::as_u64) else {
+                return Err(format!(
+                    "target_bounds.viewport.{dim} must be a positive integer"
+                ));
+            };
+            if v < 1 {
+                return Err(format!("target_bounds.viewport.{dim} must be at least 1"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rect_fields(obj: &serde_json::Map<String, Value>, context: &str) -> Result<(), String> {
+    for coord in ["x", "y"] {
+        let Some(n) = obj.get(coord).and_then(Value::as_f64) else {
+            return Err(format!("{context}.{coord} must be a finite number"));
+        };
+        if !n.is_finite() {
+            return Err(format!("{context}.{coord} must be finite"));
+        }
+    }
+    for dim in ["width", "height"] {
+        let Some(n) = obj.get(dim).and_then(Value::as_f64) else {
+            return Err(format!("{context}.{dim} must be a non-negative number"));
+        };
+        if !n.is_finite() || n < 0.0 {
+            return Err(format!("{context}.{dim} must be >= 0"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_point_value(value: &Value, context: &str) -> Result<(), String> {
+    let Some(obj) = value.as_object() else {
+        return Err(format!("target_bounds.{context} must be an object"));
+    };
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "x" | "y") {
+            return Err(format!(
+                "unexpected field `{key}` in target_bounds.{context}"
+            ));
+        }
+    }
+    for coord in ["x", "y"] {
+        let Some(n) = obj.get(coord).and_then(Value::as_f64) else {
+            return Err(format!("target_bounds.{context}.{coord} must be a number"));
+        };
+        if !n.is_finite() {
+            return Err(format!("target_bounds.{context}.{coord} must be finite"));
+        }
+    }
+    Ok(())
 }
 
 /// One case of a run.
@@ -352,6 +516,7 @@ mod tests {
                     duration: Duration::ZERO,
                     args: None,
                     result: None,
+                    target_bounds: None,
                     saved: BTreeMap::new(),
                     assertions: Vec::new(),
                     error: Some(Problem {
@@ -484,6 +649,7 @@ mod tests {
                 duration: Duration::ZERO,
                 args: None,
                 result: None,
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: None,
@@ -494,6 +660,7 @@ mod tests {
                 duration: Duration::ZERO,
                 args: None,
                 result: None,
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {
@@ -507,6 +674,7 @@ mod tests {
                 duration: Duration::ZERO,
                 args: None,
                 result: None,
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {

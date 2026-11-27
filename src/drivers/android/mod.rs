@@ -741,13 +741,20 @@ fn run_tap(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError> {
     let args: TapArgs = parse(args)?;
     check_tap(&args).map_err(StepError::InvalidArguments)?;
     let adb = Adb::from_arguments(STEP_NAMES[1], args.serial.as_deref(), args.timeout_ms);
-    with_evidence(&adb, STEP_NAMES[1], sessions, |_sessions| {
+    with_evidence(&adb, STEP_NAMES[1], sessions, |sessions| {
         let x = args.x.to_string();
         let y = args.y.to_string();
         adb.shell(
             &["input", "tap", &x, &y],
             &format!("tap ({}, {})", args.x, args.y),
         )?;
+        sessions.record_target_bounds(json!({
+            "x": args.x,
+            "y": args.y,
+            "width": 0,
+            "height": 0,
+            "point": { "x": args.x, "y": args.y },
+        }));
         Ok(json!({ "x": args.x, "y": args.y }))
     })
 }
@@ -837,7 +844,7 @@ fn run_tap_on(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
         ));
     };
     let adb = Adb::from_arguments(STEP_NAMES[5], args.serial.as_deref(), args.timeout_ms);
-    with_evidence(&adb, STEP_NAMES[5], sessions, |_sessions| {
+    with_evidence(&adb, STEP_NAMES[5], sessions, |sessions| {
         let nodes = read_hierarchy(&adb)?;
         let target = resolve_one(&nodes, &filter)?;
         let Some(bounds) = target.bounds else {
@@ -851,6 +858,13 @@ fn run_tap_on(args: &Value, sessions: &mut Sessions) -> Result<Value, StepError>
             &["input", "tap", &x.to_string(), &y.to_string()],
             &format!("tap the node {}", filter.describe()),
         )?;
+        sessions.record_target_bounds(json!({
+            "x": bounds.left,
+            "y": bounds.top,
+            "width": bounds.right.saturating_sub(bounds.left).max(0),
+            "height": bounds.bottom.saturating_sub(bounds.top).max(0),
+            "point": { "x": x, "y": y },
+        }));
         Ok(json!({
             "target": node_value(target),
             "center": { "x": x, "y": y },
