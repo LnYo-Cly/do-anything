@@ -2340,6 +2340,8 @@ fn mcp_composes_plugin_and_model_hook_flags() {
             "select_ref",
             "locate",
             "judge",
+            "extract",
+            "act",
             "export",
             "run",
             "session_stop"

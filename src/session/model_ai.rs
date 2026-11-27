@@ -1,11 +1,11 @@
 //! Built-in multi-provider model access layer backed by `genai` (`ai` feature).
 //!
-//! Invokes `select_ref`, `locate`, and `judge` across `genai`'s adapters
-//! (OpenAI Chat/Responses, Anthropic, Gemini, DeepSeek, Ollama, Omlx, and custom
-//! endpoints/`genai_<n>` adapters) using `rustls` with the workspace `ring`
-//! crypto provider. Every outgoing payload and incoming field/error passes
-//! through [`Secrets`], and calls remain strictly exploration-time only (`da run`
-//! stays model-free).
+//! Invokes `select_ref`, `locate`, `judge`, `extract`, and `act_step` across
+//! `genai`'s adapters (OpenAI Chat/Responses, Anthropic, Gemini, DeepSeek,
+//! Ollama, Omlx, and custom endpoints/`genai_<n>` adapters) using `rustls` with
+//! the workspace `ring` crypto provider. Every outgoing payload and incoming
+//! field/error passes through [`Secrets`], and calls remain strictly
+//! exploration-time only (`da run` stays model-free).
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use genai::adapter::AdapterKind;
 use genai::chat::{
     ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ContentPart, JsonSpec,
+    ReasoningEffort,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget, webc};
@@ -25,10 +26,12 @@ use crate::core::session::MaskedViewportCapture;
 use crate::report::base64_encode;
 
 use super::model_hook::{
-    BuiltinModelSpec, HookError, JudgeOutcome, JudgeParams, LocateOutcome, LocateParams,
+    ActStepOutcome, ActStepParams, BuiltinModelSpec, ExtractOutcome, ExtractParams, HookError,
+    JudgeOutcome, JudgeParams, LocateOutcome, LocateParams, METHOD_ACT_STEP, METHOD_EXTRACT,
     METHOD_JUDGE, METHOD_LOCATE, METHOD_SELECT_REF, ModelAudit, SelectRefOutcome, SelectRefParams,
-    build_judge_payload, extract_confidence, validate_judge_fields, validate_locate_coords,
-    validate_select_ref_choice,
+    build_act_step_payload, build_extract_payload, build_judge_payload, extract_confidence,
+    validate_act_step_fields, validate_extract_fields, validate_judge_fields,
+    validate_locate_coords, validate_reasoning_effort, validate_select_ref_choice,
 };
 
 const VALID_ADAPTER_HINT: &str = "use a `genai` adapter name such as `openai`, `openai_resp`, `anthropic`, `gemini`, `gemini_ix`, `deepseek`, `ollama`, `ollama_cloud`, `omlx`, `open_router`, or `genai_<n>`";
@@ -58,7 +61,16 @@ pub(crate) fn validate_spec(spec: &BuiltinModelSpec) -> Result<(), String> {
             ));
         }
     }
+    if let Some(effort) = &spec.reasoning_effort {
+        parse_reasoning_effort(effort)?;
+    }
     Ok(())
+}
+
+fn parse_reasoning_effort(raw: &str) -> Result<ReasoningEffort, String> {
+    let canonical = validate_reasoning_effort(raw)?;
+    ReasoningEffort::from_keyword(&canonical)
+        .ok_or_else(|| format!("unsupported reasoning effort `{raw}`"))
 }
 
 /// Collects environment variable names that should be tracked and redacted by [`Secrets`].
@@ -121,8 +133,10 @@ pub(crate) fn call_select_ref(
         timeout_ms,
         StructuredOp {
             method: METHOD_SELECT_REF,
-            schema_name: "select_ref_outcome",
-            schema,
+            response_format: StructuredFormat::JsonSpec {
+                name: "select_ref_outcome",
+                schema,
+            },
             system_prompt,
             user_text: payload.to_string(),
             image: None,
@@ -182,8 +196,10 @@ pub(crate) fn call_locate(
         timeout_ms,
         StructuredOp {
             method: METHOD_LOCATE,
-            schema_name: "locate_outcome",
-            schema,
+            response_format: StructuredFormat::JsonSpec {
+                name: "locate_outcome",
+                schema,
+            },
             system_prompt: &system_prompt,
             user_text: payload.to_string(),
             image: Some(&capture),
@@ -194,6 +210,28 @@ pub(crate) fn call_locate(
     Ok(LocateOutcome { x, y, audit })
 }
 
+fn prepare_viewport_payload(
+    payload: &mut Value,
+    capture: Option<&MaskedViewportCapture>,
+    method: &str,
+) -> Result<(), HookError> {
+    let Some(capture) = capture else {
+        return Ok(());
+    };
+    if capture.width == 0 || capture.height == 0 {
+        return Err(HookError::Environment(format!(
+            "cannot call `{method}` with a zero-sized viewport"
+        )));
+    }
+    if let Value::Object(map) = payload {
+        map.insert(
+            "viewport".to_string(),
+            json!({ "width": capture.width, "height": capture.height }),
+        );
+    }
+    Ok(())
+}
+
 /// Evaluates a judge rubric over redacted evidence (and optional masked screenshot) via `genai`.
 pub(crate) fn call_judge(
     spec: &BuiltinModelSpec,
@@ -201,23 +239,9 @@ pub(crate) fn call_judge(
     params: JudgeParams<'_>,
     secrets: &mut Secrets,
 ) -> Result<JudgeOutcome, HookError> {
-    if let Some(capture) = params.masked_capture
-        && (capture.width == 0 || capture.height == 0)
-    {
-        return Err(HookError::Environment(
-            "cannot call `model/judge` with a zero-sized viewport".to_string(),
-        ));
-    }
-
     let mut payload = build_judge_payload(&params, secrets);
-    if let Some(capture) = params.masked_capture
-        && let Value::Object(map) = &mut payload
-    {
-        map.insert(
-            "viewport".to_string(),
-            json!({ "width": capture.width, "height": capture.height }),
-        );
-    }
+    prepare_viewport_payload(&mut payload, params.masked_capture, METHOD_JUDGE)?;
+
     let system_prompt = if params.masked_capture.is_some() {
         "You judge whether an interactive UI session satisfies `rubric` using the provided evidence, snapshot, and attached input-masked screenshot (sensitive inputs are blacked out). Reply ONLY with JSON matching {\"passed\": <boolean>, \"rationale\": \"<concise explanation>\", \"confidence\": <number 0.0..=1.0 or null>}."
     } else {
@@ -239,8 +263,10 @@ pub(crate) fn call_judge(
         timeout_ms,
         StructuredOp {
             method: METHOD_JUDGE,
-            schema_name: "judge_outcome",
-            schema,
+            response_format: StructuredFormat::JsonSpec {
+                name: "judge_outcome",
+                schema,
+            },
             system_prompt,
             user_text: payload.to_string(),
             image: params.masked_capture,
@@ -255,6 +281,114 @@ pub(crate) fn call_judge(
     })
 }
 
+/// Extracts structured JSON data from redacted session state and optional masked screenshot via `genai`.
+pub(crate) fn call_extract(
+    spec: &BuiltinModelSpec,
+    timeout_ms: u64,
+    params: ExtractParams<'_>,
+    secrets: &mut Secrets,
+) -> Result<ExtractOutcome, HookError> {
+    let mut payload = build_extract_payload(&params, secrets);
+    prepare_viewport_payload(&mut payload, params.masked_capture, METHOD_EXTRACT)?;
+
+    let (response_format, system_prompt) = match params.schema {
+        Some(user_schema) => (
+            StructuredFormat::JsonSpec {
+                name: "extract_outcome",
+                schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["data", "confidence"],
+                    "properties": {
+                        "data": user_schema,
+                        "confidence": { "type": ["number", "null"] }
+                    }
+                }),
+            },
+            if params.masked_capture.is_some() {
+                "You extract structured data answering `query` from the provided session snapshot, evidence, and attached input-masked screenshot (sensitive inputs are blacked out). Follow `schema` for `data`. Reply ONLY with JSON matching {\"data\": <value matching schema>, \"confidence\": <number 0.0..=1.0 or null>}."
+            } else {
+                "You extract structured data answering `query` from the provided session snapshot and evidence. Follow `schema` for `data`. Reply ONLY with JSON matching {\"data\": <value matching schema>, \"confidence\": <number 0.0..=1.0 or null>}."
+            },
+        ),
+        None => (
+            StructuredFormat::JsonMode,
+            if params.masked_capture.is_some() {
+                "You extract structured data answering `query` from the provided session snapshot, evidence, and attached input-masked screenshot (sensitive inputs are blacked out). Reply ONLY with JSON matching {\"data\": <extracted JSON value>, \"confidence\": <number 0.0..=1.0 or null>}."
+            } else {
+                "You extract structured data answering `query` from the provided session snapshot and evidence. Reply ONLY with JSON matching {\"data\": <extracted JSON value>, \"confidence\": <number 0.0..=1.0 or null>}."
+            },
+        ),
+    };
+
+    let (obj, audit) = exec_structured_op(
+        spec,
+        timeout_ms,
+        StructuredOp {
+            method: METHOD_EXTRACT,
+            response_format,
+            system_prompt,
+            user_text: payload.to_string(),
+            image: params.masked_capture,
+        },
+        secrets,
+    )?;
+    let data = validate_extract_fields(&obj, secrets)?;
+    Ok(ExtractOutcome { data, audit })
+}
+
+/// Requests the next bounded autonomous action or terminal verdict from `genai`.
+pub(crate) fn call_act_step(
+    spec: &BuiltinModelSpec,
+    timeout_ms: u64,
+    params: ActStepParams<'_>,
+    secrets: &mut Secrets,
+) -> Result<ActStepOutcome, HookError> {
+    let mut payload = build_act_step_payload(&params, secrets);
+    prepare_viewport_payload(&mut payload, params.masked_capture, METHOD_ACT_STEP)?;
+
+    let has_visual =
+        params.masked_capture.is_some() || matches!(params.session_kind, "browser" | "desktop");
+    let system_prompt = if has_visual {
+        "You drive one step of a bounded interactive automation loop to accomplish `goal` (see `step_index` of `max_steps`, `snapshot`, `history`, `available_actions`, and optional masked screenshot). Reply ONLY with a JSON object.\n\
+         When another action is needed, set `status` to \"continue\" and return ONE `action`:\n\
+         - {\"status\":\"continue\",\"summary\":\"<short step note>\",\"action\":{\"kind\":\"step\",\"use\":\"<action from available_actions>\",\"with\":{...}},\"confidence\":<0..1 or null>}\n\
+         - OR visual pixel grounding (strictly 0 <= x < viewport.width, 0 <= y < viewport.height when `viewport` is present):\n\
+           {\"status\":\"continue\",\"summary\":\"<short note>\",\"action\":{\"kind\":\"locate_click\",\"x\":<number>,\"y\":<number>},\"confidence\":<0..1 or null>}\n\
+           OR {\"status\":\"continue\",\"summary\":\"<short note>\",\"action\":{\"kind\":\"locate_type\",\"x\":<number>,\"y\":<number>,\"text\":\"<text>\"},\"confidence\":<0..1 or null>}\n\
+         Action conventions for `step`: pass top-level `ref` from `snapshot` when available (e.g. `browser.click` with `{\"ref\":\"e1\"}`, `browser.type` with `{\"ref\":\"e2\",\"text\":\"...\"}`, `browser.select` with `{\"ref\":\"e3\",\"value\":\"...\"}`, `browser.press` with `{\"key\":\"Enter\"}`); never nest arguments under a `target` field.\n\
+         When `goal` is complete and verified, return {\"status\":\"done\",\"summary\":\"<what succeeded>\",\"reason\":\"<evidence>\",\"action\":null,\"confidence\":<0..1 or null>}.\n\
+         If `goal` cannot succeed, return {\"status\":\"failed\",\"summary\":\"<what blocked progress>\",\"reason\":\"<details>\",\"action\":null,\"confidence\":<0..1 or null>}."
+    } else {
+        "You drive one step of a bounded interactive automation loop to accomplish `goal` (see `step_index` of `max_steps`, `history`, `available_actions`, and `evidence`). Reply ONLY with a JSON object:\n\
+         - Next step: {\"status\":\"continue\",\"summary\":\"<short note>\",\"action\":{\"kind\":\"step\",\"use\":\"<action from available_actions>\",\"with\":{...}},\"confidence\":<0..1 or null>}\n\
+         - Complete: {\"status\":\"done\",\"summary\":\"<what succeeded>\",\"reason\":\"<evidence>\",\"action\":null,\"confidence\":<0..1 or null>}\n\
+         - Impossible/blocked: {\"status\":\"failed\",\"summary\":\"<what failed>\",\"reason\":\"<details>\",\"action\":null,\"confidence\":<0..1 or null>}."
+    };
+
+    let (obj, audit) = exec_structured_op(
+        spec,
+        timeout_ms,
+        StructuredOp {
+            method: METHOD_ACT_STEP,
+            response_format: StructuredFormat::JsonMode,
+            system_prompt,
+            user_text: payload.to_string(),
+            image: params.masked_capture,
+        },
+        secrets,
+    )?;
+    let viewport = params.masked_capture.map(|c| (c.width, c.height));
+    let (status, summary, reason, action) = validate_act_step_fields(&obj, viewport, secrets)?;
+    Ok(ActStepOutcome {
+        status,
+        summary,
+        reason,
+        action,
+        audit,
+    })
+}
+
 struct ResolvedTarget {
     adapter: AdapterKind,
     model_name: String,
@@ -262,10 +396,14 @@ struct ResolvedTarget {
     auth: AuthData,
 }
 
+enum StructuredFormat {
+    JsonSpec { name: &'static str, schema: Value },
+    JsonMode,
+}
+
 struct StructuredOp<'a> {
     method: &'a str,
-    schema_name: &'a str,
-    schema: Value,
+    response_format: StructuredFormat,
     system_prompt: &'a str,
     user_text: String,
     image: Option<&'a MaskedViewportCapture>,
@@ -291,8 +429,7 @@ fn exec_structured_op(
 ) -> Result<(Map<String, Value>, ModelAudit), HookError> {
     let StructuredOp {
         method,
-        schema_name,
-        schema,
+        response_format,
         system_prompt,
         user_text,
         image,
@@ -303,6 +440,12 @@ fn exec_structured_op(
         ));
     }
     validate_spec(spec).map_err(HookError::Usage)?;
+    let reasoning_effort = spec
+        .reasoning_effort
+        .as_deref()
+        .map(parse_reasoning_effort)
+        .transpose()
+        .map_err(HookError::Usage)?;
 
     let resolved = resolve_target(spec, secrets)?;
     let redacted_system = secrets.redact(system_prompt);
@@ -367,12 +510,13 @@ fn exec_structured_op(
     let model_iden = ModelIden::new(resolved.adapter, resolved.model_name.as_str());
     let started = Instant::now();
 
-    let strict_opts = ChatOptions::default()
-        .with_normalize_reasoning_content(true)
-        .with_response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
-            schema_name,
-            schema,
-        )));
+    let strict_format = match response_format {
+        StructuredFormat::JsonSpec { name, schema } => {
+            ChatResponseFormat::JsonSpec(JsonSpec::new(name, schema))
+        }
+        StructuredFormat::JsonMode => ChatResponseFormat::JsonMode,
+    };
+    let strict_opts = build_chat_options(reasoning_effort.clone(), Some(strict_format));
 
     let first_attempt = run_with_deadline(
         &rt,
@@ -393,7 +537,7 @@ fn exec_structured_op(
             if remaining <= Duration::from_millis(50) {
                 return Err(timeout_error(spec, method, timeout_ms, secrets));
             }
-            let plain_opts = ChatOptions::default().with_normalize_reasoning_content(true);
+            let plain_opts = build_chat_options(reasoning_effort, None);
             match run_with_deadline(
                 &rt,
                 remaining,
@@ -501,9 +645,27 @@ fn is_timeout_error(err: &genai::Error) -> bool {
     )
 }
 
+fn build_chat_options(
+    effort: Option<ReasoningEffort>,
+    format: Option<ChatResponseFormat>,
+) -> ChatOptions {
+    let mut opts = ChatOptions::default().with_normalize_reasoning_content(true);
+    if let Some(effort) = effort {
+        opts = opts.with_reasoning_effort(effort);
+    }
+    if let Some(format) = format {
+        opts = opts.with_response_format(format);
+    }
+    opts
+}
+
 fn should_retry_without_json_spec(err: &genai::Error) -> bool {
     let (status, body) = match err {
         genai::Error::WebModelCall {
+            webc_error: webc::Error::ResponseFailedStatus { status, body, .. },
+            ..
+        }
+        | genai::Error::WebAdapterCall {
             webc_error: webc::Error::ResponseFailedStatus { status, body, .. },
             ..
         } => (*status, body.as_str()),
@@ -516,7 +678,10 @@ fn should_retry_without_json_spec(err: &genai::Error) -> bool {
     let lowered = body.to_ascii_lowercase();
     lowered.contains("response_format")
         || lowered.contains("json_schema")
+        || lowered.contains("json_object")
         || lowered.contains("structured")
+        || lowered.contains("additionalproperties")
+        || lowered.contains("response_schema")
 }
 
 fn map_genai_error(
@@ -874,6 +1039,7 @@ mod tests {
             adapter: None,
             endpoint: Some("http://127.0.0.1:8000/v1".to_string()),
             api_key_env: None,
+            reasoning_effort: None,
         };
         assert_eq!(
             select_adapter_kind(&spec, Some(&ep)).expect("adapter"),
@@ -891,6 +1057,7 @@ mod tests {
             adapter: Some("anthropic".to_string()),
             endpoint: Some("http://127.0.0.1:8000/v1".to_string()),
             api_key_env: None,
+            reasoning_effort: None,
         };
         assert_eq!(
             select_adapter_kind(&explicit, Some(&ep)).expect("adapter"),
@@ -922,14 +1089,25 @@ mod tests {
             adapter: Some("genai_1".to_string()),
             endpoint: Some("${env:MY_ENDPOINT}".to_string()),
             api_key_env: Some("MY_KEY".to_string()),
+            reasoning_effort: Some("low".to_string()),
         };
         assert!(validate_spec(&ok_spec).is_ok());
+
+        let bad_effort = BuiltinModelSpec {
+            model: "m".to_string(),
+            adapter: None,
+            endpoint: None,
+            api_key_env: None,
+            reasoning_effort: Some("turbo".to_string()),
+        };
+        assert!(validate_spec(&bad_effort).is_err());
 
         let bad_adapter = BuiltinModelSpec {
             model: "m".to_string(),
             adapter: Some("nonexistent_protocol".to_string()),
             endpoint: None,
             api_key_env: None,
+            reasoning_effort: None,
         };
         assert!(validate_spec(&bad_adapter).is_err());
 
@@ -938,6 +1116,7 @@ mod tests {
             adapter: None,
             endpoint: Some("ftp://127.0.0.1/v1".to_string()),
             api_key_env: None,
+            reasoning_effort: None,
         };
         assert!(validate_spec(&bad_url).is_err());
 
@@ -946,6 +1125,7 @@ mod tests {
             adapter: None,
             endpoint: None,
             api_key_env: Some("KEY=literal".to_string()),
+            reasoning_effort: None,
         };
         assert!(validate_spec(&bad_env).is_err());
     }

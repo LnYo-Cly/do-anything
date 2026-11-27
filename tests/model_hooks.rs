@@ -21,7 +21,8 @@ use do_anything::session::export::ExportOptions;
 use do_anything::session::model_hook::ModelHookSpec;
 use do_anything::session::store;
 use do_anything::session::{
-    self, JudgeRequest, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
+    self, ActRequest, ExtractRequest, JudgeRequest, LocateRequest, SelectRefAction,
+    SelectRefRequest, SessionRequest, StepInput,
 };
 use serde_json::{Value, json};
 use support::TempDir;
@@ -163,6 +164,30 @@ fn main() {
                     json_escape(usage_tag),
                     json_escape(trace_id),
                 )
+            } else if stdin_text.contains("\"model/extract\"") {
+                let raw_data = cfg.get("extract_data").map(String::as_str).unwrap_or("{\"ok\":true}");
+                format!(
+                    "{{\"data\":{raw_data},\"confidence\":{confidence},\"model\":{},\"latency_ms\":{latency_ms},\"usage\":{{\"prompt_tokens\":96,\"completion_tokens\":12,\"note\":{}}},\"trace_id\":{}}}",
+                    json_escape(model),
+                    json_escape(usage_tag),
+                    json_escape(trace_id),
+                )
+            } else if stdin_text.contains("\"model/act_step\"") {
+                let step_idx = stdin_text
+                    .split("\"step_index\":")
+                    .nth(1)
+                    .map(|tail| tail.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+                    .unwrap_or_else(|| "1".to_string());
+                let key = format!("act_step_{step_idx}");
+                cfg.get(&key)
+                    .or_else(|| cfg.get("act_step_default"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{{\"status\":\"done\",\"summary\":\"Goal complete\",\"reason\":\"Default done\",\"action\":null,\"confidence\":{confidence},\"model\":{},\"latency_ms\":{latency_ms}}}",
+                            json_escape(model),
+                        )
+                    })
             } else {
                 let passed = cfg.get("judge_passed").map(String::as_str).unwrap_or("true");
                 let rationale = cfg.get("judge_rationale").map(String::as_str).unwrap_or("looks good");
@@ -216,7 +241,8 @@ fn run_da_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
         .env_remove("DA_MODEL")
         .env_remove("DA_MODEL_ADAPTER")
         .env_remove("DA_MODEL_ENDPOINT")
-        .env_remove("DA_MODEL_API_KEY_ENV");
+        .env_remove("DA_MODEL_API_KEY_ENV")
+        .env_remove("DA_MODEL_REASONING_EFFORT");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -433,6 +459,82 @@ fn fake_ui_registry() -> Registry {
             }
         })
         .expect("register session validator");
+
+    registry
+        .register(StepDefinition {
+            name: "browser.type",
+            description: "type into fake element",
+            args_schema: json!({
+                "type": "object",
+                "properties": {
+                    "testid": { "type": "string" },
+                    "role": { "type": "string" },
+                    "name": { "type": "string" },
+                    "at": { "type": "object" },
+                    "text": { "type": "string" }
+                }
+            }),
+            validate: |args| {
+                if args.get("ref").is_some() {
+                    return Err("`ref` is not valid in case files".to_string());
+                }
+                if args.get("text").and_then(Value::as_str).is_none() {
+                    return Err("missing `text`".to_string());
+                }
+                Ok(())
+            },
+            check_retry: disallow_retry,
+            lint_warnings: no_lint_warnings,
+            run: |args: &Value, sessions: &mut Sessions| {
+                let interactive = sessions.is_interactive();
+                let session = sessions
+                    .get_or_create("browser", || Ok(FakeUiSession::default()))
+                    .map_err(StepError::Environment)?;
+                let typed = args["text"].as_str().unwrap_or("").to_string();
+                if let Some(ref_id) = args.get("ref").and_then(Value::as_str) {
+                    let target = session
+                        .synthesize_ref(ref_id)
+                        .map_err(StepError::Execution)?
+                        .expect("synth ref");
+                    session.step_meta = Some(json!({
+                        "ref": ref_id,
+                        "synthesized_locator": target.locator,
+                        "fragile": target.fragile,
+                    }));
+                    return Ok(json!({ "typed": typed }));
+                }
+                if let Some(at) = args.get("at") {
+                    let x = at["x"].as_f64().unwrap_or(0.0);
+                    let y = at["y"].as_f64().unwrap_or(0.0);
+                    if interactive && let Ok(Some(target)) = session.synthesize_at_point(x, y) {
+                        session.step_meta = Some(json!({
+                            "synthesized_locator": target.locator,
+                            "fragile": target.fragile,
+                        }));
+                    }
+                    return Ok(json!({ "typed": typed }));
+                }
+                Ok(json!({ "typed": typed }))
+            },
+        })
+        .expect("register browser.type");
+
+    registry
+        .register_session_validator("browser.type", |args| {
+            if args.get("text").and_then(Value::as_str).is_none() {
+                return Err("missing `text`".to_string());
+            }
+            if args.get("ref").is_some()
+                || args.get("testid").is_some()
+                || args.get("role").is_some()
+                || args.get("at").is_some()
+            {
+                Ok(())
+            } else {
+                Err("missing target".to_string())
+            }
+        })
+        .expect("register browser.type session validator");
 
     registry
 }
@@ -692,6 +794,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
                 args: vec![bad_cfg.to_string_lossy().into_owned()],
             }),
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 5_000,
             act: None,
         }),
@@ -715,6 +818,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             max_nodes: None,
             hook_override: None,
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 5_000,
             act: Some(SelectRefAction {
                 action: "browser.click".to_string(),
@@ -753,6 +857,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             query: "Click Save Order button".to_string(),
             hook_override: None,
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 5_000,
             click: true,
         }),
@@ -793,6 +898,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             query: "Out of bounds".to_string(),
             hook_override: None,
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 5_000,
             click: false,
         }),
@@ -819,6 +925,7 @@ fn select_ref_and_locate_write_back_deterministic_locators_and_canvas_coordinate
             query: "Click canvas chart node".to_string(),
             hook_override: None,
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 5_000,
             click: true,
         }),
@@ -1037,6 +1144,7 @@ fn hung_crashed_and_malformed_hooks_fail_cleanly_with_zero_orphan_processes() {
                 args: vec![hang_noread_cfg.to_string_lossy().into_owned()],
             }),
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 1000,
             click: false,
         }),
@@ -1222,6 +1330,7 @@ fn judge_screenshot_attaches_masked_png_to_hook_and_requires_visual_session() {
             screenshot: false,
             hook_override: None,
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 5_000,
         }),
         &registry,
@@ -1250,6 +1359,7 @@ fn judge_screenshot_attaches_masked_png_to_hook_and_requires_visual_session() {
             screenshot: true,
             hook_override: None,
             model_override: None,
+            reasoning_effort_override: None,
             timeout_ms: 5_000,
         }),
         &registry,
@@ -1272,6 +1382,221 @@ fn judge_screenshot_attaches_masked_png_to_hook_and_requires_visual_session() {
         visual_req["params"]["image_base64"],
         base64_encode(&large_masked_png())
     );
+}
+
+#[test]
+fn hook_extract_and_act_record_deterministic_steps_and_omit_model_diagnostics() {
+    let dir = TempDir::new("hook-extract-act");
+    let sessions_dir = dir.path().join(".da/sessions");
+    let registry = fake_ui_registry();
+    let req_file = dir.path().join("extract_act_req.json");
+    let cfg_path = dir.write(
+        "hook.cfg",
+        &format!(
+            "mode=normal\nrequest_file={}\nextract_data={{\"total\":\"$42\",\"item\":\"Widget\"}}\nmodel=mock-vlm-2\nlatency_ms=31\n",
+            req_file.display()
+        ),
+    );
+
+    let started = session::handle(
+        SessionRequest::Start {
+            sessions_dir: sessions_dir.clone(),
+            idle_timeout_ms: 60_000,
+            observe: Vec::new(),
+            model_hook: Some(ModelHookSpec {
+                command: mock_hook_exe().to_string_lossy().into_owned(),
+                args: vec![cfg_path.to_string_lossy().into_owned()],
+            }),
+            model: None,
+            plugins: Vec::new(),
+        },
+        &registry,
+    );
+    assert_eq!(started.exit_code, ExitCode::Success);
+    let id = started.payload["session_id"].as_str().unwrap().to_string();
+
+    let opened = session::handle(
+        SessionRequest::Step {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            base_directory: dir.path().to_path_buf(),
+            step: StepInput::Text(
+                r#"{"use":"browser.open","with":{"url":"http://127.0.0.1/app"}}"#.to_string(),
+            ),
+        },
+        &registry,
+    );
+    assert_eq!(opened.exit_code, ExitCode::Success);
+
+    // 1. `extract` with `--schema`, `--screenshot`, `--evidence`, and `--save` stores extracted var cleanly.
+    let extracted = session::handle(
+        SessionRequest::Extract(ExtractRequest {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            base_directory: dir.path().to_path_buf(),
+            query: "Extract order total".to_string(),
+            schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "total": { "type": "string" },
+                    "item": { "type": "string" }
+                }
+            })),
+            evidence: Some(json!({ "page": "checkout" })),
+            screenshot: true,
+            save: Some("EXT_ORDER".to_string()),
+            hook_override: None,
+            model_override: None,
+            reasoning_effort_override: None,
+            timeout_ms: 5_000,
+        }),
+        &registry,
+    );
+    assert_eq!(
+        extracted.exit_code,
+        ExitCode::Success,
+        "{}",
+        extracted.payload
+    );
+    let ext_req: Value =
+        serde_json::from_str(fs::read_to_string(&req_file).unwrap().trim()).unwrap();
+    assert_eq!(ext_req["method"], "model/extract");
+    assert_eq!(ext_req["params"]["mime_type"], "image/png");
+    assert!(ext_req["params"]["schema"].is_object());
+    assert_eq!(
+        extracted.payload["data"],
+        json!({ "total": "$42", "item": "Widget" })
+    );
+    let saved_str = extracted.payload["saved"]["EXT_ORDER"]
+        .as_str()
+        .expect("saved EXT_ORDER");
+    assert_eq!(
+        serde_json::from_str::<Value>(saved_str).expect("saved json"),
+        json!({ "total": "$42", "item": "Widget" })
+    );
+
+    // 2. Bounded `act` executes: (1) `locate_type` -> synthesized locator, (2) `step` click by `ref`, (3) `done`.
+    let act_cfg = format!(
+        "mode=normal\nrequest_file={}\nmodel=mock-agent-v1\nlatency_ms=25\n\
+         act_step_1={{\"status\":\"continue\",\"summary\":\"Type email visually\",\"action\":{{\"kind\":\"locate_type\",\"x\":120,\"y\":45,\"text\":\"buyer@example.com\"}},\"confidence\":0.91,\"model\":\"mock-agent-v1\",\"latency_ms\":25}}\n\
+         act_step_2={{\"status\":\"continue\",\"summary\":\"Click Save ref e2\",\"action\":{{\"kind\":\"step\",\"use\":\"browser.click\",\"with\":{{\"ref\":\"e2\"}}}},\"confidence\":0.95,\"model\":\"mock-agent-v1\",\"latency_ms\":25}}\n\
+         act_step_3={{\"status\":\"done\",\"summary\":\"Checkout submitted\",\"reason\":\"Save clicked cleanly\",\"action\":null,\"confidence\":0.98,\"model\":\"mock-agent-v1\",\"latency_ms\":25}}\n",
+        req_file.display()
+    );
+    fs::write(&cfg_path, act_cfg).unwrap();
+
+    let acted = session::handle(
+        SessionRequest::Act(ActRequest {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            base_directory: dir.path().to_path_buf(),
+            goal: "Fill form and submit Save Order".to_string(),
+            max_steps: 5,
+            evidence: None,
+            screenshot: true,
+            hook_override: None,
+            model_override: None,
+            reasoning_effort_override: None,
+            timeout_ms: 5_000,
+        }),
+        &registry,
+    );
+    assert_eq!(acted.exit_code, ExitCode::Success, "{}", acted.payload);
+    assert_eq!(acted.payload["status"], "done");
+    assert_eq!(acted.payload["steps_taken"], 2);
+    assert_eq!(
+        acted.payload["executed_steps"][0]["synthesized_locator"],
+        json!({ "role": "button", "name": "Save Order" })
+    );
+    assert_eq!(
+        acted.payload["executed_steps"][1]["synthesized_locator"],
+        json!({ "testid": "save-order-btn" })
+    );
+
+    // 3. `max_steps` exhaustion and explicit `failed` both exit with `TestFailure`.
+    fs::write(
+        &cfg_path,
+        "mode=normal\nact_step_default={\"status\":\"continue\",\"summary\":\"Keep clicking\",\"action\":{\"kind\":\"step\",\"use\":\"browser.click\",\"with\":{\"ref\":\"e2\"}},\"confidence\":0.8,\"model\":\"mock-agent-v1\"}\n",
+    )
+    .unwrap();
+    let maxed = session::handle(
+        SessionRequest::Act(ActRequest {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            base_directory: dir.path().to_path_buf(),
+            goal: "Loop until limit".to_string(),
+            max_steps: 2,
+            evidence: None,
+            screenshot: false,
+            hook_override: None,
+            model_override: None,
+            reasoning_effort_override: None,
+            timeout_ms: 5_000,
+        }),
+        &registry,
+    );
+    assert_eq!(maxed.exit_code, ExitCode::TestFailure, "{maxed:?}");
+    assert_eq!(maxed.payload["status"], "max_steps_exceeded");
+    assert_eq!(maxed.payload["steps_taken"], 2);
+
+    fs::write(
+        &cfg_path,
+        "mode=normal\nact_step_1={\"status\":\"failed\",\"summary\":\"Blocked by disabled state\",\"reason\":\"Button disabled\",\"action\":null,\"model\":\"mock-agent-v1\"}\n",
+    )
+    .unwrap();
+    let failed_act = session::handle(
+        SessionRequest::Act(ActRequest {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            base_directory: dir.path().to_path_buf(),
+            goal: "Cannot complete".to_string(),
+            max_steps: 3,
+            evidence: None,
+            screenshot: false,
+            hook_override: None,
+            model_override: None,
+            reasoning_effort_override: None,
+            timeout_ms: 5_000,
+        }),
+        &registry,
+    );
+    assert_eq!(
+        failed_act.exit_code,
+        ExitCode::TestFailure,
+        "{failed_act:?}"
+    );
+    assert_eq!(failed_act.payload["status"], "failed");
+
+    // 4. `export` strips `model.extract` & `model.act` diagnostics and emits deterministic UI steps!
+    let out_case = dir.path().join("act-exported.yaml");
+    let exported = session::handle(
+        SessionRequest::Export {
+            sessions_dir: sessions_dir.clone(),
+            id: id.clone(),
+            options: ExportOptions {
+                case_name: Some("Act hook replay".to_string()),
+                include_reads: false,
+            },
+            out_path: Some(out_case.clone()),
+        },
+        &registry,
+    );
+    assert_eq!(
+        exported.exit_code,
+        ExitCode::Success,
+        "{}",
+        exported.payload
+    );
+    let yaml = fs::read_to_string(&out_case).unwrap();
+    assert!(!yaml.contains("model.extract"), "{yaml}");
+    assert!(!yaml.contains("model.act"), "{yaml}");
+    assert!(yaml.contains("browser.type:"), "{yaml}");
+    assert!(yaml.contains("testid: save-order-btn"), "{yaml}");
+    assert!(
+        !yaml.contains("at:"),
+        "locate_type must upgrade to synthesized locator: {yaml}"
+    );
+    let _ = session::handle(SessionRequest::Stop { sessions_dir, id }, &registry);
 }
 
 #[cfg(not(feature = "ai"))]
@@ -1833,6 +2158,7 @@ mod ai_tests {
             adapter: Some("omlx".to_string()),
             endpoint: Some(srv.endpoint("/v1")),
             api_key_env: None,
+            reasoning_effort: None,
         };
 
         let started = session::handle(
@@ -1875,6 +2201,7 @@ mod ai_tests {
                 max_nodes: None,
                 hook_override: None,
                 model_override: None,
+                reasoning_effort_override: None,
                 timeout_ms: 5_000,
                 act: None,
             }),
@@ -1898,6 +2225,7 @@ mod ai_tests {
                 max_nodes: None,
                 hook_override: None,
                 model_override: None,
+                reasoning_effort_override: None,
                 timeout_ms: 5_000,
                 act: Some(SelectRefAction {
                     action: "browser.click".to_string(),
@@ -1928,6 +2256,7 @@ mod ai_tests {
                 query: "Click Save button".to_string(),
                 hook_override: None,
                 model_override: None,
+                reasoning_effort_override: None,
                 timeout_ms: 5_000,
                 click: true,
             }),
@@ -1961,6 +2290,7 @@ mod ai_tests {
                 query: "Out of bounds".to_string(),
                 hook_override: None,
                 model_override: None,
+                reasoning_effort_override: None,
                 timeout_ms: 5_000,
                 click: false,
             }),
@@ -1984,6 +2314,7 @@ mod ai_tests {
                 screenshot: true,
                 hook_override: None,
                 model_override: None,
+                reasoning_effort_override: None,
                 timeout_ms: 5_000,
             }),
             &registry,
@@ -2042,5 +2373,478 @@ mod ai_tests {
             replay.is_ok(),
             "replay must pass deterministically after stopping mock model server: {replay:?}"
         );
+    }
+
+    #[test]
+    fn builtin_genai_extract_act_and_reasoning_effort_work_end_to_end() {
+        let dir = TempDir::new("ai-extract-act-effort");
+        let sessions_dir = dir.path().join(".da/sessions");
+        let registry = fake_ui_registry();
+        let server = MockModelServer::start();
+
+        // 1. CLI `--model-reasoning-effort low`, invalid effort rejection, per-call override, and `DA_MODEL_REASONING_EFFORT` env fallback.
+        let bad_effort = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "start",
+                "--model",
+                "local-vlm",
+                "--model-reasoning-effort",
+                "turbo",
+            ],
+            &[],
+        );
+        assert_eq!(bad_effort.status.code(), Some(2), "{bad_effort:?}");
+        assert_eq!(json_stdout(&bad_effort)["error"]["kind"], "usage");
+
+        let cli_start = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "start",
+                "--model",
+                "openai::specai-hy/hy4",
+                "--model-endpoint",
+                &server.endpoint("/v1"),
+                "--model-reasoning-effort",
+                "low",
+            ],
+            &[],
+        );
+        assert_eq!(cli_start.status.code(), Some(0), "{cli_start:?}");
+        let start_json = json_stdout(&cli_start);
+        assert_eq!(start_json["model_reasoning_effort"], "low");
+        let cli_id = start_json["session_id"].as_str().unwrap().to_string();
+        let cli_state_raw = fs::read_to_string(
+            dir.path()
+                .join(start_json["dir"].as_str().unwrap())
+                .join(store::STATE_FILE),
+        )
+        .unwrap();
+        assert!(
+            cli_state_raw.contains("\"reasoning_effort\": \"low\""),
+            "{cli_state_raw}"
+        );
+
+        // Reject per-call `--reasoning-effort` when paired with `--hook`.
+        let hook_plus_effort = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "judge",
+                &cli_id,
+                "--rubric",
+                "check",
+                "--hook",
+                "mock",
+                "--reasoning-effort",
+                "low",
+            ],
+            &[],
+        );
+        assert_eq!(
+            hook_plus_effort.status.code(),
+            Some(2),
+            "{hook_plus_effort:?}"
+        );
+
+        // CLI `extract` inherits `low`, supports `--schema`, `--save`, redacts `${env:...}` secrets,
+        // and falls back from strict JsonSpec 400 while preserving `reasoning_effort`!
+        let ext_secret = "s3cr3t-ext-value-99";
+        server.push_reply(MockReply::status_text(
+            400,
+            "Bad Request",
+            "json_schema additionalProperties is required",
+        ));
+        server.push_reply(MockReply::chat_json(
+            "hy4",
+            json!({
+                "data": { "order_id": "ORD-900", "token": ext_secret },
+                "confidence": 0.91
+            }),
+        ));
+        let cli_ext = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "extract",
+                &cli_id,
+                "--query",
+                "Extract order id without ${env:DA_EXT_CLI_SECRET}",
+                "--schema",
+                r#"{"type":"object","properties":{"order_id":{"type":"string"},"token":{"type":"string"}}}"#,
+                "--evidence",
+                r#"{"hint":"${env:DA_EXT_CLI_SECRET}"}"#,
+                "--save",
+                "ORDER_TOKEN",
+            ],
+            &[("DA_EXT_CLI_SECRET", ext_secret)],
+        );
+        assert_eq!(cli_ext.status.code(), Some(0), "{cli_ext:?}");
+        let ext_json = json_stdout(&cli_ext);
+        assert_eq!(
+            ext_json["data"],
+            json!({ "order_id": "ORD-900", "token": "***" })
+        );
+        let ext_reqs = server.take_requests();
+        assert_eq!(ext_reqs.len(), 2);
+        let first_body: Value = serde_json::from_str(&ext_reqs[0].body).unwrap();
+        let second_body: Value = serde_json::from_str(&ext_reqs[1].body).unwrap();
+        assert_eq!(first_body["reasoning_effort"], "low");
+        assert_eq!(second_body["reasoning_effort"], "low");
+        assert!(!ext_reqs[0].body.contains(ext_secret));
+        assert!(!ext_reqs[1].body.contains(ext_secret));
+
+        // Per-call `--reasoning-effort high` WITHOUT repeating `--model` overrides session `low` -> `high`!
+        server.push_reply(MockReply::chat_json(
+            "hy4",
+            json!({ "data": "ready", "confidence": 0.88 }),
+        ));
+        let cli_ext_high = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "extract",
+                &cli_id,
+                "--query",
+                "Extract scalar state",
+                "--reasoning-effort",
+                "high",
+                "--save",
+                "STATE_SCALAR",
+            ],
+            &[],
+        );
+        assert_eq!(cli_ext_high.status.code(), Some(0), "{cli_ext_high:?}");
+        let high_json = json_stdout(&cli_ext_high);
+        assert_eq!(high_json["data"], "ready");
+        assert_eq!(high_json["saved"]["STATE_SCALAR"], "ready");
+        let high_reqs = server.take_requests();
+        assert_eq!(high_reqs.len(), 1);
+        let high_body: Value = serde_json::from_str(&high_reqs[0].body).unwrap();
+        assert_eq!(high_body["reasoning_effort"], "high");
+
+        // `DA_MODEL_REASONING_EFFORT` env fallback applies when session has no configured model.
+        let bare_start = json_stdout(&run_da_env(dir.path(), &["session", "start"], &[]));
+        let bare_id = bare_start["session_id"].as_str().unwrap().to_string();
+        server.push_reply(MockReply::chat_json(
+            "hy4",
+            json!({ "passed": true, "rationale": "Env effort ok" }),
+        ));
+        let env_effort = run_da_env(
+            dir.path(),
+            &["session", "judge", &bare_id, "--rubric", "Check env effort"],
+            &[
+                ("DA_MODEL", "openai::hy4"),
+                ("DA_MODEL_ENDPOINT", &server.endpoint("/v1")),
+                ("DA_MODEL_REASONING_EFFORT", "medium"),
+            ],
+        );
+        assert_eq!(env_effort.status.code(), Some(0), "{env_effort:?}");
+        let env_body: Value = serde_json::from_str(&server.take_requests()[0].body).unwrap();
+        assert_eq!(env_body["reasoning_effort"], "medium");
+        let _ = run_da_env(dir.path(), &["session", "stop", &bare_id], &[]);
+        let _ = run_da_env(dir.path(), &["session", "stop", &cli_id], &[]);
+
+        // 2. Full visual `act` loop via built-in `genai` (`locate_type` + `step` + `done`), followed by
+        // deterministic `export` & model-free replay after server shutdown.
+        let model_spec = BuiltinModelSpec {
+            model: "local-vlm".to_string(),
+            adapter: Some("omlx".to_string()),
+            endpoint: Some(server.endpoint("/v1")),
+            api_key_env: None,
+            reasoning_effort: Some("low".to_string()),
+        };
+        let started = session::handle(
+            SessionRequest::Start {
+                sessions_dir: sessions_dir.clone(),
+                idle_timeout_ms: 60_000,
+                observe: Vec::new(),
+                model_hook: None,
+                model: Some(model_spec),
+                plugins: Vec::new(),
+            },
+            &registry,
+        );
+        assert_eq!(started.exit_code, ExitCode::Success);
+        let id = started.payload["session_id"].as_str().unwrap().to_string();
+
+        let opened = session::handle(
+            SessionRequest::Step {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                step: StepInput::Text(
+                    r#"{"use":"browser.open","with":{"url":"http://127.0.0.1/app"}}"#.to_string(),
+                ),
+            },
+            &registry,
+        );
+        assert_eq!(opened.exit_code, ExitCode::Success);
+
+        server.push_reply(MockReply::chat_json(
+            "local-vlm",
+            json!({
+                "status": "continue",
+                "summary": "Type recipient via visual coordinates",
+                "action": { "kind": "locate_type", "x": 120, "y": 45, "text": "vip@example.com" },
+                "confidence": 0.90
+            }),
+        ));
+        server.push_reply(MockReply::chat_json(
+            "local-vlm",
+            json!({
+                "status": "continue",
+                "summary": "Click Save Order ref e2",
+                "action": { "kind": "step", "use": "browser.click", "with": { "ref": "e2" } },
+                "confidence": 0.95
+            }),
+        ));
+        server.push_reply(MockReply::chat_json(
+            "local-vlm",
+            json!({
+                "status": "done",
+                "summary": "Flow completed cleanly",
+                "reason": "Typed and clicked Save Order",
+                "action": null,
+                "confidence": 0.99
+            }),
+        ));
+
+        let acted = session::handle(
+            SessionRequest::Act(ActRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                base_directory: dir.path().to_path_buf(),
+                goal: "Type recipient email and submit Save Order".to_string(),
+                max_steps: 5,
+                evidence: None,
+                screenshot: true,
+                hook_override: None,
+                model_override: None,
+                reasoning_effort_override: None,
+                timeout_ms: 5_000,
+            }),
+            &registry,
+        );
+        assert_eq!(acted.exit_code, ExitCode::Success, "{}", acted.payload);
+        assert_eq!(acted.payload["status"], "done");
+        assert_eq!(acted.payload["steps_taken"], 2);
+
+        let expected_data_url = format!(
+            "data:image/png;base64,{}",
+            base64_encode(&large_masked_png())
+        );
+        let act_reqs = server.take_requests();
+        assert_eq!(act_reqs.len(), 3);
+        for req in &act_reqs {
+            assert!(
+                req.body.contains(&expected_data_url),
+                "act iteration with screenshot=true must attach masked PNG"
+            );
+            let parsed_req: Value = serde_json::from_str(&req.body).unwrap();
+            assert_eq!(parsed_req["reasoning_effort"], "low");
+        }
+
+        let out_case = dir.path().join("ai-act-exported.yaml");
+        let exported = session::handle(
+            SessionRequest::Export {
+                sessions_dir: sessions_dir.clone(),
+                id: id.clone(),
+                options: ExportOptions {
+                    case_name: Some("AI act deterministic replay".to_string()),
+                    include_reads: false,
+                },
+                out_path: Some(out_case.clone()),
+            },
+            &registry,
+        );
+        assert_eq!(
+            exported.exit_code,
+            ExitCode::Success,
+            "{}",
+            exported.payload
+        );
+        let _ = session::handle(
+            SessionRequest::Stop {
+                sessions_dir: sessions_dir.clone(),
+                id,
+            },
+            &registry,
+        );
+        drop(server);
+
+        let yaml = fs::read_to_string(&out_case).unwrap();
+        assert!(!yaml.contains("model.act"), "{yaml}");
+        assert!(yaml.contains("browser.type:"), "{yaml}");
+        assert!(yaml.contains("testid: save-order-btn"), "{yaml}");
+
+        let parsed = case::load_file(&out_case).expect("exported YAML parses");
+        let mut secrets = Secrets::new();
+        let preflight_errors =
+            runner::preflight(std::slice::from_ref(&parsed), &registry, &mut secrets);
+        assert!(preflight_errors.is_empty(), "{preflight_errors:?}");
+        let replay = runner::run(
+            &[parsed],
+            &registry,
+            &EventBus::new(),
+            None,
+            &Filters::default(),
+            &mut secrets,
+            1,
+        );
+        assert!(
+            replay.is_ok(),
+            "replay must pass deterministically after closing mock model server: {replay:?}"
+        );
+
+        // 3. Visual `extract` with `screenshot: true`, plus `act` failure modes (`max_steps_exceeded`, `failed`)
+        // and `Secrets` redaction across `act` output.
+        let server2 = MockModelServer::start();
+        let visual_secret = "v1sual-act-secret-777";
+        let started2 = session::handle(
+            SessionRequest::Start {
+                sessions_dir: sessions_dir.clone(),
+                idle_timeout_ms: 60_000,
+                observe: Vec::new(),
+                model_hook: None,
+                model: Some(BuiltinModelSpec {
+                    model: "local-vlm".to_string(),
+                    adapter: Some("omlx".to_string()),
+                    endpoint: Some(server2.endpoint("/v1")),
+                    api_key_env: None,
+                    reasoning_effort: Some("low".to_string()),
+                }),
+                plugins: Vec::new(),
+            },
+            &registry,
+        );
+        assert_eq!(started2.exit_code, ExitCode::Success);
+        let id2 = started2.payload["session_id"].as_str().unwrap().to_string();
+        let opened2 = session::handle(
+            SessionRequest::Step {
+                sessions_dir: sessions_dir.clone(),
+                id: id2.clone(),
+                base_directory: dir.path().to_path_buf(),
+                step: StepInput::Text(
+                    r#"{"use":"browser.open","with":{"url":"http://127.0.0.1/app"}}"#.to_string(),
+                ),
+            },
+            &registry,
+        );
+        assert_eq!(opened2.exit_code, ExitCode::Success);
+
+        server2.push_reply(MockReply::chat_json(
+            "local-vlm",
+            json!({ "data": { "visible": true }, "confidence": 0.92 }),
+        ));
+        let ext_vis = session::handle(
+            SessionRequest::Extract(ExtractRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id2.clone(),
+                base_directory: dir.path().to_path_buf(),
+                query: "Inspect visual badge".to_string(),
+                schema: None,
+                evidence: None,
+                screenshot: true,
+                save: None,
+                hook_override: None,
+                model_override: None,
+                reasoning_effort_override: None,
+                timeout_ms: 5_000,
+            }),
+            &registry,
+        );
+        assert_eq!(ext_vis.exit_code, ExitCode::Success, "{}", ext_vis.payload);
+        assert_eq!(ext_vis.payload["screenshot"], true);
+        let ext_vis_reqs = server2.take_requests();
+        assert_eq!(ext_vis_reqs.len(), 1);
+        assert!(ext_vis_reqs[0].body.contains(&expected_data_url));
+
+        // `act` reaching `max_steps` returns `ExitCode::TestFailure` (1) with `status: "max_steps_exceeded"`.
+        server2.push_reply(MockReply::chat_json(
+            "local-vlm",
+            json!({
+                "status": "continue",
+                "summary": "Click Save Order",
+                "action": { "kind": "step", "use": "browser.click", "with": { "ref": "e2" } },
+                "confidence": 0.8
+            }),
+        ));
+        let max_act = session::handle(
+            SessionRequest::Act(ActRequest {
+                sessions_dir: sessions_dir.clone(),
+                id: id2.clone(),
+                base_directory: dir.path().to_path_buf(),
+                goal: "Repeat until done".to_string(),
+                max_steps: 1,
+                evidence: None,
+                screenshot: false,
+                hook_override: None,
+                model_override: None,
+                reasoning_effort_override: None,
+                timeout_ms: 5_000,
+            }),
+            &registry,
+        );
+        assert_eq!(max_act.exit_code, ExitCode::TestFailure, "{max_act:?}");
+        assert_eq!(max_act.payload["status"], "max_steps_exceeded");
+        assert_eq!(max_act.payload["steps_taken"], 1);
+        let _ = server2.take_requests();
+
+        // `act` returning `status: "failed"` returns `ExitCode::TestFailure` (1) and redacts secrets.
+        let _ = session::handle(
+            SessionRequest::Stop {
+                sessions_dir,
+                id: id2,
+            },
+            &registry,
+        );
+        drop(server2);
+
+        let cli_fail_server = MockModelServer::start();
+        cli_fail_server.push_reply(MockReply::chat_json(
+            "hy4",
+            json!({
+                "status": "failed",
+                "summary": format!("Blocked while handling {visual_secret}"),
+                "reason": format!("Missing field for {visual_secret}"),
+                "action": null,
+                "confidence": 0.7
+            }),
+        ));
+        let fail_act_start = json_stdout(&run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "start",
+                "--model",
+                "openai::hy4",
+                "--model-endpoint",
+                &cli_fail_server.endpoint("/v1"),
+            ],
+            &[],
+        ));
+        let fail_act_id = fail_act_start["session_id"].as_str().unwrap().to_string();
+        let fail_act = run_da_env(
+            dir.path(),
+            &[
+                "session",
+                "act",
+                &fail_act_id,
+                "--goal",
+                "Check ${env:DA_ACT_SECRET_CASE}",
+                "--max-steps",
+                "2",
+            ],
+            &[("DA_ACT_SECRET_CASE", visual_secret)],
+        );
+        assert_eq!(fail_act.status.code(), Some(1), "{fail_act:?}");
+        let fail_act_json = json_stdout(&fail_act);
+        assert_eq!(fail_act_json["status"], "failed");
+        assert_eq!(fail_act_json["summary"], "Blocked while handling ***");
+        assert_eq!(fail_act_json["reason"], "Missing field for ***");
+        let _ = run_da_env(dir.path(), &["session", "stop", &fail_act_id], &[]);
     }
 }

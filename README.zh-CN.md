@@ -149,8 +149,8 @@ HTML 是自包含的，离线可打开。`--shareable` 不嵌入任何截图，`
 | 每个用例的证据 | `da run --record evidence/` 记录通过、失败与出错的用例；`da report evidence/` 渲染成一个离线 HTML 文件 |
 | 外部输入 | 用 `--var name=value` 传入地址、令牌和路径 |
 | 不执行就检查用例 | `da lint cases/`：与 `da run` 相同的校验，一次报出所有文件的所有问题，不执行任何步骤 |
-| 交互式探测与用例导出 | `da session start \| step \| snapshot \| select-ref \| locate \| judge \| export \| stop`：跨命令保持会话状态，按需调用内置 `--model` 或外置 `--model-hook`，导出无模型依赖的确定性 YAML 用例 |
-| 宿主没有 shell | `da mcp`：把同一套会话协议通过标准输入输出暴露为 MCP 工具（默认 6 个，启用 `--model` 或 `--model-hook` 时为 9 个），参数不合法时直接返回该步骤的 JSON Schema |
+| 交互式探测与用例导出 | `da session start \| step \| snapshot \| select-ref \| locate \| judge \| extract \| act \| export \| stop`：跨命令保持会话状态，按需调用内置 `--model`（支持 `--reasoning-effort`）或外置 `--model-hook`，导出无模型依赖的确定性 YAML 用例 |
+| 宿主没有 shell | `da mcp`：把同一套会话协议通过标准输入输出暴露为 MCP 工具（默认 6 个，启用 `--model` / `DA_MODEL` 或 `--model-hook` 时为 11 个），参数不合法时直接返回该步骤的 JSON Schema |
 | 机器可读的用例格式 | `da schema`：包含所有已注册步骤的 JSON Schema，编辑器也能直接使用 |
 | Agent 技能文件 | [skills/do-anything/SKILL.md](skills/do-anything/SKILL.md)：供编程 Agent 加载的精简操作指南（探索、导出、重放与读取失败包） |
 

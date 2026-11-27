@@ -805,6 +805,22 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 
+fn json_escape(raw: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn main() {
     let secret = env::var("DA_MCP_TEST_SECRET").unwrap_or_default();
     let mut stdin_bytes = Vec::new();
@@ -812,11 +828,28 @@ fn main() {
     if let Some(out_path) = env::args().nth(1) {
         let _ = fs::write(out_path, &stdin_bytes);
     }
+    let da_exe = env::args().nth(2).unwrap_or_else(|| "da".to_string());
     let stdin_text = String::from_utf8_lossy(&stdin_bytes);
-    let passed = !stdin_text.contains("\"fail-now\"");
-    let line = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"passed\":{passed},\"rationale\":\"checked {secret}\",\"confidence\":0.9,\"model\":\"mcp-judge-v1\",\"latency_ms\":23,\"usage\":{{\"prompt_tokens\":10}},\"trace_id\":\"tr-{secret}\"}}}}"
-    );
+    let line = if stdin_text.contains("\"model/extract\"") {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"data\":{{\"order_id\":\"ORD-42\",\"note\":{}}},\"confidence\":0.92,\"model\":\"mcp-extract-v1\",\"latency_ms\":19}}}}",
+            json_escape(&format!("leaked {secret}")),
+        )
+    } else if stdin_text.contains("\"model/act_step\"") {
+        if stdin_text.contains("\"step_index\":1") {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"status\":\"continue\",\"summary\":\"Run version check\",\"action\":{{\"kind\":\"step\",\"use\":\"cli.run\",\"with\":{{\"command\":{},\"args\":[\"--version\"]}}}},\"confidence\":0.9,\"model\":\"mcp-act-v1\",\"latency_ms\":12}}}}",
+                json_escape(&da_exe),
+            )
+        } else {
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"status\":\"done\",\"summary\":\"Verified via act loop\",\"reason\":\"Step exited 0\",\"action\":null,\"confidence\":0.95,\"model\":\"mcp-act-v1\",\"latency_ms\":11}}".to_string()
+        }
+    } else {
+        let passed = !stdin_text.contains("\"fail-now\"");
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"passed\":{passed},\"rationale\":\"checked {secret}\",\"confidence\":0.9,\"model\":\"mcp-judge-v1\",\"latency_ms\":23,\"usage\":{{\"prompt_tokens\":10}},\"trace_id\":\"tr-{secret}\"}}}}"
+        )
+    };
     let _ = writeln!(io::stdout(), "{line}");
     let _ = io::stdout().flush();
 }
@@ -849,6 +882,8 @@ fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export
         .arg(&hook_bin)
         .arg("--model-hook-arg")
         .arg(&req_dump)
+        .arg("--model-hook-arg")
+        .arg(da())
         .current_dir(dir.path())
         .env(SECRET_VARIABLE, SECRET)
         .stdin(Stdio::piped())
@@ -882,6 +917,8 @@ fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export
             "select_ref",
             "locate",
             "judge",
+            "extract",
+            "act",
             "export",
             "run",
             "session_stop"
@@ -927,8 +964,48 @@ fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export
         "MCP judge leaked secret into model hook stdin: {hook_stdin}"
     );
 
-    let judged_fail = server.call_tool(
+    let extracted = server.call_tool(
         5,
+        "extract",
+        json!({
+            "session_id": session_id,
+            "query": "Extract order metadata",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "order_id": {"type": "string"},
+                    "note": {"type": "string"}
+                }
+            },
+            "save": "ORDER_NOTE"
+        }),
+    );
+    assert!(!failed(&extracted), "{extracted}");
+    let ext_payload = payload(&extracted);
+    assert_eq!(ext_payload["data"]["order_id"], "ORD-42");
+    assert_eq!(ext_payload["data"]["note"], "leaked ***");
+    assert_eq!(
+        serde_json::from_str::<Value>(ext_payload["saved"]["ORDER_NOTE"].as_str().unwrap())
+            .expect("saved ORDER_NOTE JSON"),
+        json!({"order_id": "ORD-42", "note": "leaked ***"})
+    );
+
+    let acted = server.call_tool(
+        6,
+        "act",
+        json!({
+            "session_id": session_id,
+            "goal": "Run version check via cli.run",
+            "max_steps": 4
+        }),
+    );
+    assert!(!failed(&acted), "{acted}");
+    let act_payload = payload(&acted);
+    assert_eq!(act_payload["status"], "done");
+    assert_eq!(act_payload["steps_taken"], 1);
+
+    let judged_fail = server.call_tool(
+        7,
         "judge",
         json!({
             "session_id": session_id,
@@ -938,12 +1015,14 @@ fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export
     assert!(failed(&judged_fail), "{judged_fail}");
     assert_eq!(payload(&judged_fail)["passed"], false);
 
-    let exported = payload(&server.call_tool(6, "export", json!({"session_id": session_id})));
-    assert_eq!(exported["exported_steps"], 1, "{exported}");
+    let exported = payload(&server.call_tool(8, "export", json!({"session_id": session_id})));
+    assert_eq!(exported["exported_steps"], 2, "{exported}");
     let yaml = exported["yaml"].as_str().unwrap();
     assert!(!yaml.contains("model.judge"), "{yaml}");
+    assert!(!yaml.contains("model.extract"), "{yaml}");
+    assert!(!yaml.contains("model.act"), "{yaml}");
 
-    let stopped = payload(&server.call_tool(7, "session_stop", json!({"session_id": session_id})));
+    let stopped = payload(&server.call_tool(9, "session_stop", json!({"session_id": session_id})));
     assert_eq!(stopped["ok"], true, "{stopped}");
 
     assert_no_leak(&server.seen);
@@ -953,6 +1032,7 @@ fn mcp_with_model_hook_exposes_model_tools_redacts_secrets_and_omits_from_export
 #[cfg(all(feature = "cli", feature = "ai"))]
 mod ai_mcp_tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -969,35 +1049,34 @@ mod ai_mcp_tests {
 
     impl McpModelMock {
         fn start(reply_content: Value) -> Self {
+            Self::start_inner(None, Some(reply_content))
+        }
+
+        fn start_queued(replies: Vec<Value>) -> Self {
+            Self::start_inner(Some(replies.into()), None)
+        }
+
+        fn start_inner(queue: Option<VecDeque<Value>>, fallback: Option<Value>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind mcp mock model");
             let port = listener.local_addr().unwrap().port();
             listener.set_nonblocking(true).unwrap();
 
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let body = json!({
-                "id": "chatcmpl-mcp-1",
-                "object": "chat.completion",
-                "created": 1700000000,
-                "model": "mcp-builtin-v1",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": reply_content.to_string() },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-            })
-            .to_string();
+            let queued = Arc::new(Mutex::new(queue.unwrap_or_default()));
+            let fallback_body = fallback.map(|c| completion_body(&c));
             let stop = Arc::new(AtomicBool::new(false));
 
             let reqs_c = Arc::clone(&requests);
+            let queued_c = Arc::clone(&queued);
             let stop_c = Arc::clone(&stop);
             let handle = thread::spawn(move || {
                 while !stop_c.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let reqs = Arc::clone(&reqs_c);
-                            let rep = body.clone();
-                            thread::spawn(move || serve_once(stream, &reqs, &rep));
+                            let q = Arc::clone(&queued_c);
+                            let fb = fallback_body.clone();
+                            thread::spawn(move || serve_once(stream, &reqs, &q, fb.as_deref()));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
@@ -1020,6 +1099,22 @@ mod ai_mcp_tests {
         }
     }
 
+    fn completion_body(reply_content: &Value) -> String {
+        json!({
+            "id": "chatcmpl-mcp-1",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "mcp-builtin-v1",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": reply_content.to_string() },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
     impl Drop for McpModelMock {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
@@ -1029,7 +1124,12 @@ mod ai_mcp_tests {
         }
     }
 
-    fn serve_once(stream: TcpStream, requests: &Mutex<Vec<String>>, body: &str) {
+    fn serve_once(
+        stream: TcpStream,
+        requests: &Mutex<Vec<String>>,
+        queued: &Mutex<VecDeque<Value>>,
+        fallback_body: Option<&str>,
+    ) {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -1068,6 +1168,14 @@ mod ai_mcp_tests {
             String::from_utf8_lossy(&body_buf)
         );
         requests.lock().unwrap().push(raw_req);
+
+        let body = if let Some(next_reply) = queued.lock().unwrap().pop_front() {
+            completion_body(&next_reply)
+        } else if let Some(fb) = fallback_body {
+            fb.to_string()
+        } else {
+            completion_body(&json!({"error": "empty mock queue"}))
+        };
 
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1126,6 +1234,8 @@ mod ai_mcp_tests {
                 "select_ref",
                 "locate",
                 "judge",
+                "extract",
+                "act",
                 "export",
                 "run",
                 "session_stop"
@@ -1137,6 +1247,18 @@ mod ai_mcp_tests {
             .expect("judge tool schema");
         assert!(judge_schema["inputSchema"]["properties"]["screenshot"].is_object());
         assert!(judge_schema["inputSchema"]["properties"]["model"].is_object());
+        assert!(judge_schema["inputSchema"]["properties"]["reasoning_effort"].is_object());
+        let extract_schema = tools
+            .iter()
+            .find(|t| t["name"] == "extract")
+            .expect("extract tool schema");
+        assert!(extract_schema["inputSchema"]["properties"]["schema"].is_object());
+        assert!(extract_schema["inputSchema"]["properties"]["save"].is_object());
+        let act_schema = tools
+            .iter()
+            .find(|t| t["name"] == "act")
+            .expect("act tool schema");
+        assert!(act_schema["inputSchema"]["properties"]["max_steps"].is_object());
 
         let started = payload(&server.call_tool(2, "session_start", json!({})));
         let session_id = started["session_id"].as_str().unwrap().to_string();
@@ -1162,7 +1284,8 @@ mod ai_mcp_tests {
             "judge",
             json!({
                 "session_id": session_id,
-                "rubric": format!("Verify ${{env:{SECRET_VARIABLE}}} succeeded")
+                "rubric": format!("Verify ${{env:{SECRET_VARIABLE}}} succeeded"),
+                "reasoning_effort": "low"
             }),
         );
         assert!(!failed(&judged), "{judged}");
@@ -1175,6 +1298,11 @@ mod ai_mcp_tests {
         let recorded = mock.requests.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert!(recorded[0].contains(&format!("AUTH=Bearer {api_key_secret}")));
+        assert!(
+            recorded[0].contains("\"reasoning_effort\":\"low\""),
+            "{}",
+            recorded[0]
+        );
         assert!(!recorded[0].contains(SECRET), "{}", recorded[0]);
 
         // `screenshot: true` without an active visual session returns `environment` error.
@@ -1210,6 +1338,7 @@ mod ai_mcp_tests {
             .env("DA_MODEL", "qwen-local")
             .env("DA_MODEL_ADAPTER", "omlx")
             .env("DA_MODEL_ENDPOINT", mock.endpoint())
+            .env("DA_MODEL_REASONING_EFFORT", "medium")
             .env_remove("DA_MODEL_API_KEY_ENV")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1233,8 +1362,10 @@ mod ai_mcp_tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names.len(), 9, "{names:?}");
+        assert_eq!(names.len(), 11, "{names:?}");
         assert!(names.contains(&"judge"));
+        assert!(names.contains(&"extract"));
+        assert!(names.contains(&"act"));
 
         let started = payload(&server.call_tool(2, "session_start", json!({})));
         let session_id = started["session_id"].as_str().unwrap().to_string();
@@ -1398,6 +1529,149 @@ mod ai_mcp_tests {
         let _ = server.call_tool(8, "session_stop", json!({"session_id": s_model_id}));
         let _ = server.call_tool(9, "session_stop", json!({"session_id": s_hook_id}));
         let _ = server.call_tool(10, "session_stop", json!({"session_id": s_default_id}));
+        server.finish();
+    }
+
+    #[test]
+    fn mcp_with_builtin_model_runs_extract_act_export_and_offline_replay() {
+        let dir = TempDir::new("mcp-extract-act");
+        let mock = McpModelMock::start_queued(vec![
+            json!({
+                "data": { "status": "ready", "leaked": SECRET },
+                "confidence": 0.93
+            }),
+            json!({
+                "status": "continue",
+                "summary": "Verify da version via cli.run",
+                "action": {
+                    "kind": "step",
+                    "use": "cli.run",
+                    "with": {
+                        "command": da(),
+                        "args": ["--version"],
+                        "env": { "TOK": format!("${{env:{SECRET_VARIABLE}}}") }
+                    }
+                },
+                "confidence": 0.95
+            }),
+            json!({
+                "status": "done",
+                "summary": "Autonomous check succeeded",
+                "reason": "cli.run exited 0",
+                "action": null,
+                "confidence": 0.99
+            }),
+        ]);
+
+        let mut child = Command::new(da())
+            .arg("mcp")
+            .arg("--model")
+            .arg("openai::hy4")
+            .arg("--model-adapter")
+            .arg("omlx")
+            .arg("--model-endpoint")
+            .arg(mock.endpoint())
+            .arg("--model-reasoning-effort")
+            .arg("low")
+            .current_dir(dir.path())
+            .env(SECRET_VARIABLE, SECRET)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start `da mcp`");
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        let mut server = Server {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            seen: String::new(),
+        };
+        server.initialize();
+
+        let started = payload(&server.call_tool(1, "session_start", json!({})));
+        let session_id = started["session_id"].as_str().unwrap().to_string();
+
+        let extracted = server.call_tool(
+            2,
+            "extract",
+            json!({
+                "session_id": session_id,
+                "query": format!("Extract readiness without ${{env:{SECRET_VARIABLE}}}"),
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "leaked": {"type": "string"}
+                    }
+                },
+                "save": "MCP_EXT_VAR",
+                "reasoning_effort": "medium"
+            }),
+        );
+        assert!(!failed(&extracted), "{extracted}");
+        let ext_payload = payload(&extracted);
+        assert_eq!(
+            ext_payload["data"],
+            json!({"status": "ready", "leaked": "***"})
+        );
+        assert!(ext_payload["saved"]["MCP_EXT_VAR"].is_string());
+
+        let acted = server.call_tool(
+            3,
+            "act",
+            json!({
+                "session_id": session_id,
+                "goal": "Run da --version cleanly",
+                "max_steps": 4
+            }),
+        );
+        assert!(!failed(&acted), "{acted}");
+        let act_payload = payload(&acted);
+        assert_eq!(act_payload["status"], "done");
+        assert_eq!(act_payload["steps_taken"], 1);
+
+        let exported_path = dir.path().join("mcp-act-replay.yaml");
+        let exported = server.call_tool(
+            4,
+            "export",
+            json!({
+                "session_id": session_id,
+                "name": "MCP act replay",
+                "out": exported_path
+            }),
+        );
+        assert!(!failed(&exported), "{exported}");
+        let exp_payload = payload(&exported);
+        let yaml = exp_payload["yaml"].as_str().unwrap();
+        assert!(!yaml.contains("model.extract"), "{yaml}");
+        assert!(!yaml.contains("model.act"), "{yaml}");
+        assert!(yaml.contains("cli.run:"), "{yaml}");
+
+        let _ = server.call_tool(5, "session_stop", json!({"session_id": session_id}));
+
+        {
+            let recorded = mock.requests.lock().unwrap();
+            assert_eq!(recorded.len(), 3);
+            assert!(recorded[0].contains("\"reasoning_effort\":\"medium\""));
+            assert!(recorded[1].contains("\"reasoning_effort\":\"low\""));
+            assert!(recorded[2].contains("\"reasoning_effort\":\"low\""));
+            for r in recorded.iter() {
+                assert!(!r.contains(SECRET), "{r}");
+            }
+        }
+        drop(mock);
+
+        // Replay the exported YAML via MCP `run` with the mock model server completely shut down!
+        let ran = server.call_tool(
+            6,
+            "run",
+            json!({ "paths": [exported_path.to_str().unwrap()] }),
+        );
+        assert!(!failed(&ran), "{ran}");
+        assert_eq!(payload(&ran)["ok"], true);
+        assert_no_leak(&server.seen);
         server.finish();
     }
 }

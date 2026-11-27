@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use do_anything::compare as run_compare;
 use do_anything::core::bundle::{self, FailureBundles};
 use do_anything::core::case::{self, CaseError, LoadedCase};
@@ -22,10 +22,13 @@ use do_anything::drivers;
 use do_anything::exit::ExitCode as DaExitCode;
 use do_anything::report as html_report;
 use do_anything::session::export::ExportOptions;
-use do_anything::session::model_hook::{BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec};
+use do_anything::session::model_hook::{
+    BuiltinModelSpec, DEFAULT_HOOK_TIMEOUT_MS, ModelHookSpec, validate_reasoning_effort,
+};
 use do_anything::session::{
-    self, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR, JudgeRequest, LocateRequest,
-    SelectRefAction, SelectRefRequest, SessionRequest, StepInput,
+    self, ActRequest, DEFAULT_ACT_MAX_STEPS, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSIONS_DIR,
+    ExtractRequest, JudgeRequest, LocateRequest, SelectRefAction, SelectRefRequest, SessionRequest,
+    StepInput,
 };
 
 /// An agent-friendly, cross-layer testing tool.
@@ -62,143 +65,206 @@ impl From<OutputFormat> for Format {
     }
 }
 
+/// Shared `--var` and `--vars-file` flags for `run` and `lint`.
+#[derive(Debug, Args)]
+struct CaseVarArgs {
+    /// Overrides or defines a case variable. Repeat for more than one.
+    #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var)]
+    vars: Vec<(String, String)>,
+    /// Reads variables from a YAML mapping. Repeat for more than one; a
+    /// later file overrides an earlier one.
+    #[arg(long = "vars-file", value_name = "FILE")]
+    vars_files: Vec<PathBuf>,
+}
+
+/// Shared case selection filters for `run` and `lint`.
+#[derive(Debug, Args)]
+struct CaseFilterArgs {
+    /// Only runs or checks cases in one of these projects. Repeat for more than one.
+    #[arg(long = "project", value_name = "NAME")]
+    projects: Vec<String>,
+    /// Only runs or checks cases in one of these suites. Repeat for more than one.
+    #[arg(long = "suite", value_name = "NAME")]
+    suites: Vec<String>,
+    /// Only runs or checks cases in one of these layers. Repeat for more than one.
+    #[arg(long = "layer", value_name = "NAME")]
+    layers: Vec<String>,
+    /// Only runs or checks cases that have one of these tags. Repeat for more than one.
+    #[arg(long = "tag", value_name = "TAG")]
+    tags: Vec<String>,
+    /// Skips cases that have any of these tags. Repeat for more than one.
+    #[arg(long = "skip-tag", value_name = "TAG")]
+    skip_tags: Vec<String>,
+}
+
+impl From<CaseFilterArgs> for Filters {
+    fn from(args: CaseFilterArgs) -> Self {
+        Self {
+            project: args.projects,
+            suite: args.suites,
+            layer: args.layers,
+            tag: args.tags,
+            skip_tag: args.skip_tags,
+        }
+    }
+}
+
+/// Shared session/MCP startup model configuration flags.
+#[derive(Debug, Args)]
+struct ModelStartArgs {
+    /// Configure an external JSON-RPC 2.0 model hook executable.
+    #[arg(long, value_name = "EXECUTABLE")]
+    model_hook: Option<String>,
+    /// Pass an argument to `--model-hook`. Repeat for more than one.
+    #[arg(
+        long = "model-hook-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true
+    )]
+    model_hook_args: Vec<String>,
+    /// Configure a built-in `genai` model identifier (e.g. `openai::gpt-4o-mini`, `omlx::ui-tars-1.5-7b`).
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+    /// Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).
+    #[arg(long, value_name = "ADAPTER")]
+    model_adapter: Option<String>,
+    /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+    #[arg(long, value_name = "URL")]
+    model_endpoint: Option<String>,
+    /// Environment variable name holding the API key for `--model`.
+    #[arg(long, value_name = "NAME")]
+    model_api_key_env: Option<String>,
+    /// Optional reasoning effort level for `--model` (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+    #[arg(long, value_name = "LEVEL")]
+    model_reasoning_effort: Option<String>,
+}
+
+/// Shared per-call model override and timeout flags for `da session` AI commands.
+#[derive(Debug, Args)]
+struct ModelCallArgs {
+    /// Override the session's model hook executable for this call.
+    #[arg(long, value_name = "EXECUTABLE")]
+    hook: Option<String>,
+    /// Pass an argument to `--hook`. Repeat for more than one.
+    #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
+    hook_args: Vec<String>,
+    /// Override with a built-in `genai` model identifier for this call.
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+    /// Optional `genai` adapter override for `--model`.
+    #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
+    adapter: Option<String>,
+    /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
+    #[arg(long, alias = "model-endpoint", value_name = "URL")]
+    endpoint: Option<String>,
+    /// Environment variable name holding the API key for `--model`.
+    #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
+    api_key_env: Option<String>,
+    /// Optional reasoning effort level (`none`/`zero`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
+    #[arg(long, alias = "model-reasoning-effort", value_name = "LEVEL")]
+    reasoning_effort: Option<String>,
+    /// Maximum model/hook runtime per call/iteration in milliseconds. Defaults to 30000.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    /// Case files or directories to run.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    #[command(flatten)]
+    vars: CaseVarArgs,
+    #[command(flatten)]
+    filters: CaseFilterArgs,
+    /// Directory that receives one subdirectory per failed case.
+    #[arg(long, value_name = "DIRECTORY")]
+    bundle_dir: Option<PathBuf>,
+    /// Do not write failure bundles.
+    #[arg(long)]
+    no_bundle: bool,
+    /// Write the evidence of every executed case into this empty directory.
+    #[arg(long, value_name = "DIRECTORY")]
+    record: Option<PathBuf>,
+    /// Capture per-step session evidence (such as screenshots and DOM snapshots) under `trace/`. Requires `--record`.
+    #[arg(long)]
+    trace_steps: bool,
+    /// Runs up to N cases at the same time. Defaults to 1.
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_jobs)]
+    jobs: usize,
+    /// Executes each selected case N times to classify flaky cases. Defaults to 1.
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_repeat)]
+    repeat: usize,
+}
+
+#[derive(Debug, Args)]
+struct CompareArgs {
+    /// Baseline directory written by `da run --record`.
+    #[arg(value_name = "BASELINE_DIR")]
+    baseline_dir: PathBuf,
+    /// Candidate directory written by `da run --record`.
+    #[arg(value_name = "CANDIDATE_DIR")]
+    candidate_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ReportArgs {
+    /// Directory written by `da run --record`, or one `.da/failures/<run>`.
+    #[arg(value_name = "DIRECTORY")]
+    directory: PathBuf,
+    /// Write the report here instead of `<directory>/report.html`.
+    #[arg(short = 'o', value_name = "FILE")]
+    output_file: Option<PathBuf>,
+    /// Do not embed screenshots.
+    #[arg(long)]
+    shareable: bool,
+}
+
+#[derive(Debug, Args)]
+struct LintArgs {
+    /// Case files or directories to validate.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    #[command(flatten)]
+    vars: CaseVarArgs,
+    /// Baseline case file or directory to guard against Goodhart assertion weakening.
+    #[arg(long, value_name = "PATH")]
+    against: Option<PathBuf>,
+    /// Explicitly acknowledge assertion weakening with a non-empty reason.
+    #[arg(long, value_name = "REASON")]
+    allow_weaken: Option<String>,
+    #[command(flatten)]
+    filters: CaseFilterArgs,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// Directory that stores session state. Defaults to `.da/sessions`.
+    #[arg(long, value_name = "DIR")]
+    sessions_dir: Option<PathBuf>,
+    /// Idle timeout in milliseconds before sessions are reaped. Defaults to 1800000.
+    #[arg(long, value_name = "MS")]
+    idle_timeout_ms: Option<u64>,
+    #[command(flatten)]
+    model: ModelStartArgs,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run test cases from the given files or directories.
-    Run {
-        /// Case files or directories to run.
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-        /// Overrides a case variable. Repeat for more than one.
-        #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var)]
-        vars: Vec<(String, String)>,
-        /// Reads variables from a YAML mapping. Repeat for more than one; a
-        /// later file overrides an earlier one.
-        #[arg(long = "vars-file", value_name = "FILE")]
-        vars_files: Vec<PathBuf>,
-        /// Only runs cases in one of these projects. Repeat for more than one.
-        #[arg(long = "project", value_name = "NAME")]
-        projects: Vec<String>,
-        /// Only runs cases in one of these suites. Repeat for more than one.
-        #[arg(long = "suite", value_name = "NAME")]
-        suites: Vec<String>,
-        /// Only runs cases in one of these layers. Repeat for more than one.
-        #[arg(long = "layer", value_name = "NAME")]
-        layers: Vec<String>,
-        /// Only runs cases that have one of these tags. Repeat for more than one.
-        #[arg(long = "tag", value_name = "TAG")]
-        tags: Vec<String>,
-        /// Skips cases that have any of these tags. Repeat for more than one.
-        #[arg(long = "skip-tag", value_name = "TAG")]
-        skip_tags: Vec<String>,
-        /// Directory that receives one subdirectory per failed case.
-        #[arg(long, value_name = "DIRECTORY")]
-        bundle_dir: Option<PathBuf>,
-        /// Do not write failure bundles.
-        #[arg(long)]
-        no_bundle: bool,
-        /// Write the evidence of every executed case into this empty directory.
-        #[arg(long, value_name = "DIRECTORY")]
-        record: Option<PathBuf>,
-        /// Capture per-step session evidence (such as screenshots and DOM snapshots) under `trace/`. Requires `--record`.
-        #[arg(long)]
-        trace_steps: bool,
-        /// Runs up to N cases at the same time. Defaults to 1.
-        #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_jobs)]
-        jobs: usize,
-        /// Executes each selected case N times to classify flaky cases. Defaults to 1.
-        #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_repeat)]
-        repeat: usize,
-    },
+    Run(Box<RunArgs>),
     /// Compare two recorded evidence directories and classify regressions.
-    Compare {
-        /// Baseline directory written by `da run --record`.
-        #[arg(value_name = "BASELINE_DIR")]
-        baseline_dir: PathBuf,
-        /// Candidate directory written by `da run --record`.
-        #[arg(value_name = "CANDIDATE_DIR")]
-        candidate_dir: PathBuf,
-    },
+    Compare(Box<CompareArgs>),
     /// Render a recorded evidence directory as one static HTML file.
-    Report {
-        /// Directory written by `da run --record`, or one `.da/failures/<run>`.
-        #[arg(value_name = "DIRECTORY")]
-        directory: PathBuf,
-        /// Write the report here instead of `<directory>/report.html`.
-        #[arg(short = 'o', value_name = "FILE")]
-        output_file: Option<PathBuf>,
-        /// Do not embed screenshots.
-        #[arg(long)]
-        shareable: bool,
-    },
+    Report(Box<ReportArgs>),
     /// Validate case files without running them.
-    Lint {
-        /// Case files or directories to validate.
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-        /// Defines a variable for every case. Repeat for more than one.
-        #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var)]
-        vars: Vec<(String, String)>,
-        /// Reads variables from a YAML mapping. Repeat for more than one; a
-        /// later file overrides an earlier one.
-        #[arg(long = "vars-file", value_name = "FILE")]
-        vars_files: Vec<PathBuf>,
-        /// Baseline case file or directory to guard against Goodhart assertion weakening.
-        #[arg(long, value_name = "PATH")]
-        against: Option<PathBuf>,
-        /// Explicitly acknowledge assertion weakening with a non-empty reason.
-        #[arg(long, value_name = "REASON")]
-        allow_weaken: Option<String>,
-        /// Active project filter when checking classification exclusions with `--against`.
-        #[arg(long = "project", value_name = "NAME")]
-        projects: Vec<String>,
-        /// Active suite filter when checking classification exclusions with `--against`.
-        #[arg(long = "suite", value_name = "NAME")]
-        suites: Vec<String>,
-        /// Active layer filter when checking classification exclusions with `--against`.
-        #[arg(long = "layer", value_name = "NAME")]
-        layers: Vec<String>,
-        /// Active tag filter when checking tag exclusions with `--against`.
-        #[arg(long = "tag", value_name = "TAG")]
-        tags: Vec<String>,
-        /// Active skip-tag filter when checking tag exclusions with `--against`.
-        #[arg(long = "skip-tag", value_name = "TAG")]
-        skip_tags: Vec<String>,
-    },
+    Lint(Box<LintArgs>),
     /// Print the JSON Schema for the case file format.
     Schema,
     /// Serve the Model Context Protocol on standard input and output.
     #[cfg(feature = "mcp")]
-    Mcp {
-        /// Directory that stores session state. Defaults to `.da/sessions`.
-        #[arg(long, value_name = "DIR")]
-        sessions_dir: Option<PathBuf>,
-        /// Idle timeout in milliseconds before sessions are reaped. Defaults to 1800000.
-        #[arg(long, value_name = "MS")]
-        idle_timeout_ms: Option<u64>,
-        /// Optional external JSON-RPC 2.0 model hook executable exposed to MCP clients.
-        #[arg(long, value_name = "EXECUTABLE")]
-        model_hook: Option<String>,
-        /// Optional argument passed to `--model-hook`. Repeat for more than one.
-        #[arg(
-            long = "model-hook-arg",
-            value_name = "ARG",
-            allow_hyphen_values = true
-        )]
-        model_hook_args: Vec<String>,
-        /// Optional built-in `genai` model identifier exposed to MCP clients (e.g. `openai::gpt-4o-mini`, `omlx::ui-tars-1.5-7b`).
-        #[arg(long, value_name = "MODEL")]
-        model: Option<String>,
-        /// Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).
-        #[arg(long, value_name = "ADAPTER")]
-        model_adapter: Option<String>,
-        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
-        #[arg(long, value_name = "URL")]
-        model_endpoint: Option<String>,
-        /// Environment variable name holding the API key for `--model`.
-        #[arg(long, value_name = "NAME")]
-        model_api_key_env: Option<String>,
-    },
+    Mcp(Box<McpArgs>),
     /// Manage persistent interactive sessions for step-by-step exploration.
     Session {
         /// Directory that stores session state. Defaults to `.da/sessions`.
@@ -208,213 +274,204 @@ enum Command {
         #[arg(long, global = true, value_name = "MS")]
         idle_timeout_ms: Option<u64>,
         #[command(subcommand)]
-        action: SessionCommand,
+        action: Box<SessionCommand>,
     },
+}
+
+#[derive(Debug, Args)]
+struct SessionStartArgs {
+    /// Attach a declared observer (`NAME=KIND`, `NAME=KIND:key=val`, or YAML/JSON mapping). Repeat for more than one.
+    #[arg(long = "observe", value_name = "SPEC")]
+    observe: Vec<String>,
+    #[command(flatten)]
+    model: ModelStartArgs,
+}
+
+#[derive(Debug, Args)]
+struct SessionStepArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// Step name (for example `browser.open`), when passing `--arg` flags.
+    action: Option<String>,
+    /// Step name (alternative to positional action).
+    #[arg(long = "use", value_name = "STEP")]
+    use_step: Option<String>,
+    /// Step argument as `KEY=VALUE`. Repeat for more than one.
+    #[arg(long = "arg", value_name = "KEY=VALUE", value_parser = parse_var)]
+    args: Vec<(String, String)>,
+    /// Step arguments mapping as YAML or JSON.
+    #[arg(long, value_name = "YAML_OR_JSON")]
+    with: Option<String>,
+    /// Complete step definition as YAML or JSON.
+    #[arg(long, value_name = "YAML_OR_JSON")]
+    step: Option<String>,
+    /// Read the step definition from a YAML or JSON file (`-` for stdin).
+    #[arg(short = 'f', long, value_name = "FILE")]
+    file: Option<PathBuf>,
+    /// Save a value from the step result as `NAME=JSONPATH`.
+    #[arg(long = "save", value_name = "NAME=JSONPATH", value_parser = parse_var)]
+    save: Vec<(String, String)>,
+}
+
+#[derive(Debug, Args)]
+struct SessionSnapshotArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// Optional element reference from a prior snapshot to expand within.
+    #[arg(long = "ref", value_name = "REF")]
+    scope_ref: Option<String>,
+    /// Maximum traversal depth (relative to root or `--ref`).
+    #[arg(long, value_name = "N")]
+    max_depth: Option<usize>,
+    /// Maximum nodes included before truncation.
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct SessionSelectRefArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// Natural-language target description (redacted via `Secrets`).
+    #[arg(long, value_name = "TEXT")]
+    query: String,
+    /// Optional element reference from a prior snapshot to scope candidates within.
+    #[arg(long = "ref", value_name = "REF")]
+    scope_ref: Option<String>,
+    /// Maximum snapshot traversal depth.
+    #[arg(long, value_name = "N")]
+    max_depth: Option<usize>,
+    /// Maximum snapshot nodes included before truncation.
+    #[arg(long, value_name = "N")]
+    max_nodes: Option<usize>,
+    #[command(flatten)]
+    model: ModelCallArgs,
+    /// Immediately execute a step (such as `browser.click`) using the selected `ref`.
+    #[arg(long, value_name = "STEP")]
+    act: Option<String>,
+    /// Step arguments mapping as YAML or JSON when `--act` is passed.
+    #[arg(long, value_name = "YAML_OR_JSON")]
+    with: Option<String>,
+    /// Step argument as `KEY=VALUE` when `--act` is passed. Repeat for more than one.
+    #[arg(long = "arg", value_name = "KEY=VALUE", value_parser = parse_var)]
+    args: Vec<(String, String)>,
+    /// Save a value from the `--act` step result as `NAME=JSONPATH`.
+    #[arg(long = "save", value_name = "NAME=JSONPATH", value_parser = parse_var)]
+    save: Vec<(String, String)>,
+}
+
+#[derive(Debug, Args)]
+struct SessionLocateArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// Visual grounding query (redacted via `Secrets`).
+    #[arg(long, value_name = "TEXT")]
+    query: String,
+    #[command(flatten)]
+    model: ModelCallArgs,
+    /// Immediately click the located target and record the step for `da session export`.
+    #[arg(long)]
+    click: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionJudgeArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// Evaluation rubric (redacted via `Secrets`).
+    #[arg(long, value_name = "TEXT")]
+    rubric: String,
+    /// Custom evidence as YAML or JSON; defaults to redacted session steps and variables.
+    #[arg(long, value_name = "YAML_OR_JSON")]
+    evidence: Option<String>,
+    /// Attach an input-masked PNG screenshot from the active visual session.
+    #[arg(long)]
+    screenshot: bool,
+    #[command(flatten)]
+    model: ModelCallArgs,
+}
+
+#[derive(Debug, Args)]
+struct SessionExtractArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// What structured data to extract (redacted via `Secrets`).
+    #[arg(long, value_name = "TEXT")]
+    query: String,
+    /// Optional JSON Schema (YAML or JSON object) constraining extracted `data`.
+    #[arg(long, value_name = "YAML_OR_JSON")]
+    schema: Option<String>,
+    /// Custom evidence as YAML or JSON; defaults to redacted session steps and variables.
+    #[arg(long, value_name = "YAML_OR_JSON")]
+    evidence: Option<String>,
+    /// Attach an input-masked PNG screenshot from the active visual session.
+    #[arg(long)]
+    screenshot: bool,
+    /// Save the extracted value into session variable `NAME` for subsequent steps.
+    #[arg(long, value_name = "NAME")]
+    save: Option<String>,
+    #[command(flatten)]
+    model: ModelCallArgs,
+}
+
+#[derive(Debug, Args)]
+struct SessionActArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// High-level goal for the bounded exploration loop (redacted via `Secrets`).
+    #[arg(long, value_name = "TEXT")]
+    goal: String,
+    /// Maximum autonomous steps before stopping. Defaults to 8.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_ACT_MAX_STEPS)]
+    max_steps: usize,
+    /// Optional custom evidence as YAML or JSON supplied on each iteration.
+    #[arg(long, value_name = "YAML_OR_JSON")]
+    evidence: Option<String>,
+    /// Capture and attach an input-masked PNG screenshot on every iteration.
+    #[arg(long)]
+    screenshot: bool,
+    #[command(flatten)]
+    model: ModelCallArgs,
+}
+
+#[derive(Debug, Args)]
+struct SessionExportArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// Write the exported YAML case to `FILE`.
+    #[arg(short = 'o', long = "out", value_name = "FILE")]
+    out: Option<PathBuf>,
+    /// Case `name:` written to the exported YAML.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+    /// Include read-only `browser.read` steps without `expect` or `save`.
+    #[arg(long)]
+    include_reads: bool,
+    /// Print raw YAML to stdout instead of a JSON report object.
+    #[arg(long)]
+    yaml: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     /// Create a new interactive session directory.
-    Start {
-        /// Attach a declared observer (`NAME=KIND`, `NAME=KIND:key=val`, or YAML/JSON mapping). Repeat for more than one.
-        #[arg(long = "observe", value_name = "SPEC")]
-        observe: Vec<String>,
-        /// Configure an external JSON-RPC 2.0 model hook executable for `select-ref`, `locate`, and `judge`.
-        #[arg(long, value_name = "EXECUTABLE")]
-        model_hook: Option<String>,
-        /// Pass an argument to `--model-hook`. Repeat for more than one.
-        #[arg(
-            long = "model-hook-arg",
-            value_name = "ARG",
-            allow_hyphen_values = true
-        )]
-        model_hook_args: Vec<String>,
-        /// Configure a built-in `genai` model identifier for `select-ref`, `locate`, and `judge`.
-        #[arg(long, value_name = "MODEL")]
-        model: Option<String>,
-        /// Optional `genai` adapter override (`openai`, `openai_resp`, `anthropic`, `gemini`, `deepseek`, `ollama`, `omlx`, `genai_<n>`, ...).
-        #[arg(long, value_name = "ADAPTER")]
-        model_adapter: Option<String>,
-        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
-        #[arg(long, value_name = "URL")]
-        model_endpoint: Option<String>,
-        /// Environment variable name holding the API key for `--model`.
-        #[arg(long, value_name = "NAME")]
-        model_api_key_env: Option<String>,
-    },
+    Start(Box<SessionStartArgs>),
     /// Execute one step in an existing session.
-    Step {
-        /// Session identifier returned by `da session start`.
-        id: String,
-        /// Step name (for example `browser.open`), when passing `--arg` flags.
-        action: Option<String>,
-        /// Step name (alternative to positional action).
-        #[arg(long = "use", value_name = "STEP")]
-        use_step: Option<String>,
-        /// Step argument as `KEY=VALUE`. Repeat for more than one.
-        #[arg(long = "arg", value_name = "KEY=VALUE", value_parser = parse_var)]
-        args: Vec<(String, String)>,
-        /// Step arguments mapping as YAML or JSON.
-        #[arg(long, value_name = "YAML_OR_JSON")]
-        with: Option<String>,
-        /// Complete step definition as YAML or JSON.
-        #[arg(long, value_name = "YAML_OR_JSON")]
-        step: Option<String>,
-        /// Read the step definition from a YAML or JSON file (`-` for stdin).
-        #[arg(short = 'f', long, value_name = "FILE")]
-        file: Option<PathBuf>,
-        /// Save a value from the step result as `NAME=JSONPATH`.
-        #[arg(long = "save", value_name = "NAME=JSONPATH", value_parser = parse_var)]
-        save: Vec<(String, String)>,
-    },
+    Step(Box<SessionStepArgs>),
     /// Take an accessibility snapshot without executing a step.
-    Snapshot {
-        /// Session identifier returned by `da session start`.
-        id: String,
-        /// Optional element reference from a prior snapshot to expand within.
-        #[arg(long = "ref", value_name = "REF")]
-        scope_ref: Option<String>,
-        /// Maximum traversal depth (relative to root or `--ref`).
-        #[arg(long, value_name = "N")]
-        max_depth: Option<usize>,
-        /// Maximum nodes included before truncation.
-        #[arg(long, value_name = "N")]
-        max_nodes: Option<usize>,
-    },
+    Snapshot(Box<SessionSnapshotArgs>),
     /// Choose a candidate `ref` from the active snapshot using the built-in model or an external `model/select_ref` hook.
-    SelectRef {
-        /// Session identifier returned by `da session start`.
-        id: String,
-        /// Natural-language target description (redacted via `Secrets`).
-        #[arg(long, value_name = "TEXT")]
-        query: String,
-        /// Optional element reference from a prior snapshot to scope candidates within.
-        #[arg(long = "ref", value_name = "REF")]
-        scope_ref: Option<String>,
-        /// Maximum snapshot traversal depth.
-        #[arg(long, value_name = "N")]
-        max_depth: Option<usize>,
-        /// Maximum snapshot nodes included before truncation.
-        #[arg(long, value_name = "N")]
-        max_nodes: Option<usize>,
-        /// Override the session's model hook executable for this call.
-        #[arg(long, value_name = "EXECUTABLE")]
-        hook: Option<String>,
-        /// Pass an argument to `--hook`. Repeat for more than one.
-        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
-        hook_args: Vec<String>,
-        /// Override with a built-in `genai` model identifier for this call.
-        #[arg(long, value_name = "MODEL")]
-        model: Option<String>,
-        /// Optional `genai` adapter override for `--model`.
-        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
-        adapter: Option<String>,
-        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
-        #[arg(long, alias = "model-endpoint", value_name = "URL")]
-        endpoint: Option<String>,
-        /// Environment variable name holding the API key for `--model`.
-        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
-        api_key_env: Option<String>,
-        /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
-        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
-        timeout_ms: u64,
-        /// Immediately execute a step (such as `browser.click`) using the selected `ref`.
-        #[arg(long, value_name = "STEP")]
-        act: Option<String>,
-        /// Step arguments mapping as YAML or JSON when `--act` is passed.
-        #[arg(long, value_name = "YAML_OR_JSON")]
-        with: Option<String>,
-        /// Step argument as `KEY=VALUE` when `--act` is passed. Repeat for more than one.
-        #[arg(long = "arg", value_name = "KEY=VALUE", value_parser = parse_var)]
-        args: Vec<(String, String)>,
-        /// Save a value from the `--act` step result as `NAME=JSONPATH`.
-        #[arg(long = "save", value_name = "NAME=JSONPATH", value_parser = parse_var)]
-        save: Vec<(String, String)>,
-    },
+    SelectRef(Box<SessionSelectRefArgs>),
     /// Capture an input-masked screenshot, invoke `model/locate`, and reverse-synthesize a deterministic locator.
-    Locate {
-        /// Session identifier returned by `da session start`.
-        id: String,
-        /// Visual grounding query (redacted via `Secrets`).
-        #[arg(long, value_name = "TEXT")]
-        query: String,
-        /// Override the session's model hook executable for this call.
-        #[arg(long, value_name = "EXECUTABLE")]
-        hook: Option<String>,
-        /// Pass an argument to `--hook`. Repeat for more than one.
-        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
-        hook_args: Vec<String>,
-        /// Override with a built-in `genai` model identifier for this call.
-        #[arg(long, value_name = "MODEL")]
-        model: Option<String>,
-        /// Optional `genai` adapter override for `--model`.
-        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
-        adapter: Option<String>,
-        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
-        #[arg(long, alias = "model-endpoint", value_name = "URL")]
-        endpoint: Option<String>,
-        /// Environment variable name holding the API key for `--model`.
-        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
-        api_key_env: Option<String>,
-        /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
-        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
-        timeout_ms: u64,
-        /// Immediately click the located target and record the step for `da session export`.
-        #[arg(long)]
-        click: bool,
-    },
+    Locate(Box<SessionLocateArgs>),
     /// Invoke `model/judge` over redacted session evidence (and optional masked screenshot) and exit 1 if `passed` is false.
-    Judge {
-        /// Session identifier returned by `da session start`.
-        id: String,
-        /// Evaluation rubric (redacted via `Secrets`).
-        #[arg(long, value_name = "TEXT")]
-        rubric: String,
-        /// Custom evidence as YAML or JSON; defaults to redacted session steps and variables.
-        #[arg(long, value_name = "YAML_OR_JSON")]
-        evidence: Option<String>,
-        /// Attach an input-masked PNG screenshot from the active visual session.
-        #[arg(long)]
-        screenshot: bool,
-        /// Override the session's model hook executable for this call.
-        #[arg(long, value_name = "EXECUTABLE")]
-        hook: Option<String>,
-        /// Pass an argument to `--hook`. Repeat for more than one.
-        #[arg(long = "hook-arg", value_name = "ARG", allow_hyphen_values = true)]
-        hook_args: Vec<String>,
-        /// Override with a built-in `genai` model identifier for this call.
-        #[arg(long, value_name = "MODEL")]
-        model: Option<String>,
-        /// Optional `genai` adapter override for `--model`.
-        #[arg(long, alias = "model-adapter", value_name = "ADAPTER")]
-        adapter: Option<String>,
-        /// Optional custom HTTP endpoint URL for `--model` (supports `${env:NAME}`).
-        #[arg(long, alias = "model-endpoint", value_name = "URL")]
-        endpoint: Option<String>,
-        /// Environment variable name holding the API key for `--model`.
-        #[arg(long, alias = "model-api-key-env", value_name = "NAME")]
-        api_key_env: Option<String>,
-        /// Maximum model/hook runtime in milliseconds. Defaults to 30000.
-        #[arg(long, value_name = "MS", default_value_t = DEFAULT_HOOK_TIMEOUT_MS)]
-        timeout_ms: u64,
-    },
+    Judge(Box<SessionJudgeArgs>),
+    /// Extract structured JSON data from redacted session state and optional masked screenshot (omitted from `export`).
+    Extract(Box<SessionExtractArgs>),
+    /// Run a bounded autonomous observe → decide → execute loop toward `--goal`, recording deterministic UI steps.
+    Act(Box<SessionActArgs>),
     /// Export successful steps as a deterministic, replayable YAML case.
-    Export {
-        /// Session identifier returned by `da session start`.
-        id: String,
-        /// Write the exported YAML case to `FILE`.
-        #[arg(short = 'o', long = "out", value_name = "FILE")]
-        out: Option<PathBuf>,
-        /// Case `name:` written to the exported YAML.
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-        /// Include read-only `browser.read` steps without `expect` or `save`.
-        #[arg(long)]
-        include_reads: bool,
-        /// Print raw YAML to stdout instead of a JSON report object.
-        #[arg(long)]
-        yaml: bool,
-    },
+    Export(Box<SessionExportArgs>),
     /// Close all resources and delete the session directory.
     Stop {
         /// Session identifier returned by `da session start`.
@@ -467,6 +524,30 @@ fn parse_repeat(text: &str) -> Result<usize, String> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    {
+        // Windows MSVC defaults the OS main-thread PE stack reserve to 1 MiB,
+        // which unoptimized debug builds with deep clap/tokio/reqwest/rustls
+        // call chains can still approach; match Unix's 8 MiB main-thread stack.
+        match std::thread::Builder::new()
+            .name("da-main".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_main)
+        {
+            Ok(handle) => match handle.join() {
+                Ok(code) => code,
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            Err(_) => run_main(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        run_main()
+    }
+}
+
+fn run_main() -> ExitCode {
     let cli = Cli::parse();
 
     let plugin_paths = deduplicate_paths(&cli.plugins);
@@ -487,10 +568,7 @@ fn main() -> ExitCode {
     };
     let session_plugins = if matches!(
         &cli.command,
-        Command::Session {
-            action: SessionCommand::Start { .. },
-            ..
-        }
+        Command::Session { action, .. } if matches!(&**action, SessionCommand::Start(..))
     ) {
         activated_plugins.clone()
     } else {
@@ -500,155 +578,18 @@ fn main() -> ExitCode {
     let default_output = cli.output.unwrap_or(OutputFormat::Text);
 
     match cli.command {
-        Command::Run {
-            paths,
-            vars,
-            vars_files,
-            projects,
-            suites,
-            layers,
-            tags,
-            skip_tags,
-            bundle_dir,
-            no_bundle,
-            record,
-            trace_steps,
-            jobs,
-            repeat,
-        } => {
-            let sources = match VarSources::load(&vars_files, &vars) {
-                Ok(sources) => sources,
-                Err(message) => return usage_error(&message),
-            };
-            if trace_steps && record.is_none() {
-                return usage_error("`--trace-steps` requires `--record <DIRECTORY>`");
-            }
-            if let Some(directory) = &record
-                && let Err(message) = check_record_directory(directory)
-            {
-                return usage_error(&message);
-            }
-            run(
-                default_output,
-                &registry,
-                RunOptions {
-                    paths,
-                    sources,
-                    filters: Filters {
-                        project: projects,
-                        suite: suites,
-                        layer: layers,
-                        tag: tags,
-                        skip_tag: skip_tags,
-                    },
-                    bundle_dir,
-                    no_bundle,
-                    record,
-                    trace_steps,
-                    jobs,
-                    repeat,
-                },
-            )
-        }
-        Command::Compare {
-            baseline_dir,
-            candidate_dir,
-        } => compare(default_output, &baseline_dir, &candidate_dir),
-        Command::Report {
-            directory,
-            output_file,
-            shareable,
-        } => report(default_output, &directory, output_file, shareable),
-        Command::Lint {
-            paths,
-            vars,
-            vars_files,
-            against,
-            allow_weaken,
-            projects,
-            suites,
-            layers,
-            tags,
-            skip_tags,
-        } => {
-            if let Some(reason) = &allow_weaken {
-                if reason.trim().is_empty() {
-                    return lint_usage_error(
-                        default_output,
-                        "`--allow-weaken` requires a non-empty reason explaining the intentional contract change",
-                    );
-                }
-                if against.is_none() {
-                    return lint_usage_error(
-                        default_output,
-                        "`--allow-weaken` requires `--against <PATH>`",
-                    );
-                }
-            }
-            let sources = match VarSources::load(&vars_files, &vars) {
-                Ok(sources) => sources,
-                Err(message) => return usage_error(&message),
-            };
-            lint(
-                &registry,
-                LintOptions {
-                    paths,
-                    format: default_output,
-                    sources,
-                    against,
-                    allow_weaken,
-                    filters: Filters {
-                        project: projects,
-                        suite: suites,
-                        layer: layers,
-                        tag: tags,
-                        skip_tag: skip_tags,
-                    },
-                },
-            )
-        }
+        Command::Run(args) => dispatch_run(default_output, &registry, *args),
+        Command::Compare(args) => compare(default_output, &args.baseline_dir, &args.candidate_dir),
+        Command::Report(args) => report(
+            default_output,
+            &args.directory,
+            args.output_file,
+            args.shareable,
+        ),
+        Command::Lint(args) => dispatch_lint(default_output, &registry, *args),
         Command::Schema => print_schema(&registry, default_output),
         #[cfg(feature = "mcp")]
-        Command::Mcp {
-            sessions_dir,
-            idle_timeout_ms,
-            model_hook,
-            model_hook_args,
-            model,
-            model_adapter,
-            model_endpoint,
-            model_api_key_env,
-        } => {
-            let (hook_spec, model_spec) = match resolve_cli_model_config(
-                model_hook,
-                model_hook_args,
-                model,
-                model_adapter,
-                model_endpoint,
-                model_api_key_env,
-                &START_CLI_MODEL_FLAGS,
-            ) {
-                Ok(pair) => pair,
-                Err(message) => return usage_error(&message),
-            };
-            if let Some(spec) = &model_spec
-                && let Err(message) = session::validate_builtin_model(spec)
-            {
-                return usage_error(&message);
-            }
-            do_anything::mcp::serve(
-                &registry,
-                do_anything::mcp::Options {
-                    sessions_dir: sessions_dir
-                        .unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
-                    idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
-                    model_hook: hook_spec,
-                    model: model_spec,
-                    plugins: activated_plugins.clone(),
-                },
-            )
-            .into()
-        }
+        Command::Mcp(args) => dispatch_mcp(&registry, &activated_plugins, *args),
         Command::Session {
             sessions_dir,
             idle_timeout_ms,
@@ -659,9 +600,97 @@ fn main() -> ExitCode {
             sessions_dir,
             idle_timeout_ms,
             &session_plugins,
-            action,
+            *action,
         ),
     }
+}
+
+fn dispatch_run(default_output: OutputFormat, registry: &Registry, args: RunArgs) -> ExitCode {
+    let sources = match VarSources::load(&args.vars.vars_files, &args.vars.vars) {
+        Ok(sources) => sources,
+        Err(message) => return usage_error(&message),
+    };
+    if args.trace_steps && args.record.is_none() {
+        return usage_error("`--trace-steps` requires `--record <DIRECTORY>`");
+    }
+    if let Some(directory) = &args.record
+        && let Err(message) = check_record_directory(directory)
+    {
+        return usage_error(&message);
+    }
+    run(
+        default_output,
+        registry,
+        RunOptions {
+            paths: args.paths,
+            sources,
+            filters: args.filters.into(),
+            bundle_dir: args.bundle_dir,
+            no_bundle: args.no_bundle,
+            record: args.record,
+            trace_steps: args.trace_steps,
+            jobs: args.jobs,
+            repeat: args.repeat,
+        },
+    )
+}
+
+fn dispatch_lint(default_output: OutputFormat, registry: &Registry, args: LintArgs) -> ExitCode {
+    if let Some(reason) = &args.allow_weaken {
+        if reason.trim().is_empty() {
+            return lint_usage_error(
+                default_output,
+                "`--allow-weaken` requires a non-empty reason explaining the intentional contract change",
+            );
+        }
+        if args.against.is_none() {
+            return lint_usage_error(
+                default_output,
+                "`--allow-weaken` requires `--against <PATH>`",
+            );
+        }
+    }
+    let sources = match VarSources::load(&args.vars.vars_files, &args.vars.vars) {
+        Ok(sources) => sources,
+        Err(message) => return usage_error(&message),
+    };
+    lint(
+        registry,
+        LintOptions {
+            paths: args.paths,
+            format: default_output,
+            sources,
+            against: args.against,
+            allow_weaken: args.allow_weaken,
+            filters: args.filters.into(),
+        },
+    )
+}
+
+#[cfg(feature = "mcp")]
+fn dispatch_mcp(registry: &Registry, activated_plugins: &[String], args: McpArgs) -> ExitCode {
+    let resolved_models = match args.model.resolve() {
+        Ok(models) => models,
+        Err(message) => return usage_error(&message),
+    };
+    if let Some(spec) = &resolved_models.model
+        && let Err(message) = session::validate_builtin_model(spec)
+    {
+        return usage_error(&message);
+    }
+    do_anything::mcp::serve(
+        registry,
+        do_anything::mcp::Options {
+            sessions_dir: args
+                .sessions_dir
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_SESSIONS_DIR)),
+            idle_timeout_ms: args.idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
+            model_hook: resolved_models.hook,
+            model: resolved_models.model,
+            plugins: activated_plugins.to_vec(),
+        },
+    )
+    .into()
 }
 
 struct CliModelFlags<'a> {
@@ -671,6 +700,7 @@ struct CliModelFlags<'a> {
     adapter_flag: &'a str,
     endpoint_flag: &'a str,
     api_key_env_flag: &'a str,
+    reasoning_effort_flag: &'a str,
 }
 
 const START_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
@@ -680,6 +710,7 @@ const START_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
     adapter_flag: "--model-adapter",
     endpoint_flag: "--model-endpoint",
     api_key_env_flag: "--model-api-key-env",
+    reasoning_effort_flag: "--model-reasoning-effort",
 };
 
 const CALL_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
@@ -689,7 +720,56 @@ const CALL_CLI_MODEL_FLAGS: CliModelFlags<'static> = CliModelFlags {
     adapter_flag: "--adapter",
     endpoint_flag: "--endpoint",
     api_key_env_flag: "--api-key-env",
+    reasoning_effort_flag: "--reasoning-effort",
 };
+
+struct CliModelInputs {
+    hook: Option<String>,
+    hook_args: Vec<String>,
+    model: Option<String>,
+    adapter: Option<String>,
+    endpoint: Option<String>,
+    api_key_env: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+impl ModelStartArgs {
+    fn resolve(self) -> Result<ResolvedCliModelConfig, String> {
+        resolve_cli_model_config(
+            CliModelInputs {
+                hook: self.model_hook,
+                hook_args: self.model_hook_args,
+                model: self.model,
+                adapter: self.model_adapter,
+                endpoint: self.model_endpoint,
+                api_key_env: self.model_api_key_env,
+                reasoning_effort: self.model_reasoning_effort,
+            },
+            &START_CLI_MODEL_FLAGS,
+            true,
+        )
+    }
+}
+
+impl ModelCallArgs {
+    fn resolve(self) -> Result<(ResolvedCliModelConfig, u64), String> {
+        let timeout_ms = self.timeout_ms;
+        let resolved = resolve_cli_model_config(
+            CliModelInputs {
+                hook: self.hook,
+                hook_args: self.hook_args,
+                model: self.model,
+                adapter: self.adapter,
+                endpoint: self.endpoint,
+                api_key_env: self.api_key_env,
+                reasoning_effort: self.reasoning_effort,
+            },
+            &CALL_CLI_MODEL_FLAGS,
+            false,
+        )?;
+        Ok((resolved, timeout_ms))
+    }
+}
 
 fn build_cli_hook_spec(
     command: Option<String>,
@@ -710,16 +790,14 @@ fn build_cli_hook_spec(
 }
 
 fn build_cli_model_spec(
-    model: Option<String>,
-    adapter: Option<String>,
-    endpoint: Option<String>,
-    api_key_env: Option<String>,
+    inputs: CliModelInputs,
     flags: &CliModelFlags<'_>,
-) -> Result<Option<BuiltinModelSpec>, String> {
+    require_model_for_effort: bool,
+) -> Result<(Option<BuiltinModelSpec>, Option<String>), String> {
     for (value, flag) in [
-        (&adapter, flags.adapter_flag),
-        (&endpoint, flags.endpoint_flag),
-        (&api_key_env, flags.api_key_env_flag),
+        (&inputs.adapter, flags.adapter_flag),
+        (&inputs.endpoint, flags.endpoint_flag),
+        (&inputs.api_key_env, flags.api_key_env_flag),
     ] {
         if let Some(raw) = value
             && raw.trim().is_empty()
@@ -727,51 +805,93 @@ fn build_cli_model_spec(
             return Err(format!("`{flag}` must not be empty"));
         }
     }
-    match model {
+    let normalized_effort = match inputs.reasoning_effort {
+        Some(raw) => Some(validate_reasoning_effort(&raw)?),
+        None => None,
+    };
+    match inputs.model {
         Some(m) => {
             if m.trim().is_empty() {
                 return Err(format!("`{}` must not be empty", flags.model_flag));
             }
-            Ok(Some(BuiltinModelSpec {
-                model: m,
-                adapter,
-                endpoint,
-                api_key_env,
-            }))
+            Ok((
+                Some(BuiltinModelSpec {
+                    model: m,
+                    adapter: inputs.adapter,
+                    endpoint: inputs.endpoint,
+                    api_key_env: inputs.api_key_env,
+                    reasoning_effort: normalized_effort,
+                }),
+                None,
+            ))
         }
         None => {
             for (present, flag) in [
-                (adapter.is_some(), flags.adapter_flag),
-                (endpoint.is_some(), flags.endpoint_flag),
-                (api_key_env.is_some(), flags.api_key_env_flag),
+                (inputs.adapter.is_some(), flags.adapter_flag),
+                (inputs.endpoint.is_some(), flags.endpoint_flag),
+                (inputs.api_key_env.is_some(), flags.api_key_env_flag),
+                (
+                    require_model_for_effort && normalized_effort.is_some(),
+                    flags.reasoning_effort_flag,
+                ),
             ] {
                 if present {
                     return Err(format!("`{flag}` requires `{} <MODEL>`", flags.model_flag));
                 }
             }
-            Ok(None)
+            Ok((None, normalized_effort))
         }
     }
 }
 
+struct ResolvedCliModelConfig {
+    hook: Option<ModelHookSpec>,
+    model: Option<BuiltinModelSpec>,
+    reasoning_effort: Option<String>,
+}
+
 fn resolve_cli_model_config(
-    hook_cmd: Option<String>,
-    hook_args: Vec<String>,
-    model: Option<String>,
-    adapter: Option<String>,
-    endpoint: Option<String>,
-    api_key_env: Option<String>,
+    mut inputs: CliModelInputs,
     flags: &CliModelFlags<'_>,
-) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
-    let hook_spec = build_cli_hook_spec(hook_cmd, hook_args, flags.hook_flag, flags.hook_arg_flag)?;
-    let model_spec = build_cli_model_spec(model, adapter, endpoint, api_key_env, flags)?;
+    require_model_for_effort: bool,
+) -> Result<ResolvedCliModelConfig, String> {
+    let hook_spec = build_cli_hook_spec(
+        inputs.hook.take(),
+        std::mem::take(&mut inputs.hook_args),
+        flags.hook_flag,
+        flags.hook_arg_flag,
+    )?;
+    let (model_spec, effort_override) =
+        build_cli_model_spec(inputs, flags, require_model_for_effort)?;
     if hook_spec.is_some() && model_spec.is_some() {
         return Err(format!(
             "pass either `{}` or `{}`, not both",
             flags.hook_flag, flags.model_flag
         ));
     }
-    Ok((hook_spec, model_spec))
+    if hook_spec.is_some() && effort_override.is_some() {
+        return Err(format!(
+            "`{}` applies only to the built-in `{}`, not `{}`",
+            flags.reasoning_effort_flag, flags.model_flag, flags.hook_flag
+        ));
+    }
+    Ok(ResolvedCliModelConfig {
+        hook: hook_spec,
+        model: model_spec,
+        reasoning_effort: effort_override,
+    })
+}
+
+fn parse_optional_session_json(
+    raw: Option<String>,
+    flag: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    match raw {
+        Some(text) => case::parse_json_value(&text)
+            .map(Some)
+            .map_err(|err| format!("could not parse `{flag}`: {err}")),
+        None => Ok(None),
+    }
 }
 
 fn run_session(
@@ -786,234 +906,202 @@ fn run_session(
     let mut print_raw_yaml = false;
 
     let request = match action {
-        SessionCommand::Start {
-            observe,
-            model_hook,
-            model_hook_args,
-            model,
-            model_adapter,
-            model_endpoint,
-            model_api_key_env,
-        } => {
-            let parsed_observe = match session::parse_observe_specs(&observe, registry) {
+        SessionCommand::Start(args) => {
+            let args = *args;
+            let parsed_observe = match session::parse_observe_specs(&args.observe, registry) {
                 Ok(items) => items,
                 Err(message) => return session_usage_error(format, &message),
             };
-            let (hook_spec, model_spec) = match resolve_cli_model_config(
-                model_hook,
-                model_hook_args,
-                model,
-                model_adapter,
-                model_endpoint,
-                model_api_key_env,
-                &START_CLI_MODEL_FLAGS,
-            ) {
-                Ok(pair) => pair,
+            let resolved_models = match args.model.resolve() {
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
             SessionRequest::Start {
                 sessions_dir,
                 idle_timeout_ms: idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS),
                 observe: parsed_observe,
-                model_hook: hook_spec,
-                model: model_spec,
+                model_hook: resolved_models.hook,
+                model: resolved_models.model,
                 plugins: session_plugins.to_vec(),
             }
         }
-        SessionCommand::Step {
-            id,
-            action,
-            use_step,
-            args,
-            with,
-            step,
-            file,
-            save,
-        } => {
-            let step_input =
-                match resolve_step_input(action, use_step, args, with, step, file, save) {
-                    Ok(input) => input,
-                    Err(message) => return session_usage_error(format, &message),
-                };
+        SessionCommand::Step(args) => {
+            let args = *args;
+            let step_input = match resolve_step_input(
+                args.action,
+                args.use_step,
+                args.args,
+                args.with,
+                args.step,
+                args.file,
+                args.save,
+            ) {
+                Ok(input) => input,
+                Err(message) => return session_usage_error(format, &message),
+            };
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             SessionRequest::Step {
                 sessions_dir,
-                id,
+                id: args.id,
                 base_directory,
                 step: step_input,
             }
         }
-        SessionCommand::Snapshot {
-            id,
-            scope_ref,
-            max_depth,
-            max_nodes,
-        } => SessionRequest::Snapshot {
-            sessions_dir,
-            id,
-            scope_ref,
-            max_depth,
-            max_nodes,
-        },
-        SessionCommand::SelectRef {
-            id,
-            query,
-            scope_ref,
-            max_depth,
-            max_nodes,
-            hook,
-            hook_args,
-            model,
-            adapter,
-            endpoint,
-            api_key_env,
-            timeout_ms,
-            act,
-            with,
-            args,
-            save,
-        } => {
-            let (hook_override, model_override) = match resolve_cli_model_config(
-                hook,
-                hook_args,
-                model,
-                adapter,
-                endpoint,
-                api_key_env,
-                &CALL_CLI_MODEL_FLAGS,
-            ) {
-                Ok(pair) => pair,
+        SessionCommand::Snapshot(args) => {
+            let args = *args;
+            SessionRequest::Snapshot {
+                sessions_dir,
+                id: args.id,
+                scope_ref: args.scope_ref,
+                max_depth: args.max_depth,
+                max_nodes: args.max_nodes,
+            }
+        }
+        SessionCommand::SelectRef(args) => {
+            let args = *args;
+            let (resolved_models, timeout_ms) = match args.model.resolve() {
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
-            if (with.is_some() || !args.is_empty() || !save.is_empty()) && act.is_none() {
+            if (args.with.is_some() || !args.args.is_empty() || !args.save.is_empty())
+                && args.act.is_none()
+            {
                 return session_usage_error(
                     format,
                     "`--with`, `--arg`, and `--save` on `select-ref` require `--act <STEP>`",
                 );
             }
-            let act_spec = act.map(|action| SelectRefAction {
+            let act_spec = args.act.map(|action| SelectRefAction {
                 action,
-                with_raw: with,
-                args,
-                save,
+                with_raw: args.with,
+                args: args.args,
+                save: args.save,
             });
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             SessionRequest::SelectRef(SelectRefRequest {
                 sessions_dir,
-                id,
+                id: args.id,
                 base_directory,
-                query,
-                scope_ref,
-                max_depth,
-                max_nodes,
-                hook_override,
-                model_override,
+                query: args.query,
+                scope_ref: args.scope_ref,
+                max_depth: args.max_depth,
+                max_nodes: args.max_nodes,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
                 timeout_ms,
                 act: act_spec,
             })
         }
-        SessionCommand::Locate {
-            id,
-            query,
-            hook,
-            hook_args,
-            model,
-            adapter,
-            endpoint,
-            api_key_env,
-            timeout_ms,
-            click,
-        } => {
-            let (hook_override, model_override) = match resolve_cli_model_config(
-                hook,
-                hook_args,
-                model,
-                adapter,
-                endpoint,
-                api_key_env,
-                &CALL_CLI_MODEL_FLAGS,
-            ) {
-                Ok(pair) => pair,
+        SessionCommand::Locate(args) => {
+            let args = *args;
+            let (resolved_models, timeout_ms) = match args.model.resolve() {
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             SessionRequest::Locate(LocateRequest {
                 sessions_dir,
-                id,
+                id: args.id,
                 base_directory,
-                query,
-                hook_override,
-                model_override,
+                query: args.query,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
                 timeout_ms,
-                click,
+                click: args.click,
             })
         }
-        SessionCommand::Judge {
-            id,
-            rubric,
-            evidence,
-            screenshot,
-            hook,
-            hook_args,
-            model,
-            adapter,
-            endpoint,
-            api_key_env,
-            timeout_ms,
-        } => {
-            let (hook_override, model_override) = match resolve_cli_model_config(
-                hook,
-                hook_args,
-                model,
-                adapter,
-                endpoint,
-                api_key_env,
-                &CALL_CLI_MODEL_FLAGS,
-            ) {
-                Ok(pair) => pair,
+        SessionCommand::Judge(args) => {
+            let args = *args;
+            let (resolved_models, timeout_ms) = match args.model.resolve() {
+                Ok(models) => models,
                 Err(message) => return session_usage_error(format, &message),
             };
-            let parsed_evidence = match evidence {
-                Some(raw) => match case::parse_json_value(&raw) {
-                    Ok(val) => Some(val),
-                    Err(err) => {
-                        return session_usage_error(
-                            format,
-                            &format!("could not parse `--evidence`: {err}"),
-                        );
-                    }
-                },
-                None => None,
+            let parsed_evidence = match parse_optional_session_json(args.evidence, "--evidence") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
             };
             let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             SessionRequest::Judge(JudgeRequest {
                 sessions_dir,
-                id,
+                id: args.id,
                 base_directory,
-                rubric,
+                rubric: args.rubric,
                 evidence: parsed_evidence,
-                screenshot,
-                hook_override,
-                model_override,
+                screenshot: args.screenshot,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
                 timeout_ms,
             })
         }
-        SessionCommand::Export {
-            id,
-            out,
-            name,
-            include_reads,
-            yaml,
-        } => {
-            print_raw_yaml = yaml || (format == OutputFormat::Text && out.is_none());
+        SessionCommand::Extract(args) => {
+            let args = *args;
+            let (resolved_models, timeout_ms) = match args.model.resolve() {
+                Ok(models) => models,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let parsed_schema = match parse_optional_session_json(args.schema, "--schema") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let parsed_evidence = match parse_optional_session_json(args.evidence, "--evidence") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            SessionRequest::Extract(ExtractRequest {
+                sessions_dir,
+                id: args.id,
+                base_directory,
+                query: args.query,
+                schema: parsed_schema,
+                evidence: parsed_evidence,
+                screenshot: args.screenshot,
+                save: args.save,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
+                timeout_ms,
+            })
+        }
+        SessionCommand::Act(args) => {
+            let args = *args;
+            let (resolved_models, timeout_ms) = match args.model.resolve() {
+                Ok(models) => models,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let parsed_evidence = match parse_optional_session_json(args.evidence, "--evidence") {
+                Ok(val) => val,
+                Err(message) => return session_usage_error(format, &message),
+            };
+            let base_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            SessionRequest::Act(ActRequest {
+                sessions_dir,
+                id: args.id,
+                base_directory,
+                goal: args.goal,
+                max_steps: args.max_steps,
+                evidence: parsed_evidence,
+                screenshot: args.screenshot,
+                hook_override: resolved_models.hook,
+                model_override: resolved_models.model,
+                reasoning_effort_override: resolved_models.reasoning_effort,
+                timeout_ms,
+            })
+        }
+        SessionCommand::Export(args) => {
+            let args = *args;
+            print_raw_yaml = args.yaml || (format == OutputFormat::Text && args.out.is_none());
             SessionRequest::Export {
                 sessions_dir,
-                id,
+                id: args.id,
                 options: ExportOptions {
-                    case_name: name,
-                    include_reads,
+                    case_name: args.name,
+                    include_reads: args.include_reads,
                 },
-                out_path: out,
+                out_path: args.out,
             }
         }
         SessionCommand::Stop { id } => SessionRequest::Stop { sessions_dir, id },

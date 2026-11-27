@@ -4007,3 +4007,350 @@ img.src = 'data:image/png;base64,{img_b64}';
         String::from_utf8_lossy(&px_run.stderr)
     );
 }
+
+#[cfg(feature = "ai")]
+mod ai_browser_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    struct BrowserModelMock {
+        port: u16,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl BrowserModelMock {
+        fn start<F>(handler: F) -> Self
+        where
+            F: Fn(usize, &Value) -> Value + Send + Sync + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind browser model mock");
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let handler = Arc::new(handler);
+
+            let reqs_c = Arc::clone(&requests);
+            let stop_c = Arc::clone(&stop);
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let handle = thread::spawn(move || {
+                while !stop_c.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let reqs = Arc::clone(&reqs_c);
+                            let h = Arc::clone(&handler);
+                            let cnt = Arc::clone(&call_count);
+                            thread::spawn(move || {
+                                serve_mock(stream, &reqs, &cnt, &*h);
+                            });
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                port,
+                requests,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://127.0.0.1:{}/v1", self.port)
+        }
+    }
+
+    impl Drop for BrowserModelMock {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn serve_mock(
+        stream: TcpStream,
+        requests: &Mutex<Vec<String>>,
+        counter: &AtomicUsize,
+        handler: &(dyn Fn(usize, &Value) -> Value + Send + Sync),
+    ) {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut writer = stream;
+
+        let mut req_line = String::new();
+        if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut len = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = trimmed.split_once(':')
+                && k.trim().eq_ignore_ascii_case("content-length")
+            {
+                len = v.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body_buf = vec![0u8; len];
+        if len > 0 {
+            let _ = reader.read_exact(&mut body_buf);
+        }
+        let raw_body = String::from_utf8_lossy(&body_buf).into_owned();
+        requests.lock().unwrap().push(raw_body.clone());
+
+        let parsed_req: Value = serde_json::from_str(&raw_body).unwrap_or(Value::Null);
+        let idx = counter.fetch_add(1, Ordering::SeqCst);
+        let content = handler(idx, &parsed_req);
+
+        let reply_body = json!({
+            "id": format!("chatcmpl-chrome-{idx}"),
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "chrome-mock-v1",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content.to_string() },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18 }
+        })
+        .to_string();
+
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            reply_body.len(),
+            reply_body
+        );
+        let _ = writer.write_all(resp.as_bytes());
+        let _ = writer.flush();
+    }
+
+    fn extract_payload_from_chat_req(req: &Value) -> Value {
+        let content = &req["messages"][1]["content"];
+        let text = if let Some(s) = content.as_str() {
+            s
+        } else if let Some(arr) = content.as_array() {
+            arr.iter()
+                .find_map(|part| {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("{}")
+        } else {
+            "{}"
+        };
+        serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn browser_session_builtin_model_extract_act_and_offline_replay() {
+        let Some(_guard) = chrome_guard() else {
+            return;
+        };
+        let routes = BTreeMap::from([(
+            "/checkout".to_string(),
+            r##"<!doctype html>
+<html>
+<head><title>Checkout</title></head>
+<body style="margin:0;padding:0;font-family:sans-serif">
+  <input id="pw" type="password" value="top-secret" style="position:fixed;left:24px;top:24px;width:200px;height:30px" />
+  <p id="order" style="position:fixed;left:24px;top:72px">Order #777: $42.50</p>
+  <label for="note-box" style="position:fixed;left:24px;top:116px">Order Note</label>
+  <input id="note-box" type="text" style="position:fixed;left:24px;top:140px;width:200px;height:30px" />
+  <button data-testid="confirm-btn" style="position:fixed;left:24px;top:190px;width:140px;height:36px" onclick="
+    document.getElementById('status').textContent = 'Confirmed: ' + document.getElementById('note-box').value;
+  ">Confirm</button>
+  <p id="status" style="position:fixed;left:24px;top:240px">Pending</p>
+</body>
+</html>"##
+                .to_string(),
+        )]);
+        let page = PageServer::start(routes);
+
+        let model_mock = BrowserModelMock::start(|idx, req| match idx {
+            0 => json!({
+                "data": { "order_id": "ORD-777", "total": "$42.50" },
+                "confidence": 0.96
+            }),
+            1 => json!({
+                "status": "continue",
+                "summary": "Type note via visual locate_type",
+                "action": { "kind": "locate_type", "x": 124, "y": 155, "text": "deliver fast" },
+                "confidence": 0.92
+            }),
+            2 => {
+                let payload = extract_payload_from_chat_req(req);
+                let tree = payload["snapshot"]["tree"]
+                    .as_array()
+                    .expect("live Chrome snapshot tree in act request");
+                let confirm_ref = find_ref_by_role_and_name(tree, "button", "Confirm")
+                    .expect("Confirm button ref in live snapshot");
+                json!({
+                    "status": "continue",
+                    "summary": "Click Confirm button by ref",
+                    "action": { "kind": "step", "use": "browser.click", "with": { "ref": confirm_ref } },
+                    "confidence": 0.95
+                })
+            }
+            _ => json!({
+                "status": "done",
+                "summary": "Checkout note submitted and confirmed",
+                "reason": "Status updated to Confirmed",
+                "action": null,
+                "confidence": 0.99
+            }),
+        });
+
+        let dir = TempDir::new("chrome-extract-act");
+        let started = json_stdout(&run_da_in(
+            dir.path(),
+            &[
+                "session",
+                "start",
+                "--model",
+                "openai::hy4",
+                "--model-adapter",
+                "omlx",
+                "--model-endpoint",
+                &model_mock.endpoint(),
+                "--model-reasoning-effort",
+                "low",
+            ],
+        ));
+        assert_eq!(started["ok"], true, "{started}");
+        let id = started["session_id"].as_str().unwrap().to_string();
+
+        let opened = run_da_in(
+            dir.path(),
+            &[
+                "session",
+                "step",
+                &id,
+                "browser.open",
+                "--arg",
+                &format!("url={}", page.url("/checkout")),
+                "--arg",
+                "width=1280",
+                "--arg",
+                "height=720",
+            ],
+        );
+        assert_eq!(opened.status.code(), Some(0), "{opened:?}");
+
+        let extracted = run_da_in(
+            dir.path(),
+            &[
+                "session",
+                "extract",
+                &id,
+                "--query",
+                "Extract order_id and total",
+                "--schema",
+                r#"{"type":"object","properties":{"order_id":{"type":"string"},"total":{"type":"string"}}}"#,
+                "--screenshot",
+                "--save",
+                "ORDER_INFO",
+            ],
+        );
+        assert_eq!(extracted.status.code(), Some(0), "{extracted:?}");
+        let ext_json = json_stdout(&extracted);
+        assert_eq!(
+            ext_json["data"],
+            json!({"order_id": "ORD-777", "total": "$42.50"})
+        );
+        assert_eq!(ext_json["screenshot"], true);
+        assert!(ext_json["saved"]["ORDER_INFO"].is_string());
+
+        let acted = run_da_in(
+            dir.path(),
+            &[
+                "session",
+                "act",
+                &id,
+                "--goal",
+                "Type deliver fast into Order Note and click Confirm",
+                "--screenshot",
+                "--max-steps",
+                "4",
+            ],
+        );
+        assert_eq!(acted.status.code(), Some(0), "{acted:?}");
+        let act_json = json_stdout(&acted);
+        assert_eq!(act_json["status"], "done");
+        assert_eq!(act_json["steps_taken"], 2);
+        assert_eq!(act_json["screenshot"], true);
+
+        let verify_read = run_da_stdin(
+            dir.path(),
+            &["session", "step", &id],
+            "browser.read:\n  css: \"#status\"\nexpect:\n  - path: $.text\n    equals: \"Confirmed: deliver fast\"\n",
+        );
+        assert_eq!(verify_read.status.code(), Some(0), "{verify_read:?}");
+
+        let out_yaml = dir.path().join("checkout-replay.yaml");
+        let exported = run_da_in(
+            dir.path(),
+            &[
+                "session",
+                "export",
+                &id,
+                "--name",
+                "Chrome extract act replay",
+                "-o",
+                out_yaml.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(exported.status.code(), Some(0), "{exported:?}");
+
+        let stop = run_da_in(dir.path(), &["session", "stop", &id]);
+        assert_eq!(stop.status.code(), Some(0), "{stop:?}");
+
+        {
+            let reqs = model_mock.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 4, "expected 1 extract + 3 act_step calls");
+            for r in reqs.iter() {
+                assert!(r.contains("data:image/png;base64,"), "{r}");
+                assert!(r.contains("\"reasoning_effort\":\"low\""), "{r}");
+            }
+        }
+        drop(model_mock);
+
+        let yaml_text = fs::read_to_string(&out_yaml).unwrap();
+        assert!(!yaml_text.contains("model.extract"), "{yaml_text}");
+        assert!(!yaml_text.contains("model.act"), "{yaml_text}");
+        assert!(yaml_text.contains("browser.type:"), "{yaml_text}");
+        assert!(yaml_text.contains("testid: confirm-btn"), "{yaml_text}");
+        assert!(yaml_text.contains("browser.read:"), "{yaml_text}");
+
+        let lint = run_da_in(dir.path(), &["lint", out_yaml.to_str().unwrap()]);
+        assert_eq!(lint.status.code(), Some(0), "{lint:?}");
+
+        let replay = run_da_in(
+            dir.path(),
+            &["run", out_yaml.to_str().unwrap(), "--no-bundle"],
+        );
+        assert_eq!(replay.status.code(), Some(0), "{replay:?}");
+    }
+}

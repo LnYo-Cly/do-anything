@@ -12,9 +12,9 @@
 //! driver features a build enabled: `session_start`, `step`, `snapshot`,
 //! `export`, `run` and `session_stop`. When model access is configured on
 //! `da mcp` (`--model`, `--model-hook`, or `DA_MODEL`), `tools/list` also
-//! exposes `select_ref`, `locate`, and `judge` (nine tools total). `step` is
-//! the single generic step tool and takes the same `use`/`with`/`expect`/`save`
-//! step a case file holds.
+//! exposes `select_ref`, `locate`, `judge`, `extract`, and `act` (eleven tools
+//! total). `step` is the single generic step tool and takes the same
+//! `use`/`with`/`expect`/`save` step a case file holds.
 //!
 //! Standard output carries responses and nothing else, so a host can parse it
 //! without stripping diagnostics. Everything written back passes through
@@ -507,6 +507,7 @@ impl Server<'_> {
                 adapter: opt(["adapter", "model_adapter"]),
                 endpoint: opt(["endpoint", "model_endpoint"]),
                 api_key_env: opt(["api_key_env", "model_api_key_env"]),
+                reasoning_effort: opt(["reasoning_effort", "model_reasoning_effort"]),
             };
             self.record_model_spec_secrets(&spec);
         }

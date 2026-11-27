@@ -538,13 +538,15 @@ on the session directory rejects concurrent operations on the same session ID.
 
 | Subcommand | Purpose & Key Options |
 | --- | --- |
-| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), optionally attach declared read-only observers (`--observe SPEC`), a built-in model (`--model`, `--model-adapter`, `--model-endpoint`, `--model-api-key-env`), or a JSON-RPC model hook (`--model-hook <exe>`, `--model-hook-arg <arg>`), print `session_id` |
+| `da session start` | Create `.da/sessions/<id>/`, reap expired sessions (`--idle-timeout-ms`, default `1800000`), optionally attach declared read-only observers (`--observe SPEC`), a built-in model (`--model`, `--model-adapter`, `--model-endpoint`, `--model-api-key-env`, `--model-reasoning-effort`), or a JSON-RPC model hook (`--model-hook <exe>`, `--model-hook-arg <arg>`), print `session_id` |
 | `da session step <id> ...` | Reattach resources, run one step (`<step> --arg k=v`, `--use` + `--with`, `--step`, or `-f <file\|->`, optional `--save name=jsonpath`), update state, detach; returns `snapshot` after browser steps |
 | `da session snapshot <id>` | Capture the current accessibility tree without running a step (`--ref <id>`, `--max-depth`, `--max-nodes`) |
-| `da session select-ref <id>` | Ask a built-in model or `model/select_ref` hook to pick a candidate `ref` (`--query <text>`, optional `--act <step>`, per-call `--model` / `--adapter` / `--endpoint` / `--api-key-env` or `--hook <exe>`, `--timeout-ms <ms>`) and synthesize its deterministic locator |
-| `da session locate <id>` | Send an input-masked PNG + viewport to a built-in model or `model/locate` VLM hook (`--query <text>`, optional `--click`, `--model` / `--hook`, `--timeout-ms <ms>`) and reverse-query the live DOM/UI tree for a deterministic locator |
-| `da session judge <id>` | Send redacted session evidence (plus a 1:1 input-masked screenshot when `--screenshot` is passed) to a built-in model or `model/judge` hook (`--rubric <text>`, optional `--evidence <yaml\|json>`, `--screenshot`, `--model` / `--hook`, `--timeout-ms <ms>`); exits `0` when `passed` is `true` and `1` when `false` |
-| `da session export <id>` | Emit deterministic, model-free YAML case (`-o <file>`, `--name <title>`, `--include-reads`, `--yaml`); skips pure `browser.read` without `expect`/`save` and exploration-only `model.*` diagnostics |
+| `da session select-ref <id>` | Ask a built-in model or `model/select_ref` hook to pick a candidate `ref` (`--query <text>`, optional `--act <step>`, per-call `--model` / `--adapter` / `--endpoint` / `--api-key-env` / `--reasoning-effort` or `--hook <exe>`, `--timeout-ms <ms>`) and synthesize its deterministic locator |
+| `da session locate <id>` | Send an input-masked PNG + viewport to a built-in model or `model/locate` VLM hook (`--query <text>`, optional `--click`, `--model` / `--reasoning-effort` / `--hook`, `--timeout-ms <ms>`) and reverse-query the live DOM/UI tree for a deterministic locator |
+| `da session judge <id>` | Send redacted session evidence (plus a 1:1 input-masked screenshot when `--screenshot` is passed) to a built-in model or `model/judge` hook (`--rubric <text>`, optional `--evidence <yaml\|json>`, `--screenshot`, `--model` / `--reasoning-effort` / `--hook`, `--timeout-ms <ms>`); exits `0` when `passed` is `true` and `1` when `false` |
+| `da session extract <id>` | Extract structured JSON `data` from redacted snapshot, evidence, and optional masked `--screenshot` (`--query <text>`, optional `--schema <yaml\|json>`, `--evidence`, `--save <NAME>`, `--model` / `--reasoning-effort` / `--hook`, `--timeout-ms <ms>`) |
+| `da session act <id>` | Run a bounded exploration-time autonomous loop toward `--goal <text>` (`--max-steps <N>`, default `8`, max `50`; optional `--evidence`, `--screenshot`, `--model` / `--reasoning-effort` / `--hook`, `--timeout-ms <ms>`) executing real steps (`step`, `locate_click`, `locate_type`) until `done`, `failed`, or `max_steps` |
+| `da session export <id>` | Emit deterministic, model-free YAML case (`-o <file>`, `--name <title>`, `--include-reads`, `--yaml`); skips pure `browser.read` without `expect`/`save` and exploration-only `model.*` diagnostics while keeping real UI steps from `act` |
 | `da session stop <id>` | Close all resources in the session and remove `.da/sessions/<id>/` and any temporary browser profile |
 | `da session list` | List active sessions and reap any session idle beyond `--idle-timeout-ms` (`0` reaps all idle sessions) |
 
@@ -735,17 +737,21 @@ Omlx, OpenRouter, vLLM, or custom endpoints directly through `genai` — without
 configuring an external hook script:
 
 - **Session default**: pass `--model <MODEL>` (plus optional `--model-adapter`,
-  `--model-endpoint <URL>`, `--model-api-key-env <VAR>`) on `da session start`
+  `--model-endpoint <URL>`, `--model-api-key-env <VAR>`,
+  `--model-reasoning-effort <LEVEL>`) on `da session start`
   or `da mcp`. Examples: `--model openai::gpt-4o-mini`, `--model deepseek::deepseek-chat`,
   `--model gemini::gemini-2.5-flash`, `--model anthropic::claude-sonnet-4-5`, or
-  a local VLM server with `--model qwen2.5-vl --model-adapter omlx --model-endpoint http://127.0.0.1:8000/v1`.
+  a local VLM server with `--model qwen2.5-vl --model-adapter omlx --model-endpoint http://127.0.0.1:8000/v1 --model-reasoning-effort low`.
 - **Per-call override**: pass `--model <MODEL>`, `--adapter` (`--model-adapter`),
-  `--endpoint` (`--model-endpoint`), and `--api-key-env` (`--model-api-key-env`)
-  on `select-ref`, `locate`, or `judge` (`--model` and `--hook` are mutually
-  exclusive).
+  `--endpoint` (`--model-endpoint`), `--api-key-env` (`--model-api-key-env`),
+  and `--reasoning-effort` (`--model-reasoning-effort`)
+  on `select-ref`, `locate`, `judge`, `extract`, or `act` (`--model` and `--hook`
+  are mutually exclusive, and `--reasoning-effort` applies only to built-in
+  `--model` backends). Accepted reasoning effort levels are `none`, `zero`,
+  `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 - **Environment fallback**: when neither `--model` nor `--model-hook` is set on
   the call or session, `da` reads `DA_MODEL` (plus optional `DA_MODEL_ADAPTER`,
-  `DA_MODEL_ENDPOINT`, `DA_MODEL_API_KEY_ENV`). Adapter default key variables
+  `DA_MODEL_ENDPOINT`, `DA_MODEL_API_KEY_ENV`, `DA_MODEL_REASONING_EFFORT`). Adapter default key variables
   (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
   etc.) are used automatically unless an explicit `--api-key-env` is given;
   anonymous custom/local `/v1` OpenAI-compatible servers work with no key via
@@ -757,13 +763,14 @@ configuring an external hook script:
   as CLI flags or written to disk; `state.json` stores only environment variable
   names and unexpanded `${env:NAME}` templates in `--model-endpoint`. Every
   resolved key and secret is registered with `Secrets` and redacted across prompts
-  and responses. Structured requests use JSON Schema (`JsonSpec`), automatically
-  fall back to plain JSON extraction on HTTP 400/422 `response_format`
-  rejections, and enforce `--timeout-ms` (`ExitCode::Timeout` `5`).
-- **Visual judge (`--screenshot`)**: `da session judge --screenshot` (and MCP
-  `judge` with `"screenshot": true`) captures the active browser viewport or
-  desktop window through the same 1:1 input-masked screenshot pipeline as `locate`
-  and attaches it as a `data:image/png;base64,...` image part (or fails with
+  and responses. Structured requests use JSON Schema (`JsonSpec`) or JSON mode,
+  automatically fall back to plain JSON extraction on HTTP 400/422
+  `response_format` rejections, and enforce `--timeout-ms` (`ExitCode::Timeout` `5`).
+- **Visual judge, extract, and bounded act (`--screenshot`)**: `da session judge --screenshot`,
+  `da session extract --screenshot`, and `da session act --screenshot` (and
+  their MCP counterparts) capture the active browser viewport or desktop window
+  through the same 1:1 input-masked screenshot pipeline as `locate` and attach
+  it as a `data:image/png;base64,...` image part (or fail with
   `ExitCode::Environment` `4` if no visual session is active).
 
 #### External model hooks
@@ -775,7 +782,8 @@ any model during `da run`.
 
 Configure a default hook for a session with `da session start --model-hook <exe>`
 (plus repeatable `--model-hook-arg <arg>`), or pass `--hook <exe>` (and
-`--hook-arg <arg>`) on a single `select-ref`, `locate`, or `judge` command. Each
+`--hook-arg <arg>`) on a single `select-ref`, `locate`, `judge`, `extract`, or
+`act` command. Each
 call spawns the executable directly without a shell, writes one single-line
 JSON-RPC 2.0 request to standard input, closes standard input, and waits up to
 `--timeout-ms` (default `30000`). A hook that exceeds `--timeout-ms` is killed
@@ -783,7 +791,7 @@ and reaped with exit code `5` (`Timeout`); a hook that crashes, returns a
 JSON-RPC error, or returns out-of-range values fails with exit code `4`
 (`Environment`).
 
-Three atomic methods are standardized:
+Five methods are standardized:
 
 1. **`model/select_ref`** (fast candidate selection, such as Jev):
 
@@ -901,10 +909,51 @@ Three atomic methods are standardized:
    when `passed` is `false` (`--output text` prints a structured human summary;
    default and `--output json` print one JSON object).
 
+4. **`model/extract`** (structured JSON extraction from snapshot, evidence, and optional masked screenshot):
+
+   ```json
+   {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "method": "model/extract",
+     "params": {
+       "session_id": "s-1794974416388-44376-0",
+       "session_kind": "browser",
+       "query": "Extract invoice_id and amount_due",
+       "schema": {"type": "object", "properties": {"invoice_id": {"type": "string"}}},
+       "snapshot": {"title": "Invoice", "tree": []},
+       "evidence": {"steps": [], "vars": {}}
+     }
+   }
+   ```
+
+   Response `result` carries `"data"` (arbitrary JSON scrubbed by `Secrets`)
+   plus optional audit fields (`"confidence"`, `"model"`, `"latency_ms"`,
+   `"usage"`, `"trace_id"`). Passing `--save <NAME>` persists the extracted
+   value into session variables (`state.vars[NAME]`) for subsequent steps.
+
+5. **`model/act_step`** (bounded exploration-time multi-step loop for `da session act`):
+
+   Each iteration passes `goal`, `step_index`, `max_steps`,
+   `available_actions`, `history`, `snapshot`, `evidence`, and (when
+   `--screenshot` is enabled) `"image_base64"`, `"mime_type"`, and
+   `"viewport"`. Response `result` returns:
+
+   - `"status": "continue"` with `"action"` either
+     `{"kind": "step", "use": "<action>", "with": {...}}`,
+     `{"kind": "locate_click", "x": <num>, "y": <num>}`, or
+     `{"kind": "locate_type", "x": <num>, "y": <num>, "text": "..."}` — each
+     step executes against the live session, upgrades coordinates/`ref`s via
+     locator synthesis, and appends to `steps.jsonl`;
+   - `"status": "done"` (`"action": null`) to exit `0`;
+   - `"status": "failed"` (`"action": null`) or exhausting `--max-steps`
+     (default `8`, max `50`) to exit `1` (`TestFailure`).
+
 Boundary and replay guarantees:
 
-- **Input masking & secret scrubbing**: `model/locate` — and `model/judge` when
-  `--screenshot` is enabled — captures a 1:1
+- **Input masking & secret scrubbing**: `model/locate` — and `model/judge`,
+  `model/extract`, and `model/act_step` when `--screenshot` is enabled —
+  captures a 1:1
   CSS-viewport PNG through the session's input-masked screenshot path: every
   accessible `<input>`, `<textarea>`, `<select>`, and `[contenteditable]` field —
   including controls inside browser top-layer elements (modal `<dialog>` via
@@ -914,16 +963,18 @@ Boundary and replay guarantees:
   (including cross-origin frames nested inside same-origin frames or top-layer
   elements) — is covered with solid black `#000000` above the element's layer
   before capture so sensitive or cross-origin password fields can never leak to
-  external vision hooks. Every outgoing `query`, `rubric`, `candidates`,
-  `snapshot`, and `evidence` payload is scrubbed through `Secrets` before
-  reaching the hook's stdin, and every incoming `rationale`, `model`, `usage`,
-  `trace_id`, and stderr diagnostic is scrubbed before being printed or
+  external vision hooks. Every outgoing `query`, `rubric`, `goal`, `schema`,
+  `history`, `candidates`, `snapshot`, and `evidence` payload is scrubbed
+  through `Secrets` before reaching the hook's stdin or model endpoint, and
+  every incoming `data`, `rationale`, `summary`, `reason`, `action`, `model`,
+  `usage`, `trace_id`, and stderr diagnostic is scrubbed before being printed or
   persisted.
 - **Audit trail & model-free `da run`**: `.da/sessions/<id>/steps.jsonl` records
-  `model`, `latency_ms`, `usage`, `trace_id`, and `confidence` on hook-assisted
-  entries. `da session export` omits `model.select_ref`, `model.locate`, and
-  `model.judge` diagnostic entries and writes only deterministic locators (or
-  viewport-pinned `at:` on `<canvas>`), so `da run` replays offline with zero
+  `model`, `latency_ms`, `usage`, `trace_id`, and `confidence` on model-assisted
+  entries. `da session export` omits `model.select_ref`, `model.locate`,
+  `model.judge`, `model.extract`, and `model.act` diagnostic entries while
+  keeping real UI/protocol steps executed during `act` as deterministic locators
+  (or viewport-pinned `at:` on `<canvas>`), so `da run` replays offline with zero
   model calls.
 
 ### Model Context Protocol (`da mcp`)
@@ -969,7 +1020,7 @@ speaks only one of them needs no negotiation.
 | `initialize` | `protocolVersion` (echoed when this server knows it, otherwise the newest one it speaks), `capabilities.tools`, `serverInfo` and `instructions` |
 | `notifications/initialized` | Nothing: JSON-RPC forbids answering a notification |
 | `ping` | `{}` |
-| `tools/list` | The six base tools (or nine when `--model` / `DA_MODEL` or `--model-hook` is configured) with their compact `inputSchema` |
+| `tools/list` | The six base tools (or eleven when `--model` / `DA_MODEL` or `--model-hook` is configured) with their compact `inputSchema` |
 | `tools/call` | The result of one tool |
 
 An unknown method answers `-32601`, a body that is not JSON answers `-32700`,
@@ -983,7 +1034,7 @@ model's context on descriptions it cannot use.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `session_start` | optional `model`, `model_adapter`, `model_endpoint`, `model_api_key_env`, or `model_hook`, `model_hook_args` | `session_id` of a new session |
+| `session_start` | optional `model`, `model_adapter`, `model_endpoint`, `model_api_key_env`, `model_reasoning_effort`, or `model_hook`, `model_hook_args` | `session_id` of a new session |
 | `step` | `session_id`, `use`, optional `with`, `expect`, `save` | The step result, its assertions and, after a browser step, a fresh `snapshot` |
 | `snapshot` | `session_id`, optional `ref`, `max_depth`, `max_nodes` | The accessibility tree without running a step |
 | `export` | `session_id`, optional `name`, `include_reads`, `out` | The YAML case, byte for byte what `da session export --yaml` writes |
@@ -991,13 +1042,15 @@ model's context on descriptions it cannot use.
 | `session_stop` | `session_id` | Closes every resource and removes the session directory |
 
 When `da mcp` is started with `--model <MODEL>` (plus optional `--model-adapter`,
-`--model-endpoint`, `--model-api-key-env`), with `DA_MODEL` set in the
-environment, or with `--model-hook <exe>` (plus optional
-`--model-hook-arg <arg>`), `tools/list` also advertises `select_ref`, `locate`,
-and `judge` backed by the same built-in model layer and
-[External model hooks](#external-model-hooks) contract (`judge` also accepts
-`"screenshot": true`, and all three accept per-call `model` / `adapter` /
-`endpoint` / `api_key_env` or `hook` / `hook_args`).
+`--model-endpoint`, `--model-api-key-env`, `--model-reasoning-effort`), with
+`DA_MODEL` (and optional `DA_MODEL_REASONING_EFFORT`) set in the environment, or
+with `--model-hook <exe>` (plus optional `--model-hook-arg <arg>`), `tools/list`
+also advertises `select_ref`, `locate`, `judge`, `extract`, and `act` backed by
+the same built-in model layer and [External model hooks](#external-model-hooks)
+contract (`judge`, `extract`, and `act` accept `"screenshot": true`; `extract`
+accepts `"schema"` and `"save"`; `act` accepts `"max_steps"`; and all five
+accept per-call `model` / `adapter` / `endpoint` / `api_key_env` /
+`reasoning_effort` or `hook` / `hook_args`).
 
 `step` is the only generic step tool: `use` names a registered step, `with`
 holds the arguments a case file nests under that name, and `expect` and `save`
