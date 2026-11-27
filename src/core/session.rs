@@ -540,6 +540,21 @@ impl Sessions {
         Ok(None)
     }
 
+    /// Captures an input-masked PNG and surface dimensions strictly from the open
+    /// session whose `kind` matches `expected_kind`, never falling back to a
+    /// different session kind in mixed sessions.
+    pub fn collect_masked_viewport_capture_for(
+        &mut self,
+        expected_kind: &str,
+    ) -> Result<Option<MaskedViewportCapture>, String> {
+        for entry in &mut self.entries {
+            if entry.kind == expected_kind {
+                return entry.session.masked_viewport_capture();
+            }
+        }
+        Ok(None)
+    }
+
     /// Synthesizes a stable target descriptor for `ref_id` from the open
     /// session of `session_kind` (or the first open session that answers).
     pub fn synthesize_ref(

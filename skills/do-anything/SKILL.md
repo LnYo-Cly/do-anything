@@ -41,7 +41,9 @@ between commands and prints JSON by default.
 1. `da session start` → a `session_id` (add `--preview-frames` — or
    `"preview_frames": true` in MCP `session_start` — to atomically write
    `#000000` input-masked `.da/sessions/<id>/preview.png` and redacted
-   `preview.json` after UI steps without adding base64 images to LLM `content`).
+   `preview.json` after mutating `browser.*` and `desktop.*` steps, captured
+   strictly from the step's driver, without adding base64 images to LLM
+   `content`).
    - Pause/resume for human takeover (login, 2FA, CAPTCHA, visual review) with
      `da session pause <id> [--reason "..."]` / `da session resume <id>` (or
      MCP `pause_for_human` / `resume`); queued agent steps fail closed while

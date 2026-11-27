@@ -2337,6 +2337,8 @@ fn mcp_composes_plugin_and_model_hook_flags() {
             "session_start",
             "step",
             "snapshot",
+            "pause_for_human",
+            "resume",
             "select_ref",
             "locate",
             "judge",

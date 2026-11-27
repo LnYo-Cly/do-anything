@@ -654,12 +654,16 @@ fn handle_step(
     let synthesis = extract_synthesis(&step, &step_meta);
 
     let mut snapshot_error: Option<String> = None;
+    let mut snapshot_kind: Option<String> = None;
     let snapshot = if !matches!(
         report.error.as_ref().map(|problem| problem.kind),
         Some(ProblemKind::Environment)
     ) {
         match sessions.collect_step_snapshot() {
-            Ok(Some((_kind, snap))) => Some(secrets.redact_json(&snap)),
+            Ok(Some((kind, snap))) => {
+                snapshot_kind = Some(kind);
+                Some(secrets.redact_json(&snap))
+            }
             Ok(None) => None,
             Err(err) => {
                 let redacted = secrets.redact(&err);
@@ -700,6 +704,7 @@ fn handle_step(
         &state,
         &record,
         &report,
+        snapshot_kind.as_deref(),
         snapshot.as_ref(),
         &mut sessions,
         &secrets,
@@ -1047,33 +1052,59 @@ impl PreviewOutcome {
     }
 }
 
-fn is_ui_preview_action(action: &str) -> bool {
-    !action.ends_with(".close")
-        && (action.starts_with("browser.")
-            || action.starts_with("desktop.")
-            || action.starts_with("android."))
+/// Maps a mutating UI step name to the persistent session kind that owns its
+/// masked visual surface.
+///
+/// Read-only actions (`browser.read`, `desktop.read`, `*.screenshot`,
+/// `*.save_state`, clipboard steps) and teardown actions (`*.close`) do not
+/// rewrite `preview.png`/`preview.json`. `android.*` steps currently have no
+/// persistent session and are intentionally excluded so they never silently
+/// capture another open driver's viewport.
+fn preview_driver_kind(action: &str) -> Option<&'static str> {
+    match action {
+        "browser.open"
+        | "browser.click"
+        | "browser.type"
+        | "browser.upload"
+        | "browser.press"
+        | "browser.wait"
+        | "browser.set_cookies"
+        | "browser.switch_tab"
+        | "browser.scroll"
+        | "browser.hover"
+        | "browser.drag" => Some("browser"),
+        "desktop.launch" | "desktop.attach" | "desktop.click" | "desktop.type"
+        | "desktop.press" | "desktop.wait" | "desktop.scroll" | "desktop.hover"
+        | "desktop.drag" => Some("desktop"),
+        _ => None,
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_write_preview_frame(
     session_dir: &Path,
     state: &SessionState,
     record: &StepRecord,
     report: &StepReport,
+    snapshot_kind: Option<&str>,
     snapshot: Option<&Value>,
     sessions: &mut Sessions,
     secrets: &Secrets,
 ) -> PreviewOutcome {
-    if !state.preview_frames || !is_ui_preview_action(&record.action) {
+    if !state.preview_frames {
         return PreviewOutcome::default();
     }
+    let Some(driver_kind) = preview_driver_kind(&record.action) else {
+        return PreviewOutcome::default();
+    };
     if matches!(
         report.error.as_ref().map(|p| p.kind),
         Some(ProblemKind::Environment)
     ) {
         return PreviewOutcome::default();
     }
-    let capture = match sessions.collect_masked_viewport_capture() {
-        Ok(Some((_kind, cap))) => cap,
+    let capture = match sessions.collect_masked_viewport_capture_for(driver_kind) {
+        Ok(Some(cap)) => cap,
         Ok(None) => return PreviewOutcome::default(),
         Err(err) => {
             return PreviewOutcome {
@@ -1082,7 +1113,8 @@ fn maybe_write_preview_frame(
             };
         }
     };
-    let url = snapshot
+    let matching_snapshot = snapshot.filter(|_| snapshot_kind == Some(driver_kind));
+    let url = matching_snapshot
         .and_then(|s| s.get("url").and_then(Value::as_str))
         .or_else(|| {
             report
@@ -1091,7 +1123,7 @@ fn maybe_write_preview_frame(
                 .and_then(|r| r.get("url").and_then(Value::as_str))
         })
         .map(|s| secrets.redact(s));
-    let title = snapshot
+    let title = matching_snapshot
         .and_then(|s| s.get("title").and_then(Value::as_str))
         .or_else(|| {
             report
@@ -1104,6 +1136,7 @@ fn maybe_write_preview_frame(
     let mut meta = json!({
         "schema_version": 1,
         "session_id": state.id,
+        "driver": driver_kind,
         "url": url,
         "title": title,
         "viewport": {
@@ -1754,17 +1787,16 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
             synthesis.synthesized_locator = synth_locator.clone();
             synthesis.fragile = synth_fragile;
         }
-        let post_snap = if !matches!(
+        let (post_snap_kind, post_snap) = if !matches!(
             report.error.as_ref().map(|p| p.kind),
             Some(ProblemKind::Environment)
         ) {
-            sessions
-                .collect_step_snapshot()
-                .ok()
-                .flatten()
-                .map(|(_, s)| s)
+            match sessions.collect_step_snapshot().ok().flatten() {
+                Some((k, s)) => (Some(k), Some(s)),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         let mut step_rec = build_step_record(
             existing_steps.len() + 2,
@@ -1784,6 +1816,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
             &state,
             &step_rec,
             &report,
+            post_snap_kind.as_deref(),
             post_snap.as_ref(),
             &mut sessions,
             &secrets,
@@ -2063,7 +2096,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
                 );
             }
         };
-        let (report, post_snap, step_rec) = execute_synthesized_step(
+        let (report, post_snap_kind, post_snap, step_rec) = execute_synthesized_step(
             &step,
             existing_steps.len() + 2,
             Some(&viewport),
@@ -2079,6 +2112,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
             &state,
             &step_rec,
             &report,
+            post_snap_kind.as_deref(),
             post_snap.as_ref(),
             &mut sessions,
             &secrets,
@@ -2168,7 +2202,7 @@ fn execute_synthesized_step(
     state: &mut SessionState,
     secrets: &mut Secrets,
     sessions: &mut Sessions,
-) -> (StepReport, Option<Value>, StepRecord) {
+) -> (StepReport, Option<String>, Option<Value>, StepRecord) {
     let started_ms = store::now_ms();
     let observations = state_observations(state);
     let report = runner::run_single_step_with_observations(
@@ -2187,17 +2221,16 @@ fn execute_synthesized_step(
         synthesis.synthesized_locator = Some(target.locator.clone());
         synthesis.fragile = target.fragile;
     }
-    let post_snap = if !matches!(
+    let (post_snap_kind, post_snap) = if !matches!(
         report.error.as_ref().map(|p| p.kind),
         Some(ProblemKind::Environment)
     ) {
-        sessions
-            .collect_step_snapshot()
-            .ok()
-            .flatten()
-            .map(|(_, s)| s)
+        match sessions.collect_step_snapshot().ok().flatten() {
+            Some((k, s)) => (Some(k), Some(s)),
+            None => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
     let mut step_rec = build_step_record(
         step_index,
@@ -2219,7 +2252,7 @@ fn execute_synthesized_step(
         step_rec.trace_id = audit.trace_id.clone();
         step_rec.confidence = audit.confidence;
     }
-    (report, post_snap, step_rec)
+    (report, post_snap_kind, post_snap, step_rec)
 }
 
 struct VisualContext {
@@ -3259,7 +3292,7 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
                         detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
                     return paused_rejection_response(&state, &secrets);
                 }
-                let (report, post_snap, step_rec) = execute_synthesized_step(
+                let (report, post_snap_kind, post_snap, step_rec) = execute_synthesized_step(
                     &step,
                     next_step_index,
                     step_vp.as_ref(),
@@ -3275,6 +3308,7 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
                     &state,
                     &step_rec,
                     &report,
+                    post_snap_kind.as_deref(),
                     post_snap.as_ref(),
                     &mut sessions,
                     &secrets,
@@ -4352,5 +4386,209 @@ mod tests {
             !dir.exists(),
             "duplicate start must not create sessions dir"
         );
+    }
+
+    #[test]
+    fn preview_frame_selects_capture_by_step_driver_and_skips_read_only_and_android() {
+        use crate::core::session::{MaskedViewportCapture, Session};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        struct FakeVisualSession {
+            png: Vec<u8>,
+            width: u32,
+            height: u32,
+        }
+        impl Session for FakeVisualSession {
+            fn close(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+                Ok(Some(MaskedViewportCapture {
+                    png: self.png.clone(),
+                    width: self.width,
+                    height: self.height,
+                }))
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("da-preview-driver-sel-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = SessionState {
+            schema_version: 1,
+            id: "s-mixed".to_string(),
+            created_at_ms: 1,
+            last_active_ms: 1,
+            idle_timeout_ms: 60_000,
+            handles: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            env_names: BTreeSet::new(),
+            observe: Vec::new(),
+            plugins: Vec::new(),
+            model_hook: None,
+            model: None,
+            preview_frames: true,
+            paused_for_human: false,
+            paused_reason: None,
+            paused_at_ms: None,
+        };
+        let secrets = Secrets::new();
+
+        // Register browser BEFORE desktop (matching BTreeMap handle reattach order).
+        let mut sessions = Sessions::new();
+        sessions
+            .insert_reattached(
+                "browser",
+                Box::new(FakeVisualSession {
+                    png: b"BROWSER_PNG_BYTES".to_vec(),
+                    width: 1280,
+                    height: 720,
+                }),
+            )
+            .unwrap();
+        sessions
+            .insert_reattached(
+                "desktop",
+                Box::new(FakeVisualSession {
+                    png: b"DESKTOP_PNG_BYTES".to_vec(),
+                    width: 1920,
+                    height: 1080,
+                }),
+            )
+            .unwrap();
+
+        let mk_step = |index: usize, action: &str| -> (StepRecord, StepReport) {
+            let record = StepRecord {
+                index,
+                action: action.to_string(),
+                raw_args: json!({}),
+                redacted_args: false,
+                status: "passed".to_string(),
+                duration_ms: 5,
+                result: Some(json!({})),
+                expect: Vec::new(),
+                save: BTreeMap::new(),
+                optional: false,
+                error: None,
+                started_at_ms: 10,
+                used_ref: None,
+                synthesized_locator: None,
+                fragile: false,
+                observed_viewport: None,
+                target_bounds: None,
+                model: None,
+                latency_ms: None,
+                usage: None,
+                trace_id: None,
+                confidence: None,
+            };
+            let report = StepReport {
+                name: action.to_string(),
+                status: StepStatus::Passed,
+                duration: std::time::Duration::from_millis(5),
+                args: Some(json!({})),
+                result: Some(json!({})),
+                saved: BTreeMap::new(),
+                assertions: Vec::new(),
+                error: None,
+                target_bounds: None,
+            };
+            (record, report)
+        };
+
+        // 1. Desktop step in mixed session must capture desktop PNG (1920x1080), not browser PNG,
+        //    and must not copy browser snapshot URL into desktop preview metadata.
+        let browser_snap = json!({ "url": "https://browser.example", "title": "Browser Tab" });
+        let (desk_rec, desk_rep) = mk_step(1, "desktop.click");
+        let desk_out = maybe_write_preview_frame(
+            &dir,
+            &state,
+            &desk_rec,
+            &desk_rep,
+            Some("browser"),
+            Some(&browser_snap),
+            &mut sessions,
+            &secrets,
+        );
+        assert!(desk_out.preview_path.is_some());
+        assert_eq!(
+            std::fs::read(dir.join(store::PREVIEW_IMAGE_FILE)).unwrap(),
+            b"DESKTOP_PNG_BYTES"
+        );
+        let desk_meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(store::PREVIEW_META_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(desk_meta["driver"], json!("desktop"));
+        assert_eq!(desk_meta["action"], json!("desktop.click"));
+        assert_eq!(
+            desk_meta["viewport"],
+            json!({ "width": 1920, "height": 1080 })
+        );
+        assert!(desk_meta["url"].is_null());
+
+        // 2. Browser step captures browser PNG (1280x720) and matching browser snapshot URL/title.
+        let (br_rec, br_rep) = mk_step(2, "browser.click");
+        let br_out = maybe_write_preview_frame(
+            &dir,
+            &state,
+            &br_rec,
+            &br_rep,
+            Some("browser"),
+            Some(&browser_snap),
+            &mut sessions,
+            &secrets,
+        );
+        assert!(br_out.preview_path.is_some());
+        assert_eq!(
+            std::fs::read(dir.join(store::PREVIEW_IMAGE_FILE)).unwrap(),
+            b"BROWSER_PNG_BYTES"
+        );
+        let br_meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(store::PREVIEW_META_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(br_meta["driver"], json!("browser"));
+        assert_eq!(br_meta["action"], json!("browser.click"));
+        assert_eq!(br_meta["viewport"], json!({ "width": 1280, "height": 720 }));
+        assert_eq!(br_meta["url"], json!("https://browser.example"));
+        assert_eq!(br_meta["title"], json!("Browser Tab"));
+
+        // 3. Read-only steps (`browser.read`, `desktop.read`) and non-session `android.*` steps
+        //    must NOT capture or overwrite preview files.
+        for skipped_action in [
+            "browser.read",
+            "desktop.read",
+            "browser.close",
+            "android.tap",
+        ] {
+            let (rec, rep) = mk_step(3, skipped_action);
+            let out = maybe_write_preview_frame(
+                &dir,
+                &state,
+                &rec,
+                &rep,
+                Some("browser"),
+                Some(&browser_snap),
+                &mut sessions,
+                &secrets,
+            );
+            assert!(
+                out.preview_path.is_none() && out.preview_error.is_none(),
+                "{skipped_action} must not emit preview"
+            );
+        }
+        // Latest preview remains step_seq 2 (`browser.click`).
+        let final_meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(store::PREVIEW_META_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(final_meta["step_seq"], json!(2));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

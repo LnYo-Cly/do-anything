@@ -1099,14 +1099,16 @@ model to spend extra tokens on `browser.screenshot` calls:
 
 1. **Opt-in side-channel masked frames (`preview_frames: true` / `--preview-frames`):**
    Pass `"preview_frames": true` to MCP `session_start` (or `--preview-frames`
-   to `da session start`). After every mutating UI step (`browser.*`, `desktop.*`,
-   `android.*`, `locate --click`, `act`), `da` atomically writes
-   `.da/sessions/<id>/preview.png` (captured through the `#000000` input-masked
-   screenshot path so passwords, `<input>` fields, and cross-origin iframes are
-   blacked out) followed by `.da/sessions/<id>/preview.json` (`schema_version`,
-   `session_id`, `url`, `title`, `viewport`, `step_seq`, `action`,
-   `target_bounds`, `status`, `paused_for_human`, `updated_at_ms`). No base64
-   image data is added to LLM `content`.
+   to `da session start`). After every mutating `browser.*` or `desktop.*` UI
+   step (plus `select-ref`, `locate --click`, and `act` UI steps; read-only
+   steps such as `browser.read`, `desktop.read`, `*.screenshot`, `*.close`, and
+   stateless `android.*` steps do not rewrite previews), `da` captures strictly
+   from the driver that executed the step via its `#000000` input-masked
+   screenshot path and atomically writes `.da/sessions/<id>/preview.png`
+   followed by `.da/sessions/<id>/preview.json` (`schema_version`, `session_id`,
+   `driver`, `url`, `title`, `viewport`, `step_seq`, `action`, `target_bounds`,
+   `status`, `paused_for_human`, `updated_at_ms`). No base64 image data is added
+   to LLM `content`.
 2. **Standard MCP `structuredContent`:**
    Every `da mcp` `tools/call` response keeps `content[0].text` for backward
    compatibility while populating `structuredContent` with the redacted JSON
