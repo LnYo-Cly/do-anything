@@ -80,11 +80,12 @@ impl ToolOutcome {
     }
 }
 
-/// Describes the six tools for `tools/list`.
+/// Describes the six base tools for `tools/list`.
 ///
-/// The schemas are written by hand because they describe this protocol, not a
-/// step: a step's own arguments schema comes from the registry and is echoed
-/// back when a `step` call is refused.
+/// Use [`definitions_for`] to include the optional model tools (`select_ref`,
+/// `locate`, `judge`). The schemas are written by hand because they describe
+/// this protocol, not a step: a step's own arguments schema comes from the
+/// registry and is echoed back when a `step` call is refused.
 pub fn definitions() -> Vec<Value> {
     vec![
         json!({
@@ -369,7 +370,7 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
     ) {
         return ToolOutcome::failed(refusal(message));
     }
-    let (model_hook, model) = match resolve_tool_models(context, arguments, &START_MODEL_KEYS) {
+    let (model_hook, model) = match resolve_start_models(context, arguments, &START_MODEL_KEYS) {
         Ok(pair) => pair,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
@@ -524,11 +525,10 @@ fn select_ref(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome 
         Ok(value) => value,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let (hook_override, model_override) =
-        match resolve_tool_models(context, arguments, &CALL_MODEL_KEYS) {
-            Ok(pair) => pair,
-            Err(message) => return ToolOutcome::failed(refusal(message)),
-        };
+    let (hook_override, model_override) = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(pair) => pair,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
     let timeout_ms = match optional_timeout_ms(arguments) {
         Ok(ms) => ms,
         Err(message) => return ToolOutcome::failed(refusal(message)),
@@ -597,11 +597,10 @@ fn locate(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
         Ok(value) => value,
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let (hook_override, model_override) =
-        match resolve_tool_models(context, arguments, &CALL_MODEL_KEYS) {
-            Ok(pair) => pair,
-            Err(message) => return ToolOutcome::failed(refusal(message)),
-        };
+    let (hook_override, model_override) = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(pair) => pair,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
     let timeout_ms = match optional_timeout_ms(arguments) {
         Ok(ms) => ms,
         Err(message) => return ToolOutcome::failed(refusal(message)),
@@ -659,11 +658,10 @@ fn judge(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
         Ok(flag) => flag.unwrap_or(false),
         Err(message) => return ToolOutcome::failed(refusal(message)),
     };
-    let (hook_override, model_override) =
-        match resolve_tool_models(context, arguments, &CALL_MODEL_KEYS) {
-            Ok(pair) => pair,
-            Err(message) => return ToolOutcome::failed(refusal(message)),
-        };
+    let (hook_override, model_override) = match resolve_call_models(arguments, &CALL_MODEL_KEYS) {
+        Ok(pair) => pair,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
     let timeout_ms = match optional_timeout_ms(arguments) {
         Ok(ms) => ms,
         Err(message) => return ToolOutcome::failed(refusal(message)),
@@ -976,8 +974,10 @@ fn optional_model_spec(
     }
 }
 
-fn resolve_tool_models(
-    context: &Context,
+/// Parses per-call model/hook overrides without substituting server defaults,
+/// so session-level `model` / `model_hook` persisted at `session_start` remain
+/// authoritative unless explicitly overridden on the call.
+fn resolve_call_models(
     arguments: &Map<String, Value>,
     keys: &ModelOptionKeys<'_>,
 ) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
@@ -989,6 +989,17 @@ fn resolve_tool_models(
             keys.hook, keys.model
         ));
     }
+    Ok((hook, model))
+}
+
+/// Resolves session-start model/hook config, falling back to the MCP server's
+/// startup defaults only when the caller omits both `model_hook` and `model`.
+fn resolve_start_models(
+    context: &Context,
+    arguments: &Map<String, Value>,
+    keys: &ModelOptionKeys<'_>,
+) -> Result<(Option<ModelHookSpec>, Option<BuiltinModelSpec>), String> {
+    let (hook, model) = resolve_call_models(arguments, keys)?;
     if hook.is_some() || model.is_some() {
         Ok((hook, model))
     } else {
@@ -1357,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn model_and_hook_overrides_are_mutually_exclusive_and_override_server_defaults() {
+    fn model_and_hook_overrides_are_mutually_exclusive_and_preserve_session_precedence() {
         let registry = registry();
         let default_model = BuiltinModelSpec {
             model: "openai::gpt-4o-mini".to_string(),
@@ -1371,20 +1382,46 @@ mod tests {
         let mut both = Map::new();
         both.insert("hook".to_string(), json!("./hook"));
         both.insert("model".to_string(), json!("deepseek::deepseek-chat"));
-        let err = resolve_tool_models(&ctx, &both, &CALL_MODEL_KEYS)
+        let err = resolve_call_models(&both, &CALL_MODEL_KEYS)
             .expect_err("hook and model together must fail");
         assert!(err.contains("not both"), "got: {err}");
 
-        let mut hook_only = Map::new();
-        hook_only.insert("hook".to_string(), json!("./hook"));
-        let (hook, model) = resolve_tool_models(&ctx, &hook_only, &CALL_MODEL_KEYS)
-            .expect("hook override suppresses server default model");
+        // Omitting per-call args must leave overrides `None` so session-level
+        // `model` / `model_hook` persisted by `session_start` are not shadowed.
+        let empty = Map::new();
+        let (call_hook, call_model) =
+            resolve_call_models(&empty, &CALL_MODEL_KEYS).expect("empty call args must not fail");
+        assert!(call_hook.is_none());
+        assert!(call_model.is_none());
+
+        // `session_start` inherits server defaults when both args are omitted,
+        // and overrides server defaults when the caller specifies `model_hook`.
+        let (start_default_hook, start_default_model) =
+            resolve_start_models(&ctx, &empty, &START_MODEL_KEYS)
+                .expect("empty session_start inherits server default");
+        assert!(start_default_hook.is_none());
+        assert_eq!(
+            start_default_model.as_ref().map(|m| m.model.as_str()),
+            Some("openai::gpt-4o-mini")
+        );
+
+        let mut start_hook_only = Map::new();
+        start_hook_only.insert("model_hook".to_string(), json!("./hook"));
+        let (hook, model) = resolve_start_models(&ctx, &start_hook_only, &START_MODEL_KEYS)
+            .expect("session_start hook suppresses server default model");
+        assert!(hook.is_some());
+        assert!(model.is_none());
+
+        let mut call_hook_only = Map::new();
+        call_hook_only.insert("hook".to_string(), json!("./hook"));
+        let (hook, model) = resolve_call_models(&call_hook_only, &CALL_MODEL_KEYS)
+            .expect("per-call hook override succeeds");
         assert!(hook.is_some());
         assert!(model.is_none());
 
         let mut orphan_endpoint = Map::new();
         orphan_endpoint.insert("endpoint".to_string(), json!("http://127.0.0.1:8000/v1"));
-        let err = resolve_tool_models(&ctx, &orphan_endpoint, &CALL_MODEL_KEYS)
+        let err = resolve_call_models(&orphan_endpoint, &CALL_MODEL_KEYS)
             .expect_err("endpoint without model must fail");
         assert!(err.contains("requires `model`"), "got: {err}");
     }

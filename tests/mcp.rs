@@ -1256,4 +1256,148 @@ mod ai_mcp_tests {
         let _ = server.call_tool(4, "session_stop", json!({"session_id": session_id}));
         server.finish();
     }
+
+    #[test]
+    fn mcp_session_start_model_and_hook_override_server_defaults() {
+        let dir = TempDir::new("mcp-session-model-precedence");
+        let server_mock = McpModelMock::start(json!({
+            "passed": true,
+            "rationale": "from server default",
+            "confidence": 0.9
+        }));
+        let session_mock = McpModelMock::start(json!({
+            "passed": true,
+            "rationale": "from session model",
+            "confidence": 0.95
+        }));
+
+        let hook_src = dir.write("mcp_session_override_hook.rs", MCP_MOCK_HOOK_RS);
+        let hook_bin = dir.path().join(if cfg!(windows) {
+            "mcp_session_override_hook.exe"
+        } else {
+            "mcp_session_override_hook"
+        });
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let status = Command::new(rustc)
+            .arg(&hook_src)
+            .arg("-O")
+            .arg("-o")
+            .arg(&hook_bin)
+            .status()
+            .expect("compile mcp_session_override_hook.rs");
+        assert!(
+            status.success(),
+            "rustc failed for mcp_session_override_hook.rs"
+        );
+
+        let mut child = Command::new(da())
+            .arg("mcp")
+            .arg("--model")
+            .arg("omlx::server-default")
+            .arg("--model-endpoint")
+            .arg(server_mock.endpoint())
+            .current_dir(dir.path())
+            .env(SECRET_VARIABLE, SECRET)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start `da mcp --model`");
+        let stdin = child.stdin.take().expect("mcp stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+        let mut server = Server {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            seen: String::new(),
+        };
+        server.initialize();
+
+        // 1. Session configured with its own built-in model must NOT be shadowed by server default.
+        let s_model = payload(&server.call_tool(
+            1,
+            "session_start",
+            json!({
+                "model": "omlx::session-custom",
+                "model_endpoint": session_mock.endpoint()
+            }),
+        ));
+        let s_model_id = s_model["session_id"].as_str().unwrap().to_string();
+        let judged_session_model = server.call_tool(
+            2,
+            "judge",
+            json!({
+                "session_id": s_model_id,
+                "rubric": "check session model",
+                "evidence": {"ok": true}
+            }),
+        );
+        assert!(!failed(&judged_session_model), "{judged_session_model}");
+        assert_eq!(
+            payload(&judged_session_model)["rationale"],
+            "from session model"
+        );
+        assert_eq!(session_mock.requests.lock().unwrap().len(), 1);
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 0);
+
+        // 2. Session configured with a `model_hook` must NOT be shadowed by server `--model`.
+        let s_hook = payload(&server.call_tool(
+            3,
+            "session_start",
+            json!({
+                "model_hook": hook_bin.to_string_lossy().to_string()
+            }),
+        ));
+        let s_hook_id = s_hook["session_id"].as_str().unwrap().to_string();
+        let judged_session_hook = server.call_tool(
+            4,
+            "judge",
+            json!({
+                "session_id": s_hook_id,
+                "rubric": "check session hook",
+                "evidence": {"ok": true}
+            }),
+        );
+        assert!(!failed(&judged_session_hook), "{judged_session_hook}");
+        assert_eq!(payload(&judged_session_hook)["model"], "mcp-judge-v1");
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 0);
+
+        // 3. Explicit per-call `model` still overrides the session's `model_hook`.
+        let judged_per_call = server.call_tool(
+            5,
+            "judge",
+            json!({
+                "session_id": s_hook_id,
+                "rubric": "check per-call override",
+                "evidence": {"ok": true},
+                "model": "omlx::call-override",
+                "endpoint": session_mock.endpoint()
+            }),
+        );
+        assert!(!failed(&judged_per_call), "{judged_per_call}");
+        assert_eq!(payload(&judged_per_call)["rationale"], "from session model");
+        assert_eq!(session_mock.requests.lock().unwrap().len(), 2);
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 0);
+
+        // 4. Session with no explicit model inherits the server default persisted at `session_start`.
+        let s_default = payload(&server.call_tool(6, "session_start", json!({})));
+        let s_default_id = s_default["session_id"].as_str().unwrap().to_string();
+        let judged_default = server.call_tool(
+            7,
+            "judge",
+            json!({
+                "session_id": s_default_id,
+                "rubric": "check server default",
+                "evidence": {"ok": true}
+            }),
+        );
+        assert!(!failed(&judged_default), "{judged_default}");
+        assert_eq!(payload(&judged_default)["rationale"], "from server default");
+        assert_eq!(server_mock.requests.lock().unwrap().len(), 1);
+
+        let _ = server.call_tool(8, "session_stop", json!({"session_id": s_model_id}));
+        let _ = server.call_tool(9, "session_stop", json!({"session_id": s_hook_id}));
+        let _ = server.call_tool(10, "session_stop", json!({"session_id": s_default_id}));
+        server.finish();
+    }
 }

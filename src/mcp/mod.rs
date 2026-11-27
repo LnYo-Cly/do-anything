@@ -8,10 +8,13 @@
 //! `Content-Length` framing of the Language Server Protocol, and every response
 //! mirrors the framing of the request it answers.
 //!
-//! The tools are fixed at six, so the size of the tool list never depends on
-//! which driver features a build enabled: `session_start`, `step`, `snapshot`,
-//! `export`, `run` and `session_stop`. `step` is the single generic step tool
-//! and takes the same `use`/`with`/`expect`/`save` step a case file holds.
+//! The base tool set is fixed at six, so its shape never depends on which
+//! driver features a build enabled: `session_start`, `step`, `snapshot`,
+//! `export`, `run` and `session_stop`. When model access is configured on
+//! `da mcp` (`--model`, `--model-hook`, or `DA_MODEL`), `tools/list` also
+//! exposes `select_ref`, `locate`, and `judge` (nine tools total). `step` is
+//! the single generic step tool and takes the same `use`/`with`/`expect`/`save`
+//! step a case file holds.
 //!
 //! Standard output carries responses and nothing else, so a host can parse it
 //! without stripping diagnostics. Everything written back passes through
