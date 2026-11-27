@@ -302,6 +302,7 @@ mod tests {
                 duration: Duration::from_millis(2),
                 args: None,
                 result: None,
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: error.clone(),

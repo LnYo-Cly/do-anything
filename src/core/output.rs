@@ -673,16 +673,30 @@ pub fn step_json(step: &StepReport) -> Value {
 }
 
 fn step_value(step: &StepReport) -> Value {
-    json!({
-        "name": step.name,
-        "status": step.status.as_str(),
-        "duration_ms": millis(step.duration),
-        "args": step.args,
-        "result": step.result,
-        "saved": step.saved,
-        "assertions": step.assertions.iter().map(assertion_value).collect::<Vec<Value>>(),
-        "error": step.error.as_ref().map(problem_value),
-    })
+    let mut object = Map::new();
+    object.insert("name".to_string(), json!(step.name));
+    object.insert("status".to_string(), json!(step.status.as_str()));
+    object.insert("duration_ms".to_string(), json!(millis(step.duration)));
+    object.insert("args".to_string(), json!(step.args));
+    object.insert("result".to_string(), json!(step.result));
+    if let Some(target_bounds) = &step.target_bounds {
+        object.insert("target_bounds".to_string(), target_bounds.clone());
+    }
+    object.insert("saved".to_string(), json!(step.saved));
+    object.insert(
+        "assertions".to_string(),
+        json!(
+            step.assertions
+                .iter()
+                .map(assertion_value)
+                .collect::<Vec<Value>>()
+        ),
+    );
+    object.insert(
+        "error".to_string(),
+        json!(step.error.as_ref().map(problem_value)),
+    );
+    Value::Object(object)
 }
 
 fn assertion_value(assertion: &AssertionReport) -> Value {
@@ -1415,6 +1429,7 @@ mod tests {
                     duration: Duration::from_millis(2),
                     args: None,
                     result: Some(json!({"status": 200})),
+                    target_bounds: None,
                     saved: BTreeMap::new(),
                     assertions: vec![AssertionReport {
                         path: "$.status".to_string(),
@@ -1466,6 +1481,7 @@ mod tests {
                         duration: Duration::from_millis(2),
                         args: None,
                         result: Some(json!({"found": false})),
+                        target_bounds: None,
                         saved: BTreeMap::new(),
                         assertions: vec![AssertionReport {
                             path: "$.found".to_string(),
@@ -1486,6 +1502,7 @@ mod tests {
                         duration: Duration::from_millis(1),
                         args: None,
                         result: Some(json!({"ok": true})),
+                        target_bounds: None,
                         saved: BTreeMap::new(),
                         assertions: Vec::new(),
                         error: None,
@@ -1566,6 +1583,7 @@ mod tests {
             duration: Duration::ZERO,
             args: None,
             result: None,
+            target_bounds: None,
             saved: BTreeMap::new(),
             assertions: Vec::new(),
             error: None,
@@ -2023,6 +2041,7 @@ mod tests {
                 duration: Duration::from_millis(2),
                 args: None,
                 result: Some(json!({ "token": "s3cr3t-value" })),
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {
@@ -2036,6 +2055,7 @@ mod tests {
                 duration: Duration::from_millis(1),
                 args: None,
                 result: None,
+                target_bounds: None,
                 saved: BTreeMap::new(),
                 assertions: Vec::new(),
                 error: Some(Problem {

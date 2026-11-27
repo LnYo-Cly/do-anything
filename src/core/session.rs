@@ -176,6 +176,12 @@ pub trait Session: Send + AsAny {
         None
     }
 
+    /// Returns UI target geometry (`target_bounds`) captured by the most recent
+    /// step on this session, clearing it afterward.
+    fn take_target_bounds(&mut self) -> Option<Value> {
+        None
+    }
+
     /// Returns a reason why evidence from this session must stay local-only,
     /// or `None` when source-based redaction covers all state.
     fn local_only_reason(&self) -> Option<String> {
@@ -251,6 +257,8 @@ pub struct Sessions {
     base_directory: Option<PathBuf>,
     /// Whether steps execute inside an interactive `da session` command.
     interactive: bool,
+    /// Optional per-step target geometry recorded by stateless steps.
+    last_target_bounds: Option<Value>,
 }
 
 /// One open session and the kind it is stored under.
@@ -496,6 +504,27 @@ impl Sessions {
             }
         }
         out
+    }
+
+    /// Records UI target geometry (`target_bounds`) for the step currently executing.
+    ///
+    /// Stateless steps without a persistent [`Session`] call this directly;
+    /// stateful sessions may instead implement [`Session::take_target_bounds`].
+    pub fn record_target_bounds(&mut self, bounds: Value) {
+        self.last_target_bounds = Some(bounds);
+    }
+
+    /// Collects and clears any `target_bounds` recorded during the most recent step.
+    pub fn take_target_bounds(&mut self) -> Option<Value> {
+        let mut found = self.last_target_bounds.take();
+        for entry in &mut self.entries {
+            if let Some(bounds) = entry.session.take_target_bounds()
+                && found.is_none()
+            {
+                found = Some(bounds);
+            }
+        }
+        found
     }
 
     /// Captures an input-masked PNG and surface dimensions from the first open

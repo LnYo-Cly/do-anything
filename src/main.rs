@@ -209,7 +209,7 @@ struct CompareArgs {
 
 #[derive(Debug, Args)]
 struct ReportArgs {
-    /// Directory written by `da run --record`, or one `.da/failures/<run>`.
+    /// Directory written by `da run --record`, one `.da/failures/<run>`, or a `.da/sessions/<id>` session.
     #[arg(value_name = "DIRECTORY")]
     directory: PathBuf,
     /// Write the report here instead of `<directory>/report.html`.
