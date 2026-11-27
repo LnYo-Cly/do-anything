@@ -283,6 +283,9 @@ struct SessionStartArgs {
     /// Attach a declared observer (`NAME=KIND`, `NAME=KIND:key=val`, or YAML/JSON mapping). Repeat for more than one.
     #[arg(long = "observe", value_name = "SPEC")]
     observe: Vec<String>,
+    /// Atomically write input-masked `preview.png` and `preview.json` after UI steps without adding images to LLM content.
+    #[arg(long)]
+    preview_frames: bool,
     #[command(flatten)]
     model: ModelStartArgs,
 }
@@ -452,6 +455,28 @@ struct SessionExportArgs {
     yaml: bool,
 }
 
+#[cfg(feature = "live-preview")]
+#[derive(Debug, Args)]
+struct SessionPreviewBridgeArgs {
+    /// Session identifier returned by `da session start`.
+    id: String,
+    /// Loopback TCP port on `127.0.0.1` (`0` selects an ephemeral port).
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+    /// Screencast image format (`jpeg` or `png`).
+    #[arg(long, default_value = "jpeg")]
+    format: String,
+    /// JPEG compression quality (`1..=100`).
+    #[arg(long, default_value_t = 80)]
+    quality: u8,
+    /// Optional maximum screencast frame width in pixels.
+    #[arg(long)]
+    max_width: Option<u32>,
+    /// Optional maximum screencast frame height in pixels.
+    #[arg(long)]
+    max_height: Option<u32>,
+}
+
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     /// Create a new interactive session directory.
@@ -460,6 +485,22 @@ enum SessionCommand {
     Step(Box<SessionStepArgs>),
     /// Take an accessibility snapshot without executing a step.
     Snapshot(Box<SessionSnapshotArgs>),
+    /// Pause an active session for human takeover, immediately rejecting queued agent steps.
+    Pause {
+        /// Session identifier returned by `da session start`.
+        id: String,
+        /// Optional human-readable reason recorded in `state.json` and `preview.json`.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
+    /// Resume a paused session so queued agent steps can proceed again.
+    Resume {
+        /// Session identifier returned by `da session start`.
+        id: String,
+    },
+    /// Run the opt-in `127.0.0.1` loopback bearer-authenticated CDP screencast & takeover bridge.
+    #[cfg(feature = "live-preview")]
+    PreviewBridge(Box<SessionPreviewBridgeArgs>),
     /// Choose a candidate `ref` from the active snapshot using the built-in model or an external `model/select_ref` hook.
     SelectRef(Box<SessionSelectRefArgs>),
     /// Capture an input-masked screenshot, invoke `model/locate`, and reverse-synthesize a deterministic locator.
@@ -923,7 +964,18 @@ fn run_session(
                 model_hook: resolved_models.hook,
                 model: resolved_models.model,
                 plugins: session_plugins.to_vec(),
+                preview_frames: args.preview_frames,
             }
+        }
+        SessionCommand::Pause { id, reason } => SessionRequest::Pause {
+            sessions_dir,
+            id,
+            reason,
+        },
+        SessionCommand::Resume { id } => SessionRequest::Resume { sessions_dir, id },
+        #[cfg(feature = "live-preview")]
+        SessionCommand::PreviewBridge(args) => {
+            return run_preview_bridge(sessions_dir, *args, format);
         }
         SessionCommand::Step(args) => {
             let args = *args;
@@ -1142,6 +1194,56 @@ fn session_usage_error(format: OutputFormat, message: &str) -> ExitCode {
         let _ = write_stderr(&format!("error: {message}\n"));
     }
     DaExitCode::Usage.into()
+}
+
+#[cfg(feature = "live-preview")]
+fn run_preview_bridge(
+    sessions_dir: PathBuf,
+    args: SessionPreviewBridgeArgs,
+    format: OutputFormat,
+) -> ExitCode {
+    use do_anything::session::live_preview::{BridgeConfig, LivePreviewBridge};
+
+    let config = BridgeConfig {
+        sessions_dir,
+        session_id: args.id,
+        port: args.port,
+        format: args.format,
+        quality: args.quality,
+        max_width: args.max_width,
+        max_height: args.max_height,
+    };
+    if let Err(message) = config.validate() {
+        return session_usage_error(format, &message);
+    }
+    let mut bridge = match LivePreviewBridge::start(config) {
+        Ok(bridge) => bridge,
+        Err(message) => {
+            if format == OutputFormat::Json {
+                let err = serde_json::json!({
+                    "ok": false,
+                    "error": { "kind": "environment", "message": message }
+                });
+                let _ = write_stdout(&format!("{err}\n"));
+            } else {
+                let _ = write_stderr(&format!("error: {message}\n"));
+            }
+            return DaExitCode::Environment.into();
+        }
+    };
+    let announcement = bridge.announcement_json();
+    let _ = write_stdout(&format!("{announcement}\n"));
+    // Keep serving until the parent host closes stdin (or the process receives SIGINT/SIGTERM).
+    let mut stdin = io::stdin().lock();
+    let mut buf = [0u8; 64];
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    bridge.shutdown();
+    DaExitCode::Success.into()
 }
 
 /// Deduplicates explicit `--plugin` paths on this invocation while preserving order.

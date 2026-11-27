@@ -30,20 +30,24 @@ use crate::session::{
 };
 
 /// Names of the base tools, in the order `tools/list` reports them without server model config.
-pub const NAMES: [&str; 6] = [
+pub const NAMES: [&str; 8] = [
     "session_start",
     "step",
     "snapshot",
+    "pause_for_human",
+    "resume",
     "export",
     "run",
     "session_stop",
 ];
 
 /// Names of all tools exposed when `--model-hook`, `--model`, or `DA_MODEL` is configured on `da mcp`.
-pub const ALL_NAMES: [&str; 11] = [
+pub const ALL_NAMES: [&str; 13] = [
     "session_start",
     "step",
     "snapshot",
+    "pause_for_human",
+    "resume",
     "select_ref",
     "locate",
     "judge",
@@ -100,6 +104,8 @@ pub fn definitions() -> Vec<Value> {
         session_start_definition(),
         step_definition(),
         snapshot_definition(),
+        pause_for_human_definition(),
+        resume_definition(),
         export_definition(),
         run_definition(),
         session_stop_definition(),
@@ -114,6 +120,10 @@ fn session_start_definition() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "preview_frames": {
+                    "type": "boolean",
+                    "description": "When true, atomically write input-masked `.da/sessions/<id>/preview.png` and `preview.json` after mutating UI steps without adding base64 images to LLM `content`.",
+                },
                 "model_hook": {
                     "type": "string",
                     "description": "Optional external JSON-RPC 2.0 model hook executable persisted for `select_ref`, `locate`, and `judge`.",
@@ -286,6 +296,40 @@ fn session_stop_definition() -> Value {
     })
 }
 
+fn pause_for_human_definition() -> Value {
+    json!({
+        "name": "pause_for_human",
+        "description": "Pauses an active session for human takeover (`paused_for_human: true`). Queued agent steps are immediately refused until `resume` is called.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason for pausing (for example login, 2FA, or visual confirmation).",
+                },
+            },
+        },
+    })
+}
+
+fn resume_definition() -> Value {
+    json!({
+        "name": "resume",
+        "description": "Resumes a session paused by `pause_for_human` so agent steps can proceed again.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["session_id"],
+            "properties": {
+                "session_id": {"type": "string", "description": "Identifier returned by `session_start`."},
+            },
+        },
+    })
+}
+
 /// Describes `tools/list`, including `select_ref`, `locate`, `judge`, `extract`,
 /// and `act` when `--model-hook`, `--model`, or `DA_MODEL` is configured on `da mcp`.
 pub fn definitions_for(include_model_hooks: bool) -> Vec<Value> {
@@ -294,8 +338,8 @@ pub fn definitions_for(include_model_hooks: bool) -> Vec<Value> {
         return base;
     }
     let hook_defs = model_hook_definitions();
-    // Insert right after `snapshot` (index 3) so exploration tools stay grouped.
-    base.splice(3..3, hook_defs);
+    // Insert right after `resume` (index 5) so exploration tools stay grouped.
+    base.splice(5..5, hook_defs);
     base
 }
 
@@ -479,6 +523,8 @@ pub fn call(context: &Context, name: &str, arguments: &Map<String, Value>) -> Op
         "session_start" => session_start(context, arguments),
         "step" => step(context, arguments),
         "snapshot" => snapshot(context, arguments),
+        "pause_for_human" => pause_for_human(context, arguments),
+        "resume" => resume(context, arguments),
         "select_ref" => select_ref(context, arguments),
         "locate" => locate(context, arguments),
         "judge" => judge(context, arguments),
@@ -497,6 +543,7 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
     if let Err(message) = only(
         arguments,
         &[
+            "preview_frames",
             "model_hook",
             "model_hook_args",
             "model",
@@ -508,6 +555,10 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
     ) {
         return ToolOutcome::failed(refusal(message));
     }
+    let preview_frames = match optional_flag(arguments, "preview_frames") {
+        Ok(value) => value.unwrap_or(false),
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
     let resolved_models = match resolve_start_models(context, arguments, &START_MODEL_KEYS) {
         Ok(models) => models,
         Err(message) => return ToolOutcome::failed(refusal(message)),
@@ -520,6 +571,46 @@ fn session_start(context: &Context, arguments: &Map<String, Value>) -> ToolOutco
             model_hook: resolved_models.hook,
             model: resolved_models.model,
             plugins: context.plugins.to_vec(),
+            preview_frames,
+        },
+        context.registry,
+    ))
+}
+
+fn pause_for_human(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
+    if let Err(message) = only(arguments, &["session_id", "reason"]) {
+        return ToolOutcome::failed(refusal(message));
+    }
+    let session_id = match text_argument(arguments, "session_id") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    let reason = match optional_text(arguments, "reason") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    from_response(session::handle(
+        SessionRequest::Pause {
+            sessions_dir: context.sessions_dir.to_path_buf(),
+            id: session_id,
+            reason,
+        },
+        context.registry,
+    ))
+}
+
+fn resume(context: &Context, arguments: &Map<String, Value>) -> ToolOutcome {
+    if let Err(message) = only(arguments, &["session_id"]) {
+        return ToolOutcome::failed(refusal(message));
+    }
+    let session_id = match text_argument(arguments, "session_id") {
+        Ok(value) => value,
+        Err(message) => return ToolOutcome::failed(refusal(message)),
+    };
+    from_response(session::handle(
+        SessionRequest::Resume {
+            sessions_dir: context.sessions_dir.to_path_buf(),
+            id: session_id,
         },
         context.registry,
     ))

@@ -6,6 +6,8 @@
 //! without ever persisting resolved environment secrets.
 
 pub mod export;
+#[cfg(feature = "live-preview")]
+pub mod live_preview;
 #[cfg(feature = "ai")]
 pub(crate) mod model_ai;
 pub mod model_hook;
@@ -167,6 +169,7 @@ pub enum SessionRequest {
         model_hook: Option<ModelHookSpec>,
         model: Option<BuiltinModelSpec>,
         plugins: Vec<String>,
+        preview_frames: bool,
     },
     Step {
         sessions_dir: PathBuf,
@@ -180,6 +183,15 @@ pub enum SessionRequest {
         scope_ref: Option<String>,
         max_depth: Option<usize>,
         max_nodes: Option<usize>,
+    },
+    Pause {
+        sessions_dir: PathBuf,
+        id: String,
+        reason: Option<String>,
+    },
+    Resume {
+        sessions_dir: PathBuf,
+        id: String,
     },
     SelectRef(SelectRefRequest),
     Locate(LocateRequest),
@@ -223,6 +235,7 @@ pub fn handle(request: SessionRequest, registry: &Registry) -> SessionResponse {
             model_hook,
             model,
             plugins,
+            preview_frames,
         } => handle_start(
             &sessions_dir,
             idle_timeout_ms,
@@ -230,6 +243,7 @@ pub fn handle(request: SessionRequest, registry: &Registry) -> SessionResponse {
             model_hook,
             model,
             plugins,
+            preview_frames,
             registry,
         ),
         SessionRequest::Step {
@@ -252,6 +266,12 @@ pub fn handle(request: SessionRequest, registry: &Registry) -> SessionResponse {
             max_nodes,
             registry,
         ),
+        SessionRequest::Pause {
+            sessions_dir,
+            id,
+            reason,
+        } => handle_pause(&sessions_dir, &id, reason.as_deref()),
+        SessionRequest::Resume { sessions_dir, id } => handle_resume(&sessions_dir, &id),
         SessionRequest::SelectRef(req) => handle_select_ref(req, registry),
         SessionRequest::Locate(req) => handle_locate(req, registry),
         SessionRequest::Judge(req) => handle_judge(req, registry),
@@ -286,6 +306,7 @@ fn error_response(code: ExitCode, kind: &str, message: impl Into<String>) -> Ses
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_start(
     sessions_dir: &Path,
     idle_timeout_ms: u64,
@@ -293,6 +314,7 @@ fn handle_start(
     model_hook: Option<ModelHookSpec>,
     mut model: Option<BuiltinModelSpec>,
     plugins: Vec<String>,
+    preview_frames: bool,
     registry: &Registry,
 ) -> SessionResponse {
     if model_hook.is_some() && model.is_some() {
@@ -404,6 +426,10 @@ fn handle_start(
         plugins,
         model_hook,
         model,
+        preview_frames,
+        paused_for_human: false,
+        paused_reason: None,
+        paused_at_ms: None,
     };
     if let Err(message) = store::save_state(&session_dir, &state, &secrets) {
         let _ = store::remove_session_dir(&session_dir);
@@ -421,9 +447,17 @@ fn handle_start(
         "idle_timeout_ms": idle_timeout_ms,
         "observers": observer_names,
         "plugins": state.plugins,
+        "preview_frames": preview_frames,
+        "paused_for_human": false,
         "reaped": list_report.reaped,
         "reap_errors": list_report.errors,
     });
+    if preview_frames {
+        payload["preview_path"] =
+            Value::String(paths::display(&session_dir.join(store::PREVIEW_IMAGE_FILE)));
+        payload["preview_meta_path"] =
+            Value::String(paths::display(&session_dir.join(store::PREVIEW_META_FILE)));
+    }
     if let Some(cmd) = hook_display {
         payload["model_hook"] = Value::String(cmd);
     }
@@ -561,6 +595,9 @@ fn handle_step(
     };
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
+    if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+        return paused_rejection_response(&state, &secrets);
+    }
     let effective_registry = match resolve_target_session_registry(&state.plugins, registry) {
         Ok(reg) => reg,
         Err((code, kind, message)) => return error_response(code, kind, secrets.redact(&message)),
@@ -617,12 +654,16 @@ fn handle_step(
     let synthesis = extract_synthesis(&step, &step_meta);
 
     let mut snapshot_error: Option<String> = None;
+    let mut snapshot_kind: Option<String> = None;
     let snapshot = if !matches!(
         report.error.as_ref().map(|problem| problem.kind),
         Some(ProblemKind::Environment)
     ) {
         match sessions.collect_step_snapshot() {
-            Ok(Some((_kind, snap))) => Some(secrets.redact_json(&snap)),
+            Ok(Some((kind, snap))) => {
+                snapshot_kind = Some(kind);
+                Some(secrets.redact_json(&snap))
+            }
             Ok(None) => None,
             Err(err) => {
                 let redacted = secrets.redact(&err);
@@ -648,11 +689,6 @@ fn handle_step(
         None
     };
 
-    let local_only_reason = sessions.local_only_reason();
-    let detached = sessions.detach_all();
-    state.handles = detached.handles;
-    state.last_active_ms = store::now_ms();
-
     let existing_steps = store::load_steps(&session_dir).unwrap_or_default();
     let record = build_step_record(
         existing_steps.len() + 1,
@@ -662,6 +698,23 @@ fn handle_step(
         started_at_ms,
         synthesis,
     );
+
+    let preview_outcome = maybe_write_preview_frame(
+        &session_dir,
+        &state,
+        &record,
+        &report,
+        snapshot_kind.as_deref(),
+        snapshot.as_ref(),
+        &mut sessions,
+        &secrets,
+    );
+
+    let local_only_reason = sessions.local_only_reason();
+    let detached = sessions.detach_all();
+    state.handles = detached.handles;
+    state.last_active_ms = store::now_ms();
+
     if let Err(err) = store::append_step(&session_dir, &record, &secrets) {
         return error_response(ExitCode::Environment, "environment", secrets.redact(&err));
     }
@@ -682,6 +735,7 @@ fn handle_step(
     let mut payload = json!({
         "ok": ok,
         "session_id": state.id,
+        "paused_for_human": state.paused_for_human,
         "step": output::step_json(&report),
     });
     if let Some(snap) = snapshot {
@@ -690,6 +744,7 @@ fn handle_step(
     if let Some(err) = snapshot_error {
         payload["snapshot_error"] = Value::String(err);
     }
+    preview_outcome.apply_to_payload(&mut payload);
     if !detached.errors.is_empty() {
         payload["detach_errors"] = json!(detached.errors);
     }
@@ -772,6 +827,7 @@ fn handle_snapshot(
     let payload = json!({
         "ok": detached.errors.is_empty(),
         "session_id": state.id,
+        "paused_for_human": state.paused_for_human,
         "snapshot": snapshot,
     });
     SessionResponse {
@@ -783,6 +839,332 @@ fn handle_snapshot(
         payload: secrets.redact_json(&payload),
         raw_yaml: None,
         raw_text: None,
+    }
+}
+
+/// Persists `paused_for_human = true` for an existing session directory.
+///
+/// Writes `paused.json` atomically without waiting on `SessionLock` so an
+/// emergency stop immediately interrupts an in-flight `act` loop, and updates
+/// `state.json` + `preview.json` immediately when the lock is free.
+pub fn pause_session_dir(
+    session_dir: &Path,
+    id: &str,
+    reason: Option<&str>,
+) -> Result<Value, (ExitCode, &'static str, String)> {
+    if !session_dir.is_dir() || !session_dir.join(store::STATE_FILE).is_file() {
+        return Err((
+            ExitCode::Environment,
+            "not_found",
+            format!("session `{id}` does not exist; run `da session start` first"),
+        ));
+    }
+    let state = store::load_state(session_dir)
+        .map_err(|msg| (ExitCode::Environment, "environment", msg))?;
+    let mut env_names = state.env_names.clone();
+    if let Some(reason_text) = reason {
+        env_names.extend(case::env_references(&Value::String(
+            reason_text.to_string(),
+        )));
+    }
+    let secrets = store::secrets_from_env_names(&env_names);
+    let now = store::now_ms();
+    let flag = store::write_pause_flag(session_dir, reason, now, &secrets)
+        .map_err(|msg| (ExitCode::Environment, "environment", secrets.redact(&msg)))?;
+
+    if let Ok(_lock) = SessionLock::try_acquire(session_dir, id)
+        && let Ok(mut locked_state) = store::load_state(session_dir)
+    {
+        locked_state.paused_for_human = true;
+        locked_state.paused_reason = flag.reason.clone();
+        locked_state.paused_at_ms = Some(flag.paused_at_ms);
+        locked_state.last_active_ms = now;
+        let _ = store::save_state(session_dir, &locked_state, &secrets);
+        let _ =
+            store::update_preview_paused(session_dir, true, flag.reason.as_deref(), now, &secrets);
+    }
+
+    let mut payload = json!({
+        "ok": true,
+        "session_id": id,
+        "paused_for_human": true,
+        "paused_at_ms": flag.paused_at_ms,
+    });
+    if let Some(reason_text) = &flag.reason {
+        payload["paused_reason"] = Value::String(reason_text.clone());
+    }
+    let meta_path = session_dir.join(store::PREVIEW_META_FILE);
+    if meta_path.is_file() {
+        payload["preview_path"] =
+            Value::String(paths::display(&session_dir.join(store::PREVIEW_IMAGE_FILE)));
+        payload["preview_meta_path"] = Value::String(paths::display(&meta_path));
+    }
+    Ok(secrets.redact_json(&payload))
+}
+
+/// Clears `paused_for_human` for an existing session directory so agent steps
+/// can proceed again.
+pub fn resume_session_dir(
+    session_dir: &Path,
+    id: &str,
+) -> Result<Value, (ExitCode, &'static str, String)> {
+    if !session_dir.is_dir() || !session_dir.join(store::STATE_FILE).is_file() {
+        return Err((
+            ExitCode::Environment,
+            "not_found",
+            format!("session `{id}` does not exist; run `da session start` first"),
+        ));
+    }
+    let _lock = SessionLock::try_acquire(session_dir, id).map_err(|err| match err {
+        LockError::Busy(msg) => (ExitCode::Environment, "busy", msg),
+        LockError::Io(msg) => (ExitCode::Environment, "environment", msg),
+    })?;
+    let mut state = store::load_state(session_dir)
+        .map_err(|msg| (ExitCode::Environment, "environment", msg))?;
+    let secrets = store::secrets_from_env_names(&state.env_names);
+    store::clear_pause_flag(session_dir)
+        .map_err(|msg| (ExitCode::Environment, "environment", secrets.redact(&msg)))?;
+    let now = store::now_ms();
+    state.paused_for_human = false;
+    state.paused_reason = None;
+    state.paused_at_ms = None;
+    state.last_active_ms = now;
+    store::save_state(session_dir, &state, &secrets)
+        .map_err(|msg| (ExitCode::Environment, "environment", secrets.redact(&msg)))?;
+    let _ = store::update_preview_paused(session_dir, false, None, now, &secrets);
+
+    let mut payload = json!({
+        "ok": true,
+        "session_id": state.id,
+        "paused_for_human": false,
+    });
+    let meta_path = session_dir.join(store::PREVIEW_META_FILE);
+    if meta_path.is_file() {
+        payload["preview_path"] =
+            Value::String(paths::display(&session_dir.join(store::PREVIEW_IMAGE_FILE)));
+        payload["preview_meta_path"] = Value::String(paths::display(&meta_path));
+    }
+    Ok(secrets.redact_json(&payload))
+}
+
+fn handle_pause(sessions_dir: &Path, id: &str, reason: Option<&str>) -> SessionResponse {
+    if let Err(message) = store::validate_session_id(id) {
+        return error_response(ExitCode::Usage, "usage", message);
+    }
+    let session_dir = sessions_dir.join(id);
+    match pause_session_dir(&session_dir, id, reason) {
+        Ok(payload) => SessionResponse {
+            exit_code: ExitCode::Success,
+            payload,
+            raw_yaml: None,
+            raw_text: None,
+        },
+        Err((code, kind, message)) => error_response(code, kind, message),
+    }
+}
+
+fn handle_resume(sessions_dir: &Path, id: &str) -> SessionResponse {
+    if let Err(message) = store::validate_session_id(id) {
+        return error_response(ExitCode::Usage, "usage", message);
+    }
+    let session_dir = sessions_dir.join(id);
+    match resume_session_dir(&session_dir, id) {
+        Ok(payload) => SessionResponse {
+            exit_code: ExitCode::Success,
+            payload,
+            raw_yaml: None,
+            raw_text: None,
+        },
+        Err((code, kind, message)) => error_response(code, kind, message),
+    }
+}
+
+fn sync_pause_from_disk(session_dir: &Path, state: &mut SessionState, secrets: &Secrets) -> bool {
+    if let Some(flag) = store::read_pause_flag(session_dir) {
+        if !state.paused_for_human {
+            state.paused_for_human = true;
+            state.paused_reason = flag.reason.clone();
+            state.paused_at_ms = Some(flag.paused_at_ms);
+            state.last_active_ms = store::now_ms();
+            let _ = store::save_state(session_dir, state, secrets);
+            let _ = store::update_preview_paused(
+                session_dir,
+                true,
+                flag.reason.as_deref(),
+                state.last_active_ms,
+                secrets,
+            );
+        }
+        return true;
+    }
+    state.paused_for_human
+}
+
+fn paused_rejection_response(state: &SessionState, secrets: &Secrets) -> SessionResponse {
+    let message = match &state.paused_reason {
+        Some(reason) if !reason.is_empty() => format!(
+            "session `{}` is paused for human takeover ({reason}); call `da session resume {}` or MCP `resume` to continue",
+            state.id, state.id
+        ),
+        _ => format!(
+            "session `{}` is paused for human takeover; call `da session resume {}` or MCP `resume` to continue",
+            state.id, state.id
+        ),
+    };
+    let mut payload = json!({
+        "ok": false,
+        "session_id": state.id,
+        "paused_for_human": true,
+        "error": {
+            "kind": "paused_for_human",
+            "message": message,
+        }
+    });
+    if let Some(reason) = &state.paused_reason {
+        payload["paused_reason"] = Value::String(reason.clone());
+    }
+    SessionResponse {
+        exit_code: ExitCode::TestFailure,
+        payload: secrets.redact_json(&payload),
+        raw_yaml: None,
+        raw_text: None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct PreviewOutcome {
+    preview_path: Option<String>,
+    preview_meta_path: Option<String>,
+    preview_error: Option<String>,
+}
+
+impl PreviewOutcome {
+    fn apply_to_payload(&self, payload: &mut Value) {
+        if let Some(path) = &self.preview_path {
+            payload["preview_path"] = Value::String(path.clone());
+        }
+        if let Some(meta_path) = &self.preview_meta_path {
+            payload["preview_meta_path"] = Value::String(meta_path.clone());
+        }
+        if let Some(err) = &self.preview_error {
+            payload["preview_error"] = Value::String(err.clone());
+        }
+    }
+}
+
+/// Maps a mutating UI step name to the persistent session kind that owns its
+/// masked visual surface.
+///
+/// Read-only actions (`browser.read`, `desktop.read`, `*.screenshot`,
+/// `*.save_state`, clipboard steps) and teardown actions (`*.close`) do not
+/// rewrite `preview.png`/`preview.json`. `android.*` steps currently have no
+/// persistent session and are intentionally excluded so they never silently
+/// capture another open driver's viewport.
+fn preview_driver_kind(action: &str) -> Option<&'static str> {
+    match action {
+        "browser.open"
+        | "browser.click"
+        | "browser.type"
+        | "browser.upload"
+        | "browser.press"
+        | "browser.wait"
+        | "browser.set_cookies"
+        | "browser.switch_tab"
+        | "browser.scroll"
+        | "browser.hover"
+        | "browser.drag" => Some("browser"),
+        "desktop.launch" | "desktop.attach" | "desktop.click" | "desktop.type"
+        | "desktop.press" | "desktop.wait" | "desktop.scroll" | "desktop.hover"
+        | "desktop.drag" => Some("desktop"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_write_preview_frame(
+    session_dir: &Path,
+    state: &SessionState,
+    record: &StepRecord,
+    report: &StepReport,
+    snapshot_kind: Option<&str>,
+    snapshot: Option<&Value>,
+    sessions: &mut Sessions,
+    secrets: &Secrets,
+) -> PreviewOutcome {
+    if !state.preview_frames {
+        return PreviewOutcome::default();
+    }
+    let Some(driver_kind) = preview_driver_kind(&record.action) else {
+        return PreviewOutcome::default();
+    };
+    if matches!(
+        report.error.as_ref().map(|p| p.kind),
+        Some(ProblemKind::Environment)
+    ) {
+        return PreviewOutcome::default();
+    }
+    let capture = match sessions.collect_masked_viewport_capture_for(driver_kind) {
+        Ok(Some(cap)) => cap,
+        Ok(None) => return PreviewOutcome::default(),
+        Err(err) => {
+            return PreviewOutcome {
+                preview_error: Some(secrets.redact(&err)),
+                ..Default::default()
+            };
+        }
+    };
+    let matching_snapshot = snapshot.filter(|_| snapshot_kind == Some(driver_kind));
+    let url = matching_snapshot
+        .and_then(|s| s.get("url").and_then(Value::as_str))
+        .or_else(|| {
+            report
+                .result
+                .as_ref()
+                .and_then(|r| r.get("url").and_then(Value::as_str))
+        })
+        .map(|s| secrets.redact(s));
+    let title = matching_snapshot
+        .and_then(|s| s.get("title").and_then(Value::as_str))
+        .or_else(|| {
+            report
+                .result
+                .as_ref()
+                .and_then(|r| r.get("title").and_then(Value::as_str))
+        })
+        .map(|s| secrets.redact(s));
+    let updated_at_ms = store::now_ms();
+    let mut meta = json!({
+        "schema_version": 1,
+        "session_id": state.id,
+        "driver": driver_kind,
+        "url": url,
+        "title": title,
+        "viewport": {
+            "width": capture.width,
+            "height": capture.height,
+        },
+        "step_seq": record.index,
+        "action": record.action,
+        "target_bounds": record.target_bounds,
+        "status": record.status,
+        "paused_for_human": state.paused_for_human,
+        "updated_at_ms": updated_at_ms,
+    });
+    if let Some(reason) = &state.paused_reason
+        && state.paused_for_human
+    {
+        meta["paused_reason"] = Value::String(secrets.redact(reason));
+    }
+    match store::write_preview_frame(session_dir, &capture.png, &meta, secrets) {
+        Ok((img_path, meta_path)) => PreviewOutcome {
+            preview_path: Some(paths::display(&img_path)),
+            preview_meta_path: Some(paths::display(&meta_path)),
+            preview_error: None,
+        },
+        Err(err) => PreviewOutcome {
+            preview_error: Some(secrets.redact(&err)),
+            ..Default::default()
+        },
     }
 }
 
@@ -1209,6 +1591,9 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
     }
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
+    if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+        return paused_rejection_response(&state, &secrets);
+    }
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
@@ -1362,6 +1747,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
     );
 
     let mut act_report_opt: Option<(StepReport, Option<Value>, StepRecord)> = None;
+    let mut act_preview = PreviewOutcome::default();
     if let Some(act_spec) = req.act {
         let mut pairs = act_spec.args;
         if !pairs.iter().any(|(k, _)| k == "ref") {
@@ -1401,17 +1787,16 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
             synthesis.synthesized_locator = synth_locator.clone();
             synthesis.fragile = synth_fragile;
         }
-        let post_snap = if !matches!(
+        let (post_snap_kind, post_snap) = if !matches!(
             report.error.as_ref().map(|p| p.kind),
             Some(ProblemKind::Environment)
         ) {
-            sessions
-                .collect_step_snapshot()
-                .ok()
-                .flatten()
-                .map(|(_, s)| s)
+            match sessions.collect_step_snapshot().ok().flatten() {
+                Some((k, s)) => (Some(k), Some(s)),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         let mut step_rec = build_step_record(
             existing_steps.len() + 2,
@@ -1426,6 +1811,16 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
         step_rec.usage = outcome.audit.usage.clone();
         step_rec.trace_id = outcome.audit.trace_id.clone();
         step_rec.confidence = outcome.audit.confidence;
+        act_preview = maybe_write_preview_frame(
+            &session_dir,
+            &state,
+            &step_rec,
+            &report,
+            post_snap_kind.as_deref(),
+            post_snap.as_ref(),
+            &mut sessions,
+            &secrets,
+        );
         act_report_opt = Some((report, post_snap, step_rec));
     }
 
@@ -1450,6 +1845,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
         "ok": ok,
         "session_id": state.id,
         "session_kind": session_kind,
+        "paused_for_human": state.paused_for_human,
         "ref": outcome.selected_ref,
         "candidate": chosen_candidate,
         "synthesized_locator": synth_locator,
@@ -1460,6 +1856,7 @@ fn handle_select_ref(req: SelectRefRequest, registry: &Registry) -> SessionRespo
         "usage": outcome.audit.usage,
         "trace_id": outcome.audit.trace_id,
     });
+    act_preview.apply_to_payload(&mut payload);
 
     if let Some((report, post_snap, step_rec)) = act_report_opt {
         if let Err(err) = store::append_step(&session_dir, &step_rec, &secrets) {
@@ -1518,6 +1915,9 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         .env_names
         .extend(case::env_references(&Value::String(req.query.clone())));
     let mut secrets = store::secrets_from_env_names(&state.env_names);
+    if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+        return paused_rejection_response(&state, &secrets);
+    }
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
@@ -1672,6 +2072,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
     }
 
     let mut click_outcome_opt: Option<(StepReport, Option<Value>, StepRecord)> = None;
+    let mut click_preview = PreviewOutcome::default();
     if req.click {
         let click_action = if session_kind == "desktop" {
             "desktop.click"
@@ -1695,7 +2096,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
                 );
             }
         };
-        click_outcome_opt = Some(execute_synthesized_step(
+        let (report, post_snap_kind, post_snap, step_rec) = execute_synthesized_step(
             &step,
             existing_steps.len() + 2,
             Some(&viewport),
@@ -1705,7 +2106,18 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
             &mut state,
             &mut secrets,
             &mut sessions,
-        ));
+        );
+        click_preview = maybe_write_preview_frame(
+            &session_dir,
+            &state,
+            &step_rec,
+            &report,
+            post_snap_kind.as_deref(),
+            post_snap.as_ref(),
+            &mut sessions,
+            &secrets,
+        );
+        click_outcome_opt = Some((report, post_snap, step_rec));
     }
 
     let local_only_reason = sessions.local_only_reason();
@@ -1728,6 +2140,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         "ok": ok,
         "session_id": state.id,
         "session_kind": session_kind,
+        "paused_for_human": state.paused_for_human,
         "x": x_val,
         "y": y_val,
         "viewport": viewport,
@@ -1740,6 +2153,7 @@ fn handle_locate(req: LocateRequest, registry: &Registry) -> SessionResponse {
         "usage": outcome.audit.usage,
         "trace_id": outcome.audit.trace_id,
     });
+    click_preview.apply_to_payload(&mut payload);
 
     if let Some((report, post_snap, step_rec)) = click_outcome_opt {
         if let Err(err) = store::append_step(&session_dir, &step_rec, &secrets) {
@@ -1788,7 +2202,7 @@ fn execute_synthesized_step(
     state: &mut SessionState,
     secrets: &mut Secrets,
     sessions: &mut Sessions,
-) -> (StepReport, Option<Value>, StepRecord) {
+) -> (StepReport, Option<String>, Option<Value>, StepRecord) {
     let started_ms = store::now_ms();
     let observations = state_observations(state);
     let report = runner::run_single_step_with_observations(
@@ -1807,17 +2221,16 @@ fn execute_synthesized_step(
         synthesis.synthesized_locator = Some(target.locator.clone());
         synthesis.fragile = target.fragile;
     }
-    let post_snap = if !matches!(
+    let (post_snap_kind, post_snap) = if !matches!(
         report.error.as_ref().map(|p| p.kind),
         Some(ProblemKind::Environment)
     ) {
-        sessions
-            .collect_step_snapshot()
-            .ok()
-            .flatten()
-            .map(|(_, s)| s)
+        match sessions.collect_step_snapshot().ok().flatten() {
+            Some((k, s)) => (Some(k), Some(s)),
+            None => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
     let mut step_rec = build_step_record(
         step_index,
@@ -1839,7 +2252,7 @@ fn execute_synthesized_step(
         step_rec.trace_id = audit.trace_id.clone();
         step_rec.confidence = audit.confidence;
     }
-    (report, post_snap, step_rec)
+    (report, post_snap_kind, post_snap, step_rec)
 }
 
 struct VisualContext {
@@ -2051,6 +2464,9 @@ fn handle_judge(req: JudgeRequest, registry: &Registry) -> SessionResponse {
     }
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
+    if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+        return paused_rejection_response(&state, &secrets);
+    }
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
@@ -2277,6 +2693,9 @@ fn handle_extract(req: ExtractRequest, registry: &Registry) -> SessionResponse {
     }
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
+    if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+        return paused_rejection_response(&state, &secrets);
+    }
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
@@ -2569,6 +2988,9 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
     }
 
     let mut secrets = store::secrets_from_env_names(&state.env_names);
+    if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+        return paused_rejection_response(&state, &secrets);
+    }
     let backend = match resolve_model_backend(
         req.hook_override.as_ref(),
         req.model_override.as_ref(),
@@ -2660,7 +3082,12 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
     let mut max_model_latency_ms: u64 = 0;
     let mut usage_totals = ActUsageAccumulator::default();
 
+    let mut last_preview = PreviewOutcome::default();
     for step_num in 1..=req.max_steps {
+        if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+            let _ = detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+            return paused_rejection_response(&state, &secrets);
+        }
         let (mut session_kind, snapshot) = match sessions.collect_snapshot(None, None, None) {
             Ok(Some((kind, snap))) => (kind, Some(secrets.redact_json(&snap))),
             Err(message) if is_allowed_origins_error(&message) => {
@@ -2860,7 +3287,12 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
                     last_viewport = Some(vp.clone());
                 }
 
-                let (report, _post_snap, step_rec) = execute_synthesized_step(
+                if sync_pause_from_disk(&session_dir, &mut state, &secrets) {
+                    let _ =
+                        detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
+                    return paused_rejection_response(&state, &secrets);
+                }
+                let (report, post_snap_kind, post_snap, step_rec) = execute_synthesized_step(
                     &step,
                     next_step_index,
                     step_vp.as_ref(),
@@ -2871,6 +3303,19 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
                     &mut secrets,
                     &mut sessions,
                 );
+                let step_preview = maybe_write_preview_frame(
+                    &session_dir,
+                    &state,
+                    &step_rec,
+                    &report,
+                    post_snap_kind.as_deref(),
+                    post_snap.as_ref(),
+                    &mut sessions,
+                    &secrets,
+                );
+                if step_preview.preview_path.is_some() || step_preview.preview_error.is_some() {
+                    last_preview = step_preview;
+                }
                 if let Err(err) = store::append_step(&session_dir, &step_rec, &secrets) {
                     let _ =
                         detach_and_persist_handles(&session_dir, &mut state, sessions, &secrets);
@@ -3041,6 +3486,8 @@ fn handle_act(req: ActRequest, registry: &Registry) -> SessionResponse {
         payload["local_only"] = json!(true);
         payload["local_only_reason"] = json!(reason);
     }
+    last_preview.apply_to_payload(&mut payload);
+    payload["paused_for_human"] = json!(state.paused_for_human);
 
     let mut text = format!(
         "act: {final_status} (steps: {}/{}, model: {}, latency_ms: {total_model_latency_ms})\n",
@@ -3903,6 +4350,7 @@ mod tests {
                 model_hook: None,
                 model: None,
                 plugins: Vec::new(),
+                preview_frames: false,
             },
             &registry,
         );
@@ -3929,6 +4377,7 @@ mod tests {
                 model_hook: None,
                 model: None,
                 plugins: Vec::new(),
+                preview_frames: false,
             },
             &registry,
         );
@@ -3937,5 +4386,209 @@ mod tests {
             !dir.exists(),
             "duplicate start must not create sessions dir"
         );
+    }
+
+    #[test]
+    fn preview_frame_selects_capture_by_step_driver_and_skips_read_only_and_android() {
+        use crate::core::session::{MaskedViewportCapture, Session};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        struct FakeVisualSession {
+            png: Vec<u8>,
+            width: u32,
+            height: u32,
+        }
+        impl Session for FakeVisualSession {
+            fn close(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn masked_viewport_capture(&mut self) -> Result<Option<MaskedViewportCapture>, String> {
+                Ok(Some(MaskedViewportCapture {
+                    png: self.png.clone(),
+                    width: self.width,
+                    height: self.height,
+                }))
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("da-preview-driver-sel-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = SessionState {
+            schema_version: 1,
+            id: "s-mixed".to_string(),
+            created_at_ms: 1,
+            last_active_ms: 1,
+            idle_timeout_ms: 60_000,
+            handles: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            env_names: BTreeSet::new(),
+            observe: Vec::new(),
+            plugins: Vec::new(),
+            model_hook: None,
+            model: None,
+            preview_frames: true,
+            paused_for_human: false,
+            paused_reason: None,
+            paused_at_ms: None,
+        };
+        let secrets = Secrets::new();
+
+        // Register browser BEFORE desktop (matching BTreeMap handle reattach order).
+        let mut sessions = Sessions::new();
+        sessions
+            .insert_reattached(
+                "browser",
+                Box::new(FakeVisualSession {
+                    png: b"BROWSER_PNG_BYTES".to_vec(),
+                    width: 1280,
+                    height: 720,
+                }),
+            )
+            .unwrap();
+        sessions
+            .insert_reattached(
+                "desktop",
+                Box::new(FakeVisualSession {
+                    png: b"DESKTOP_PNG_BYTES".to_vec(),
+                    width: 1920,
+                    height: 1080,
+                }),
+            )
+            .unwrap();
+
+        let mk_step = |index: usize, action: &str| -> (StepRecord, StepReport) {
+            let record = StepRecord {
+                index,
+                action: action.to_string(),
+                raw_args: json!({}),
+                redacted_args: false,
+                status: "passed".to_string(),
+                duration_ms: 5,
+                result: Some(json!({})),
+                expect: Vec::new(),
+                save: BTreeMap::new(),
+                optional: false,
+                error: None,
+                started_at_ms: 10,
+                used_ref: None,
+                synthesized_locator: None,
+                fragile: false,
+                observed_viewport: None,
+                target_bounds: None,
+                model: None,
+                latency_ms: None,
+                usage: None,
+                trace_id: None,
+                confidence: None,
+            };
+            let report = StepReport {
+                name: action.to_string(),
+                status: StepStatus::Passed,
+                duration: std::time::Duration::from_millis(5),
+                args: Some(json!({})),
+                result: Some(json!({})),
+                saved: BTreeMap::new(),
+                assertions: Vec::new(),
+                error: None,
+                target_bounds: None,
+            };
+            (record, report)
+        };
+
+        // 1. Desktop step in mixed session must capture desktop PNG (1920x1080), not browser PNG,
+        //    and must not copy browser snapshot URL into desktop preview metadata.
+        let browser_snap = json!({ "url": "https://browser.example", "title": "Browser Tab" });
+        let (desk_rec, desk_rep) = mk_step(1, "desktop.click");
+        let desk_out = maybe_write_preview_frame(
+            &dir,
+            &state,
+            &desk_rec,
+            &desk_rep,
+            Some("browser"),
+            Some(&browser_snap),
+            &mut sessions,
+            &secrets,
+        );
+        assert!(desk_out.preview_path.is_some());
+        assert_eq!(
+            std::fs::read(dir.join(store::PREVIEW_IMAGE_FILE)).unwrap(),
+            b"DESKTOP_PNG_BYTES"
+        );
+        let desk_meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(store::PREVIEW_META_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(desk_meta["driver"], json!("desktop"));
+        assert_eq!(desk_meta["action"], json!("desktop.click"));
+        assert_eq!(
+            desk_meta["viewport"],
+            json!({ "width": 1920, "height": 1080 })
+        );
+        assert!(desk_meta["url"].is_null());
+
+        // 2. Browser step captures browser PNG (1280x720) and matching browser snapshot URL/title.
+        let (br_rec, br_rep) = mk_step(2, "browser.click");
+        let br_out = maybe_write_preview_frame(
+            &dir,
+            &state,
+            &br_rec,
+            &br_rep,
+            Some("browser"),
+            Some(&browser_snap),
+            &mut sessions,
+            &secrets,
+        );
+        assert!(br_out.preview_path.is_some());
+        assert_eq!(
+            std::fs::read(dir.join(store::PREVIEW_IMAGE_FILE)).unwrap(),
+            b"BROWSER_PNG_BYTES"
+        );
+        let br_meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(store::PREVIEW_META_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(br_meta["driver"], json!("browser"));
+        assert_eq!(br_meta["action"], json!("browser.click"));
+        assert_eq!(br_meta["viewport"], json!({ "width": 1280, "height": 720 }));
+        assert_eq!(br_meta["url"], json!("https://browser.example"));
+        assert_eq!(br_meta["title"], json!("Browser Tab"));
+
+        // 3. Read-only steps (`browser.read`, `desktop.read`) and non-session `android.*` steps
+        //    must NOT capture or overwrite preview files.
+        for skipped_action in [
+            "browser.read",
+            "desktop.read",
+            "browser.close",
+            "android.tap",
+        ] {
+            let (rec, rep) = mk_step(3, skipped_action);
+            let out = maybe_write_preview_frame(
+                &dir,
+                &state,
+                &rec,
+                &rep,
+                Some("browser"),
+                Some(&browser_snap),
+                &mut sessions,
+                &secrets,
+            );
+            assert!(
+                out.preview_path.is_none() && out.preview_error.is_none(),
+                "{skipped_action} must not emit preview"
+            );
+        }
+        // Latest preview remains step_seq 2 (`browser.click`).
+        let final_meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(store::PREVIEW_META_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(final_meta["step_seq"], json!(2));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

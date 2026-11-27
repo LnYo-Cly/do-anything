@@ -38,7 +38,22 @@ env.yaml` instead of editing the case for each environment.
 **No case yet: explore, export, replay.** `da session` keeps a browser alive
 between commands and prints JSON by default.
 
-1. `da session start` → a `session_id`.
+1. `da session start` → a `session_id` (add `--preview-frames` — or
+   `"preview_frames": true` in MCP `session_start` — to atomically write
+   `#000000` input-masked `.da/sessions/<id>/preview.png` and redacted
+   `preview.json` after mutating `browser.*` and `desktop.*` steps, captured
+   strictly from the step's driver, without adding base64 images to LLM
+   `content`).
+   - Pause/resume for human takeover (login, 2FA, CAPTCHA, visual review) with
+     `da session pause <id> [--reason "..."]` / `da session resume <id>` (or
+     MCP `pause_for_human` / `resume`); queued agent steps fail closed while
+     paused. Every `da mcp` `tools/call` also emits standard `structuredContent`
+     alongside `content` text.
+   - When built with default-off `--features live-preview`,
+     `da session preview-bridge <id>` starts a `127.0.0.1`-only bearer-protected
+     CDP Screencast + input-forwarding bridge scoped strictly to the session's
+     owned tab (human-typed credentials cannot be retroactively redacted by
+     `Secrets`).
 2. Drive the page with the accessibility snapshot returned after every browser
    step:
 

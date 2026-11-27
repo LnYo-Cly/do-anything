@@ -40,6 +40,10 @@ db = [
 ]
 # The `browser.*` steps and the Chrome DevTools Protocol client they need.
 browser = ["dep:schemars", "dep:tungstenite"]
+# Opt-in loopback-only (`127.0.0.1`) CDP Screencast & human takeover bridge
+# (`da session preview-bridge`). Off by default to keep the default `da` binary
+# surface minimal.
+live-preview = ["browser"]
 # The `android.*` steps, which drive a device by spawning `adb`. It is off by
 # default because it is only useful on a machine with an Android device.
 android = ["dep:schemars"]
